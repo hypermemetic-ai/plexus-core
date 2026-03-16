@@ -38,3 +38,4 @@ agents.db
 
 # Substrate data directory
 .substrate/
+output.log

@@ -86,7 +86,7 @@ pub fn wrap_stream<T: Serialize + Send + 'static>(
 /// let merged_stream = wrap_fn(user_stream);
 /// ```
 pub fn create_bidir_stream<Req, Resp>(
-    content_type: &'static str,
+    _content_type: &'static str,
     provenance: Vec<String>,
 ) -> (
     Arc<BidirChannel<Req, Resp>>,

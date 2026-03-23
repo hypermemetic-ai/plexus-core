@@ -13,6 +13,57 @@ use std::collections::HashMap;
 
 use super::bidirectional::{StandardRequest, StandardResponse};
 
+// =============================================================================
+// HTTP Method Enum
+// =============================================================================
+
+/// HTTP method for REST endpoint routing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    /// GET: Idempotent read operations with no side effects
+    Get,
+    /// POST: Create operations or non-idempotent actions (default)
+    Post,
+    /// PUT: Replace/update operations (idempotent)
+    Put,
+    /// DELETE: Remove operations (idempotent)
+    Delete,
+    /// PATCH: Partial update operations
+    Patch,
+}
+
+impl Default for HttpMethod {
+    fn default() -> Self {
+        HttpMethod::Post
+    }
+}
+
+impl HttpMethod {
+    /// Parse from string (case-insensitive)
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "GET" => Some(HttpMethod::Get),
+            "POST" => Some(HttpMethod::Post),
+            "PUT" => Some(HttpMethod::Put),
+            "DELETE" => Some(HttpMethod::Delete),
+            "PATCH" => Some(HttpMethod::Patch),
+            _ => None,
+        }
+    }
+
+    /// Convert to uppercase string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+            HttpMethod::Delete => "DELETE",
+            HttpMethod::Patch => "PATCH",
+        }
+    }
+}
+
 // ============================================================================
 // Plugin Schema
 // ============================================================================
@@ -109,6 +160,20 @@ pub struct MethodSchema {
     /// and wait for responses (e.g., confirmations, prompts, selections).
     #[serde(default)]
     pub bidirectional: bool,
+
+    /// HTTP method for REST endpoints (GET, POST, PUT, DELETE, PATCH)
+    ///
+    /// This field is used by the HTTP gateway to determine which HTTP method
+    /// to use when exposing this method as a REST endpoint. Defaults to POST
+    /// for backward compatibility.
+    ///
+    /// - GET: Idempotent read operations (no side effects)
+    /// - POST: Create operations or non-idempotent actions (default)
+    /// - PUT: Replace/update operations (idempotent)
+    /// - DELETE: Remove operations (idempotent)
+    /// - PATCH: Partial update operations
+    #[serde(default)]
+    pub http_method: HttpMethod,
 
     /// JSON Schema for the request type sent from server to client
     ///
@@ -364,6 +429,7 @@ impl MethodSchema {
             returns: None,
             streaming: false,
             bidirectional: false,
+            http_method: HttpMethod::default(),
             request_type: None,
             response_type: None,
         }
@@ -387,6 +453,21 @@ impl MethodSchema {
     /// - `false` → method returns single result (use `Promise<T>`)
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
+        self
+    }
+
+    /// Set the HTTP method for REST endpoints
+    ///
+    /// Defaults to POST for backward compatibility.
+    ///
+    /// # Guidelines
+    /// - GET: Idempotent read operations with no side effects
+    /// - POST: Create operations or non-idempotent actions
+    /// - PUT: Replace/update operations (idempotent)
+    /// - DELETE: Remove operations (idempotent)
+    /// - PATCH: Partial update operations
+    pub fn with_http_method(mut self, http_method: HttpMethod) -> Self {
+        self.http_method = http_method;
         self
     }
 

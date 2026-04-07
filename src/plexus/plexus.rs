@@ -42,6 +42,7 @@ pub enum PlexusError {
     ExecutionError(String),
     HandleNotSupported(String),
     TransportError(TransportErrorKind),
+    Unauthenticated(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +99,7 @@ impl std::fmt::Display for PlexusError {
                     write!(f, "Network error: {}", message)
                 }
             }
+            PlexusError::Unauthenticated(msg) => write!(f, "Authentication required: {}", msg),
         }
     }
 }
@@ -140,7 +142,7 @@ pub trait Activation: Send + Sync + 'static {
         uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, format!("{}@{}", self.namespace(), major_version).as_bytes())
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError>;
+    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError>;
     async fn resolve_handle(&self, _handle: &Handle) -> Result<PlexusStream, PlexusError> {
         Err(PlexusError::HandleNotSupported(self.namespace().to_string()))
     }
@@ -199,7 +201,7 @@ pub trait ChildRouter: Send + Sync {
     fn router_namespace(&self) -> &str;
 
     /// Call a method on this router
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError>;
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError>;
 
     /// Get a child activation instance by name for nested routing
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>>;
@@ -214,11 +216,12 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
     parent: &T,
     method: &str,
     params: Value,
+    auth: Option<&super::auth::AuthContext>,
 ) -> Result<PlexusStream, PlexusError> {
     // Try to split on first dot for nested routing
     if let Some((child_name, rest)) = method.split_once('.') {
         if let Some(child) = parent.get_child(child_name).await {
-            return child.router_call(rest, params).await;
+            return child.router_call(rest, params, auth).await;
         }
         return Err(PlexusError::ActivationNotFound(child_name.to_string()));
     }
@@ -241,8 +244,8 @@ impl ChildRouter for ArcChildRouter {
         self.0.router_namespace()
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        self.0.router_call(method, params).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
+        self.0.router_call(method, params, auth).await
     }
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
@@ -264,7 +267,7 @@ trait ActivationObject: Send + Sync + 'static {
     fn methods(&self) -> Vec<&str>;
     fn method_help(&self, method: &str) -> Option<String>;
     fn plugin_id(&self) -> uuid::Uuid;
-    async fn call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError>;
+    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError>;
     async fn resolve_handle(&self, handle: &Handle) -> Result<PlexusStream, PlexusError>;
     fn plugin_schema(&self) -> PluginSchema;
     fn schema(&self) -> Schema;
@@ -284,8 +287,8 @@ impl<A: Activation> ActivationObject for ActivationWrapper<A> {
     fn method_help(&self, method: &str) -> Option<String> { self.inner.method_help(method) }
     fn plugin_id(&self) -> uuid::Uuid { self.inner.plugin_id() }
 
-    async fn call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        self.inner.call(method, params).await
+    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
+        self.inner.call(method, params, auth).await
     }
 
     async fn resolve_handle(&self, handle: &Handle) -> Result<PlexusStream, PlexusError> {
@@ -637,18 +640,18 @@ impl DynamicHub {
     }
 
     /// Route a call to the appropriate activation
-    pub async fn route(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
+    pub async fn route(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
         let (namespace, method_name) = self.parse_method(method)?;
 
         // Handle plexus's own methods
         if namespace == self.inner.namespace {
-            return Activation::call(self, method_name, params).await;
+            return Activation::call(self, method_name, params, auth).await;
         }
 
         let activation = self.inner.activations.get(namespace)
             .ok_or_else(|| PlexusError::ActivationNotFound(namespace.to_string()))?;
 
-        activation.call(method_name, params).await
+        activation.call(method_name, params, auth).await
     }
 
     /// Resolve a handle using the activation registry
@@ -770,7 +773,7 @@ impl DynamicHub {
                 Box::pin(async move {
                     // Parse params: {"method": "...", "params": {...}}
                     let p: CallParams = params.parse()?;
-                    let stream = plexus.route(&p.method, p.params.unwrap_or_default()).await
+                    let stream = plexus.route(&p.method, p.params.unwrap_or_default(), None).await
                         .map_err(|e| jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>))?;
                     pipe_stream_to_subscription(pending, stream).await
                 })
@@ -894,11 +897,14 @@ impl DynamicHub {
             call_method,
             call_method,
             call_unsub,
-            move |params, pending, _ctx, _ext| {
+            move |params, pending, _ctx, ext| {
                 let hub = hub_for_call.clone();
                 Box::pin(async move {
                     let p: CallParams = params.parse()?;
-                    let stream = hub.route(&p.method, p.params.unwrap_or_default()).await
+                    // Extract auth context from Extensions (if present)
+                    let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>()
+                        .map(|arc| arc.as_ref());
+                    let stream = hub.route(&p.method, p.params.unwrap_or_default(), auth).await
                         .map_err(|e| jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>))?;
                     pipe_stream_to_subscription(pending, stream).await
                 })
@@ -1114,7 +1120,7 @@ impl DynamicHub {
         use super::context::PlexusContext;
         use super::types::{PlexusStreamItem, StreamMetadata};
 
-        let result = self.route(&method, params.unwrap_or_default()).await;
+        let result = self.route(&method, params.unwrap_or_default(), None).await;
 
         match result {
             Ok(plexus_stream) => {
@@ -1200,7 +1206,7 @@ impl HubContext for Weak<DynamicHub> {
         let hub = self.upgrade().ok_or_else(|| {
             PlexusError::ExecutionError("Parent hub has been dropped".to_string())
         })?;
-        hub.route(method, params).await
+        hub.route(method, params, None).await
     }
 
     fn is_valid(&self) -> bool {
@@ -1218,10 +1224,10 @@ impl ChildRouter for DynamicHub {
         &self.inner.namespace
     }
 
-    async fn router_call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
         // DynamicHub routes via its registered activations
         // Method format: "activation.method" or "activation.child.method"
-        self.route(method, params).await
+        self.route(method, params, auth).await
     }
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {

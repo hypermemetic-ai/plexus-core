@@ -1,6 +1,8 @@
 // Guidance system removed during caller-wraps streaming architecture refactor
 // pub mod guidance;
 
+pub mod auth;
+pub mod test_validator;
 pub mod bidirectional;
 pub mod context;
 pub mod dispatch;
@@ -14,6 +16,8 @@ pub mod schema;
 pub mod streaming;
 pub mod types;
 
+pub use auth::{AuthContext, SessionValidator};
+pub use test_validator::TestSessionValidator;
 pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirChannel, StandardRequest, StandardResponse};
 pub use context::PlexusContext;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]

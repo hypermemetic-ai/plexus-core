@@ -130,7 +130,7 @@ impl Activation for Health {
         }
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
+    async fn call(&self, method: &str, params: Value, _auth: Option<&crate::plexus::AuthContext>) -> Result<PlexusStream, PlexusError> {
         match method {
             "check" => {
                 let stream = self.check_stream();

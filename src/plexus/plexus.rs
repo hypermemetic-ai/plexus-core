@@ -106,6 +106,28 @@ impl std::fmt::Display for PlexusError {
 
 impl std::error::Error for PlexusError {}
 
+/// Convert PlexusError to a JSON-RPC ErrorObject with semantic error codes.
+///
+/// Codes:
+/// - `-32001`: Authentication required (custom app-level error)
+/// - `-32601`: Method/activation not found (standard JSON-RPC)
+/// - `-32602`: Invalid parameters (standard JSON-RPC)
+/// - `-32000`: Generic server error (execution, transport, handle errors)
+/// Get the semantic JSON-RPC error code for a PlexusError.
+fn plexus_error_code(e: &PlexusError) -> i32 {
+    match e {
+        PlexusError::Unauthenticated(_) => -32001,
+        PlexusError::InvalidParams(_) => -32602,
+        PlexusError::MethodNotFound { .. } | PlexusError::ActivationNotFound(_) => -32601,
+        _ => -32000,
+    }
+}
+
+/// Convert PlexusError to a JSON-RPC ErrorObject with semantic error codes.
+fn plexus_error_to_jsonrpc(e: &PlexusError) -> jsonrpsee::types::ErrorObjectOwned {
+    jsonrpsee::types::ErrorObject::owned(plexus_error_code(e), e.to_string(), None::<()>)
+}
+
 // ============================================================================
 // Schema Types
 // ============================================================================
@@ -771,11 +793,26 @@ impl DynamicHub {
             move |params, pending, _ctx, _ext| {
                 let plexus = plexus_for_call.clone();
                 Box::pin(async move {
-                    // Parse params: {"method": "...", "params": {...}}
                     let p: CallParams = params.parse()?;
-                    let stream = plexus.route(&p.method, p.params.unwrap_or_default(), None).await
-                        .map_err(|e| jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>))?;
-                    pipe_stream_to_subscription(pending, stream).await
+                    match plexus.route(&p.method, p.params.unwrap_or_default(), None).await {
+                        Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
+                        Err(e) => {
+                            let sink = pending.accept().await?;
+                            let error_item = super::types::PlexusStreamItem::Error {
+                                metadata: super::types::StreamMetadata::new(
+                                    vec![ns_static.into()],
+                                    PlexusContext::hash(),
+                                ),
+                                message: e.to_string(),
+                                code: Some(plexus_error_code(&e).to_string()),
+                                recoverable: false,
+                            };
+                            if let Ok(raw) = serde_json::value::to_raw_value(&error_item) {
+                                let _ = sink.send(raw).await;
+                            }
+                            Ok(())
+                        }
+                    }
                 })
             }
         )?;
@@ -904,9 +941,29 @@ impl DynamicHub {
                     // Extract auth context from Extensions (if present)
                     let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>()
                         .map(|arc| arc.as_ref());
-                    let stream = hub.route(&p.method, p.params.unwrap_or_default(), auth).await
-                        .map_err(|e| jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>))?;
-                    pipe_stream_to_subscription(pending, stream).await
+                    match hub.route(&p.method, p.params.unwrap_or_default(), auth).await {
+                        Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
+                        Err(e) => {
+                            // Accept the subscription, then send the error as a stream item.
+                            // This preserves the error message and code — returning Err(...)
+                            // from a subscription handler causes jsonrpsee to wrap it as
+                            // generic -32603, discarding our semantic error code.
+                            let sink = pending.accept().await?;
+                            let error_item = super::types::PlexusStreamItem::Error {
+                                metadata: super::types::StreamMetadata::new(
+                                    vec![ns_static.into()],
+                                    PlexusContext::hash(),
+                                ),
+                                message: e.to_string(),
+                                code: Some(plexus_error_code(&e).to_string()),
+                                recoverable: false,
+                            };
+                            if let Ok(raw) = serde_json::value::to_raw_value(&error_item) {
+                                let _ = sink.send(raw).await;
+                            }
+                            Ok(())
+                        }
+                    }
                 })
             }
         )?;

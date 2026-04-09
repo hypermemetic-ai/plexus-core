@@ -1152,7 +1152,7 @@ async fn pipe_stream_to_subscription(
 // DynamicHub RPC Methods (via plexus-macros)
 // ============================================================================
 
-#[plexus_macros::hub_methods(
+#[plexus_macros::activation(
     namespace = "plexus",
     version = "1.0.0",
     description = "Central routing and introspection",
@@ -1161,7 +1161,7 @@ async fn pipe_stream_to_subscription(
 )]
 impl DynamicHub {
     /// Route a call to a registered activation
-    #[plexus_macros::hub_method(
+    #[plexus_macros::method(
         streaming,
         description = "Route a call to a registered activation",
         params(
@@ -1206,14 +1206,14 @@ impl DynamicHub {
     ///
     /// This hash changes whenever any method or child activation changes.
     /// It's computed from the method hashes rolled up through the schema tree.
-    #[plexus_macros::hub_method(description = "Get plexus configuration hash (from the recursive schema)\n\n This hash changes whenever any method or child plugin changes.\n It's computed from the method hashes rolled up through the schema tree.")]
+    #[plexus_macros::method(description = "Get plexus configuration hash (from the recursive schema)\n\n This hash changes whenever any method or child plugin changes.\n It's computed from the method hashes rolled up through the schema tree.")]
     async fn hash(&self) -> impl Stream<Item = HashEvent> + Send + 'static {
         let schema = Activation::plugin_schema(self);
         stream! { yield HashEvent::Hash { value: schema.hash }; }
     }
 
     /// Get plugin hashes for cache validation (lightweight alternative to full schema)
-    #[plexus_macros::hub_method(description = "Get plugin hashes for cache validation")]
+    #[plexus_macros::method(description = "Get plugin hashes for cache validation")]
     async fn hashes(&self) -> impl Stream<Item = PluginHashes> + Send + 'static {
         let schema = Activation::plugin_schema(self);
 

@@ -34,3 +34,15 @@ pub use builder::build_example_hub;
 pub use mcp_bridge::PlexusMcpBridge;
 pub use plexus::{Activation, DynamicHub, PlexusError, PLEXUS_NOTIF_METHOD};
 pub use types::{Envelope, Handle, HandleParseError, HandleResolutionParams, Origin};
+
+// Proc-macro re-exports.
+// Use as `plexus_core::activation` / `plexus_core::method`, or via a
+// `plexus = { package = "plexus-core" }` Cargo alias as `plexus::activation` / `plexus::method`.
+pub use plexus_macros::activation;
+pub use plexus_macros::method;
+#[allow(deprecated)]
+#[deprecated(since = "0.5.0", note = "Use `plexus_core::activation` instead")]
+pub use plexus_macros::hub_methods;
+#[allow(deprecated)]
+#[deprecated(since = "0.5.0", note = "Use `plexus_core::method` instead")]
+pub use plexus_macros::hub_method;

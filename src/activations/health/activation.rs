@@ -1,6 +1,6 @@
 use super::methods::HealthMethod;
 use super::types::HealthEvent;
-use crate::plexus::{wrap_stream, PlexusError, PlexusStream, Activation, PlexusStreamItem, StreamMetadata, PlexusContext};
+use crate::plexus::{wrap_stream, PlexusError, PlexusStream, Activation, ChildRouter, PlexusStreamItem, StreamMetadata, PlexusContext};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -130,7 +130,7 @@ impl Activation for Health {
         }
     }
 
-    async fn call(&self, method: &str, params: Value, _auth: Option<&crate::plexus::AuthContext>) -> Result<PlexusStream, PlexusError> {
+    async fn call(&self, method: &str, params: Value, _auth: Option<&crate::plexus::AuthContext>, _raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
         match method {
             "check" => {
                 let stream = self.check_stream();
@@ -194,5 +194,21 @@ impl Activation for Health {
     fn into_rpc_methods(self) -> Methods {
         // Register RPC subscription methods
         self.into_rpc().into()
+    }
+}
+
+/// ChildRouter implementation for Health — leaf activation, no children.
+#[async_trait]
+impl ChildRouter for Health {
+    fn router_namespace(&self) -> &str {
+        "health"
+    }
+
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&crate::plexus::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        self.call(method, params, auth, raw_ctx).await
+    }
+
+    async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {
+        None
     }
 }

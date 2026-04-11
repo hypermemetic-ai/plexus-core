@@ -1,6 +1,7 @@
 //! Authentication context for Plexus RPC
 
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,7 +18,7 @@ use serde_json::Value;
 /// - `session_id`: Keycloak session ID
 /// - `roles`: User roles within the tenant/realm
 /// - `metadata`: Additional JWT claims (realm, tenant ID, custom attributes)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AuthContext {
     /// User identifier (e.g., Keycloak sub claim, user UUID)
     pub user_id: String,

@@ -26,6 +26,7 @@ pub mod builder;
 pub mod mcp_bridge;
 pub mod plexus;
 pub mod plugin_system;
+pub mod request;
 pub mod serde_helpers;
 pub mod types;
 
@@ -34,6 +35,12 @@ pub use builder::build_example_hub;
 pub use mcp_bridge::PlexusMcpBridge;
 pub use plexus::{Activation, DynamicHub, PlexusError, PLEXUS_NOTIF_METHOD};
 pub use types::{Envelope, Handle, HandleParseError, HandleResolutionParams, Origin};
+
+// Re-export schemars under a stable private path so PlexusRequest derive-generated code
+// can reference the real schemars::JsonSchema trait without requiring the caller to have
+// schemars in their own dependencies.
+#[doc(hidden)]
+pub use schemars as __schemars;
 
 // Proc-macro re-exports.
 // Use as `plexus_core::activation` / `plexus_core::method`, or via a

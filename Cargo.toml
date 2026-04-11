@@ -29,6 +29,9 @@ anyhow = "1.0"
 # Schema generation
 schemars = { version = "1.1", features = ["derive", "uuid1"] }
 
+# HTTP types for RawRequestContext
+http = "1"
+
 # Core types
 uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

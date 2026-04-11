@@ -164,7 +164,13 @@ pub trait Activation: Send + Sync + 'static {
         uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, format!("{}@{}", self.namespace(), major_version).as_bytes())
     }
 
-    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError>;
+    async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        auth: Option<&super::auth::AuthContext>,
+        raw_ctx: Option<&crate::request::RawRequestContext>,
+    ) -> Result<PlexusStream, PlexusError>;
     async fn resolve_handle(&self, _handle: &Handle) -> Result<PlexusStream, PlexusError> {
         Err(PlexusError::HandleNotSupported(self.namespace().to_string()))
     }
@@ -223,7 +229,7 @@ pub trait ChildRouter: Send + Sync {
     fn router_namespace(&self) -> &str;
 
     /// Call a method on this router
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError>;
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError>;
 
     /// Get a child activation instance by name for nested routing
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>>;
@@ -239,11 +245,12 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
     method: &str,
     params: Value,
     auth: Option<&super::auth::AuthContext>,
+    raw_ctx: Option<&crate::request::RawRequestContext>,
 ) -> Result<PlexusStream, PlexusError> {
     // Try to split on first dot for nested routing
     if let Some((child_name, rest)) = method.split_once('.') {
         if let Some(child) = parent.get_child(child_name).await {
-            return child.router_call(rest, params, auth).await;
+            return child.router_call(rest, params, auth, raw_ctx).await;
         }
         return Err(PlexusError::ActivationNotFound(child_name.to_string()));
     }
@@ -266,8 +273,8 @@ impl ChildRouter for ArcChildRouter {
         self.0.router_namespace()
     }
 
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
-        self.0.router_call(method, params, auth).await
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        self.0.router_call(method, params, auth, raw_ctx).await
     }
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
@@ -289,7 +296,7 @@ trait ActivationObject: Send + Sync + 'static {
     fn methods(&self) -> Vec<&str>;
     fn method_help(&self, method: &str) -> Option<String>;
     fn plugin_id(&self) -> uuid::Uuid;
-    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError>;
+    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError>;
     async fn resolve_handle(&self, handle: &Handle) -> Result<PlexusStream, PlexusError>;
     fn plugin_schema(&self) -> PluginSchema;
     fn schema(&self) -> Schema;
@@ -309,8 +316,8 @@ impl<A: Activation> ActivationObject for ActivationWrapper<A> {
     fn method_help(&self, method: &str) -> Option<String> { self.inner.method_help(method) }
     fn plugin_id(&self) -> uuid::Uuid { self.inner.plugin_id() }
 
-    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
-        self.inner.call(method, params, auth).await
+    async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        self.inner.call(method, params, auth, raw_ctx).await
     }
 
     async fn resolve_handle(&self, handle: &Handle) -> Result<PlexusStream, PlexusError> {
@@ -561,10 +568,11 @@ impl DynamicHub {
     }
 
     /// Register an activation
-    pub fn register<A: Activation + Clone>(mut self, activation: A) -> Self {
+    pub fn register<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
         let namespace = activation.namespace().to_string();
         let plugin_id = activation.plugin_id();
         let activation_for_rpc = activation.clone();
+        let activation_for_router = activation.clone();
 
         let inner = Arc::get_mut(&mut self.inner)
             .expect("Cannot register: DynamicHub has multiple references");
@@ -576,7 +584,8 @@ impl DynamicHub {
             namespace.clone(), // Use namespace as plugin_type for now
         );
 
-        inner.activations.insert(namespace, Arc::new(ActivationWrapper { inner: activation }));
+        inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
+        inner.child_routers.insert(namespace.clone(), Arc::new(activation_for_router));
         inner.pending_rpc.lock().unwrap()
             .push(Box::new(move || activation_for_rpc.into_rpc_methods()));
         self
@@ -586,6 +595,7 @@ impl DynamicHub {
     ///
     /// Hub activations implement `ChildRouter`, enabling direct nested method calls
     /// like `hub.solar.mercury.info` at the RPC layer (no hub.call indirection).
+    #[deprecated(since = "0.5.0", note = "Use register() — it now handles both leaf and hub activations")]
     pub fn register_hub<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
         let namespace = activation.namespace().to_string();
         let plugin_id = activation.plugin_id();
@@ -663,17 +673,22 @@ impl DynamicHub {
 
     /// Route a call to the appropriate activation
     pub async fn route(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
+        self.route_with_ctx(method, params, auth, None).await
+    }
+
+    /// Route a call to the appropriate activation, with optional raw HTTP request context.
+    pub async fn route_with_ctx(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
         let (namespace, method_name) = self.parse_method(method)?;
 
         // Handle plexus's own methods
         if namespace == self.inner.namespace {
-            return Activation::call(self, method_name, params, auth).await;
+            return Activation::call(self, method_name, params, auth, raw_ctx).await;
         }
 
         let activation = self.inner.activations.get(namespace)
             .ok_or_else(|| PlexusError::ActivationNotFound(namespace.to_string()))?;
 
-        activation.call(method_name, params, auth).await
+        activation.call(method_name, params, auth, raw_ctx).await
     }
 
     /// Resolve a handle using the activation registry
@@ -1281,10 +1296,10 @@ impl ChildRouter for DynamicHub {
         &self.inner.namespace
     }
 
-    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>) -> Result<PlexusStream, PlexusError> {
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
         // DynamicHub routes via its registered activations
         // Method format: "activation.method" or "activation.child.method"
-        self.route(method, params, auth).await
+        self.route_with_ctx(method, params, auth, raw_ctx).await
     }
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {

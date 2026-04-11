@@ -111,6 +111,17 @@ pub struct PluginSchema {
     /// Child plugin summaries (None = leaf plugin, Some = hub plugin)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<ChildSummary>>,
+
+    /// JSON Schema for the HTTP request type this activation extracts from incoming connections.
+    ///
+    /// Present when the activation declares `request = MyRequest` in `#[plexus::activation(...)]`.
+    /// The schema includes `x-plexus-source` extension fields on each property describing
+    /// where each field is sourced from (cookie, header, query param, peer address, etc.).
+    ///
+    /// Clients can use this to understand what request data the activation expects and
+    /// to generate appropriate authentication/context documentation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<serde_json::Value>,
 }
 
 /// Result of a schema query - either full plugin or single method
@@ -292,6 +303,7 @@ impl PluginSchema {
             hash,
             methods,
             children: None,
+            request: None,
         }
     }
 
@@ -316,6 +328,7 @@ impl PluginSchema {
             hash,
             methods,
             children: None,
+            request: None,
         }
     }
 
@@ -340,6 +353,7 @@ impl PluginSchema {
             hash,
             methods,
             children: Some(children),
+            request: None,
         }
     }
 
@@ -365,6 +379,7 @@ impl PluginSchema {
             hash,
             methods,
             children: Some(children),
+            request: None,
         }
     }
 

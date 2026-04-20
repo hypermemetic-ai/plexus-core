@@ -1,0 +1,305 @@
+{
+  "namespace": "solar",
+  "version": "1.0.0",
+  "description": "Solar system model - demonstrates nested plugin hierarchy",
+  "self_hash": "0b8b317cf7c7e34c",
+  "children_hash": "9c1e929fe8d72347",
+  "hash": "f763a2ca448aca90",
+  "methods": [
+    {
+      "name": "observe",
+      "description": "Get an overview of the solar system",
+      "hash": "1de72ff82a3a5bb8",
+      "returns": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "SolarEvent",
+        "description": "Events from solar system observations",
+        "oneOf": [
+          {
+            "description": "Information about a celestial body",
+            "type": "object",
+            "properties": {
+              "body_type": {
+                "$ref": "#/$defs/BodyType"
+              },
+              "mass_kg": {
+                "type": "number",
+                "format": "double"
+              },
+              "name": {
+                "type": "string"
+              },
+              "orbital_period_days": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "double"
+              },
+              "parent": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "radius_km": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "const": "body"
+              }
+            },
+            "required": [
+              "type",
+              "name",
+              "body_type",
+              "mass_kg",
+              "radius_km"
+            ]
+          },
+          {
+            "description": "System overview",
+            "type": "object",
+            "properties": {
+              "moon_count": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "planet_count": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "star": {
+                "type": "string"
+              },
+              "total_bodies": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "const": "system"
+              }
+            },
+            "required": [
+              "type",
+              "star",
+              "planet_count",
+              "moon_count",
+              "total_bodies"
+            ]
+          }
+        ],
+        "$defs": {
+          "BodyType": {
+            "description": "Type of celestial body",
+            "type": "string",
+            "enum": [
+              "star",
+              "planet",
+              "dwarf_planet",
+              "moon"
+            ]
+          }
+        }
+      },
+      "streaming": false,
+      "bidirectional": false,
+      "http_method": "POST",
+      "role": {
+        "kind": "rpc"
+      }
+    },
+    {
+      "name": "info",
+      "description": "Get detailed information about a celestial body at `path`\n(e.g., `\"earth\"`, `\"jupiter.io\"`, `\"saturn.titan\"`).",
+      "hash": "4b8967667bc555ec",
+      "params": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "description": "The path parameter",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "returns": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "SolarEvent",
+        "description": "Events from solar system observations",
+        "oneOf": [
+          {
+            "description": "Information about a celestial body",
+            "type": "object",
+            "properties": {
+              "body_type": {
+                "$ref": "#/$defs/BodyType"
+              },
+              "mass_kg": {
+                "type": "number",
+                "format": "double"
+              },
+              "name": {
+                "type": "string"
+              },
+              "orbital_period_days": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "double"
+              },
+              "parent": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "radius_km": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "const": "body"
+              }
+            },
+            "required": [
+              "type",
+              "name",
+              "body_type",
+              "mass_kg",
+              "radius_km"
+            ]
+          },
+          {
+            "description": "System overview",
+            "type": "object",
+            "properties": {
+              "moon_count": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "planet_count": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "star": {
+                "type": "string"
+              },
+              "total_bodies": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "const": "system"
+              }
+            },
+            "required": [
+              "type",
+              "star",
+              "planet_count",
+              "moon_count",
+              "total_bodies"
+            ]
+          }
+        ],
+        "$defs": {
+          "BodyType": {
+            "description": "Type of celestial body",
+            "type": "string",
+            "enum": [
+              "star",
+              "planet",
+              "dwarf_planet",
+              "moon"
+            ]
+          }
+        }
+      },
+      "streaming": false,
+      "bidirectional": false,
+      "http_method": "POST",
+      "role": {
+        "kind": "rpc"
+      }
+    },
+    {
+      "name": "schema",
+      "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
+      "hash": "auto_schema",
+      "streaming": false,
+      "bidirectional": false,
+      "http_method": "POST",
+      "role": {
+        "kind": "rpc"
+      }
+    },
+    {
+      "name": "body",
+      "description": "Look up a celestial body by name (case-insensitive).",
+      "hash": "",
+      "streaming": false,
+      "bidirectional": false,
+      "http_method": "POST",
+      "role": {
+        "kind": "dynamic_child",
+        "list_method": "body_names"
+      }
+    }
+  ],
+  "children": [
+    {
+      "namespace": "mercury",
+      "description": "Mercury - planet",
+      "hash": "a22ac060c67a9cba"
+    },
+    {
+      "namespace": "venus",
+      "description": "Venus - planet",
+      "hash": "9e0eecf67a739504"
+    },
+    {
+      "namespace": "earth",
+      "description": "Earth - planet",
+      "hash": "9b070a0aa9553226"
+    },
+    {
+      "namespace": "mars",
+      "description": "Mars - planet",
+      "hash": "85bf6504f3a097ba"
+    },
+    {
+      "namespace": "jupiter",
+      "description": "Jupiter - planet",
+      "hash": "2433ca46d7c24de7"
+    },
+    {
+      "namespace": "saturn",
+      "description": "Saturn - planet",
+      "hash": "32b1d6eb02f3ace0"
+    },
+    {
+      "namespace": "uranus",
+      "description": "Uranus - planet",
+      "hash": "8352eee18e167c9d"
+    },
+    {
+      "namespace": "neptune",
+      "description": "Neptune - planet",
+      "hash": "5e0d4b4a2e25d445"
+    }
+  ]
+}

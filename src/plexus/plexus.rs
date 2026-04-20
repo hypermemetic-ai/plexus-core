@@ -237,7 +237,20 @@ bitflags! {
     ///
     /// These rules are not runtime-enforced; advertising a capability you
     /// do not implement is a correctness bug in the router.
+    ///
+    /// # Deprecated (IR-4)
+    ///
+    /// This bitflags type is superseded by the `MethodRole::DynamicChild {
+    /// list_method, search_method }` tag on the corresponding gate method.
+    /// Consumers that want to know whether a child router supports list /
+    /// search operations should inspect the gate method's role instead of
+    /// calling `ChildRouter::capabilities()`. The type stays on the wire for
+    /// the 0.5 transition window and is slated for removal in 0.7.
     #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+    #[deprecated(
+        since = "0.5",
+        note = "Use MethodRole::DynamicChild { list_method, search_method } instead. Removed in 0.7."
+    )]
     pub struct ChildCapabilities: u32 {
         /// The router promises `list_children()` returns `Some(stream)`.
         const LIST = 0b0000_0001;
@@ -278,6 +291,7 @@ pub trait ChildRouter: Send + Sync {
     ///
     /// Defaults to [`ChildCapabilities::empty()`]: a router that only
     /// exposes `get_child` for exact-name lookup.
+    #[allow(deprecated)]
     fn capabilities(&self) -> ChildCapabilities {
         ChildCapabilities::empty()
     }
@@ -351,6 +365,7 @@ impl ChildRouter for ArcChildRouter {
         self.0.get_child(name).await
     }
 
+    #[allow(deprecated)]
     fn capabilities(&self) -> ChildCapabilities {
         self.0.capabilities()
     }
@@ -1256,6 +1271,7 @@ async fn pipe_stream_to_subscription(
     hub,
     namespace_fn = "runtime_namespace"
 )]
+#[allow(deprecated)]
 impl DynamicHub {
     /// Route a call to a registered activation
     #[plexus_macros::method(
@@ -1311,6 +1327,7 @@ impl DynamicHub {
 
     /// Get plugin hashes for cache validation (lightweight alternative to full schema)
     #[plexus_macros::method(description = "Get plugin hashes for cache validation")]
+    #[allow(deprecated)]
     async fn hashes(&self) -> impl Stream<Item = PluginHashes> + Send + 'static {
         let schema = Activation::plugin_schema(self);
 
@@ -1395,6 +1412,7 @@ impl ChildRouter for DynamicHub {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

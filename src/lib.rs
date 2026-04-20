@@ -33,6 +33,7 @@ pub mod types;
 // Re-export commonly used items
 pub use builder::build_example_hub;
 pub use mcp_bridge::PlexusMcpBridge;
+#[allow(deprecated)]
 pub use plexus::{
     Activation, ChildCapabilities, ChildRouter, DeprecationInfo, DynamicHub, MethodRole,
     PlexusError, ReturnShape, PLEXUS_NOTIF_METHOD,

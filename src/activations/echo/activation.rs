@@ -41,6 +41,7 @@ impl Default for Echo {
     version = "1.0.0",
     description = "Echo messages back - demonstrates hub-macro usage"
 )]
+#[allow(deprecated)]
 impl Echo {
     /// Echo a message back
     #[plexus_macros::method(

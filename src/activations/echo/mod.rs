@@ -1,5 +1,7 @@
 //! Echo activation module
 
+#![allow(deprecated)]
+
 mod activation;
 mod types;
 

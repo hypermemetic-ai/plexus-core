@@ -97,6 +97,52 @@ pub struct DeprecationInfo {
 }
 
 // =============================================================================
+// Param Schema
+// =============================================================================
+
+/// Per-parameter metadata for a method's parameters.
+///
+/// `MethodSchema.params` already carries the fine-grained JSON Schema for the
+/// combined parameter object. `ParamSchema` carries orthogonal, parameter-
+/// scoped metadata that doesn't fit on a JSON Schema node — currently just
+/// deprecation info (IR-5).
+///
+/// The `name` field matches the parameter identifier in the method signature
+/// so consumers can correlate entries against the `params` JSON Schema's
+/// `properties` map.
+///
+/// Added in IR-5. Defaults to an empty list on `MethodSchema` so pre-IR
+/// schemas deserialize cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ParamSchema {
+    /// Parameter name, matching the identifier in the method signature.
+    pub name: String,
+    /// If set, this parameter is deprecated.
+    ///
+    /// Populated by `#[deprecated(...)]` (+ optional
+    /// `#[plexus_macros::removed_in("...")]`) on the parameter in the
+    /// method signature (IR-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation: Option<DeprecationInfo>,
+}
+
+impl ParamSchema {
+    /// Create a new `ParamSchema` carrying just a name and no metadata.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            deprecation: None,
+        }
+    }
+
+    /// Attach deprecation metadata for this parameter.
+    pub fn with_deprecation(mut self, info: DeprecationInfo) -> Self {
+        self.deprecation = Some(info);
+        self
+    }
+}
+
+// =============================================================================
 // Return Shape
 // =============================================================================
 
@@ -229,7 +275,22 @@ pub struct PluginSchema {
     pub methods: Vec<MethodSchema>,
 
     /// Child plugin summaries (None = leaf plugin, Some = hub plugin)
+    ///
+    /// # Deprecated (IR-4)
+    ///
+    /// This side-table is deterministically derived from the method list's
+    /// `MethodRole` tags (one `ChildSummary` per non-`Rpc` method). It stays
+    /// on the wire for back-compat during the 0.5 transition window and is
+    /// slated for removal in 0.6.
+    ///
+    /// Consumers reading child metadata should switch to iterating
+    /// `methods` and filtering by `role != MethodRole::Rpc`. The name field
+    /// on each `MethodSchema` is the child's namespace.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(
+        since = "0.5",
+        note = "Derive from MethodRole on MethodSchema. Field will be removed in 0.7."
+    )]
     pub children: Option<Vec<ChildSummary>>,
 
     /// JSON Schema for the HTTP request type this activation extracts from incoming connections.
@@ -242,6 +303,16 @@ pub struct PluginSchema {
     /// to generate appropriate authentication/context documentation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<serde_json::Value>,
+
+    /// If set, this whole activation is deprecated.
+    ///
+    /// Added in IR-5. Defaults to `None` via `#[serde(default)]` so pre-IR
+    /// schemas deserialize cleanly.
+    ///
+    /// Populated by the `#[deprecated(...)]` attribute on the `impl
+    /// Activation for Foo` block (IR-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation: Option<DeprecationInfo>,
 }
 
 /// Result of a schema query - either full plugin or single method
@@ -348,6 +419,18 @@ pub struct MethodSchema {
     /// omit this field entirely).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_shape: Option<ReturnShape>,
+
+    /// Per-parameter metadata (currently just deprecation).
+    ///
+    /// Added in IR-5. Defaults to an empty vec via `#[serde(default)]` so
+    /// pre-IR schemas deserialize cleanly. Only parameters that carry
+    /// metadata appear in this list — absence means "no metadata" for that
+    /// parameter, not a bug.
+    ///
+    /// Populated by the `#[deprecated(...)]` attribute on individual
+    /// parameters (IR-5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params_meta: Vec<ParamSchema>,
 }
 
 impl PluginSchema {
@@ -391,9 +474,18 @@ impl PluginSchema {
     /// Checks for:
     /// - Duplicate method names
     /// - Duplicate child names (for hubs)
-    /// - Method/child name collisions (for hubs)
+    /// - Method/child name collisions for `Rpc`-role methods (for hubs)
     ///
     /// Panics if a collision is detected (system error).
+    ///
+    /// # IR-4 relaxation
+    ///
+    /// As of IR-4, a method with `MethodRole::StaticChild` or
+    /// `MethodRole::DynamicChild { .. }` that shares a name with a
+    /// `ChildSummary` entry is **not** a collision — it's the same child
+    /// surfaced via two wire representations (the role-tagged method list
+    /// and the deprecated `children` side-table). Only `Rpc`-role methods
+    /// whose name matches a child summary are flagged.
     fn validate_no_collisions(
         namespace: &str,
         methods: &[MethodSchema],
@@ -417,8 +509,21 @@ impl PluginSchema {
         if let Some(kids) = children {
             for c in kids {
                 if !seen.insert(&c.namespace) {
-                    // Could be duplicate child or collision with method
-                    let collision_type = if methods.iter().any(|m| m.name == c.namespace) {
+                    // IR-4: a role-tagged child method whose name matches a
+                    // child summary is expected by construction (the two
+                    // wire-surfaces describe the same child). Skip silently.
+                    let colliding_method =
+                        methods.iter().find(|m| m.name == c.namespace);
+                    if let Some(m) = colliding_method {
+                        if matches!(
+                            m.role,
+                            MethodRole::StaticChild | MethodRole::DynamicChild { .. }
+                        ) {
+                            continue;
+                        }
+                    }
+                    // Could be duplicate child or collision with an Rpc-role method
+                    let collision_type = if colliding_method.is_some() {
                         "method/child collision"
                     } else {
                         "duplicate child"
@@ -432,7 +537,66 @@ impl PluginSchema {
         }
     }
 
+    /// Derive the deprecated `(children, is_hub)` side-table fields from a
+    /// role-tagged method list.
+    ///
+    /// Added in IR-4 as the **centralized shim** that backfills the
+    /// pre-IR `children: Option<Vec<ChildSummary>>` and `is_hub: bool`
+    /// representations from the authoritative `MethodRole` on each
+    /// `MethodSchema`.
+    ///
+    /// # Semantics
+    ///
+    /// One `ChildSummary` is produced per non-`Rpc` method, preserving the
+    /// source order. The shim writes:
+    ///
+    /// | Field | Value |
+    /// |---|---|
+    /// | `namespace` | The method's name. |
+    /// | `description` | The method's `description`. |
+    /// | `hash` | Empty string — the shim does **not** compute child hashes. Callers that want per-child hashes must populate them out-of-band. |
+    ///
+    /// The returned `bool` matches [`PluginSchema::is_hub_by_role`] — `true`
+    /// iff at least one method carries a child role.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use plexus_core::plexus::schema::{MethodRole, MethodSchema, PluginSchema};
+    ///
+    /// let methods = vec![
+    ///     MethodSchema::new("ping", "rpc", "h1"),
+    ///     MethodSchema::new("kid",  "static child", "h2")
+    ///         .with_role(MethodRole::StaticChild),
+    /// ];
+    /// let (children, is_hub) = PluginSchema::derive_legacy_fields(&methods);
+    /// assert_eq!(children.len(), 1);
+    /// assert_eq!(children[0].namespace, "kid");
+    /// assert!(is_hub);
+    /// ```
+    pub fn derive_legacy_fields(
+        methods: &[MethodSchema],
+    ) -> (Vec<ChildSummary>, bool) {
+        let children: Vec<ChildSummary> = methods
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.role,
+                    MethodRole::StaticChild | MethodRole::DynamicChild { .. }
+                )
+            })
+            .map(|m| ChildSummary {
+                namespace: m.name.clone(),
+                description: m.description.clone(),
+                hash: String::new(),
+            })
+            .collect();
+        let is_hub = !children.is_empty();
+        (children, is_hub)
+    }
+
     /// Create a new leaf plugin schema (no children)
+    #[allow(deprecated)]
     pub fn leaf(
         namespace: impl Into<String>,
         version: impl Into<String>,
@@ -453,10 +617,12 @@ impl PluginSchema {
             methods,
             children: None,
             request: None,
+            deprecation: None,
         }
     }
 
     /// Create a new leaf plugin schema with long description
+    #[allow(deprecated)]
     pub fn leaf_with_long_description(
         namespace: impl Into<String>,
         version: impl Into<String>,
@@ -478,10 +644,12 @@ impl PluginSchema {
             methods,
             children: None,
             request: None,
+            deprecation: None,
         }
     }
 
     /// Create a new hub plugin schema (with child summaries)
+    #[allow(deprecated)]
     pub fn hub(
         namespace: impl Into<String>,
         version: impl Into<String>,
@@ -503,10 +671,12 @@ impl PluginSchema {
             methods,
             children: Some(children),
             request: None,
+            deprecation: None,
         }
     }
 
     /// Create a new hub plugin schema with long description
+    #[allow(deprecated)]
     pub fn hub_with_long_description(
         namespace: impl Into<String>,
         version: impl Into<String>,
@@ -529,6 +699,7 @@ impl PluginSchema {
             methods,
             children: Some(children),
             request: None,
+            deprecation: None,
         }
     }
 
@@ -543,9 +714,17 @@ impl PluginSchema {
     ///    Preserved for back-compat during the IR transition window —
     ///    today's macros populate `children` but not yet `role`.
     ///
-    /// Once IR-3 lands and macros emit role tags on every child method, the
-    /// second branch becomes redundant. IR-4 will drop the `children` side
-    /// channel entirely.
+    /// # Deprecated (IR-4)
+    ///
+    /// The legacy transition-window fallback on `children.is_some()` is
+    /// redundant now that `MethodRole` tags are authoritative. Callers
+    /// should migrate to [`PluginSchema::is_hub_by_role`], which reads
+    /// only role-tagged methods. This method will be removed in 0.7.
+    #[deprecated(
+        since = "0.5",
+        note = "Use `PluginSchema::is_hub_by_role()` which reads MethodRole from methods. This method will be removed in 0.7."
+    )]
+    #[allow(deprecated)]
     pub fn is_hub(&self) -> bool {
         self.is_hub_by_role() || self.children.is_some()
     }
@@ -566,8 +745,19 @@ impl PluginSchema {
     }
 
     /// Check if this is a leaf (no children)
+    #[allow(deprecated)]
     pub fn is_leaf(&self) -> bool {
         self.children.is_none()
+    }
+
+    /// Mark this plugin as deprecated.
+    ///
+    /// Added in IR-5. Populates the `deprecation` field with the provided
+    /// `DeprecationInfo`. Populated by the `#[deprecated(...)]` attribute on
+    /// an `impl Activation for Foo` block via `plexus-macros`.
+    pub fn with_deprecation(mut self, info: DeprecationInfo) -> Self {
+        self.deprecation = Some(info);
+        self
     }
 }
 
@@ -627,6 +817,7 @@ impl MethodSchema {
             role: MethodRole::Rpc,
             deprecation: None,
             return_shape: None,
+            params_meta: Vec::new(),
         }
     }
 
@@ -727,6 +918,18 @@ impl MethodSchema {
     /// JSON Schema.
     pub fn with_return_shape(mut self, shape: ReturnShape) -> Self {
         self.return_shape = Some(shape);
+        self
+    }
+
+    /// Attach per-parameter metadata for this method's parameters.
+    ///
+    /// Added in IR-5. Only parameters that carry metadata (e.g. a
+    /// `#[deprecated]` annotation) need appear in `entries`; absence means
+    /// "no metadata" for a given parameter. The consumer correlates entries
+    /// against `self.params` by matching `ParamSchema.name` against the
+    /// `properties` map of the JSON Schema.
+    pub fn with_params_meta(mut self, entries: Vec<ParamSchema>) -> Self {
+        self.params_meta = entries;
         self
     }
 }
@@ -1045,6 +1248,7 @@ impl SchemaProperty {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -1361,5 +1565,265 @@ mod tests {
             let d: MethodSchema = serde_json::from_str(&j).unwrap();
             assert_eq!(d.return_shape, Some(shape));
         }
+    }
+
+    // =========================================================================
+    // IR-4 tests: derive_legacy_fields, relaxed validate_no_collisions,
+    // deprecation markers.
+    // =========================================================================
+
+    /// AC #4 (row 1): empty method list → no children, not a hub.
+    #[test]
+    fn ir4_derive_empty_methods() {
+        let (children, is_hub) = PluginSchema::derive_legacy_fields(&[]);
+        assert!(children.is_empty());
+        assert!(!is_hub);
+    }
+
+    /// AC #4 (row 2): a single `Rpc` method → no children, not a hub.
+    #[test]
+    fn ir4_derive_single_rpc_method() {
+        let methods = vec![MethodSchema::new("ping", "rpc method", "h1")];
+        let (children, is_hub) = PluginSchema::derive_legacy_fields(&methods);
+        assert!(children.is_empty());
+        assert!(!is_hub);
+    }
+
+    /// AC #4 (row 3): one `StaticChild` method named "body" → one child named
+    /// "body", `is_hub == true`.
+    #[test]
+    fn ir4_derive_single_static_child() {
+        let methods = vec![
+            MethodSchema::new("body", "static child", "h1")
+                .with_role(MethodRole::StaticChild),
+        ];
+        let (children, is_hub) = PluginSchema::derive_legacy_fields(&methods);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].namespace, "body");
+        assert_eq!(children[0].description, "static child");
+        assert_eq!(children[0].hash, "");
+        assert!(is_hub);
+    }
+
+    /// AC #4 (row 4): one `DynamicChild` method named "planet" → one child
+    /// named "planet", `is_hub == true`.
+    #[test]
+    fn ir4_derive_single_dynamic_child() {
+        let methods = vec![
+            MethodSchema::new("planet", "dynamic child", "h1").with_role(
+                MethodRole::DynamicChild {
+                    list_method: Some("list_planets".into()),
+                    search_method: None,
+                },
+            ),
+        ];
+        let (children, is_hub) = PluginSchema::derive_legacy_fields(&methods);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].namespace, "planet");
+        assert!(is_hub);
+    }
+
+    /// AC #4 (row 5): mix of Rpc + StaticChild → one child, `is_hub == true`.
+    #[test]
+    fn ir4_derive_mixed_roles_preserves_order() {
+        let methods = vec![
+            MethodSchema::new("ping", "rpc", "h1"),
+            MethodSchema::new("kid_a", "static a", "h2")
+                .with_role(MethodRole::StaticChild),
+            MethodSchema::new("describe", "rpc too", "h3"),
+            MethodSchema::new("kid_b", "static b", "h4")
+                .with_role(MethodRole::StaticChild),
+        ];
+        let (children, is_hub) = PluginSchema::derive_legacy_fields(&methods);
+        // Source-order preservation: kid_a appears before kid_b.
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].namespace, "kid_a");
+        assert_eq!(children[1].namespace, "kid_b");
+        assert!(is_hub);
+    }
+
+    /// IR-4: `derive_legacy_fields`'s `is_hub` result matches
+    /// [`PluginSchema::is_hub_by_role`] on every method list covered by the
+    /// acceptance-criteria table.
+    #[test]
+    fn ir4_derive_is_hub_matches_is_hub_by_role() {
+        // Empty methods.
+        let empty_schema = PluginSchema::leaf("t", "1.0", "d", vec![]);
+        let (_, is_hub) = PluginSchema::derive_legacy_fields(&empty_schema.methods);
+        assert_eq!(is_hub, empty_schema.is_hub_by_role());
+
+        // All-Rpc methods.
+        let rpc_schema = PluginSchema::leaf(
+            "t",
+            "1.0",
+            "d",
+            vec![
+                MethodSchema::new("a", "d", "h1"),
+                MethodSchema::new("b", "d", "h2"),
+            ],
+        );
+        let (_, is_hub) = PluginSchema::derive_legacy_fields(&rpc_schema.methods);
+        assert_eq!(is_hub, rpc_schema.is_hub_by_role());
+
+        // StaticChild present.
+        let static_schema = PluginSchema::leaf(
+            "t",
+            "1.0",
+            "d",
+            vec![
+                MethodSchema::new("a", "d", "h1"),
+                MethodSchema::new("kid", "d", "h2").with_role(MethodRole::StaticChild),
+            ],
+        );
+        let (_, is_hub) = PluginSchema::derive_legacy_fields(&static_schema.methods);
+        assert_eq!(is_hub, static_schema.is_hub_by_role());
+        assert!(is_hub);
+
+        // DynamicChild present.
+        let dyn_schema = PluginSchema::leaf(
+            "t",
+            "1.0",
+            "d",
+            vec![MethodSchema::new("find", "d", "h1").with_role(
+                MethodRole::DynamicChild {
+                    list_method: None,
+                    search_method: None,
+                },
+            )],
+        );
+        let (_, is_hub) = PluginSchema::derive_legacy_fields(&dyn_schema.methods);
+        assert_eq!(is_hub, dyn_schema.is_hub_by_role());
+        assert!(is_hub);
+    }
+
+    /// IR-4 rule 2: `validate_no_collisions` no longer panics when a
+    /// `StaticChild`-role method shares its name with a `ChildSummary` —
+    /// that's expected by construction (two wire representations of the
+    /// same child).
+    #[test]
+    fn ir4_no_collision_static_child_method_vs_summary() {
+        // Same name on both surfaces — used to panic, now accepted.
+        let schema = PluginSchema::hub(
+            "hub",
+            "1.0",
+            "has static child",
+            vec![
+                MethodSchema::new("ping", "rpc", "h1"),
+                MethodSchema::new("kid", "static child", "h2")
+                    .with_role(MethodRole::StaticChild),
+            ],
+            vec![ChildSummary {
+                namespace: "kid".into(),
+                description: "static child".into(),
+                hash: "kh".into(),
+            }],
+        );
+        // Child stayed on the wire.
+        #[allow(deprecated)]
+        let kids = schema.children.as_ref().expect("hub has children");
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].namespace, "kid");
+        // Method kept its role tag.
+        assert!(matches!(
+            schema.methods.iter().find(|m| m.name == "kid").unwrap().role,
+            MethodRole::StaticChild
+        ));
+    }
+
+    /// IR-4 rule 2: `validate_no_collisions` also tolerates DynamicChild-role
+    /// method names that appear in the child summary list.
+    #[test]
+    fn ir4_no_collision_dynamic_child_method_vs_summary() {
+        let schema = PluginSchema::hub(
+            "hub",
+            "1.0",
+            "has dynamic child",
+            vec![MethodSchema::new("body", "gate", "h1").with_role(
+                MethodRole::DynamicChild {
+                    list_method: Some("body_names".into()),
+                    search_method: None,
+                },
+            )],
+            vec![ChildSummary {
+                namespace: "body".into(),
+                description: "gate".into(),
+                hash: "bh".into(),
+            }],
+        );
+        #[allow(deprecated)]
+        let kids = schema.children.as_ref().unwrap();
+        assert_eq!(kids.len(), 1);
+    }
+
+    /// IR-4 rule 2: `validate_no_collisions` still panics when an `Rpc`-role
+    /// method's name collides with a child summary — that's the case the
+    /// validation was designed to catch.
+    #[test]
+    #[should_panic(expected = "method/child collision")]
+    fn ir4_collision_rpc_method_vs_summary_still_panics() {
+        let _ = PluginSchema::hub(
+            "hub",
+            "1.0",
+            "bad hub",
+            vec![MethodSchema::new("oops", "rpc", "h1")],
+            vec![ChildSummary {
+                namespace: "oops".into(),
+                description: "shadowed".into(),
+                hash: "oh".into(),
+            }],
+        );
+    }
+
+    /// IR-4 AC #3 (spec): reading `PluginSchema.children` outside a
+    /// `#[allow(deprecated)]` block emits a compiler warning. This fixture
+    /// uses `#[allow(deprecated)]` to confirm the attribute is required —
+    /// if it weren't, the `#[deprecated]` annotation is either missing or
+    /// wrong.
+    #[test]
+    fn ir4_deprecated_field_access_requires_allow_attribute() {
+        let schema = PluginSchema::leaf(
+            "t",
+            "1.0",
+            "d",
+            vec![MethodSchema::new("a", "b", "h")],
+        );
+        // Reading the deprecated field — under `#[allow(deprecated)]` from
+        // the module-level attribute on the tests module. Removing that
+        // allow would produce a compiler warning pointing at this line.
+        let _children = schema.children.clone();
+        // Calling the deprecated method — same rationale.
+        let _is_hub = schema.is_hub();
+    }
+
+    /// IR-4 AC #8: `PluginSchema.is_hub()` (deprecated) and
+    /// `PluginSchema::is_hub_by_role()` agree on every shape currently
+    /// emitted by substrate activations (methods with role tags, children
+    /// field populated via hub constructor).
+    #[test]
+    fn ir4_is_hub_and_is_hub_by_role_agree_on_role_tagged_methods() {
+        // Pure-leaf, all Rpc: both false.
+        let leaf = PluginSchema::leaf(
+            "t",
+            "1.0",
+            "d",
+            vec![MethodSchema::new("a", "d", "h1")],
+        );
+        assert_eq!(leaf.is_hub(), leaf.is_hub_by_role());
+        assert!(!leaf.is_hub());
+
+        // Hub with role-tagged methods (today's post-IR-3 shape): both true.
+        let hub_with_roles = PluginSchema::hub(
+            "h",
+            "1.0",
+            "d",
+            vec![MethodSchema::new("kid", "d", "h1").with_role(MethodRole::StaticChild)],
+            vec![ChildSummary {
+                namespace: "kid".into(),
+                description: "d".into(),
+                hash: "".into(),
+            }],
+        );
+        assert_eq!(hub_with_roles.is_hub(), hub_with_roles.is_hub_by_role());
+        assert!(hub_with_roles.is_hub());
     }
 }

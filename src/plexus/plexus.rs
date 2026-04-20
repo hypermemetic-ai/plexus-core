@@ -14,7 +14,9 @@ use super::{
 use crate::types::Handle;
 use async_stream::stream;
 use async_trait::async_trait;
+use bitflags::bitflags;
 use futures::Stream;
+use futures_core::stream::BoxStream;
 use jsonrpsee::core::server::Methods;
 use jsonrpsee::RpcModule;
 
@@ -215,6 +217,36 @@ pub trait Activation: Send + Sync + 'static {
 // Child Routing for Hub Plugins
 // ============================================================================
 
+bitflags! {
+    /// Opt-in capability flags advertising which optional `ChildRouter`
+    /// operations a router supports.
+    ///
+    /// The Plexus RPC network is a *graph*, not a tree: children may be
+    /// remote, infinite, or deliberately private. Listing and searching
+    /// children are therefore opt-in — routers must declare them here
+    /// before callers can rely on them.
+    ///
+    /// # Contract
+    ///
+    /// | Condition | Expected |
+    /// |---|---|
+    /// | `capabilities().contains(LIST)` is `true` | `list_children().await` returns `Some(stream)` |
+    /// | `capabilities().contains(LIST)` is `false` | `list_children().await` returns `None` |
+    /// | `capabilities().contains(SEARCH)` is `true` | `search_children(q).await` returns `Some(stream)` for every `q` |
+    /// | `capabilities().contains(SEARCH)` is `false` | `search_children(q).await` returns `None` for every `q` |
+    ///
+    /// These rules are not runtime-enforced; advertising a capability you
+    /// do not implement is a correctness bug in the router.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct ChildCapabilities: u32 {
+        /// The router promises `list_children()` returns `Some(stream)`.
+        const LIST = 0b0000_0001;
+        /// The router promises `search_children(query)` returns
+        /// `Some(stream)` for any query.
+        const SEARCH = 0b0000_0010;
+    }
+}
+
 /// Trait for activations that can route to child activations
 ///
 /// Hub activations implement this to support nested method routing.
@@ -223,6 +255,14 @@ pub trait Activation: Send + Sync + 'static {
 ///
 /// This trait is separate from Activation to avoid associated type issues
 /// with dynamic dispatch.
+///
+/// # Optional capabilities
+///
+/// In addition to the required `router_namespace` + `get_child` surface,
+/// routers may opt in to advertising enumerable and searchable children
+/// via [`ChildCapabilities`]. When a flag is set, the corresponding
+/// `list_children` / `search_children` method must return `Some(stream)`.
+/// The default implementations report no capabilities and return `None`.
 #[async_trait]
 pub trait ChildRouter: Send + Sync {
     /// Get the namespace of this router (for error messages)
@@ -233,6 +273,36 @@ pub trait ChildRouter: Send + Sync {
 
     /// Get a child activation instance by name for nested routing
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>>;
+
+    /// Which optional operations (list / search) this router supports.
+    ///
+    /// Defaults to [`ChildCapabilities::empty()`]: a router that only
+    /// exposes `get_child` for exact-name lookup.
+    fn capabilities(&self) -> ChildCapabilities {
+        ChildCapabilities::empty()
+    }
+
+    /// Stream every child name the router is willing to enumerate.
+    ///
+    /// Returns `None` when the router does not support listing — callers
+    /// should check [`ChildRouter::capabilities`] first.
+    ///
+    /// Routers that implement this **must** set
+    /// [`ChildCapabilities::LIST`] in [`ChildRouter::capabilities`].
+    async fn list_children(&self) -> Option<BoxStream<'_, String>> {
+        None
+    }
+
+    /// Stream child names matching the router-defined query semantics.
+    ///
+    /// Returns `None` when the router does not support searching — callers
+    /// should check [`ChildRouter::capabilities`] first.
+    ///
+    /// Routers that implement this **must** set
+    /// [`ChildCapabilities::SEARCH`] in [`ChildRouter::capabilities`].
+    async fn search_children(&self, _query: &str) -> Option<BoxStream<'_, String>> {
+        None
+    }
 }
 
 /// Route a method call to a child activation
@@ -279,6 +349,18 @@ impl ChildRouter for ArcChildRouter {
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
         self.0.get_child(name).await
+    }
+
+    fn capabilities(&self) -> ChildCapabilities {
+        self.0.capabilities()
+    }
+
+    async fn list_children(&self) -> Option<BoxStream<'_, String>> {
+        self.0.list_children().await
+    }
+
+    async fn search_children(&self, query: &str) -> Option<BoxStream<'_, String>> {
+        self.0.search_children(query).await
     }
 }
 
@@ -1542,5 +1624,144 @@ mod tests {
         );
         assert_eq!(health1.plugin_id(), expected,
             "plugin_id should be deterministic from namespace@major_version");
+    }
+
+    // ========================================================================
+    // CHILD-2: ChildRouter capabilities + opt-in list/search
+    // ========================================================================
+
+    /// A minimal `ChildRouter` that overrides only the required methods.
+    /// Exercises default implementations of `capabilities`, `list_children`
+    /// and `search_children`.
+    struct MinimalRouter;
+
+    #[async_trait]
+    impl ChildRouter for MinimalRouter {
+        fn router_namespace(&self) -> &str {
+            "minimal"
+        }
+
+        async fn router_call(
+            &self,
+            _method: &str,
+            _params: Value,
+            _auth: Option<&super::super::auth::AuthContext>,
+            _raw_ctx: Option<&crate::request::RawRequestContext>,
+        ) -> Result<PlexusStream, PlexusError> {
+            Err(PlexusError::MethodNotFound {
+                activation: "minimal".into(),
+                method: "none".into(),
+            })
+        }
+
+        async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn child_router_defaults_report_no_capabilities_and_none_streams() {
+        let router = MinimalRouter;
+
+        assert_eq!(
+            router.capabilities(),
+            ChildCapabilities::empty(),
+            "default capabilities should be empty"
+        );
+        assert!(
+            router.list_children().await.is_none(),
+            "default list_children should be None"
+        );
+        assert!(
+            router.search_children("anything").await.is_none(),
+            "default search_children should be None"
+        );
+    }
+
+    /// A `ChildRouter` that opts in to both LIST and SEARCH.
+    struct ListingRouter {
+        names: Vec<String>,
+    }
+
+    #[async_trait]
+    impl ChildRouter for ListingRouter {
+        fn router_namespace(&self) -> &str {
+            "listing"
+        }
+
+        async fn router_call(
+            &self,
+            _method: &str,
+            _params: Value,
+            _auth: Option<&super::super::auth::AuthContext>,
+            _raw_ctx: Option<&crate::request::RawRequestContext>,
+        ) -> Result<PlexusStream, PlexusError> {
+            Err(PlexusError::MethodNotFound {
+                activation: "listing".into(),
+                method: "none".into(),
+            })
+        }
+
+        async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
+            if self.names.iter().any(|n| n == name) {
+                // Return the same type to keep the test simple; we only care
+                // that the override compiles and is reachable.
+                Some(Box::new(ListingRouter { names: vec![] }))
+            } else {
+                None
+            }
+        }
+
+        fn capabilities(&self) -> ChildCapabilities {
+            ChildCapabilities::LIST | ChildCapabilities::SEARCH
+        }
+
+        async fn list_children(&self) -> Option<BoxStream<'_, String>> {
+            let stream = futures::stream::iter(self.names.iter().cloned());
+            Some(Box::pin(stream))
+        }
+
+        async fn search_children(&self, query: &str) -> Option<BoxStream<'_, String>> {
+            let q = query.to_string();
+            let stream = futures::stream::iter(
+                self.names
+                    .iter()
+                    .filter(move |n| n.contains(&q))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            Some(Box::pin(stream))
+        }
+    }
+
+    #[tokio::test]
+    async fn child_router_overrides_report_capabilities_and_yield_streams() {
+        use futures::StreamExt;
+
+        let router = ListingRouter {
+            names: vec!["alpha".into(), "beta".into(), "alphabet".into()],
+        };
+
+        // Capabilities
+        let caps = router.capabilities();
+        assert!(caps.contains(ChildCapabilities::LIST));
+        assert!(caps.contains(ChildCapabilities::SEARCH));
+        assert_eq!(caps, ChildCapabilities::LIST | ChildCapabilities::SEARCH);
+
+        // list_children yields the full, non-empty, finite sequence.
+        let list_stream = router
+            .list_children()
+            .await
+            .expect("LIST capability set — expected Some(stream)");
+        let listed: Vec<String> = list_stream.collect().await;
+        assert_eq!(listed, vec!["alpha".to_string(), "beta".into(), "alphabet".into()]);
+
+        // search_children filters by the query string.
+        let search_stream = router
+            .search_children("alpha")
+            .await
+            .expect("SEARCH capability set — expected Some(stream)");
+        let matched: Vec<String> = search_stream.collect().await;
+        assert_eq!(matched, vec!["alpha".to_string(), "alphabet".into()]);
     }
 }

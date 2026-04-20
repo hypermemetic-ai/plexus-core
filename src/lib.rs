@@ -33,7 +33,7 @@ pub mod types;
 // Re-export commonly used items
 pub use builder::build_example_hub;
 pub use mcp_bridge::PlexusMcpBridge;
-pub use plexus::{Activation, DynamicHub, PlexusError, PLEXUS_NOTIF_METHOD};
+pub use plexus::{Activation, ChildCapabilities, ChildRouter, DynamicHub, PlexusError, PLEXUS_NOTIF_METHOD};
 pub use types::{Envelope, Handle, HandleParseError, HandleResolutionParams, Origin};
 
 // Re-export schemars under a stable private path so PlexusRequest derive-generated code

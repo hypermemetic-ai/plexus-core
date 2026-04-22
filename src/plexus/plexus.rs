@@ -1206,16 +1206,16 @@ impl DynamicHub {
 
         // Register pending RPC methods from activations
         let pending = std::mem::take(&mut *hub.inner.pending_rpc.lock().unwrap());
-        eprintln!("[TRACE] arc_into_rpc_module: merging {} activation RPC factories", pending.len());
+        tracing::trace!(factories = pending.len(), "merging activation RPC factories");
         for (idx, factory) in pending.into_iter().enumerate() {
-            eprintln!("[TRACE] arc_into_rpc_module: calling factory {} to get Methods", idx);
+            tracing::trace!(factory_idx = idx, "calling factory to get Methods");
             let methods = factory();
-            eprintln!("[TRACE] arc_into_rpc_module: factory {} returned Methods with {} methods", idx, methods.method_names().count());
-            eprintln!("[TRACE] arc_into_rpc_module: merging factory {} methods into module", idx);
+            let method_count = methods.method_names().count();
+            tracing::trace!(factory_idx = idx, methods = method_count, "factory returned Methods; merging into module");
             module.merge(methods)?;
-            eprintln!("[TRACE] arc_into_rpc_module: successfully merged factory {} methods", idx);
+            tracing::trace!(factory_idx = idx, "successfully merged factory methods");
         }
-        eprintln!("[TRACE] arc_into_rpc_module: all activations merged successfully");
+        tracing::trace!("all activations merged successfully");
 
         Ok(module)
     }

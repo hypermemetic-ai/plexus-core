@@ -52,6 +52,11 @@ rmcp = { version = "0.12", features = ["server", "transport-io", "transport-stre
 # Hub macro for activation generation
 plexus-macros = { path = "../plexus-macros", version = "0.5.0" }
 
+# Sealed-type auth primitives. plexus-core re-exports AuthContext /
+# VerifiedUser / Principal from here for backward compatibility. New code
+# should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.1" }
+
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

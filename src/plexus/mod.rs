@@ -16,7 +16,10 @@ pub mod schema;
 pub mod streaming;
 pub mod types;
 
-pub use auth::{AuthContext, SessionValidator};
+// AuthContext + SessionValidator + the sealed Principal / VerifiedUser /
+// ServiceIdentity types are re-exported from plexus-auth-core via
+// plexus::auth. New code should import directly from plexus_auth_core.
+pub use auth::{AuthContext, Principal, ServiceIdentity, SessionValidator, VerifiedUser};
 pub use test_validator::TestSessionValidator;
 pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirChannel, StandardRequest, StandardResponse};
 pub use context::PlexusContext;

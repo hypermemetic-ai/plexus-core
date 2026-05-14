@@ -5,6 +5,7 @@ pub mod auth;
 pub mod test_validator;
 pub mod bidirectional;
 pub mod context;
+pub mod credential_envelope;
 pub mod dispatch;
 pub mod errors;
 pub mod hub_context;

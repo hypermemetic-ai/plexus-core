@@ -9,6 +9,17 @@
 
 pub use plexus_auth_core::{AuthContext, Principal, ServiceIdentity, SessionValidator, VerifiedUser};
 
+// AUTHLANG-2 — forwarding-policy primitives. Re-exported so consumers
+// of plexus-core can reference them without taking a direct
+// dependency on plexus-auth-core. New code should import directly
+// from plexus_auth_core; these re-exports exist for symmetry with the
+// existing AuthContext / Principal re-exports.
+pub use plexus_auth_core::{
+    Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName,
+    IdentityOnly, MethodPath, MethodPathError, PassThrough,
+    ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
+};
+
 // Note on `#[deprecated]`:
 //
 // We intentionally do NOT mark the `pub use` re-exports above with

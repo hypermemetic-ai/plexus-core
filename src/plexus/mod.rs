@@ -7,6 +7,7 @@ pub mod bidirectional;
 pub mod context;
 pub mod dispatch;
 pub mod errors;
+pub mod forward_registry;
 pub mod hub_context;
 pub mod method_enum;
 pub mod middleware;
@@ -25,6 +26,7 @@ pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirCha
 pub use context::PlexusContext;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
+pub use forward_registry::ForwardPolicyRegistry;
 #[deprecated(note = "Middleware removed - guidance provided via PlexusStreamEvent::Guidance")]
 pub use middleware::{ActivationRegistry, GuidedErrorMiddleware};
 pub use path::Provenance;

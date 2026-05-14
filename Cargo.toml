@@ -61,3 +61,10 @@ plexus-auth-core = { path = "../plexus-auth-core", version = "0.1" }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
+
+# Enable the `test-support` feature for plexus-auth-core in test builds
+# only, so the end-to-end credential-envelope tests in
+# `src/plexus/credential_envelope.rs` can mint real `Credential<T>`
+# values. Added by AUTHZ-CRED-CORE-1B as part of wiring CRED-CORE-2's
+# deferred end-to-end ACs (#1, #2 full, #4 end-to-end, #5 end-to-end).
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.1", features = ["test-support"] }

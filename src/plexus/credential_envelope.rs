@@ -287,28 +287,38 @@ pub(crate) fn assemble_envelope_content(
 /// Serialize `payload` and capture any credentials inside it.
 ///
 /// This is the dispatch-time entry point that `wrap_stream` calls for
-/// every stream item. Today (per AUTHZ-CRED-CORE-2-RUN-NOTES.md) it
-/// performs the serialization without an installed
-/// `DispatchCaptureGuard` because the guard's constructor is currently
-/// `pub(crate)` to `plexus-auth-core` and unreachable from this crate.
-/// The wire-envelope assembly path that consumes the returned `captured`
-/// map is fully implemented; once the plexus-auth-core public exposure
-/// lands the body of this function changes to install the guard and
-/// drain it.
+/// every stream item. The function installs the
+/// `DispatchCaptureGuard` via plexus-auth-core's public scoped-callback
+/// API (`run_with_credential_capture`, landed by AUTHZ-CRED-CORE-1B), so
+/// any `Credential<T>` inside `payload` registers its inner value into
+/// the sidecar while emitting only the sentinel inline.
 ///
-/// The function takes a closure rather than a value so the future
-/// guard-wrapped form is a one-line internal change.
+/// Returns `(serialized_value, captured_map)` where `serialized_value`
+/// is the JSON form of `payload` (with credential fields rendered as
+/// `{"$credential": "<id>"}` sentinels) and `captured_map` is the
+/// per-id sidecar of inner values + metadata ready for
+/// [`assemble_envelope_content`].
 pub(crate) fn serialize_with_credential_capture<T: Serialize>(
     payload: &T,
 ) -> (Value, HashMap<CredentialId, CapturedCredential>) {
-    // TODO(AUTHZ-CRED-CORE-2-RUN-NOTES.md §Blocker): once
-    // plexus-auth-core exposes a public `run_with_credential_capture`
-    // helper (or a `pub` `DispatchCaptureGuard::install` constructor),
-    // wrap this serialization in the guard so the sidecar is populated.
-    // Today the serialization runs with no toggle active, so credentials
-    // serialize as sentinel-only and the captured map is empty.
-    let value = serde_json::to_value(payload).unwrap_or(Value::Null);
-    (value, HashMap::new())
+    // The scoped-callback runs the serializer inside the guard's
+    // lifetime: any nested `Credential<T>::serialize` call registers
+    // its inner value in the thread-local sidecar; the guard drops at
+    // the end of the closure invocation, so we cannot accidentally
+    // retain capture state past this call.
+    let (value, captured_vec) = plexus_auth_core::credential::run_with_credential_capture(|| {
+        serde_json::to_value(payload).unwrap_or(Value::Null)
+    });
+
+    // Rebuild the by-id map for [`assemble_envelope_content`]. Each
+    // `CapturedCredential` carries its own `id` (AUTHZ-CRED-CORE-1B),
+    // so this is a straight projection.
+    let captured: HashMap<CredentialId, CapturedCredential> = captured_vec
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+
+    (value, captured)
 }
 
 /// Schema-build warning emitted when a method's return-type schema
@@ -420,9 +430,14 @@ mod tests {
     }
 
     fn capture(id: &str, value: Value, metadata: CredentialMetadata) -> (CredentialId, CapturedCredential) {
+        let cred_id = CredentialId::new(id);
         (
-            CredentialId::new(id),
-            CapturedCredential { value, metadata },
+            cred_id.clone(),
+            CapturedCredential {
+                id: cred_id,
+                value,
+                metadata,
+            },
         )
     }
 
@@ -705,14 +720,11 @@ mod tests {
     }
 
     #[test]
-    fn serialize_with_credential_capture_returns_empty_until_blocker_resolved() {
-        // Documents the current state described in
-        // AUTHZ-CRED-CORE-2-RUN-NOTES.md §Blocker: without a public
-        // entry point on plexus-auth-core to install a
-        // DispatchCaptureGuard, the captured map is always empty.
-        // The wire-envelope code is exercised independently by the
-        // tests above using directly-constructed CapturedCredential
-        // values.
+    fn serialize_with_credential_capture_returns_empty_for_plain_payload() {
+        // A payload with zero `Credential<T>` fields produces a serialized
+        // body identical to today (no `_credentials` field) and an empty
+        // captured map. Wire-format-identical to pre-CRED-CORE-2 behavior
+        // (additive only).
         #[derive(Serialize)]
         struct Simple {
             x: u32,
@@ -720,9 +732,198 @@ mod tests {
         let s = Simple { x: 42 };
         let (value, captured) = serialize_with_credential_capture(&s);
         assert_eq!(value, json!({ "x": 42 }));
-        assert!(
-            captured.is_empty(),
-            "captured map is empty until plexus-auth-core exposes the guard publicly"
+        assert!(captured.is_empty(), "no credentials -> empty map");
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end tests with REAL `Credential<T>` values. CRED-CORE-2's
+    // deferred ACs (#1 end-to-end, #2 end-to-end, #4 end-to-end, #5
+    // end-to-end) now pass because plexus-auth-core's
+    // `run_with_credential_capture` (AUTHZ-CRED-CORE-1B) is reachable.
+    // -----------------------------------------------------------------
+
+    use plexus_auth_core::credential::{Credential, CredentialMinter};
+
+    /// Mint a fresh Bearer credential with the test issuer.
+    fn mint_bearer(minter: &CredentialMinter, value: &str) -> Credential<String> {
+        minter.mint(value.to_string(), header_metadata())
+    }
+
+    /// Mint a fresh Cookie credential with the test issuer.
+    fn mint_cookie(minter: &CredentialMinter, value: &str) -> Credential<String> {
+        minter.mint(value.to_string(), cookie_metadata())
+    }
+
+    #[test]
+    fn ac1_end_to_end_real_credential_emits_wire_envelope() {
+        // CRED-CORE-2 acceptance criterion 1, end-to-end: a payload
+        // containing one `Credential<T>` field, serialized via the real
+        // dispatch entry point (`serialize_with_credential_capture` →
+        // `assemble_envelope_content`), produces a wire item with the
+        // sentinel in the body AND a `_credentials` sidecar containing
+        // value+metadata for that credential's id.
+        #[derive(Serialize)]
+        struct LoginResponse {
+            user_id: String,
+            session: Credential<String>,
+        }
+        let minter = CredentialMinter::new_for_test(sample_issuer());
+        let session = mint_bearer(&minter, "jwt-token-bytes");
+        let session_id = session.id().clone();
+        let payload = LoginResponse {
+            user_id: "alice".into(),
+            session,
+        };
+
+        let (value, captured) = serialize_with_credential_capture(&payload);
+
+        // Body: sentinel inline.
+        let session_field = value.get("session").expect("session field");
+        assert_eq!(
+            session_field.get("$credential").and_then(|v| v.as_str()),
+            Some(session_id.as_str())
         );
+        // Inner value never appears in the body.
+        let body_str = serde_json::to_string(&value).unwrap();
+        assert!(
+            !body_str.contains("jwt-token-bytes"),
+            "inner JWT must not appear in serialized body: {body_str}"
+        );
+
+        // Captured map: one entry keyed by id.
+        assert_eq!(captured.len(), 1);
+        let entry = captured.get(&session_id).expect("captured by id");
+        assert_eq!(entry.value, Value::String("jwt-token-bytes".into()));
+
+        // Envelope assembly: produces the `_credentials` sidecar.
+        let (content, hints) =
+            assemble_envelope_content(value, captured, &CookieProjector::All);
+        let creds = content.get("_credentials").expect("sidecar present");
+        let entry = creds
+            .get(session_id.as_str())
+            .expect("sidecar contains id");
+        assert_eq!(entry["value"], Value::String("jwt-token-bytes".into()));
+        assert!(entry.get("metadata").is_some());
+        // Header attach → no cookie projection hint.
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn ac2_end_to_end_real_multi_credential_payload() {
+        // CRED-CORE-2 acceptance criterion 2, end-to-end: multiple
+        // `Credential<T>` fields produce one sidecar with one entry per
+        // credential, identifiers assigned in stable mint order.
+        #[derive(Serialize)]
+        struct TokenSet {
+            access: Credential<String>,
+            refresh: Credential<String>,
+        }
+        let minter = CredentialMinter::new_for_test(sample_issuer());
+        let access = mint_bearer(&minter, "access-bytes");
+        let refresh = mint_bearer(&minter, "refresh-bytes");
+        let access_id = access.id().clone();
+        let refresh_id = refresh.id().clone();
+        let payload = TokenSet { access, refresh };
+
+        let (value, captured) = serialize_with_credential_capture(&payload);
+
+        // Body: each credential field becomes a sentinel.
+        assert_eq!(
+            value
+                .get("access")
+                .and_then(|v| v.get("$credential"))
+                .and_then(|v| v.as_str()),
+            Some(access_id.as_str())
+        );
+        assert_eq!(
+            value
+                .get("refresh")
+                .and_then(|v| v.get("$credential"))
+                .and_then(|v| v.as_str()),
+            Some(refresh_id.as_str())
+        );
+
+        // Captured map has both, distinct ids.
+        assert_eq!(captured.len(), 2);
+        assert!(captured.contains_key(&access_id));
+        assert!(captured.contains_key(&refresh_id));
+        assert_ne!(access_id, refresh_id);
+    }
+
+    #[test]
+    fn ac4_end_to_end_cookie_credential_over_http_strips_value() {
+        // CRED-CORE-2 acceptance criterion 4, end-to-end: a real
+        // `Credential<T>` with `AttachmentSite::Cookie` over a
+        // cookie-projecting transport (`CookieProjector::All`) → the
+        // sidecar's `value` is stripped and the projection hint carries
+        // the cookie name + value.
+        #[derive(Serialize)]
+        struct LoginResponse {
+            user: String,
+            session: Credential<String>,
+        }
+        let minter = CredentialMinter::new_for_test(sample_issuer());
+        let session = mint_cookie(&minter, "opaque-cookie-value");
+        let session_id = session.id().clone();
+        let payload = LoginResponse {
+            user: "alice".into(),
+            session,
+        };
+
+        let (value, captured) = serialize_with_credential_capture(&payload);
+        let (content, hints) =
+            assemble_envelope_content(value, captured, &CookieProjector::All);
+
+        // Sidecar entry: value stripped, metadata stays.
+        let entry = content
+            .get("_credentials")
+            .and_then(|c| c.get(session_id.as_str()))
+            .expect("sidecar entry");
+        assert!(
+            entry.get("value").is_none(),
+            "cookie projection must strip value from sidecar"
+        );
+        assert!(entry.get("metadata").is_some(), "metadata must remain");
+
+        // One cookie projection hint.
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].cookie_name.as_str(), "plexus_session");
+        assert_eq!(
+            hints[0].cookie_value,
+            Value::String("opaque-cookie-value".into())
+        );
+    }
+
+    #[test]
+    fn ac5_end_to_end_cookie_credential_over_stdio_keeps_value() {
+        // CRED-CORE-2 acceptance criterion 5, end-to-end: same shape,
+        // but over a non-cookie-projecting transport (`CookieProjector::None`)
+        // → the cookie value stays in the sidecar, no projection hint.
+        #[derive(Serialize)]
+        struct LoginResponse {
+            user: String,
+            session: Credential<String>,
+        }
+        let minter = CredentialMinter::new_for_test(sample_issuer());
+        let session = mint_cookie(&minter, "opaque-cookie-value");
+        let session_id = session.id().clone();
+        let payload = LoginResponse {
+            user: "alice".into(),
+            session,
+        };
+
+        let (value, captured) = serialize_with_credential_capture(&payload);
+        let (content, hints) =
+            assemble_envelope_content(value, captured, &CookieProjector::None);
+
+        let entry = content
+            .get("_credentials")
+            .and_then(|c| c.get(session_id.as_str()))
+            .expect("sidecar entry");
+        assert_eq!(
+            entry["value"],
+            Value::String("opaque-cookie-value".into())
+        );
+        assert!(hints.is_empty());
     }
 }

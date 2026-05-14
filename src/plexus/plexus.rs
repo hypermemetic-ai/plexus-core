@@ -468,21 +468,24 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
                 "forward_policy_applied (audit-record emission stubbed pending PRIVACY-1)"
             );
 
-            // Step 5: framework-only construction of the callee sealed
-            // AuthContext. The policy NEVER sees this constructed value —
-            // it returned *parameters*; the framework consumed them.
-            let callee_ctx: Option<super::auth::AuthContext> = auth.map(|caller_ctx| {
-                super::auth::AuthContext::derive_callee_context(
-                    caller_ctx,
-                    &derivation,
-                    &site.caller,
-                )
-            });
-
-            // Step 6: dispatch with the derived context.
-            return child
-                .router_call(rest, params, callee_ctx.as_ref(), raw_ctx)
-                .await;
+            // Step 5+6: framework-blessed derivation of the callee sealed
+            // AuthContext, and dispatch with it. The policy NEVER sees the
+            // constructed value — it returned *parameters*; the framework
+            // consumed them via `with_callee_context`, which scopes the
+            // callee to the dispatch closure (the raw constructor remains
+            // pub(crate) to plexus-auth-core).
+            return match auth {
+                Some(caller_ctx) => {
+                    caller_ctx
+                        .with_callee_context(&derivation, &site.caller, |callee_ctx| async move {
+                            child
+                                .router_call(rest, params, Some(&callee_ctx), raw_ctx)
+                                .await
+                        })
+                        .await
+                }
+                None => child.router_call(rest, params, None, raw_ctx).await,
+            };
         }
         return Err(PlexusError::ActivationNotFound(child_name.to_string()));
     }

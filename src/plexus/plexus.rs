@@ -585,6 +585,28 @@ impl PluginRegistry {
 // DynamicHub (formerly Plexus)
 // ============================================================================
 
+/// Build the JSON payload for the `_info` well-known endpoint.
+///
+/// The shape is `{"backend": "<ns>", "auth_capabilities": {…}}` per
+/// AUTHZ-S01-output §2 / AUTHZ-CORE-3. When the backend has not declared its
+/// capabilities via [`DynamicHub::with_auth_capabilities`], the field falls
+/// back to [`plexus_auth_core::BackendAuthCapabilities::anonymous_default`]
+/// (a single `Anonymous` mechanism). The `_info` endpoint itself remains
+/// public — no authentication is required to read it.
+fn build_info_payload(
+    namespace: &str,
+    caps: Option<&plexus_auth_core::BackendAuthCapabilities>,
+) -> serde_json::Value {
+    let advertised = match caps {
+        Some(c) => c.clone(),
+        None => plexus_auth_core::BackendAuthCapabilities::anonymous_default(),
+    };
+    serde_json::json!({
+        "backend": namespace,
+        "auth_capabilities": advertised,
+    })
+}
+
 struct DynamicHubInner {
     /// Custom namespace for this hub instance (defaults to "plexus")
     namespace: String,
@@ -594,6 +616,17 @@ struct DynamicHubInner {
     /// Activation registry mapping UUIDs to paths
     registry: std::sync::RwLock<PluginRegistry>,
     pending_rpc: std::sync::Mutex<Vec<Box<dyn FnOnce() -> Methods + Send>>>,
+    /// What this backend advertises at `_info`'s `auth_capabilities` field.
+    ///
+    /// `None` means the backend has not called
+    /// [`DynamicHub::with_auth_capabilities`]; `_info` falls back to
+    /// [`plexus_auth_core::BackendAuthCapabilities::anonymous_default`]
+    /// (a single `Anonymous` mechanism, no default). This preserves today's
+    /// no-auth substrate behavior while signaling "no auth wired" to
+    /// capability-aware clients.
+    ///
+    /// Per AUTHZ-CORE-3 and AUTHZ-S01-output §2.
+    auth_capabilities: Option<plexus_auth_core::BackendAuthCapabilities>,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -644,8 +677,64 @@ impl DynamicHub {
                 child_routers: HashMap::new(),
                 registry: std::sync::RwLock::new(PluginRegistry::new()),
                 pending_rpc: std::sync::Mutex::new(Vec::new()),
+                auth_capabilities: None,
             }),
         }
+    }
+
+    /// Declare the backend's authentication capabilities, served at `_info`.
+    ///
+    /// Backends call this at builder time to advertise which auth mechanisms
+    /// they support (Bearer, Cookie, OIDC, Anonymous). Generic clients
+    /// (synapse CLI, gamma, generated SDKs) read the advertisement to decide
+    /// which authentication flow to drive.
+    ///
+    /// Without calling this method, `_info` emits the
+    /// [`plexus_auth_core::BackendAuthCapabilities::anonymous_default`]
+    /// fallback: a single `Anonymous` mechanism, no default. This preserves
+    /// today's no-auth substrate behavior.
+    ///
+    /// Per AUTHZ-CORE-3 / AUTHZ-S01-output §2.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use plexus_core::DynamicHub;
+    /// use plexus_auth_core::{
+    ///     AuthMechanism, BackendAuthCapabilities, CookieName, MethodPath,
+    /// };
+    ///
+    /// let caps = BackendAuthCapabilities::new(
+    ///     vec![AuthMechanism::Cookie {
+    ///         cookie: CookieName::try_new("plexus_session").unwrap(),
+    ///         login: MethodPath::try_new("auth.login").unwrap(),
+    ///         refresh: None,
+    ///         logout: None,
+    ///     }],
+    ///     Some(0),
+    /// )
+    /// .unwrap();
+    ///
+    /// let hub = DynamicHub::new("my-backend").with_auth_capabilities(caps);
+    /// ```
+    pub fn with_auth_capabilities(
+        mut self,
+        caps: plexus_auth_core::BackendAuthCapabilities,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot set auth_capabilities: DynamicHub has multiple references");
+        inner.auth_capabilities = Some(caps);
+        self
+    }
+
+    /// Returns the configured [`BackendAuthCapabilities`], or `None` if the
+    /// backend has not called [`Self::with_auth_capabilities`].
+    ///
+    /// Test-side accessor; production code reads the advertisement off `_info`.
+    ///
+    /// [`BackendAuthCapabilities`]: plexus_auth_core::BackendAuthCapabilities
+    pub fn auth_capabilities(&self) -> Option<&plexus_auth_core::BackendAuthCapabilities> {
+        self.inner.auth_capabilities.as_ref()
     }
 
     /// Deprecated: Use new() with explicit namespace instead
@@ -980,20 +1069,24 @@ impl DynamicHub {
             }
         )?;
 
-        // Register _info well-known endpoint (no namespace prefix)
-        // Returns backend name as a single-item stream with automatic Done event
-        let backend_name = self.runtime_namespace().to_string();
+        // Register _info well-known endpoint (no namespace prefix).
+        // Returns backend name + auth_capabilities (AUTHZ-CORE-3) as a
+        // single-item stream with automatic Done event. Backends that have not
+        // called with_auth_capabilities get the anonymous-default fallback so
+        // capability-aware clients can still discover the auth surface.
+        let info_payload = build_info_payload(
+            self.runtime_namespace(),
+            self.inner.auth_capabilities.as_ref(),
+        );
         module.register_subscription(
             "_info",
             PLEXUS_NOTIF_METHOD,
             "_info_unsub",
             move |_params, pending, _ctx, _ext| {
-                let name = backend_name.clone();
+                let payload = info_payload.clone();
                 Box::pin(async move {
                     // Create a single-item stream with the info response
-                    let info_stream = futures::stream::once(async move {
-                        serde_json::json!({"backend": name})
-                    });
+                    let info_stream = futures::stream::once(async move { payload });
 
                     // Wrap to auto-append Done event
                     let wrapped = super::streaming::wrap_stream(
@@ -1133,20 +1226,23 @@ impl DynamicHub {
             }
         )?;
 
-        // Register _info well-known endpoint (no namespace prefix)
-        // Returns backend name as a single-item stream with automatic Done event
-        let backend_name = hub.runtime_namespace().to_string();
+        // Register _info well-known endpoint (no namespace prefix).
+        // Returns backend name + auth_capabilities (AUTHZ-CORE-3) as a
+        // single-item stream with automatic Done event. Same payload shape as
+        // the sibling registration in into_rpc_module.
+        let info_payload = build_info_payload(
+            hub.runtime_namespace(),
+            hub.inner.auth_capabilities.as_ref(),
+        );
         module.register_subscription(
             "_info",
             PLEXUS_NOTIF_METHOD,
             "_info_unsub",
             move |_params, pending, _ctx, _ext| {
-                let name = backend_name.clone();
+                let payload = info_payload.clone();
                 Box::pin(async move {
                     // Create a single-item stream with the info response
-                    let info_stream = futures::stream::once(async move {
-                        serde_json::json!({"backend": name})
-                    });
+                    let info_stream = futures::stream::once(async move { payload });
 
                     // Wrap to auto-append Done event
                     let wrapped = super::streaming::wrap_stream(

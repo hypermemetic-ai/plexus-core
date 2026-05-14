@@ -317,6 +317,39 @@ pub trait ChildRouter: Send + Sync {
     async fn search_children(&self, _query: &str) -> Option<BoxStream<'_, String>> {
         None
     }
+
+    // AUTHLANG-3 — three default-implemented methods that the framework's
+    // dispatch path (`route_to_child` below) consults. Existing impls keep
+    // compiling unchanged: they inherit the defaults below. Hub-level impls
+    // (DynamicHub) override them to consult the registry/principal/sink the
+    // hub holds.
+
+    /// Look up the forward policy declared for a callee namespace.
+    ///
+    /// Default: returns `None`, which the framework interprets as
+    /// [`plexus_auth_core::IdentityOnly`] — the safe default per
+    /// `AUTHLANG-S01-output` §5. Macro-emitted impls (AUTHLANG-4) override
+    /// this from the `#[plexus::activation(forward_policy = ...)]`
+    /// attribute; the [`DynamicHub`] override consults its
+    /// [`ForwardPolicyRegistry`](super::forward_registry::ForwardPolicyRegistry).
+    fn forward_policy_for(
+        &self,
+        _callee_ns: &str,
+    ) -> Option<std::sync::Arc<dyn plexus_auth_core::ForwardPolicy>> {
+        None
+    }
+
+    /// Framework-stamped immediate-caller [`plexus_auth_core::Principal`] of
+    /// this router.
+    ///
+    /// Default: [`plexus_auth_core::Principal::Anonymous`]. The dispatch
+    /// path passes this into the [`plexus_auth_core::CallSite`] handed to
+    /// the policy so policies can implement callee-and-caller-aware
+    /// decisions (e.g., "PassThrough only when callee is in `audit.*`").
+    /// Hub-level impls override to return the per-connection stamp.
+    fn framework_stamped_principal(&self) -> plexus_auth_core::Principal {
+        plexus_auth_core::Principal::Anonymous
+    }
 }
 
 /// Route a method call to a child activation
@@ -324,6 +357,31 @@ pub trait ChildRouter: Send + Sync {
 /// This is called from generated code when a hub activation receives
 /// a method that doesn't match its local methods. If the method
 /// contains a dot (e.g., "mercury.info"), it routes to the child.
+///
+/// # AUTHLANG-3 dispatch sequence
+///
+/// Between callee resolution (`get_child`) and the actual dispatch
+/// (`router_call`), the framework runs the forwarding-policy step pinned
+/// in `plans/AUTHLANG/AUTHLANG-S01-output.md` §3:
+///
+/// 1. Resolve the policy registered for the callee namespace via
+///    [`ChildRouter::forward_policy_for`]; default
+///    [`plexus_auth_core::IdentityOnly`] when none is declared.
+/// 2. Build a [`plexus_auth_core::CallSite`] from the parent router's
+///    framework-stamped principal and the callee's [`MethodPath`].
+/// 3. Invoke [`plexus_auth_core::ForwardPolicy::forward`] to obtain a
+///    [`plexus_auth_core::ForwardDerivation`].
+/// 4. *(deferred — PRIVACY-1)* Emit one `AuditRecord` with
+///    `kind: ForwardPolicyApplied` to the configured `AuditSink`.
+/// 5. Mint the callee `AuthContext` via the framework-only constructor
+///    [`plexus_auth_core::AuthContext::derive_callee_context`].
+/// 6. Dispatch to `child.router_call(...)` with the derived context.
+///
+/// The policy step is invisible to activation authors per AUTHZ-0
+/// principle 1 ("trust is structural, not procedural"). The
+/// [`plexus_auth_core::ForwardPolicy::forward`] surface returns
+/// *parameters*, never a constructed `AuthContext`; the framework is the
+/// only entity that can mint one, per the sealed-type pattern.
 pub async fn route_to_child<T: ChildRouter + ?Sized>(
     parent: &T,
     method: &str,
@@ -334,7 +392,97 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
     // Try to split on first dot for nested routing
     if let Some((child_name, rest)) = method.split_once('.') {
         if let Some(child) = parent.get_child(child_name).await {
-            return child.router_call(rest, params, auth, raw_ctx).await;
+            // ── AUTHLANG-3: forwarding-policy dispatch sequence ───────────
+            // Steps 1–3, 5–6 per the pinned spike §3. Step 4 (audit
+            // emission) is deferred until PRIVACY-1 lands `AuditRecord` /
+            // `AuditSink` / `ForwardPolicyApplied`; the TODO below marks
+            // the exact insertion point. See run-notes on the ticket.
+
+            // Step 1: resolve the policy registered for the callee
+            // namespace; default to IdentityOnly per the spike-pinned safe
+            // default (AUTHLANG-S01-output §5).
+            let policy: std::sync::Arc<dyn plexus_auth_core::ForwardPolicy> = parent
+                .forward_policy_for(child_name)
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(plexus_auth_core::IdentityOnly)
+                        as std::sync::Arc<dyn plexus_auth_core::ForwardPolicy>
+                });
+
+            // Step 2: build the CallSite. The framework-built path string
+            // is always a valid MethodPath because the caller already
+            // validated the inbound method on its way in; if validation
+            // ever fails here it indicates a framework bug, not a user
+            // input error.
+            let callee_method_str = format!("{}.{}", child_name, rest);
+            let callee_method = plexus_auth_core::MethodPath::try_new(callee_method_str.as_str())
+                .map_err(|e| PlexusError::ExecutionError(format!(
+                    "framework-built MethodPath rejected: {} ({:?})",
+                    callee_method_str, e
+                )))?;
+            let site = plexus_auth_core::CallSite::new(
+                parent.framework_stamped_principal(),
+                callee_method,
+            );
+
+            // Step 3: invoke the policy. When the caller has no
+            // AuthContext (anonymous edge), feed the policy the anonymous
+            // sealed context so the policy contract is honored uniformly.
+            let anonymous_owned;
+            let caller_ctx: &super::auth::AuthContext = match auth {
+                Some(ctx) => ctx,
+                None => {
+                    anonymous_owned = super::auth::AuthContext::anonymous();
+                    &anonymous_owned
+                }
+            };
+            let derivation = policy.forward(caller_ctx, &site);
+
+            // Step 4 (DEFERRED — PRIVACY-1): emit AuditRecord with
+            // kind: ForwardPolicyApplied before dispatch. When PRIVACY-1
+            // lands `AuditRecord`, `AuditSink`, and `ForwardPolicyApplied`
+            // in `plexus_auth_core`, add a `ChildRouter::audit_sink()`
+            // default method (returning a no-op sink) and call:
+            //
+            //     parent.audit_sink().write(
+            //         AuditRecord::for_forward(
+            //             &site.callee_method,
+            //             &site.caller,
+            //             policy.name(),
+            //             derivation,
+            //             auth.and_then(|c| c.verified_user_id()),
+            //         )
+            //     ).await;
+            //
+            // Sink failure must be logged at WARN and NOT propagated
+            // (acceptance-criteria row 4 in AUTHLANG-3 §"Required
+            // behavior"). Until then, log a structured trace event so
+            // operators can confirm the policy step ran:
+            tracing::trace!(
+                target: "plexus::audit",
+                policy = policy.name().as_str(),
+                callee_method = %site.callee_method.as_str(),
+                derivation_keep_verified_user = derivation.keep_verified_user,
+                derivation_keep_roles = derivation.keep_roles,
+                derivation_keep_capabilities = derivation.keep_capabilities,
+                derivation_keep_metadata = derivation.keep_metadata,
+                "forward_policy_applied (audit-record emission stubbed pending PRIVACY-1)"
+            );
+
+            // Step 5: framework-only construction of the callee sealed
+            // AuthContext. The policy NEVER sees this constructed value —
+            // it returned *parameters*; the framework consumed them.
+            let callee_ctx: Option<super::auth::AuthContext> = auth.map(|caller_ctx| {
+                super::auth::AuthContext::derive_callee_context(
+                    caller_ctx,
+                    &derivation,
+                    &site.caller,
+                )
+            });
+
+            // Step 6: dispatch with the derived context.
+            return child
+                .router_call(rest, params, callee_ctx.as_ref(), raw_ctx)
+                .await;
         }
         return Err(PlexusError::ActivationNotFound(child_name.to_string()));
     }
@@ -376,6 +524,20 @@ impl ChildRouter for ArcChildRouter {
 
     async fn search_children(&self, query: &str) -> Option<BoxStream<'_, String>> {
         self.0.search_children(query).await
+    }
+
+    // AUTHLANG-3 — forward the new ChildRouter trait methods through the
+    // Arc wrapper so a `DynamicHub` reached via `get_child` keeps its
+    // overrides (especially `forward_policy_for`).
+    fn forward_policy_for(
+        &self,
+        callee_ns: &str,
+    ) -> Option<std::sync::Arc<dyn plexus_auth_core::ForwardPolicy>> {
+        self.0.forward_policy_for(callee_ns)
+    }
+
+    fn framework_stamped_principal(&self) -> plexus_auth_core::Principal {
+        self.0.framework_stamped_principal()
     }
 }
 
@@ -627,6 +789,15 @@ struct DynamicHubInner {
     ///
     /// Per AUTHZ-CORE-3 and AUTHZ-S01-output §2.
     auth_capabilities: Option<plexus_auth_core::BackendAuthCapabilities>,
+    /// AUTHLANG-3 — per-hub mapping from callee namespace to the
+    /// [`plexus_auth_core::ForwardPolicy`] consulted at every
+    /// cross-boundary call routed through this hub. Populated declaratively
+    /// (by the AUTHLANG-4 macro emission) or imperatively (via
+    /// [`DynamicHub::with_forward_policy`]). When the registry has no entry
+    /// for a callee namespace, the framework falls back to
+    /// [`plexus_auth_core::IdentityOnly`] per the spike-pinned safe
+    /// default. See `plans/AUTHLANG/AUTHLANG-S01-output.md` §3.
+    forward_policies: super::forward_registry::ForwardPolicyRegistry,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -678,8 +849,48 @@ impl DynamicHub {
                 registry: std::sync::RwLock::new(PluginRegistry::new()),
                 pending_rpc: std::sync::Mutex::new(Vec::new()),
                 auth_capabilities: None,
+                forward_policies: super::forward_registry::ForwardPolicyRegistry::new(),
             }),
         }
+    }
+
+    /// Register a [`plexus_auth_core::ForwardPolicy`] for a callee
+    /// namespace.
+    ///
+    /// AUTHLANG-3 — every cross-boundary call through this hub consults
+    /// the registry at dispatch time. When `callee_ns` has no entry, the
+    /// framework falls back to [`plexus_auth_core::IdentityOnly`].
+    ///
+    /// AUTHLANG-4's `#[plexus::activation(forward_policy = ...)]`
+    /// attribute is the declarative path; this builder is the imperative
+    /// escape hatch used by integration tests and hand-rolled wiring.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use plexus_auth_core::PassThrough;
+    /// use std::sync::Arc;
+    ///
+    /// let hub = DynamicHub::new("my-backend")
+    ///     .with_forward_policy("solar", Arc::new(PassThrough));
+    /// ```
+    pub fn with_forward_policy(
+        mut self,
+        callee_ns: impl Into<String>,
+        policy: std::sync::Arc<dyn plexus_auth_core::ForwardPolicy>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot register forward policy: DynamicHub has multiple references");
+        inner.forward_policies.register(callee_ns, policy);
+        self
+    }
+
+    /// Read-only view of the registered forward policies.
+    ///
+    /// Test-side accessor; production dispatch consults the registry via
+    /// the [`ChildRouter::forward_policy_for`] override.
+    pub fn forward_policies(&self) -> &super::forward_registry::ForwardPolicyRegistry {
+        &self.inner.forward_policies
     }
 
     /// Declare the backend's authentication capabilities, served at `_info`.
@@ -1505,6 +1716,22 @@ impl ChildRouter for DynamicHub {
                 Box::new(ArcChildRouter(router.clone())) as Box<dyn ChildRouter>
             })
     }
+
+    /// AUTHLANG-3 — consult the hub's
+    /// [`ForwardPolicyRegistry`](super::forward_registry::ForwardPolicyRegistry).
+    fn forward_policy_for(
+        &self,
+        callee_ns: &str,
+    ) -> Option<std::sync::Arc<dyn plexus_auth_core::ForwardPolicy>> {
+        self.inner.forward_policies.get(callee_ns)
+    }
+
+    // `framework_stamped_principal` retains the trait default
+    // (`Principal::Anonymous`) for now. AUTHLANG-3 wires the dispatch path
+    // to read this; populating it with the per-connection stamp lands
+    // when the principal-minting service (post-AUTHZ-0 / future
+    // CRED-CORE) is wired into the WS upgrade path. The current
+    // anonymous return value is correct under today's no-auth substrate.
 }
 
 #[cfg(test)]

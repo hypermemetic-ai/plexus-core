@@ -11,6 +11,11 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use plexus_auth_core::{
+    AttachmentSite, CredentialFieldMarker, CredentialIssuer, CredentialKind, CredentialMetadata,
+    Scope,
+};
+
 use super::bidirectional::{StandardRequest, StandardResponse};
 
 // =============================================================================
@@ -139,6 +144,171 @@ impl ParamSchema {
     pub fn with_deprecation(mut self, info: DeprecationInfo) -> Self {
         self.deprecation = Some(info);
         self
+    }
+}
+
+// =============================================================================
+// Credential projections (AUTHZ-CRED-CORE-3)
+// =============================================================================
+
+/// One entry per credential-bearing field in a method's return type.
+///
+/// Pinned by `AUTHZ-CRED-S01-output.md` §4 and `AUTHZ-CRED-CORE-3` §"Required
+/// behavior". Projected onto `MethodSchema.credentials` at schema-build time
+/// from the `CredentialFieldMarker` registry the `#[derive(Credentials)]` macro
+/// emits per credential-bearing type (`AUTHZ-CRED-MACRO-1`).
+///
+/// # Field path semantics (Tier B Q-IR-1)
+///
+/// `field_path` is the JSON-object path to the credential field within the
+/// method's return type. v1 always uses object-field paths (one segment per
+/// field name walked); array indices and JSON Pointer syntax are intentionally
+/// excluded because credentials always live on object fields in v1, never
+/// inside array elements.
+///
+/// Example: for a return type
+/// `struct LoginResult { session: Credential<String> }`, the field path is
+/// `["session"]`. For a nested case
+/// `struct LoginResult { auth: AuthBundle }` where `AuthBundle` itself
+/// declares a `#[plexus::credential(..)]` field `token: Credential<String>`,
+/// the field path is `["auth", "token"]`.
+///
+/// # Variant tagging
+///
+/// `variant_tag` is `Some(tag)` when the method's return type is an enum and
+/// the credential lives on a single variant. The tag matches the variant
+/// identifier as the macro registry records it (e.g. `"Issued"` for the
+/// `LoginEvent::Issued` variant). `None` means the return type is a struct,
+/// or the credential appears on every variant of the enum (rare).
+///
+/// # Wire back-compat
+///
+/// Added in `AUTHZ-CRED-CORE-3`. Pre-existing readers tolerate `credentials:
+/// []` (the default on `MethodSchema` when no credentials are declared) and
+/// pre-existing IRs that omit the field altogether decode cleanly via
+/// `#[serde(default)]` on the field site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CredentialFieldDecl {
+    /// JSON-object path to the credential field within the method's return
+    /// type. One segment per field-name walk; pinned to object paths (no
+    /// array indices, no JSON Pointer) per Tier B Q-IR-1.
+    pub field_path: Vec<String>,
+
+    /// Variant tag when the return type is an enum and the credential lives
+    /// on a single variant. `None` for structs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_tag: Option<String>,
+
+    /// The credential's metadata (kind, attach site, scheme, scopes, expiry,
+    /// refresh/revoke hints, issuer, sensitivity). Carried verbatim so
+    /// consumers embed identical storage-and-attach logic to the runtime.
+    pub metadata: CredentialMetadata,
+}
+
+impl CredentialFieldDecl {
+    /// Construct a `CredentialFieldDecl` by composing a `CredentialFieldMarker`
+    /// from the macro-emitted registry with the runtime-supplied pieces
+    /// (`expires_at` known only at mint time; `issuer` known at schema-build
+    /// time from the originating method's `(Origin, MethodPath)`).
+    ///
+    /// `path_prefix` is the field-path walk to the marker's parent type — for
+    /// a flat struct it is empty; for a nested case where this marker lives
+    /// inside a field of the method's return type the prefix is the path to
+    /// that wrapping field. The marker's own `field` and `variant` are
+    /// appended.
+    pub fn from_marker(
+        marker: &CredentialFieldMarker,
+        path_prefix: &[&str],
+        issuer: CredentialIssuer,
+    ) -> Self {
+        let mut field_path: Vec<String> = path_prefix.iter().map(|s| (*s).to_owned()).collect();
+        field_path.push(marker.field.to_owned());
+        let variant_tag = marker.variant.map(|v| v.to_owned());
+        let metadata = marker.to_metadata(None, issuer);
+        Self {
+            field_path,
+            variant_tag,
+            metadata,
+        }
+    }
+}
+
+/// What a method requires on input — the implicit-derivation projection of
+/// scope tagging and credential-graph linkage onto a per-method filter.
+///
+/// Pinned by `AUTHZ-CRED-S01-output.md` §4 (Q-SELECT-1 resolution: implicit
+/// derivation from scope tagging plus refresh/revoke linkage) and
+/// `AUTHZ-CRED-CORE-3` §"Implicit derivation". This ticket explicitly does
+/// NOT add a `#[plexus::method(requires_credential = { .. })]` attribute
+/// surface — the proposal from `AUTHZ-CRED-S01-output` §10 is superseded by
+/// the implicit-derivation approach pinned here.
+///
+/// # Matching semantics (consumer-side)
+///
+/// A candidate credential matches this `RequiredCredential` iff:
+/// 1. `kind`: if `Some(k)`, the candidate's `CredentialMetadata.kind`
+///    matches `k` (or the kind-subsumption table per `AUTHZ-CRED-CORE-1`
+///    accepts the substitution; e.g. `OauthAccess <: Bearer`). If `None`,
+///    any kind whose scope set matches is acceptable.
+/// 2. `scopes`: each scope in this set must be wildcard-matched by the
+///    candidate's `CredentialMetadata.scopes`. The wildcard rules belong to
+///    the `Scope` type itself.
+/// 3. `site_hint`: when populated, prefers the candidate whose
+///    `CredentialMetadata.attach_as` equals the hint. Advisory only — a
+///    candidate without the hint is not rejected.
+///
+/// # Wire back-compat
+///
+/// Added in `AUTHZ-CRED-CORE-3`. Pre-existing readers tolerate
+/// `requires_credential: null` (omitted on the wire when `None`) and
+/// pre-existing IRs that omit the field altogether decode cleanly via
+/// `#[serde(default)]` on the field site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RequiredCredential {
+    /// Specific kind a candidate credential must have (e.g.,
+    /// `OauthRefresh`), or `None` for "any kind whose scope set matches".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CredentialKind>,
+
+    /// Required scope set. A candidate credential's metadata scopes must
+    /// wildcard-match each scope in this set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<Scope>,
+
+    /// Preferred attach site for the client to use when the candidate
+    /// credential has multiple alternates. Advisory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_hint: Option<AttachmentSite>,
+}
+
+impl RequiredCredential {
+    /// Derive a `RequiredCredential` from a method's required scope tagging
+    /// (per `AUTHZ-S01-output` §4). The `kind` field is left `None` — any
+    /// kind whose scope set wildcard-matches `scope` is acceptable.
+    ///
+    /// Used when a method declares `#[plexus::method(scope = "...")]` (or
+    /// the framework derives an implicit scope from the method's path).
+    pub fn from_method_scope(scope: Scope) -> Self {
+        Self {
+            kind: None,
+            scopes: vec![scope],
+            site_hint: None,
+        }
+    }
+
+    /// Derive a `RequiredCredential` for a method that appears as the target
+    /// of another credential's `metadata.refresh_via` or `metadata.revoke_via`
+    /// (per `AUTHZ-CRED-CORE-3` §"Implicit derivation" row 3). The `kind`
+    /// field narrows to the issuing credential's kind so the selection step
+    /// picks the right kind (e.g., `OauthRefresh` for the
+    /// `auth.refresh` call on an `OauthAccess` credential per the OAuth
+    /// flow described in `AUTHZ-CRED-S01-output` §7.2).
+    pub fn from_refresh_revoke_target(kind: CredentialKind, scopes: Vec<Scope>) -> Self {
+        Self {
+            kind: Some(kind),
+            scopes,
+            site_hint: None,
+        }
     }
 }
 
@@ -431,6 +601,42 @@ pub struct MethodSchema {
     /// parameters (IR-5).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params_meta: Vec<ParamSchema>,
+
+    /// Credential-bearing fields in this method's return type.
+    ///
+    /// One entry per `#[plexus::credential(...)]`-annotated field on the
+    /// return-type struct/enum, in stable declaration order. Empty when
+    /// the return type contains no credentials.
+    ///
+    /// Added in `AUTHZ-CRED-CORE-3`. Defaults to an empty vec via
+    /// `#[serde(default)]` so pre-IR schemas deserialize cleanly. The
+    /// `skip_serializing_if = "Vec::is_empty"` clause keeps the wire JSON
+    /// shape unchanged for methods with no credential-bearing fields
+    /// (back-compat per the ticket's "Wire-format back-compat" table).
+    ///
+    /// Populated at schema-build time from the `CredentialFieldMarker`
+    /// registry emitted by `#[derive(Credentials)]` (`AUTHZ-CRED-MACRO-1`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<CredentialFieldDecl>,
+
+    /// What credential this method requires on input (if any).
+    ///
+    /// Derived implicitly from the method's scope tagging and the
+    /// credential-graph linkage at schema-build time (per
+    /// `AUTHZ-CRED-CORE-3` §"Implicit derivation"):
+    ///
+    /// - `scope = "..."` → `RequiredCredential::from_method_scope(scope)`.
+    /// - `public` method → `None` (the absence of this field).
+    /// - target of `refresh_via`/`revoke_via` of another credential →
+    ///   `RequiredCredential::from_refresh_revoke_target(kind, scopes)`.
+    ///
+    /// Added in `AUTHZ-CRED-CORE-3`. Defaults to `None` via
+    /// `#[serde(default)]` so pre-IR schemas deserialize cleanly. The
+    /// `skip_serializing_if = "Option::is_none"` clause keeps the wire JSON
+    /// shape unchanged for public methods and methods with no scope-derived
+    /// requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_credential: Option<RequiredCredential>,
 }
 
 impl PluginSchema {
@@ -861,6 +1067,8 @@ impl MethodSchema {
             deprecation: None,
             return_shape: None,
             params_meta: Vec::new(),
+            credentials: Vec::new(),
+            requires_credential: None,
         }
     }
 
@@ -973,6 +1181,38 @@ impl MethodSchema {
     /// `properties` map of the JSON Schema.
     pub fn with_params_meta(mut self, entries: Vec<ParamSchema>) -> Self {
         self.params_meta = entries;
+        self
+    }
+
+    /// Attach the credential-field projection for this method's return type.
+    ///
+    /// Added in `AUTHZ-CRED-CORE-3`. The build-path supplies one
+    /// `CredentialFieldDecl` per `#[plexus::credential(...)]`-annotated
+    /// field in the return type, in stable declaration order. Absence (the
+    /// default empty vec) means the return type carries no credentials.
+    ///
+    /// The constructor `CredentialFieldDecl::from_marker` composes one
+    /// entry from a `CredentialFieldMarker` (emitted by the
+    /// `#[derive(Credentials)]` macro) plus the runtime-known issuer.
+    pub fn with_credentials(mut self, credentials: Vec<CredentialFieldDecl>) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// Attach the implicit-derived `requires_credential` filter for this
+    /// method.
+    ///
+    /// Added in `AUTHZ-CRED-CORE-3`. The build-path supplies a
+    /// `RequiredCredential` derived from either (a) the method's `scope`
+    /// attribute or (b) the method's appearance as a `refresh_via` /
+    /// `revoke_via` target of some other credential in the schema. Public
+    /// methods leave this field as `None` (the default).
+    ///
+    /// `RequiredCredential::from_method_scope` and
+    /// `RequiredCredential::from_refresh_revoke_target` are the two derivation
+    /// entry points.
+    pub fn with_requires_credential(mut self, req: RequiredCredential) -> Self {
+        self.requires_credential = Some(req);
         self
     }
 }
@@ -1919,5 +2159,399 @@ mod tests {
         );
         assert_eq!(hub_with_roles.is_hub(), hub_with_roles.is_hub_by_role());
         assert!(hub_with_roles.is_hub());
+    }
+
+    // =========================================================================
+    // AUTHZ-CRED-CORE-3 tests: CredentialFieldDecl, RequiredCredential,
+    // MethodSchema.credentials / .requires_credential projections.
+    // =========================================================================
+
+    use plexus_auth_core::{
+        AttachmentSite, CredentialFieldMarker, CredentialIssuer, CredentialKind,
+        CredentialMetadata, CredentialScheme, HeaderName, MethodPath, Origin, Scope,
+    };
+
+    fn sample_issuer() -> CredentialIssuer {
+        CredentialIssuer::new(
+            Origin::new("ws://localhost:4444"),
+            MethodPath::try_new("auth.login").unwrap(),
+        )
+    }
+
+    fn sample_marker_single() -> CredentialFieldMarker {
+        CredentialFieldMarker::new(
+            None,
+            "session",
+            CredentialKind::Bearer,
+            AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            },
+            Some(CredentialScheme::new("Bearer ")),
+            vec![Scope::new("cone.send_message")],
+            Some(MethodPath::try_new("auth.refresh").unwrap()),
+            Some(MethodPath::try_new("auth.logout").unwrap()),
+        )
+    }
+
+    /// AC #1: A method whose return type contains one `Credential<T>` field
+    /// produces a `MethodSchema` whose `credentials` field has one
+    /// `CredentialFieldDecl` entry with the correct field path and metadata.
+    #[test]
+    fn cred_core_3_ac1_single_credential_projection() {
+        let marker = sample_marker_single();
+        let decl = CredentialFieldDecl::from_marker(&marker, &[], sample_issuer());
+
+        // Field path is the marker's single field name.
+        assert_eq!(decl.field_path, vec!["session".to_string()]);
+        // No variant tag for a struct return type.
+        assert!(decl.variant_tag.is_none());
+        // Metadata composes correctly from the marker.
+        assert_eq!(decl.metadata.kind, CredentialKind::Bearer);
+        assert_eq!(
+            decl.metadata.attach_as,
+            AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            }
+        );
+        assert_eq!(decl.metadata.scheme, Some(CredentialScheme::new("Bearer ")));
+        assert_eq!(decl.metadata.scopes, vec![Scope::new("cone.send_message")]);
+        assert_eq!(
+            decl.metadata.refresh_via,
+            Some(MethodPath::try_new("auth.refresh").unwrap())
+        );
+        assert_eq!(
+            decl.metadata.revoke_via,
+            Some(MethodPath::try_new("auth.logout").unwrap())
+        );
+        assert_eq!(decl.metadata.issuer, sample_issuer());
+
+        // Project into a MethodSchema and confirm the field is populated.
+        let method = MethodSchema::new("login", "logs in", "h_login").with_credentials(vec![decl]);
+        assert_eq!(method.credentials.len(), 1);
+        assert_eq!(method.credentials[0].field_path, vec!["session".to_string()]);
+    }
+
+    /// AC #2: A method whose return type contains multiple `Credential<T>`
+    /// fields produces a `MethodSchema` whose `credentials` field has one
+    /// entry per credential, in stable order.
+    #[test]
+    fn cred_core_3_ac2_multiple_credentials_stable_order() {
+        let m1 = CredentialFieldMarker::new(
+            None,
+            "access",
+            CredentialKind::OauthAccess,
+            AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            },
+            Some(CredentialScheme::new("Bearer ")),
+            vec![Scope::new("cone.send")],
+            Some(MethodPath::try_new("auth.refresh").unwrap()),
+            None,
+        );
+        let m2 = CredentialFieldMarker::new(
+            None,
+            "refresh",
+            CredentialKind::OauthRefresh,
+            AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            },
+            None,
+            vec![Scope::new("auth.refresh")],
+            None,
+            None,
+        );
+
+        let decls = vec![
+            CredentialFieldDecl::from_marker(&m1, &[], sample_issuer()),
+            CredentialFieldDecl::from_marker(&m2, &[], sample_issuer()),
+        ];
+        let method = MethodSchema::new("login", "logs in", "h_oauth").with_credentials(decls);
+
+        // Two entries, in declaration order.
+        assert_eq!(method.credentials.len(), 2);
+        assert_eq!(method.credentials[0].field_path, vec!["access".to_string()]);
+        assert_eq!(method.credentials[0].metadata.kind, CredentialKind::OauthAccess);
+        assert_eq!(method.credentials[1].field_path, vec!["refresh".to_string()]);
+        assert_eq!(method.credentials[1].metadata.kind, CredentialKind::OauthRefresh);
+    }
+
+    /// AC #3: A method whose return type is an enum with credentials only on
+    /// one variant produces a `MethodSchema` with the correct `variant_tag`
+    /// set on each entry.
+    #[test]
+    fn cred_core_3_ac3_enum_variant_tag_set() {
+        let marker = CredentialFieldMarker::new(
+            Some("Issued"),
+            "session",
+            CredentialKind::Bearer,
+            AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            },
+            Some(CredentialScheme::new("Bearer ")),
+            vec![Scope::new("cone.send_message")],
+            None,
+            None,
+        );
+        let decl = CredentialFieldDecl::from_marker(&marker, &[], sample_issuer());
+        assert_eq!(decl.variant_tag, Some("Issued".to_string()));
+        assert_eq!(decl.field_path, vec!["session".to_string()]);
+
+        let method = MethodSchema::new("login", "logs in", "h_login").with_credentials(vec![decl]);
+        assert_eq!(method.credentials[0].variant_tag, Some("Issued".to_string()));
+    }
+
+    /// `CredentialFieldDecl::from_marker` honors a non-empty path prefix
+    /// (nested-field walk).
+    #[test]
+    fn cred_core_3_from_marker_with_nested_path_prefix() {
+        let marker = sample_marker_single();
+        let decl = CredentialFieldDecl::from_marker(&marker, &["auth"], sample_issuer());
+        assert_eq!(decl.field_path, vec!["auth".to_string(), "session".to_string()]);
+    }
+
+    /// AC #4: A method tagged `#[plexus::method(public)]` produces a
+    /// `MethodSchema` whose `requires_credential` is `None`.
+    ///
+    /// "Public" maps to "no implicit derivation occurs"; the schema-build
+    /// surface simply doesn't call `with_requires_credential`, leaving the
+    /// field at its `None` default.
+    #[test]
+    fn cred_core_3_ac4_public_method_requires_credential_none() {
+        let method = MethodSchema::new("auth.login", "logs in", "h_login");
+        assert!(method.requires_credential.is_none());
+
+        // After round-trip the field also serializes/deserializes as None
+        // (omitted on the wire).
+        let json = serde_json::to_value(&method).unwrap();
+        assert!(
+            !json
+                .as_object()
+                .unwrap()
+                .contains_key("requires_credential"),
+            "requires_credential must be omitted from wire JSON when None, got {json}"
+        );
+        let decoded: MethodSchema = serde_json::from_value(json).unwrap();
+        assert!(decoded.requires_credential.is_none());
+    }
+
+    /// AC #5: A method tagged with a scope produces a `MethodSchema` whose
+    /// `requires_credential.scopes` contains that scope and whose
+    /// `requires_credential.kind` is `None`.
+    #[test]
+    fn cred_core_3_ac5_scoped_method_implicit_requires_credential() {
+        let req = RequiredCredential::from_method_scope(Scope::new("cone.send_message"));
+        assert!(req.kind.is_none());
+        assert_eq!(req.scopes, vec![Scope::new("cone.send_message")]);
+        assert!(req.site_hint.is_none());
+
+        let method = MethodSchema::new("send", "sends a message", "h_send")
+            .with_requires_credential(req.clone());
+        assert_eq!(method.requires_credential.as_ref().unwrap(), &req);
+    }
+
+    /// AC #6: A method whose path appears as the `refresh_via` or
+    /// `revoke_via` of any credential in the schema produces a `MethodSchema`
+    /// whose `requires_credential.kind` matches the issuing credential's
+    /// kind.
+    #[test]
+    fn cred_core_3_ac6_refresh_target_narrows_kind() {
+        // The OAuth refresh flow: the access credential carries
+        // `refresh_via = auth.refresh`. The implicit-derivation rule
+        // narrows the requires_credential of `auth.refresh` to
+        // `OauthRefresh`.
+        let req = RequiredCredential::from_refresh_revoke_target(
+            CredentialKind::OauthRefresh,
+            vec![Scope::new("auth.refresh")],
+        );
+        assert_eq!(req.kind, Some(CredentialKind::OauthRefresh));
+        assert_eq!(req.scopes, vec![Scope::new("auth.refresh")]);
+
+        let refresh_method =
+            MethodSchema::new("refresh", "refreshes a token", "h_refresh")
+                .with_requires_credential(req.clone());
+        assert_eq!(
+            refresh_method.requires_credential.as_ref().unwrap().kind,
+            Some(CredentialKind::OauthRefresh)
+        );
+    }
+
+    /// AC #6 variant: site_hint can be threaded through if a build-path
+    /// derivation step has a preferred attach site (e.g., the OAuth refresh
+    /// path that knows the refresh token is attached via header).
+    #[test]
+    fn cred_core_3_required_credential_site_hint_preserved() {
+        let mut req = RequiredCredential::from_refresh_revoke_target(
+            CredentialKind::OauthRefresh,
+            vec![Scope::new("auth.refresh")],
+        );
+        let hint = AttachmentSite::Header {
+            name: HeaderName::try_new("authorization").unwrap(),
+        };
+        req.site_hint = Some(hint.clone());
+        let method = MethodSchema::new("refresh", "refreshes", "h_refresh")
+            .with_requires_credential(req);
+
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: MethodSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.requires_credential.as_ref().unwrap().site_hint,
+            Some(hint)
+        );
+    }
+
+    /// AC #7: A pre-existing schema consumer (synapse IR builder,
+    /// hub-codegen) decodes the new schema fields with their additive
+    /// defaults and continues to function.
+    ///
+    /// Tested by deserializing a pre-CRED-CORE-3 JSON shape (no
+    /// `credentials`, no `requires_credential` fields) and asserting the
+    /// defaults are applied.
+    #[test]
+    fn cred_core_3_ac7_pre_ir_json_deserializes_with_empty_defaults() {
+        let pre_ir_json = serde_json::json!({
+            "name": "ping",
+            "description": "pong",
+            "hash": "abc"
+        });
+        let schema: MethodSchema = serde_json::from_value(pre_ir_json).unwrap();
+        assert!(schema.credentials.is_empty());
+        assert!(schema.requires_credential.is_none());
+    }
+
+    /// AC #7 variant: a pre-IR PluginSchema with multiple methods
+    /// deserializes cleanly with every method's credential projections
+    /// defaulted.
+    #[test]
+    fn cred_core_3_ac7_pre_ir_plugin_schema_deserializes() {
+        let pre_ir_json = serde_json::json!({
+            "namespace": "legacy",
+            "version": "1.0",
+            "description": "no credentials",
+            "self_hash": "s1",
+            "hash": "h1",
+            "methods": [
+                { "name": "a", "description": "alpha", "hash": "ah" },
+                { "name": "b", "description": "beta",  "hash": "bh" }
+            ]
+        });
+        let plugin: PluginSchema = serde_json::from_value(pre_ir_json).unwrap();
+        for m in &plugin.methods {
+            assert!(m.credentials.is_empty());
+            assert!(m.requires_credential.is_none());
+        }
+    }
+
+    /// AC #8: The `_info` capability advertisement carries the new fields
+    /// when populated.
+    ///
+    /// `_info` reads `MethodSchema`'s serde representation directly. We
+    /// verify the wire JSON contains the new fields when populated.
+    #[test]
+    fn cred_core_3_ac8_info_advertisement_carries_populated_fields() {
+        let marker = sample_marker_single();
+        let decl = CredentialFieldDecl::from_marker(&marker, &[], sample_issuer());
+        let req = RequiredCredential::from_method_scope(Scope::new("cone.send_message"));
+        let method = MethodSchema::new("login", "logs in", "h_login")
+            .with_credentials(vec![decl])
+            .with_requires_credential(req);
+
+        let json = serde_json::to_value(&method).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            obj.contains_key("credentials"),
+            "populated credentials must appear in wire JSON"
+        );
+        assert!(
+            obj.contains_key("requires_credential"),
+            "populated requires_credential must appear in wire JSON"
+        );
+        // And the entry shape is decodeable.
+        let decoded: MethodSchema = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.credentials.len(), 1);
+        assert_eq!(decoded.credentials[0].field_path, vec!["session".to_string()]);
+        assert_eq!(
+            decoded.requires_credential.as_ref().unwrap().scopes,
+            vec![Scope::new("cone.send_message")]
+        );
+    }
+
+    /// AC #11 (no regression): a method that does not return credentials and
+    /// has no scope-derived requirement has identical wire JSON to a pre-IR
+    /// schema for the same method (the new fields are omitted on the wire).
+    #[test]
+    fn cred_core_3_ac11_methods_without_credentials_have_unchanged_wire_shape() {
+        let method = MethodSchema::new("ping", "pong", "h_ping");
+        let json = serde_json::to_value(&method).unwrap();
+        let obj = json.as_object().unwrap();
+        // No credentials key, no requires_credential key.
+        assert!(!obj.contains_key("credentials"));
+        assert!(!obj.contains_key("requires_credential"));
+
+        // And the round-trip preserves the empty defaults.
+        let decoded: MethodSchema = serde_json::from_value(json).unwrap();
+        assert!(decoded.credentials.is_empty());
+        assert!(decoded.requires_credential.is_none());
+    }
+
+    /// Round-trip coverage: a full `MethodSchema` with both projections
+    /// populated round-trips through serde without losing fields.
+    #[test]
+    fn cred_core_3_full_method_roundtrip_preserves_credentials_and_requires() {
+        let marker = sample_marker_single();
+        let decl = CredentialFieldDecl::from_marker(&marker, &[], sample_issuer());
+        let req = RequiredCredential::from_method_scope(Scope::new("cone.send_message"));
+        let method = MethodSchema::new("login", "logs in", "h_login")
+            .with_credentials(vec![decl.clone()])
+            .with_requires_credential(req.clone());
+
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: MethodSchema = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.credentials.len(), 1);
+        assert_eq!(decoded.credentials[0], decl);
+        assert_eq!(decoded.requires_credential.as_ref().unwrap(), &req);
+    }
+
+    /// `CredentialFieldDecl` round-trips via serde — pinned independently
+    /// of MethodSchema so consumers reading the decl in isolation (e.g.
+    /// `AUTHZ-CRED-IR-1` Haskell decoder testing parity) have a
+    /// trustworthy shape contract.
+    #[test]
+    fn cred_core_3_credential_field_decl_roundtrip() {
+        let marker = sample_marker_single();
+        let original = CredentialFieldDecl::from_marker(&marker, &["envelope"], sample_issuer());
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: CredentialFieldDecl = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    /// `RequiredCredential` round-trips via serde — pinned independently
+    /// for the same cross-stack reason as `CredentialFieldDecl`.
+    #[test]
+    fn cred_core_3_required_credential_roundtrip() {
+        let req = RequiredCredential {
+            kind: Some(CredentialKind::OauthRefresh),
+            scopes: vec![Scope::new("auth.refresh")],
+            site_hint: Some(AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RequiredCredential = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, req);
+    }
+
+    /// `RequiredCredential` with `kind: None, scopes: [...], site_hint:
+    /// None` (the `from_method_scope` shape) serializes to a compact wire
+    /// form that omits the absent fields.
+    #[test]
+    fn cred_core_3_required_credential_compact_wire_shape() {
+        let req = RequiredCredential::from_method_scope(Scope::new("cone.send"));
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        // Only the scopes field is present on the wire.
+        assert!(!obj.contains_key("kind"));
+        assert!(obj.contains_key("scopes"));
+        assert!(!obj.contains_key("site_hint"));
     }
 }

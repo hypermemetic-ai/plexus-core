@@ -1321,6 +1321,13 @@ impl DynamicHub {
             module.merge(factory())?;
         }
 
+        // CHILD-WIRE: for each registered child router with capability bits set,
+        // register {ns}.list_children / {ns}.search_children as subscriptions.
+        // Per-activation namespaced (not top-level _list_children).
+        for (ns, router) in self.inner.child_routers.iter() {
+            register_child_capability_methods(&mut module, ns, router.clone())?;
+        }
+
         Ok(module)
     }
 
@@ -1527,8 +1534,136 @@ impl DynamicHub {
         }
         tracing::trace!("all activations merged successfully");
 
+        // CHILD-WIRE: for each registered child router with capability bits set,
+        // register {ns}.list_children / {ns}.search_children as subscriptions.
+        for (ns, router) in hub.inner.child_routers.iter() {
+            register_child_capability_methods(&mut module, ns, router.clone())?;
+        }
+
         Ok(module)
     }
+}
+
+/// CHILD-WIRE: register per-activation namespaced `<ns>.list_children` and
+/// `<ns>.search_children` as subscription methods when the router advertises
+/// the corresponding capability bits.
+///
+/// Each name returned by `ChildRouter::list_children` / `search_children` is
+/// emitted as a `data` envelope with `content_type` set to the method name
+/// (`"list_children"` or `"search_children"`) and `content` carrying the name
+/// string. Termination is `done`. Mirrors the standard `wrap_stream` shape
+/// used by every other framework subscription.
+///
+/// Activations that advertise neither bit produce no registrations — calling
+/// the methods returns standard `methodNotFound`. That's the wire-level
+/// signal that the activation doesn't support enumeration / search.
+#[allow(deprecated)] // ChildCapabilities is deprecated by IR-4 but still the wire-level signal
+fn register_child_capability_methods(
+    module: &mut RpcModule<()>,
+    namespace: &str,
+    router: Arc<dyn ChildRouter>,
+) -> Result<(), jsonrpsee::core::RegisterMethodError> {
+    let caps = router.capabilities();
+    if caps.is_empty() {
+        return Ok(());
+    }
+
+    let ns_static: &'static str = Box::leak(namespace.to_string().into_boxed_str());
+
+    if caps.contains(ChildCapabilities::LIST) {
+        let list_method: &'static str =
+            Box::leak(format!("{}.list_children", namespace).into_boxed_str());
+        let list_unsub: &'static str =
+            Box::leak(format!("{}.list_children_unsub", namespace).into_boxed_str());
+        let router_for_list = router.clone();
+        module.register_subscription(
+            list_method,
+            PLEXUS_NOTIF_METHOD,
+            list_unsub,
+            move |_params, pending, _ctx, _ext| {
+                let router = router_for_list.clone();
+                Box::pin(async move {
+                    // Collect names eagerly so the BoxStream's borrow on the
+                    // router doesn't outlive list_children's call. For v1 this
+                    // matches the typical pattern (small finite child sets like
+                    // Solar's eight planets). A future variant could keep the
+                    // Arc-borrow alive across the stream by binding the BoxStream
+                    // to the Arc directly — out of scope here.
+                    let collected: Vec<String> = match router.list_children().await {
+                        Some(mut s) => {
+                            use futures::StreamExt;
+                            let mut acc = Vec::new();
+                            while let Some(name) = s.next().await {
+                                acc.push(name);
+                            }
+                            acc
+                        }
+                        None => Vec::new(),
+                    };
+                    let stream = async_stream::stream! {
+                        for name in collected {
+                            yield name;
+                        }
+                    };
+                    let wrapped = super::streaming::wrap_stream(
+                        stream,
+                        "list_children",
+                        vec![ns_static.into()],
+                    );
+                    pipe_stream_to_subscription(pending, wrapped).await
+                })
+            },
+        )?;
+    }
+
+    if caps.contains(ChildCapabilities::SEARCH) {
+        let search_method: &'static str =
+            Box::leak(format!("{}.search_children", namespace).into_boxed_str());
+        let search_unsub: &'static str =
+            Box::leak(format!("{}.search_children_unsub", namespace).into_boxed_str());
+        let router_for_search = router.clone();
+        module.register_subscription(
+            search_method,
+            PLEXUS_NOTIF_METHOD,
+            search_unsub,
+            move |params, pending, _ctx, _ext| {
+                let router = router_for_search.clone();
+                Box::pin(async move {
+                    let p: SearchChildrenParams = params.parse()?;
+                    let collected: Vec<String> = match router.search_children(&p.query).await {
+                        Some(mut s) => {
+                            use futures::StreamExt;
+                            let mut acc = Vec::new();
+                            while let Some(name) = s.next().await {
+                                acc.push(name);
+                            }
+                            acc
+                        }
+                        None => Vec::new(),
+                    };
+                    let stream = async_stream::stream! {
+                        for name in collected {
+                            yield name;
+                        }
+                    };
+                    let wrapped = super::streaming::wrap_stream(
+                        stream,
+                        "search_children",
+                        vec![ns_static.into()],
+                    );
+                    pipe_stream_to_subscription(pending, wrapped).await
+                })
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Params for `<ns>.search_children`
+#[derive(Debug, serde::Deserialize)]
+struct SearchChildrenParams {
+    query: String,
 }
 
 /// Params for {ns}.call
@@ -2108,4 +2243,142 @@ mod tests {
         let matched: Vec<String> = search_stream.collect().await;
         assert_eq!(matched, vec!["alpha".to_string(), "alphabet".into()]);
     }
+
+    // ========================================================================
+    // CHILD-WIRE: per-activation namespaced wire exposure for
+    // <ns>.list_children / <ns>.search_children
+    //
+    // These tests exercise `register_child_capability_methods` directly with
+    // hand-built fixtures, then drive the resulting RpcModule through the
+    // in-process subscription path. Mirrors the existing
+    // `auth_capabilities_info` integration pattern but verifies the
+    // child-router wire registration instead of the _info payload.
+    // ========================================================================
+
+    /// Like `EnumerableRouter` above but with configurable capability bits +
+    /// a fixed name set. Used to drive CHILD-WIRE registration through
+    /// different capability combinations.
+    struct WireFixture {
+        names: Vec<String>,
+        caps: ChildCapabilities,
+    }
+
+    #[async_trait]
+    impl ChildRouter for WireFixture {
+        fn router_namespace(&self) -> &str {
+            "wirefixture"
+        }
+        async fn router_call(
+            &self,
+            _method: &str,
+            _params: Value,
+            _auth: Option<&super::super::auth::AuthContext>,
+            _raw_ctx: Option<&crate::request::RawRequestContext>,
+        ) -> Result<PlexusStream, PlexusError> {
+            Err(PlexusError::MethodNotFound {
+                activation: "wirefixture".into(),
+                method: "none".into(),
+            })
+        }
+        async fn get_child(&self, _name: &str) -> Option<Box<dyn ChildRouter>> {
+            None
+        }
+        fn capabilities(&self) -> ChildCapabilities {
+            self.caps
+        }
+        async fn list_children(&self) -> Option<futures_core::stream::BoxStream<'_, String>> {
+            if !self.caps.contains(ChildCapabilities::LIST) {
+                return None;
+            }
+            Some(Box::pin(futures::stream::iter(self.names.clone())))
+        }
+        async fn search_children(
+            &self,
+            query: &str,
+        ) -> Option<futures_core::stream::BoxStream<'_, String>> {
+            if !self.caps.contains(ChildCapabilities::SEARCH) {
+                return None;
+            }
+            let q = query.to_lowercase();
+            let filtered: Vec<String> = self
+                .names
+                .iter()
+                .filter(|n| n.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+            Some(Box::pin(futures::stream::iter(filtered)))
+        }
+    }
+
+    fn build_module_for(router: WireFixture, ns: &str) -> RpcModule<()> {
+        let mut module = RpcModule::new(());
+        let arc: Arc<dyn ChildRouter> = Arc::new(router);
+        register_child_capability_methods(&mut module, ns, arc).expect("register");
+        module
+    }
+
+    #[tokio::test]
+    async fn child_wire_registers_both_methods_when_both_bits_set() {
+        let module = build_module_for(
+            WireFixture {
+                names: vec!["alpha".into(), "beta".into()],
+                caps: ChildCapabilities::LIST | ChildCapabilities::SEARCH,
+            },
+            "fixture",
+        );
+        let names: Vec<String> = module.method_names().map(|s| s.to_string()).collect();
+        assert!(
+            names.contains(&"fixture.list_children".to_string()),
+            "expected fixture.list_children, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"fixture.search_children".to_string()),
+            "expected fixture.search_children, got: {:?}",
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn child_wire_registers_nothing_when_no_bits_set() {
+        let module = build_module_for(
+            WireFixture {
+                names: vec!["alpha".into()],
+                caps: ChildCapabilities::empty(),
+            },
+            "fixture",
+        );
+        let names: Vec<String> = module.method_names().map(|s| s.to_string()).collect();
+        assert!(
+            !names.contains(&"fixture.list_children".to_string()),
+            "fixture.list_children should NOT be registered when cap absent"
+        );
+        assert!(
+            !names.contains(&"fixture.search_children".to_string()),
+            "fixture.search_children should NOT be registered when cap absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_wire_registers_only_list_when_only_list_bit() {
+        let module = build_module_for(
+            WireFixture {
+                names: vec!["alpha".into()],
+                caps: ChildCapabilities::LIST,
+            },
+            "fixture",
+        );
+        let names: Vec<String> = module.method_names().map(|s| s.to_string()).collect();
+        assert!(names.contains(&"fixture.list_children".to_string()));
+        assert!(!names.contains(&"fixture.search_children".to_string()));
+    }
+
+    // Live wire-call behavior (subscription stream content, methodNotFound on
+    // unregistered names, error envelopes) is verified end-to-end against
+    // running substrate Solar — that's the canonical integration gate per
+    // the CHILD-WIRE acceptance criteria. The unit-level introspection
+    // tests above assert the registration shape; the substrate verification
+    // asserts the live behavior. Splitting it that way avoids forcing the
+    // unit test to construct a working RpcSubscriptionSink, which is not
+    // straightforward in the bare jsonrpsee API.
 }

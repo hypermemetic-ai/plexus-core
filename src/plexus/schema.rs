@@ -13,8 +13,14 @@ use std::collections::HashMap;
 
 use plexus_auth_core::{
     AttachmentSite, CredentialFieldMarker, CredentialIssuer, CredentialKind, CredentialMetadata,
-    Scope,
 };
+
+/// Re-exported so macro-generated code (R-1: `#[plexus::method(scope = "...")]`)
+/// can construct `RequiredCredential` scope values through `plexus-core`'s
+/// path alone — consumers don't need a direct `plexus-auth-core` dependency
+/// (the umbrella path `::plexus_rpc::core::plexus::schema::Scope` also
+/// resolves, per Z2H-2).
+pub use plexus_auth_core::Scope;
 
 use super::bidirectional::{StandardRequest, StandardResponse};
 
@@ -296,6 +302,22 @@ impl RequiredCredential {
         }
     }
 
+    /// Multi-scope variant of [`Self::from_method_scope`] for methods that
+    /// declare `scope = "..."` more than once (AUTHZ-CORE-2: the caller must
+    /// satisfy ALL listed scopes — conjunction, not alternation). The `kind`
+    /// field is left `None` — any kind whose scope set wildcard-matches every
+    /// listed scope is acceptable.
+    ///
+    /// Added in R-2 (`ir-credential-emission`) alongside the macro-side
+    /// population (R-1).
+    pub fn from_method_scopes(scopes: Vec<Scope>) -> Self {
+        Self {
+            kind: None,
+            scopes,
+            site_hint: None,
+        }
+    }
+
     /// Derive a `RequiredCredential` for a method that appears as the target
     /// of another credential's `metadata.refresh_via` or `metadata.revoke_via`
     /// (per `AUTHZ-CRED-CORE-3` §"Implicit derivation" row 3). The `kind`
@@ -310,6 +332,47 @@ impl RequiredCredential {
             site_hint: None,
         }
     }
+}
+
+// =============================================================================
+// Auth Posture
+// =============================================================================
+
+/// Declared auth-enforcement posture of the activation a method belongs to.
+///
+/// Mirrors `plexus-macros`' RED-6 `auth = "required" | "optional" | "mixed" |
+/// "none"` activation attribute, which until R-1/R-2 (the ROLES+AP merged
+/// wave) was parsed and compile-enforced but never emitted — invisible to
+/// every downstream IR consumer (synapse, hub-codegen, generated clients).
+///
+/// Semantics (compile-time enforcement lives in plexus-macros; this is the
+/// escaped declaration):
+///
+/// - `Required` — every method is auth-gated (`#[from_auth]`) or explicitly
+///   `public`.
+/// - `Optional` — no enforcement; auth may be asymmetric across methods.
+/// - `Mixed` — like `Optional`, but the asymmetry is explicitly acknowledged.
+/// - `None` — affirmatively public activation; no method takes auth.
+///
+/// # Wire back-compat
+///
+/// Added in R-2 (joint AP-1). Pre-existing readers tolerate the field's
+/// absence (`auth_posture` is omitted on the wire when the activation never
+/// declared a posture) and pre-existing IRs that omit the field decode
+/// cleanly via `#[serde(default)]` on the field site. `#[non_exhaustive]`
+/// reserves space for future postures without breaking downstream match arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AuthPosture {
+    /// Every method is auth-gated or explicitly public.
+    Required,
+    /// No enforcement; auth may be asymmetric across methods.
+    Optional,
+    /// Asymmetric auth, explicitly acknowledged.
+    Mixed,
+    /// Affirmatively public activation; no method takes auth.
+    None,
 }
 
 // =============================================================================
@@ -637,6 +700,39 @@ pub struct MethodSchema {
     /// requirement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_credential: Option<RequiredCredential>,
+
+    /// Declared auth posture of the activation this method belongs to.
+    ///
+    /// Populated by `#[plexus_macros::activation(auth = "...")]` (R-1) —
+    /// stamped onto every RPC method of the activation. `None` means the
+    /// activation never declared a posture (pre-R-1 emissions and
+    /// posture-silent activations are byte-identical on the wire).
+    ///
+    /// Added in R-2 (joint AP-1). Defaults to `None` via `#[serde(default)]`
+    /// so pre-R IRs decode cleanly; `skip_serializing_if` keeps the wire
+    /// shape unchanged when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_posture: Option<AuthPosture>,
+
+    /// Whether this method is explicitly public — exempt from the
+    /// default-deny gate (AUTHZ-CORE-2's `#[plexus::method(public)]`).
+    ///
+    /// `public` and a populated `requires_credential` are mutually exclusive
+    /// by construction: the macro rejects `public` + `scope = "..."` at
+    /// compile time.
+    ///
+    /// Added in R-2. Defaults to `false` via `#[serde(default)]` so pre-R
+    /// IRs decode cleanly; `skip_serializing_if` keeps the wire shape
+    /// unchanged for non-public methods (i.e., every pre-R method).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public: bool,
+}
+
+/// `skip_serializing_if` helper: omit `false` booleans from the wire so
+/// additive flags keep pre-existing JSON byte-identical (see
+/// `MethodSchema::public`).
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl PluginSchema {
@@ -1069,6 +1165,8 @@ impl MethodSchema {
             params_meta: Vec::new(),
             credentials: Vec::new(),
             requires_credential: None,
+            auth_posture: None,
+            public: false,
         }
     }
 
@@ -1213,6 +1311,29 @@ impl MethodSchema {
     /// entry points.
     pub fn with_requires_credential(mut self, req: RequiredCredential) -> Self {
         self.requires_credential = Some(req);
+        self
+    }
+
+    /// Stamp the activation-declared auth posture onto this method.
+    ///
+    /// Added in R-2 (joint AP-1). Populated by the `#[plexus_macros::
+    /// activation(auth = "...")]` emission (R-1); only explicitly declared
+    /// postures are stamped — activations that never declare `auth = "..."`
+    /// leave this `None` so their wire output is byte-identical to pre-R
+    /// emissions.
+    pub fn with_auth_posture(mut self, posture: AuthPosture) -> Self {
+        self.auth_posture = Some(posture);
+        self
+    }
+
+    /// Mark this method as explicitly public (AUTHZ-CORE-2's
+    /// `#[plexus::method(public)]`) — exempt from the default-deny gate.
+    ///
+    /// Added in R-2. Populated by the macro emission (R-1); the macro
+    /// rejects `public` + `scope = "..."` at compile time, so a public
+    /// method never carries a scope-derived `requires_credential`.
+    pub fn with_public(mut self, public: bool) -> Self {
+        self.public = public;
         self
     }
 }
@@ -2523,6 +2644,146 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let parsed: CredentialFieldDecl = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    // =========================================================================
+    // R-2 wire snapshot tests: `auth_posture` + `public` on MethodSchema
+    // (ROLES+AP merged wave; joint AP-1).
+    //
+    // "old" = the pre-R-2 wire shape (no `auth_posture`, no `public` keys).
+    // "new" = the R-2 emitter.
+    // =========================================================================
+
+    /// Old-decodes-new: a schema that never sets the R-2 fields serializes to
+    /// JSON containing neither key — byte-identical to the pre-R-2 wire, so
+    /// old readers (synapse, hub-codegen, pinned IRs) see exactly what they
+    /// always saw.
+    #[test]
+    fn r2_unset_fields_are_omitted_from_wire() {
+        let method = MethodSchema::new("ping", "pong", "h_ping");
+        let json = serde_json::to_value(&method).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("auth_posture"),
+            "auth_posture must be omitted when never declared, got {json}"
+        );
+        assert!(
+            !obj.contains_key("public"),
+            "public must be omitted when false, got {json}"
+        );
+    }
+
+    /// New-decodes-old: a pinned pre-R-2 JSON snapshot (no `auth_posture`,
+    /// no `public`) decodes cleanly with the additive defaults.
+    #[test]
+    fn r2_pre_r2_snapshot_decodes_with_defaults() {
+        // Pinned old-wire shape: exactly what a pre-R-2 emitter produced for
+        // a plain method (see `r2_unset_fields_are_omitted_from_wire`).
+        let old_wire = r#"{"name":"ping","description":"pong","hash":"h_ping","streaming":false,"bidirectional":false,"http_method":"POST","role":{"kind":"rpc"}}"#;
+        let decoded: MethodSchema = serde_json::from_str(old_wire).unwrap();
+        assert!(decoded.auth_posture.is_none());
+        assert!(!decoded.public);
+        assert!(decoded.requires_credential.is_none());
+    }
+
+    /// Populated round-trip: posture + public + requires_credential all
+    /// surface in the wire JSON and decode back losslessly.
+    #[test]
+    fn r2_populated_fields_roundtrip() {
+        let gated = MethodSchema::new("send", "sends", "h_send")
+            .with_auth_posture(AuthPosture::Required)
+            .with_requires_credential(RequiredCredential::from_method_scope(Scope::new(
+                "cone.send_message",
+            )));
+        let json = serde_json::to_value(&gated).unwrap();
+        assert_eq!(json["auth_posture"], "required");
+        assert_eq!(
+            json["requires_credential"]["scopes"],
+            serde_json::json!(["cone.send_message"])
+        );
+        let decoded: MethodSchema = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.auth_posture, Some(AuthPosture::Required));
+
+        let public = MethodSchema::new("login", "logs in", "h_login")
+            .with_auth_posture(AuthPosture::Mixed)
+            .with_public(true);
+        let json = serde_json::to_value(&public).unwrap();
+        assert_eq!(json["auth_posture"], "mixed");
+        assert_eq!(json["public"], true);
+        let decoded: MethodSchema = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.auth_posture, Some(AuthPosture::Mixed));
+        assert!(decoded.public);
+    }
+
+    /// All four posture variants serialize to their snake_case wire names
+    /// and round-trip.
+    #[test]
+    fn r2_auth_posture_wire_names() {
+        for (posture, wire) in [
+            (AuthPosture::Required, "\"required\""),
+            (AuthPosture::Optional, "\"optional\""),
+            (AuthPosture::Mixed, "\"mixed\""),
+            (AuthPosture::None, "\"none\""),
+        ] {
+            let s = serde_json::to_string(&posture).unwrap();
+            assert_eq!(s, wire);
+            let back: AuthPosture = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, posture);
+        }
+    }
+
+    /// `RequiredCredential::from_method_scopes` (R-2): multi-scope
+    /// conjunction — kind stays `None`, scope order preserved, round-trips.
+    #[test]
+    fn r2_from_method_scopes_multi_scope_conjunction() {
+        let req = RequiredCredential::from_method_scopes(vec![
+            Scope::new("facet.write"),
+            Scope::new("facet.admin"),
+        ]);
+        assert!(req.kind.is_none());
+        assert!(req.site_hint.is_none());
+        assert_eq!(
+            req.scopes,
+            vec![Scope::new("facet.write"), Scope::new("facet.admin")]
+        );
+
+        let method =
+            MethodSchema::new("update", "updates", "h_update").with_requires_credential(req.clone());
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: MethodSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.requires_credential.as_ref().unwrap(), &req);
+    }
+
+    /// A populated `_info`-shaped PluginSchema carries the R-2 fields on its
+    /// methods (serde emission is the `_info` path — PluginSchema embeds
+    /// `Vec<MethodSchema>` verbatim).
+    #[test]
+    fn r2_plugin_schema_info_emission_carries_fields() {
+        let plugin = PluginSchema::leaf(
+            "fixture",
+            "1.0",
+            "r2 fixture",
+            vec![
+                MethodSchema::new("gated", "needs scope", "h1")
+                    .with_auth_posture(AuthPosture::Required)
+                    .with_requires_credential(RequiredCredential::from_method_scope(
+                        Scope::new("fixture.gated"),
+                    )),
+                MethodSchema::new("open", "anonymous ok", "h2")
+                    .with_auth_posture(AuthPosture::Required)
+                    .with_public(true),
+            ],
+        );
+        let json = serde_json::to_value(&plugin).unwrap();
+        let methods = json["methods"].as_array().unwrap();
+        assert_eq!(methods[0]["auth_posture"], "required");
+        assert_eq!(
+            methods[0]["requires_credential"]["scopes"],
+            serde_json::json!(["fixture.gated"])
+        );
+        assert!(methods[0].get("public").is_none());
+        assert_eq!(methods[1]["public"], true);
+        assert!(methods[1].get("requires_credential").is_none());
     }
 
     /// `RequiredCredential` round-trips via serde — pinned independently

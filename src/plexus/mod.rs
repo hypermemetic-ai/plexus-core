@@ -15,6 +15,7 @@ pub mod middleware;
 pub mod path;
 pub mod plexus;
 pub mod schema;
+pub(crate) mod scope_gate;
 pub mod streaming;
 pub mod types;
 
@@ -32,7 +33,7 @@ pub use forward_registry::ForwardPolicyRegistry;
 pub use middleware::{ActivationRegistry, GuidedErrorMiddleware};
 pub use path::Provenance;
 #[allow(deprecated)]
-pub use plexus::{Activation, ActivationInfo, ChildCapabilities, ChildRouter, DynamicHub, PlexusError, TransportErrorKind, route_to_child, PLEXUS_NOTIF_METHOD};
+pub use plexus::{Activation, ActivationInfo, AuthzDenyReason, ChildCapabilities, ChildRouter, DynamicHub, PlexusError, TransportErrorKind, route_to_child, PLEXUS_NOTIF_METHOD};
 pub use crate::types::Handle;
 pub use schema::{
     AuthPosture, ChildHashes, ChildSummary, DeprecationInfo, MethodRole, MethodSchema,

@@ -45,6 +45,35 @@ pub enum PlexusError {
     HandleNotSupported(String),
     TransportError(TransportErrorKind),
     Unauthenticated(String),
+    /// Layer-2+ denial from the layered denial model (AUTHZ-0 §4, R-5):
+    /// the caller is authenticated but the call is not authorized.
+    ///
+    /// Produced by the scope gate ([`super::scope_gate`]) when a required
+    /// scope is unmet. The full wire-side rendering policy is
+    /// AUTHZ-PRIVACY-4's (`plexus_error_to_jsonrpc`); this variant only
+    /// commits to the typed server-side value.
+    Forbidden { reason: AuthzDenyReason },
+}
+
+/// Why a [`PlexusError::Forbidden`] denial fired — the layered denial
+/// model's typed discriminator (AUTHZ-S01-output §1, R-5).
+///
+/// No-enumeration posture per AUTHZ-CORE-1/5: each variant carries at most
+/// the single fact the caller already failed. The registry's role taxonomy
+/// and the method's full requirement set are never rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthzDenyReason {
+    /// Layer 2 (method authorization): the caller's effective scope set
+    /// does not satisfy `scope` — the FIRST unmet required scope.
+    /// Emitted by the scope gate (R-5 / AUTHZ-CORE-5).
+    MissingScope { scope: plexus_auth_core::Scope },
+    /// Layer 4 (data isolation): typed here per AUTHZ-S01-output §1 but
+    /// NOT emitted by the scope gate — the tenant-scoped storage layer
+    /// (AUTHZ-DATA) owns its emission.
+    TenantBoundary,
+    /// Layer 3 (action context): typed here but NOT emitted by the scope
+    /// gate — AUTHLANG-3's action gate owns its emission.
+    NotAccepted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +131,16 @@ impl std::fmt::Display for PlexusError {
                 }
             }
             PlexusError::Unauthenticated(msg) => write!(f, "Authentication required: {}", msg),
+            PlexusError::Forbidden { reason } => match reason {
+                // Names ONLY the unmet scope — never the registry's
+                // taxonomy or the method's full requirement set
+                // (no-enumeration posture, AUTHZ-CORE-1/5).
+                AuthzDenyReason::MissingScope { scope } => {
+                    write!(f, "Forbidden: missing required scope '{}'", scope)
+                }
+                AuthzDenyReason::TenantBoundary => write!(f, "Forbidden: tenant boundary"),
+                AuthzDenyReason::NotAccepted => write!(f, "Forbidden: call not accepted"),
+            },
         }
     }
 }
@@ -112,6 +151,7 @@ impl std::error::Error for PlexusError {}
 ///
 /// Codes:
 /// - `-32001`: Authentication required (custom app-level error)
+/// - `-32003`: Forbidden — authenticated but not authorized (custom app-level error)
 /// - `-32601`: Method/activation not found (standard JSON-RPC)
 /// - `-32602`: Invalid parameters (standard JSON-RPC)
 /// - `-32000`: Generic server error (execution, transport, handle errors)
@@ -119,6 +159,7 @@ impl std::error::Error for PlexusError {}
 fn plexus_error_code(e: &PlexusError) -> i32 {
     match e {
         PlexusError::Unauthenticated(_) => -32001,
+        PlexusError::Forbidden { .. } => -32003,
         PlexusError::InvalidParams(_) => -32602,
         PlexusError::MethodNotFound { .. } | PlexusError::ActivationNotFound(_) => -32601,
         _ => -32000,
@@ -801,6 +842,33 @@ struct DynamicHubInner {
     /// [`plexus_auth_core::IdentityOnly`] per the spike-pinned safe
     /// default. See `plans/AUTHLANG/AUTHLANG-S01-output.md` §3.
     forward_policies: super::forward_registry::ForwardPolicyRegistry,
+    /// R-5 (AUTHZ-CORE-4 acceptance 8) — the deployment's role→scope
+    /// taxonomy, consulted by the scope gate at every dispatch through
+    /// [`DynamicHub::route_with_ctx`]. `None` means no registry is
+    /// configured: with `default_deny` also off (the default), dispatch
+    /// behaves byte-for-byte as before the gate existed.
+    scope_registry: Option<Arc<plexus_auth_core::ScopeRegistry>>,
+    /// R-5 (AUTHZ-CORE-1) — the default-deny posture. **Ships OFF.**
+    ///
+    /// Whether / when each backend flips this ON is an open human decision
+    /// (R-S01 open question 4); see [`super::scope_gate`] module docs for
+    /// the full decision table and the deviation note (runtime builder
+    /// option here vs CORE-1's Cargo feature flag).
+    default_deny: bool,
+    /// Where the scope gate writes its `ScopeCheck` [`AuditRecord`]s
+    /// (AUTHZ-CORE-5). Defaults to [`plexus_auth_core::TracingAuditSink`];
+    /// override via [`DynamicHub::with_audit_sink`].
+    ///
+    /// [`AuditRecord`]: plexus_auth_core::AuditRecord
+    audit_sink: Arc<dyn plexus_auth_core::AuditSink>,
+    /// Lazily-built index from full dotted method path
+    /// (`<activation>.<method>`, hub-own methods under
+    /// `<hub-ns>.<method>`) to the gate-relevant schema facts. Built once
+    /// on the first gated dispatch so the gate never re-walks plugin
+    /// schemas on the hot path; activations registered after the first
+    /// gated dispatch are not in the index (registration is builder-time,
+    /// before serving, in every supported composition).
+    gate_index: std::sync::OnceLock<HashMap<String, super::scope_gate::MethodGateInfo>>,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -853,8 +921,118 @@ impl DynamicHub {
                 pending_rpc: std::sync::Mutex::new(Vec::new()),
                 auth_capabilities: None,
                 forward_policies: super::forward_registry::ForwardPolicyRegistry::new(),
+                scope_registry: None,
+                default_deny: false,
+                audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
+                gate_index: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Configure the deployment's [`ScopeRegistry`] — the scope gate's
+    /// source of truth for role→scope expansion, public-method
+    /// declarations, and per-method scope overlays (R-5 / AUTHZ-CORE-4
+    /// acceptance 8).
+    ///
+    /// Once a registry is configured, every dispatch through this hub
+    /// consults the gate: methods whose [`MethodSchema`] carries
+    /// `requires_credential` scopes (or that have a registry overlay) are
+    /// enforced; `public` methods bypass; methods with no declared
+    /// requirement pass through unchanged unless
+    /// [`DynamicHub::with_default_deny`] is also set.
+    ///
+    /// A hub that never calls this (and never sets `default_deny`)
+    /// dispatches byte-for-byte as before the gate existed.
+    ///
+    /// See [`super::scope_gate`] for the full decision table.
+    ///
+    /// [`ScopeRegistry`]: plexus_auth_core::ScopeRegistry
+    /// [`MethodSchema`]: super::schema::MethodSchema
+    pub fn with_scope_registry(mut self, registry: plexus_auth_core::ScopeRegistry) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot set scope_registry: DynamicHub has multiple references");
+        inner.scope_registry = Some(Arc::new(registry));
+        self
+    }
+
+    /// Set the default-deny posture (R-5 / AUTHZ-CORE-1). **Ships OFF.**
+    ///
+    /// With it ON, methods with NO declared requirement are enforced
+    /// against the implicit full-path scope
+    /// ([`ScopeRegistry::required_scopes_for`]'s implicit rule) — fail
+    /// closed, including when no registry is configured at all. With it
+    /// OFF (the default), such methods behave exactly as today.
+    ///
+    /// **Open human decision (R-S01 Q4):** whether / when each backend
+    /// flips this ON (inside the ROLES wave's completion gate vs left to
+    /// backend epics à la AUTHZ-FLOWS-4) is unresolved. Until that call is
+    /// made, no backend should enable it in production.
+    ///
+    /// Deviation from AUTHZ-CORE-1: this is a runtime builder option, not
+    /// the Cargo feature flag CORE-1 pinned — see [`super::scope_gate`]
+    /// module docs for the rationale.
+    ///
+    /// [`ScopeRegistry::required_scopes_for`]: plexus_auth_core::ScopeRegistry::required_scopes_for
+    pub fn with_default_deny(mut self, default_deny: bool) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot set default_deny: DynamicHub has multiple references");
+        inner.default_deny = default_deny;
+        self
+    }
+
+    /// Override where the scope gate writes its `ScopeCheck`
+    /// [`AuditRecord`]s (AUTHZ-CORE-5). Default:
+    /// [`plexus_auth_core::TracingAuditSink`] (`tracing::info!` events on
+    /// the `plexus::audit` target).
+    ///
+    /// The gate awaits the sink's write BEFORE the dispatch responds
+    /// ("audit before respond", AUTHZ-S01-output §8). Sink implementors
+    /// are responsible for low-latency writes.
+    ///
+    /// [`AuditRecord`]: plexus_auth_core::AuditRecord
+    pub fn with_audit_sink(mut self, sink: Arc<dyn plexus_auth_core::AuditSink>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot set audit_sink: DynamicHub has multiple references");
+        inner.audit_sink = sink;
+        self
+    }
+
+    /// Read-only view of the configured [`ScopeRegistry`], if any.
+    /// Test-side accessor.
+    ///
+    /// [`ScopeRegistry`]: plexus_auth_core::ScopeRegistry
+    pub fn scope_registry(&self) -> Option<&plexus_auth_core::ScopeRegistry> {
+        self.inner.scope_registry.as_deref()
+    }
+
+    /// The gate's path→schema-facts index; built once on first gated
+    /// dispatch. See the field docs on `DynamicHubInner::gate_index`.
+    fn gate_index(&self) -> &HashMap<String, super::scope_gate::MethodGateInfo> {
+        self.inner.gate_index.get_or_init(|| {
+            let mut index = HashMap::new();
+            // The hub's own methods, addressable as "<hub-ns>.<method>".
+            for m in &Activation::plugin_schema(self).methods {
+                index.insert(
+                    format!("{}.{}", self.inner.namespace, m.name),
+                    super::scope_gate::MethodGateInfo::from_schema(m),
+                );
+            }
+            // Each registered activation's methods, addressable as
+            // "<activation-ns>.<method>". Deeper nested paths (an
+            // activation's own children) are not indexed here — they have
+            // no MethodSchema at this hub's level; the gate treats them as
+            // schema-less (registry overlay / default_deny still apply).
+            for activation in self.inner.activations.values() {
+                let schema = activation.plugin_schema();
+                for m in &schema.methods {
+                    index.insert(
+                        format!("{}.{}", schema.namespace, m.name),
+                        super::scope_gate::MethodGateInfo::from_schema(m),
+                    );
+                }
+            }
+            index
+        })
     }
 
     /// Register a [`plexus_auth_core::ForwardPolicy`] for a callee
@@ -1078,6 +1256,28 @@ impl DynamicHub {
 
     /// Route a call to the appropriate activation, with optional raw HTTP request context.
     pub async fn route_with_ctx(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        // R-5 scope gate (AUTHZ-CORE-1 + CORE-5). Inactive unless a
+        // ScopeRegistry is configured or default_deny is set — a hub with
+        // neither pays exactly this one branch and dispatches as before
+        // the gate existed (the hard backward-safety constraint).
+        if self.inner.scope_registry.is_some() || self.inner.default_deny {
+            let registry = self
+                .inner
+                .scope_registry
+                .as_deref()
+                .unwrap_or_else(|| super::scope_gate::empty_registry());
+            super::scope_gate::enforce(
+                registry,
+                self.inner.default_deny,
+                &self.inner.audit_sink,
+                method,
+                self.gate_index().get(method),
+                auth,
+                raw_ctx.and_then(|ctx| ctx.peer.map(|peer| peer.ip())),
+            )
+            .await?;
+        }
+
         let (namespace, method_name) = self.parse_method(method)?;
 
         // Handle plexus's own methods

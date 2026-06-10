@@ -911,6 +911,22 @@ impl DynamicHub {
     /// - "myapp" - for your application name
     ///
     /// The namespace appears in method calls: `{namespace}.call`, `{namespace}.schema`
+    ///
+    /// # The root name is a routing namespace, not a label
+    ///
+    /// Routing resolves the hub root namespace **before** registered
+    /// activations, so the root name must differ from the namespace of every
+    /// activation you later [`register`](Self::register). A hub root that
+    /// shares its name with a child (`DynamicHub::new("echo").register(Echo)`
+    /// where `Echo`'s namespace is also `"echo"`) makes every method on that
+    /// child unreachable: `echo.<method>` resolves to the hub root and fails
+    /// with `Command not found`, and navigators resolve the like-named child
+    /// back to the root schema. This is silent at construction and fatal at
+    /// call time, so [`register`](Self::register) rejects the collision with
+    /// a panic. Pick a distinct root name (e.g. `"echo_hub"`).
+    ///
+    /// Z2H-8 / HOSTLESS-3 — register-time detection of the root/activation
+    /// namespace shadow.
     pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(DynamicHubInner {
@@ -1145,9 +1161,42 @@ impl DynamicHub {
         self.inner.registry.read().unwrap()
     }
 
+    /// Panic if `child_namespace` shadows the hub root namespace.
+    ///
+    /// Z2H-8 / HOSTLESS-3 — routing resolves the hub root before registered
+    /// activations (see [`Self::route_with_ctx`]), so a child activation whose
+    /// namespace equals the hub root name is silently unreachable: every
+    /// `<ns>.<method>` call resolves to the root (which only has
+    /// call/hash/hashes/schema) and navigators resolve the like-named child
+    /// back to the root schema. The published echo example shipped exactly
+    /// this shape and was dead on arrival. A loud, immediate error at
+    /// registration time beats silent unreachability at call time.
+    fn assert_no_root_shadow(&self, child_namespace: &str) {
+        if child_namespace == self.inner.namespace {
+            panic!(
+                "DynamicHub namespace shadow: activation namespace '{child}' collides with the hub root namespace '{root}'. \
+                 The hub root name is a routing namespace, not a label — routing resolves the root first, so a like-named \
+                 child activation is unreachable (every '{child}.<method>' call resolves to the hub root and fails with \
+                 'Command not found', and navigation resolves the child back to the root schema). \
+                 Fix: rename the hub root so it differs from every registered activation's namespace, \
+                 e.g. DynamicHub::new(\"{root}_hub\").register(...). [Z2H-8 / HOSTLESS-3]",
+                child = child_namespace,
+                root = self.inner.namespace,
+            );
+        }
+    }
+
     /// Register an activation
+    ///
+    /// # Panics
+    ///
+    /// Panics if the activation's namespace equals the hub root namespace —
+    /// such a child would be unreachable at call time (Z2H-8 / HOSTLESS-3,
+    /// see [`Self::new`]). Also panics if the hub has already been shared
+    /// (multiple `Arc` references).
     pub fn register<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
         let namespace = activation.namespace().to_string();
+        self.assert_no_root_shadow(&namespace);
         let plugin_id = activation.plugin_id();
         let activation_for_rpc = activation.clone();
         let activation_for_router = activation.clone();
@@ -1173,9 +1222,15 @@ impl DynamicHub {
     ///
     /// Hub activations implement `ChildRouter`, enabling direct nested method calls
     /// like `hub.solar.mercury.info` at the RPC layer (no hub.call indirection).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`Self::register`]: panics on a root/activation
+    /// namespace collision (Z2H-8 / HOSTLESS-3).
     #[deprecated(since = "0.5.0", note = "Use register() — it now handles both leaf and hub activations")]
     pub fn register_hub<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
         let namespace = activation.namespace().to_string();
+        self.assert_no_root_shadow(&namespace);
         let plugin_id = activation.plugin_id();
         let activation_for_rpc = activation.clone();
         let activation_for_router = activation.clone();
@@ -2117,6 +2172,63 @@ mod tests {
         // Health should be in the children summaries
         let health = children.iter().find(|c| c.namespace == "health").expect("should have health child");
         assert!(!health.hash.is_empty(), "health should have a hash");
+    }
+
+    /// Z2H-8 / HOSTLESS-3 — a hub root that shares its name with a registered
+    /// activation's namespace is rejected loudly at registration time instead
+    /// of producing a silently unreachable child (the shipped echo example's
+    /// exact failure shape).
+    #[test]
+    #[should_panic(expected = "activation namespace 'health' collides with the hub root namespace 'health'")]
+    fn dynamic_hub_rejects_root_namespace_shadow() {
+        use crate::activations::health::Health;
+        let _hub = DynamicHub::new("health").register(Health::new());
+    }
+
+    /// Z2H-8 / HOSTLESS-3 — the deprecated register_hub path enforces the
+    /// same collision contract.
+    #[test]
+    #[should_panic(expected = "activation namespace 'health' collides with the hub root namespace 'health'")]
+    fn dynamic_hub_register_hub_rejects_root_namespace_shadow() {
+        use crate::activations::health::Health;
+        let _hub = DynamicHub::new("health").register_hub(Health::new());
+    }
+
+    /// Z2H-8 — the shadow error names both colliding strings and suggests the
+    /// fix (rename the hub root), so the failure is actionable without
+    /// reading plexus-core source.
+    #[test]
+    fn dynamic_hub_shadow_error_names_collision_and_fix() {
+        use crate::activations::health::Health;
+        let result = std::panic::catch_unwind(|| {
+            let _hub = DynamicHub::new("health").register(Health::new());
+        });
+        let err = result.expect_err("shadow registration must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .expect("panic payload should be a string");
+        assert!(msg.contains("'health'"), "must name the colliding namespace: {msg}");
+        assert!(msg.contains("hub root namespace"), "must name the root side: {msg}");
+        assert!(msg.contains("rename the hub root"), "must suggest the fix: {msg}");
+        assert!(msg.contains("Z2H-8"), "must cite the ticket: {msg}");
+    }
+
+    /// Z2H-8 — non-colliding registration is unaffected by shadow detection:
+    /// the child registers, routes, and appears in the schema.
+    #[test]
+    fn dynamic_hub_non_colliding_registration_unaffected() {
+        use crate::activations::health::Health;
+        let hub = DynamicHub::new("health_hub").register(Health::new());
+        assert_eq!(hub.runtime_namespace(), "health_hub");
+        let schema = hub.plugin_schema();
+        let children = schema.children.expect("hub should have children");
+        assert!(
+            children.iter().any(|c| c.namespace == "health"),
+            "health child must be registered"
+        );
+        assert!(hub.list_methods().iter().any(|m| m.starts_with("health.")));
     }
 
     #[test]

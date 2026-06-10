@@ -50,7 +50,7 @@ jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 rmcp = { version = "0.12", features = ["server", "transport-io", "transport-streamable-http-server"] }
 
 # Hub macro for activation generation
-plexus-macros = { path = "../plexus-macros", version = "0.5.0" }
+plexus-macros = { path = "../plexus-macros", version = "0.6.0" }
 
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code

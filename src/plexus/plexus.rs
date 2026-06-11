@@ -813,6 +813,44 @@ fn build_info_payload(
     })
 }
 
+/// CA-1 (trak facet `ccc924ad-0e78-4d4b-b71f-0018d249d0bf`): map a schema
+/// response stream so every `requires_credential` lacking a `site_hint`
+/// gets the hub-derived attach site.
+///
+/// Only `Data` items whose `content_type` is a schema payload
+/// (`*.schema` / `*.method_schema`) are touched; their `content` is decoded
+/// as a [`super::SchemaResult`], hint-filled, and re-encoded. Items that do
+/// not decode (defensive: a custom activation emitting a non-standard
+/// payload under a schema content type) pass through unchanged, as do all
+/// non-`Data` items.
+fn fill_site_hints_in_schema_stream(
+    stream: PlexusStream,
+    site: plexus_auth_core::AttachmentSite,
+) -> PlexusStream {
+    use futures::StreamExt;
+    Box::pin(stream.map(move |item| match item {
+        super::types::PlexusStreamItem::Data {
+            metadata,
+            content_type,
+            content,
+        } if content_type.ends_with(".schema") || content_type.ends_with(".method_schema") => {
+            let content = match serde_json::from_value::<super::SchemaResult>(content.clone()) {
+                Ok(mut result) => {
+                    result.fill_site_hints(&site);
+                    serde_json::to_value(&result).unwrap_or(content)
+                }
+                Err(_) => content,
+            };
+            super::types::PlexusStreamItem::Data {
+                metadata,
+                content_type,
+                content,
+            }
+        }
+        other => other,
+    }))
+}
+
 struct DynamicHubInner {
     /// Custom namespace for this hub instance (defaults to "plexus")
     namespace: String,
@@ -1336,14 +1374,47 @@ impl DynamicHub {
         let (namespace, method_name) = self.parse_method(method)?;
 
         // Handle plexus's own methods
-        if namespace == self.inner.namespace {
-            return Activation::call(self, method_name, params, auth, raw_ctx).await;
+        let stream = if namespace == self.inner.namespace {
+            Activation::call(self, method_name, params, auth, raw_ctx).await?
+        } else {
+            let activation = self.inner.activations.get(namespace)
+                .ok_or_else(|| PlexusError::ActivationNotFound(namespace.to_string()))?;
+
+            activation.call(method_name, params, auth, raw_ctx).await?
+        };
+
+        // CA-1 (trak facet ccc924ad): schema responses leaving this hub get
+        // their `requires_credential.site_hint` filled from the backend's
+        // advertised auth capabilities. Backends that never call
+        // `with_auth_capabilities` (or advertise anonymous-only) derive no
+        // site, and the stream passes through untouched — byte-identical to
+        // pre-CA-1 emissions.
+        if Self::is_schema_query(method_name) {
+            if let Some(site) = self.derived_site_hint() {
+                return Ok(fill_site_hints_in_schema_stream(stream, site));
+            }
         }
+        Ok(stream)
+    }
 
-        let activation = self.inner.activations.get(namespace)
-            .ok_or_else(|| PlexusError::ActivationNotFound(namespace.to_string()))?;
+    /// Whether a routed `method_name` (the part after the first dot) is a
+    /// schema query: `"schema"` (`<ns>.schema`, with or without a `method`
+    /// param) or a nested `"<child...>.schema"` path routed into a child
+    /// activation.
+    fn is_schema_query(method_name: &str) -> bool {
+        method_name == "schema" || method_name.ends_with(".schema")
+    }
 
-        activation.call(method_name, params, auth, raw_ctx).await
+    /// CA-1: the [`AttachmentSite`] implied by this backend's advertised
+    /// auth capabilities, or `None` when no capabilities are configured or
+    /// none of the advertised mechanisms implies a site.
+    ///
+    /// [`AttachmentSite`]: plexus_auth_core::AttachmentSite
+    pub fn derived_site_hint(&self) -> Option<plexus_auth_core::AttachmentSite> {
+        self.inner
+            .auth_capabilities
+            .as_ref()
+            .and_then(|caps| caps.implied_attachment_site())
     }
 
     /// Resolve a handle using the activation registry
@@ -1516,7 +1587,11 @@ impl DynamicHub {
                 let plexus = plexus_for_schema.clone();
                 Box::pin(async move {
                     let p: SchemaParams = params.parse().unwrap_or_default();
-                    let plugin_schema = Activation::plugin_schema(&plexus);
+                    let mut plugin_schema = Activation::plugin_schema(&plexus);
+                    // CA-1: hub-derived site hints on the hub's own schema.
+                    if let Some(site) = plexus.derived_site_hint() {
+                        plugin_schema.fill_site_hints(&site);
+                    }
 
                     let result = if let Some(ref name) = p.method {
                         plugin_schema.methods.iter()
@@ -1678,7 +1753,11 @@ impl DynamicHub {
                 let hub = hub_for_schema.clone();
                 Box::pin(async move {
                     let p: SchemaParams = params.parse().unwrap_or_default();
-                    let plugin_schema = Activation::plugin_schema(&*hub);
+                    let mut plugin_schema = Activation::plugin_schema(&*hub);
+                    // CA-1: hub-derived site hints on the hub's own schema.
+                    if let Some(site) = hub.derived_site_hint() {
+                        plugin_schema.fill_site_hints(&site);
+                    }
 
                     let result = if let Some(ref name) = p.method {
                         plugin_schema.methods.iter()

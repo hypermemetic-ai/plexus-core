@@ -332,6 +332,18 @@ impl RequiredCredential {
             site_hint: None,
         }
     }
+
+    /// CA-1 (trak facet `ccc924ad-0e78-4d4b-b71f-0018d249d0bf`): fill
+    /// `site_hint` with the hub-derived attach site — but only when no hint
+    /// is already present. An explicitly-populated hint (e.g. a future
+    /// per-method override, or a refresh/revoke derivation that learned the
+    /// site from the issuing credential) always wins over the
+    /// capability-derived default.
+    pub fn fill_site_hint(&mut self, site: &AttachmentSite) {
+        if self.site_hint.is_none() {
+            self.site_hint = Some(site.clone());
+        }
+    }
 }
 
 // =============================================================================
@@ -1104,6 +1116,29 @@ impl PluginSchema {
         self.deprecation = Some(info);
         self
     }
+
+    /// CA-1: fill `site_hint` on every method's `requires_credential` that
+    /// lacks one, using the hub-derived attach site. Applied at
+    /// schema-assembly time by [`DynamicHub`] when the backend's advertised
+    /// auth capabilities imply a site — service authors write nothing.
+    ///
+    /// [`DynamicHub`]: super::DynamicHub
+    pub fn fill_site_hints(&mut self, site: &AttachmentSite) {
+        for method in &mut self.methods {
+            method.fill_site_hint(site);
+        }
+    }
+}
+
+impl SchemaResult {
+    /// CA-1: fill `site_hint`s across whichever schema shape this result
+    /// carries — see [`PluginSchema::fill_site_hints`].
+    pub fn fill_site_hints(&mut self, site: &AttachmentSite) {
+        match self {
+            SchemaResult::Plugin(plugin) => plugin.fill_site_hints(site),
+            SchemaResult::Method(method) => method.fill_site_hint(site),
+        }
+    }
 }
 
 /// Summary of a child plugin
@@ -1335,6 +1370,17 @@ impl MethodSchema {
     pub fn with_public(mut self, public: bool) -> Self {
         self.public = public;
         self
+    }
+
+    /// CA-1: fill `requires_credential.site_hint` with the hub-derived
+    /// attach site when the method carries a requirement that lacks one.
+    /// Methods without a `requires_credential` are untouched — derivation
+    /// never *creates* a requirement (AUTHZ-CRED-CORE-3's implicit-only
+    /// contract).
+    pub fn fill_site_hint(&mut self, site: &AttachmentSite) {
+        if let Some(req) = self.requires_credential.as_mut() {
+            req.fill_site_hint(site);
+        }
     }
 }
 
@@ -2814,5 +2860,67 @@ mod tests {
         assert!(!obj.contains_key("kind"));
         assert!(obj.contains_key("scopes"));
         assert!(!obj.contains_key("site_hint"));
+    }
+
+    /// CA-1: `fill_site_hint` fills only an ABSENT hint — an existing one
+    /// (e.g. a future explicit override) always wins over the
+    /// capability-derived default.
+    #[test]
+    fn ca1_fill_site_hint_fills_absent_and_preserves_existing() {
+        let derived = AttachmentSite::Cookie {
+            name: plexus_auth_core::CookieName::try_new("access_token").unwrap(),
+        };
+
+        // Absent → filled.
+        let mut req = RequiredCredential::from_method_scope(Scope::new("cone.send"));
+        req.fill_site_hint(&derived);
+        assert_eq!(req.site_hint.as_ref(), Some(&derived));
+
+        // Present → preserved.
+        let existing = AttachmentSite::Header {
+            name: HeaderName::try_new("authorization").unwrap(),
+        };
+        let mut req = RequiredCredential::from_method_scope(Scope::new("cone.send"));
+        req.site_hint = Some(existing.clone());
+        req.fill_site_hint(&derived);
+        assert_eq!(req.site_hint, Some(existing));
+    }
+
+    /// CA-1: the plugin-level fill never CREATES a `requires_credential` —
+    /// methods without one keep their pre-CA-1 wire shape exactly.
+    #[test]
+    fn ca1_plugin_fill_never_creates_requirements() {
+        let derived = AttachmentSite::Header {
+            name: HeaderName::try_new("authorization").unwrap(),
+        };
+        let mut plugin = PluginSchema::leaf(
+            "fixture",
+            "1.0",
+            "ca-1 fixture",
+            vec![
+                MethodSchema::new("gated", "needs scope", "h1").with_requires_credential(
+                    RequiredCredential::from_method_scope(Scope::new("fixture.gated")),
+                ),
+                MethodSchema::new("open", "anonymous ok", "h2").with_public(true),
+            ],
+        );
+        let before_open = serde_json::to_value(&plugin.methods[1]).unwrap();
+
+        plugin.fill_site_hints(&derived);
+
+        assert_eq!(
+            plugin.methods[0]
+                .requires_credential
+                .as_ref()
+                .unwrap()
+                .site_hint
+                .as_ref(),
+            Some(&derived)
+        );
+        assert_eq!(
+            serde_json::to_value(&plugin.methods[1]).unwrap(),
+            before_open,
+            "methods without a requirement must be byte-identical after the fill"
+        );
     }
 }

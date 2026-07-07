@@ -1531,11 +1531,21 @@ impl DynamicHub {
             call_method,
             PLEXUS_NOTIF_METHOD,
             call_unsub,
-            move |params, pending, _ctx, _ext| {
+            move |params, pending, _ctx, ext| {
                 let plexus = plexus_for_call.clone();
                 Box::pin(async move {
                     let p: CallParams = params.parse()?;
-                    match plexus.route(&p.method, p.params.unwrap_or_default(), None).await {
+                    // PLX-18: thread the per-request AuthContext and
+                    // RawRequestContext (origin/headers/peer) the gateway
+                    // stashed in the connection Extensions, so origin/CSRF
+                    // enforcement and client-IP scope gates are reachable.
+                    // Absent extensions ⇒ None ⇒ identical to the prior
+                    // `route(.., None)` behavior.
+                    let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>()
+                        .map(|arc| arc.as_ref());
+                    let raw_ctx = ext.get::<std::sync::Arc<crate::request::RawRequestContext>>()
+                        .map(|arc| arc.as_ref());
+                    match plexus.route_with_ctx(&p.method, p.params.unwrap_or_default(), auth, raw_ctx).await {
                         Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
                         Err(e) => {
                             let sink = pending.accept().await?;
@@ -1697,7 +1707,13 @@ impl DynamicHub {
                     // Extract auth context from Extensions (if present)
                     let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>()
                         .map(|arc| arc.as_ref());
-                    match hub.route(&p.method, p.params.unwrap_or_default(), auth).await {
+                    // PLX-18: also extract the RawRequestContext (origin/
+                    // headers/peer) the gateway stashed, and dispatch via
+                    // route_with_ctx so origin/CSRF enforcement and client-IP
+                    // scope gates fire. Absent ⇒ None ⇒ prior behavior.
+                    let raw_ctx = ext.get::<std::sync::Arc<crate::request::RawRequestContext>>()
+                        .map(|arc| arc.as_ref());
+                    match hub.route_with_ctx(&p.method, p.params.unwrap_or_default(), auth, raw_ctx).await {
                         Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
                         Err(e) => {
                             // Accept the subscription, then send the error as a stream item.

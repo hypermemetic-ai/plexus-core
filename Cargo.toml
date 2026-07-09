@@ -3,6 +3,7 @@ name = "plexus-core"
 version = "0.6.0"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
+repository = "https://github.com/hypermemetic-ai/plexus-core"
 license = "AGPL-3.0-only"
 
 [lib]

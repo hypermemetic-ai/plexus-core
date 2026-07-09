@@ -178,20 +178,23 @@ async fn cookie_caps_derive_cookie_site() {
 }
 
 #[tokio::test]
-async fn method_query_fills_single_method_schema() {
-    // The `{"method": "..."}` query path returns SchemaResult::Method —
-    // the fill applies there too.
+async fn method_query_returns_unified_plugin_schema() {
+    // PROT schema unification (PLX-13): the `{"method": "..."}` query path no
+    // longer returns a bare MethodSchema (SchemaResult::Method) — it returns the
+    // single unified PluginSchema, and the CA-1 site-hint fill applies to the
+    // method inside `methods[]`.
     let hub = hub_with(Some(bearer_caps()));
-    let method = fetch_schema_json(
+    let plugin = fetch_schema_json(
         &hub,
         "vault.schema",
         serde_json::json!({ "method": "write" }),
     )
     .await;
 
-    assert_eq!(method["name"], "write");
+    let write = method_json(&plugin, "write");
+    assert_eq!(write["name"], "write");
     assert_eq!(
-        method["requires_credential"]["site_hint"],
+        write["requires_credential"]["site_hint"],
         serde_json::json!({ "site": "header", "name": "authorization" }),
     );
 }

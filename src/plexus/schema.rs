@@ -560,14 +560,18 @@ pub struct PluginSchema {
     pub deprecation: Option<DeprecationInfo>,
 }
 
-/// Result of a schema query - either full plugin or single method
+/// Result of a schema query — always the single unified plugin schema.
+///
+/// PROT schema unification (PLX-13) removed the former `Method(MethodSchema)`
+/// variant: per-method detail is read from [`PluginSchema::methods`], never
+/// returned as a distinct schema result, so every `.schema` fetch at any tree
+/// depth returns one `PluginSchema` tagged `<ns>.schema`. `MethodSchema` itself
+/// remains the element type of [`PluginSchema::methods`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum SchemaResult {
-    /// Full plugin schema (when no method specified)
+    /// The unified full plugin schema.
     Plugin(PluginSchema),
-    /// Single method schema (when method specified)
-    Method(MethodSchema),
 }
 
 /// Schema for a single method exposed by a plugin
@@ -1134,10 +1138,8 @@ impl SchemaResult {
     /// CA-1: fill `site_hint`s across whichever schema shape this result
     /// carries — see [`PluginSchema::fill_site_hints`].
     pub fn fill_site_hints(&mut self, site: &AttachmentSite) {
-        match self {
-            SchemaResult::Plugin(plugin) => plugin.fill_site_hints(site),
-            SchemaResult::Method(method) => method.fill_site_hint(site),
-        }
+        let SchemaResult::Plugin(plugin) = self;
+        plugin.fill_site_hints(site);
     }
 }
 

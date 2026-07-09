@@ -1596,25 +1596,18 @@ impl DynamicHub {
             move |params, pending, _ctx, _ext| {
                 let plexus = plexus_for_schema.clone();
                 Box::pin(async move {
-                    let p: SchemaParams = params.parse().unwrap_or_default();
+                    let _p: SchemaParams = params.parse().unwrap_or_default();
                     let mut plugin_schema = Activation::plugin_schema(&plexus);
                     // CA-1: hub-derived site hints on the hub's own schema.
                     if let Some(site) = plexus.derived_site_hint() {
                         plugin_schema.fill_site_hints(&site);
                     }
 
-                    let result = if let Some(ref name) = p.method {
-                        plugin_schema.methods.iter()
-                            .find(|m| m.name == *name)
-                            .map(|m| super::SchemaResult::Method(m.clone()))
-                            .ok_or_else(|| jsonrpsee::types::ErrorObject::owned(
-                                -32602,
-                                format!("Method '{}' not found", name),
-                                None::<()>,
-                            ))?
-                    } else {
-                        super::SchemaResult::Plugin(plugin_schema)
-                    };
+                    // PROT schema unification (PLX-13): `.schema` always yields the
+                    // single unified PluginSchema; the `method` param no longer selects
+                    // a per-method result (the `_p` parse is kept so an old client
+                    // sending `{"method": ...}` is tolerated, not errored).
+                    let result = super::SchemaResult::Plugin(plugin_schema);
 
                     let stream = async_stream::stream! { yield result; };
                     let wrapped = super::streaming::wrap_stream(stream, schema_content_type, vec![ns_static.into()]);
@@ -1768,25 +1761,18 @@ impl DynamicHub {
             move |params, pending, _ctx, _ext| {
                 let hub = hub_for_schema.clone();
                 Box::pin(async move {
-                    let p: SchemaParams = params.parse().unwrap_or_default();
+                    let _p: SchemaParams = params.parse().unwrap_or_default();
                     let mut plugin_schema = Activation::plugin_schema(&*hub);
                     // CA-1: hub-derived site hints on the hub's own schema.
                     if let Some(site) = hub.derived_site_hint() {
                         plugin_schema.fill_site_hints(&site);
                     }
 
-                    let result = if let Some(ref name) = p.method {
-                        plugin_schema.methods.iter()
-                            .find(|m| m.name == *name)
-                            .map(|m| super::SchemaResult::Method(m.clone()))
-                            .ok_or_else(|| jsonrpsee::types::ErrorObject::owned(
-                                -32602,
-                                format!("Method '{}' not found", name),
-                                None::<()>,
-                            ))?
-                    } else {
-                        super::SchemaResult::Plugin(plugin_schema)
-                    };
+                    // PROT schema unification (PLX-13): `.schema` always yields the
+                    // single unified PluginSchema; the `method` param no longer selects
+                    // a per-method result (the `_p` parse is kept so an old client
+                    // sending `{"method": ...}` is tolerated, not errored).
+                    let result = super::SchemaResult::Plugin(plugin_schema);
 
                     let stream = async_stream::stream! {
                         yield result;

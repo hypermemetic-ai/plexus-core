@@ -28,10 +28,6 @@ fn is_default_ir_version(v: &u32) -> bool {
     *v == IR_VERSION
 }
 
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
 // ===========================================================================
 // SchemaRef — a type reference that cannot degrade
 // ===========================================================================
@@ -51,8 +47,9 @@ pub enum SchemaRefError {
     ///
     /// This is the exact silent-degradation target PLX-75 forbids: a bidir
     /// request/response type that "could not be represented" used to become
-    /// `()`. A `SchemaRef` can never denote `()`; a method with no meaningful
-    /// return expresses that as `MethodIr::returns == None`.
+    /// `()`. A `SchemaRef` can never denote `()`; a turn with no meaningful
+    /// terminal value expresses that as `MethodIr::terminal == None`, and a
+    /// turn that emits no updates as `MethodIr::updates == None`.
     #[error("schema reference type name `{0}` denotes the unit type; a SchemaRef may never be `()`")]
     UnitTypeName(String),
 
@@ -92,8 +89,8 @@ pub enum SchemaRefError {
 ///
 /// Consequently *any* `SchemaRef` value that exists anywhere in a program is a
 /// resolved, non-unit, informative type reference — which is what makes
-/// [`MethodShape::Bidirectional`]'s non-optional `request`/`response` fields a
-/// static guarantee rather than a convention.
+/// [`CallbackIr`]'s non-optional `request`/`response` fields a static guarantee
+/// rather than a convention.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "SchemaRefWire")]
 pub struct SchemaRef {
@@ -298,71 +295,50 @@ impl DeprecationIr {
 }
 
 // ===========================================================================
-// MethodShape
+// CallbackIr
 // ===========================================================================
 
-/// How a method exchanges data with its caller.
+/// One server-to-client request a method may issue during its turn.
 ///
-/// Bidirectional is **first-class** by operator decision (2026-07-25), not an
-/// attribute: it is the primitive ACP is built on (server-to-client permission
-/// prompts, `fs/*` and `terminal/*` callbacks issued mid-stream). Its
-/// request/response types are [`SchemaRef`]s, which by construction cannot be
-/// empty, unresolved, or `()` — see [`SchemaRef`] for why there is no
-/// silent-degradation path.
+/// PLX-77 replaces PLX-75's `MethodShape::Bidirectional { request, response }`,
+/// which could express exactly **one** callback shape per method. ACP's
+/// `session/prompt` issues four distinct ones
+/// (`session/request_permission`, `fs/read_text_file`, `fs/write_text_file`,
+/// `terminal/create`), so callbacks are a **set**, not a pair.
+///
+/// Both halves are [`SchemaRef`]s, so PLX-75's no-silent-degradation guarantee
+/// carries over unchanged: a callback whose request or response type could not
+/// be resolved is a construction error, never a `()`.
+///
+/// The authoritative producer of these values is a capability marker's
+/// descriptor — see [`crate::capability`]. A later build derives
+/// [`MethodIr::callbacks`] from the `Client<C>` handle in a method signature,
+/// which is what makes the declared set and the usable set the same thing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MethodShape {
-    /// One request, one response.
-    Unary,
-    /// One request, N server-pushed events.
-    Streaming,
-    /// N events plus server-to-client requests the caller must answer.
-    Bidirectional {
-        /// Type of the request the *server* sends to the client mid-stream.
-        request: SchemaRef,
-        /// Type of the reply the client sends back.
-        response: SchemaRef,
-    },
+pub struct CallbackIr {
+    /// Wire name of the server-to-client request, e.g. `"fs/read_text_file"`.
+    pub name: String,
+    /// Type the *server* sends to the client.
+    pub request: SchemaRef,
+    /// Type the client sends back.
+    pub response: SchemaRef,
 }
 
-impl Default for MethodShape {
-    fn default() -> Self {
-        Self::Unary
-    }
-}
-
-impl MethodShape {
-    /// Build a [`MethodShape::Bidirectional`].
-    ///
-    /// Present for symmetry and discoverability; the guarantee lives in
-    /// [`SchemaRef`], so the struct-literal form is equally safe.
-    pub fn bidirectional(request: SchemaRef, response: SchemaRef) -> Self {
-        Self::Bidirectional { request, response }
-    }
-
-    /// The bidirectional request/response pair, if this is a bidir method.
-    pub fn bidir_types(&self) -> Option<(&SchemaRef, &SchemaRef)> {
-        match self {
-            Self::Bidirectional { request, response } => Some((request, response)),
-            _ => None,
+impl CallbackIr {
+    /// Build a callback descriptor.
+    pub fn new(name: impl Into<String>, request: SchemaRef, response: SchemaRef) -> Self {
+        Self {
+            name: name.into(),
+            request,
+            response,
         }
     }
 
-    fn hash_into(&self, h: &mut Hasher) {
-        h.tag("plexus.ir.shape.v1");
-        match self {
-            Self::Unary => {
-                h.str("unary");
-            }
-            Self::Streaming => {
-                h.str("streaming");
-            }
-            Self::Bidirectional { request, response } => {
-                h.str("bidirectional");
-                request.hash_into(h);
-                response.hash_into(h);
-            }
-        }
+    pub(crate) fn hash_into(&self, h: &mut Hasher) {
+        h.tag("plexus.ir.callback.v1");
+        h.str(&self.name);
+        self.request.hash_into(h);
+        self.response.hash_into(h);
     }
 }
 
@@ -453,27 +429,47 @@ pub struct MethodIr {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<ParamIr>,
 
-    /// The method's return type.
+    /// Type of the items the turn streams *before* it terminates.
     ///
-    /// `None` means the method declares no meaningful return (the old `()`).
-    /// A [`SchemaRef`] can never *be* `()`, so "returns nothing" and "returns
-    /// something the IR failed to resolve" are not the same value.
+    /// `None` means the turn emits no updates — the unary case. A
+    /// [`SchemaRef`] can never *be* `()`, so "emits nothing" and "emits
+    /// something the IR failed to resolve" are not the same value (PLX-75
+    /// residual #5, preserved).
+    ///
+    /// PLX-73 `q-ir-completeness` item 7 used to be carried by
+    /// `MethodShape::Streaming`; it is now simply `updates.is_some()`, and the
+    /// classifier [`MethodIr::is_streaming`] is *derived*, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub returns: Option<SchemaRef>,
+    pub updates: Option<SchemaRef>,
 
-    /// Unary / Streaming / Bidirectional.
-    #[serde(default)]
-    pub shape: MethodShape,
-
-    /// Client-presentation hint only: `true` → `AsyncGenerator<T>`, `false` →
-    /// `Promise<T>`.
+    /// Type of the turn's single terminal value.
     ///
-    /// PLX-73 `q-ir-completeness` item 7: **informational, NOT load-bearing for
-    /// dispatch**. Dispatch is universally streaming; [`MethodIr::shape`] is
-    /// the semantic field. This one exists so the client generator can pick a
-    /// return shape.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub streaming: bool,
+    /// `None` means the turn returns nothing meaningful (the old `()`), with
+    /// the same never-`()`-`SchemaRef` property as [`updates`](Self::updates).
+    ///
+    /// PLX-75 conflated this with the update-item type in one `returns` field,
+    /// which meant a streaming method had no way to describe what it finally
+    /// resolved to. Adopting ACP turn semantics (PLX-73
+    /// `q-acp-as-communication-model`) makes a turn *always* both: zero or more
+    /// updates, then exactly one terminal carrying a
+    /// [`StopReason`](crate::ir::StopReason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<SchemaRef>,
+
+    /// Server-to-client requests this method may issue during its turn.
+    ///
+    /// PLX-73 `q-ir-completeness` item 8 (the reply channel) and PLX-76
+    /// `q-acp-callbacks`. This is a **set**, not the single request/response
+    /// pair `MethodShape::Bidirectional` allowed: one method routinely issues
+    /// several distinct callbacks. Streaming and callbacks are independent
+    /// axes — a method may have updates without callbacks, callbacks without
+    /// updates, both, or neither.
+    ///
+    /// The union of this field across the IR is what a service advertises, so a
+    /// peer that cannot serve a required callback is rejected pre-flight rather
+    /// than surprised mid-turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callbacks: Vec<CallbackIr>,
 
     /// HTTP verb for REST projections.
     #[serde(default)]
@@ -502,7 +498,8 @@ pub struct MethodIr {
 }
 
 impl MethodIr {
-    /// A unary, auth-required method with no params and no return.
+    /// A unary, auth-required method with no params, no updates, no terminal
+    /// value and no callbacks.
     pub fn new(name: impl Into<String>, dotted_id: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -510,9 +507,9 @@ impl MethodIr {
             description: String::new(),
             hash: String::new(),
             params: Vec::new(),
-            returns: None,
-            shape: MethodShape::Unary,
-            streaming: false,
+            updates: None,
+            terminal: None,
+            callbacks: Vec::new(),
             http_method: HttpMethodIr::default(),
             auth: AuthRequirementIr::default(),
             deprecation: None,
@@ -532,22 +529,52 @@ impl MethodIr {
         self
     }
 
-    /// Declare the return type.
-    pub fn with_returns(mut self, r: SchemaRef) -> Self {
-        self.returns = Some(r);
+    /// Declare the type of the items this turn streams.
+    pub fn with_updates(mut self, u: SchemaRef) -> Self {
+        self.updates = Some(u);
         self
     }
 
-    /// Set the method shape.
-    pub fn with_shape(mut self, s: MethodShape) -> Self {
-        self.shape = s;
+    /// Declare the type of this turn's terminal value.
+    pub fn with_terminal(mut self, t: SchemaRef) -> Self {
+        self.terminal = Some(t);
         self
     }
 
-    /// Set the client-presentation streaming hint.
-    pub fn with_streaming(mut self, s: bool) -> Self {
-        self.streaming = s;
+    /// Append one server-to-client callback this method may issue.
+    pub fn with_callback(mut self, c: CallbackIr) -> Self {
+        self.callbacks.push(c);
         self
+    }
+
+    /// Declare the whole callback set at once — the shape a later build uses
+    /// when deriving it from a `Client<C>` handle
+    /// (see [`crate::capability::CapabilitySet::callbacks`]).
+    pub fn with_callbacks(mut self, cs: impl IntoIterator<Item = CallbackIr>) -> Self {
+        self.callbacks.extend(cs);
+        self
+    }
+
+    /// Derived classifier: does this turn emit updates before terminating?
+    ///
+    /// **Derived, never stored, never serialized.** PLX-75 stored a `streaming:
+    /// bool` alongside a `MethodShape`, which is two sources of truth for one
+    /// fact; the turn envelope has exactly one.
+    pub fn is_streaming(&self) -> bool {
+        self.updates.is_some()
+    }
+
+    /// Derived classifier: may this turn issue server-to-client requests?
+    ///
+    /// Independent of [`is_streaming`](Self::is_streaming) — that
+    /// independence is the defect PLX-77 fixes.
+    pub fn is_bidirectional(&self) -> bool {
+        !self.callbacks.is_empty()
+    }
+
+    /// Look up one declared callback by wire name.
+    pub fn callback(&self, name: &str) -> Option<&CallbackIr> {
+        self.callbacks.iter().find(|c| c.name == name)
     }
 
     /// Set the REST verb.
@@ -591,17 +618,28 @@ impl MethodIr {
         h.str(&self.dotted_id);
         h.str(&self.description);
         h.seq(&self.params, |h, p| p.hash_into(h));
-        match &self.returns {
+        // Turn envelope: updates, terminal, callbacks. Each is content, so
+        // mutating any of them changes this method's hash and every ancestor's.
+        h.tag("plexus.ir.turn.v1");
+        match &self.updates {
             None => {
                 h.bool(false);
             }
-            Some(r) => {
+            Some(u) => {
                 h.bool(true);
-                r.hash_into(&mut h);
+                u.hash_into(&mut h);
             }
         }
-        self.shape.hash_into(&mut h);
-        h.bool(self.streaming);
+        match &self.terminal {
+            None => {
+                h.bool(false);
+            }
+            Some(t) => {
+                h.bool(true);
+                t.hash_into(&mut h);
+            }
+        }
+        h.seq(&self.callbacks, |h, c| c.hash_into(h));
         h.str(self.http_method.as_str());
         h.str(self.auth.tag());
         match &self.deprecation {
@@ -795,7 +833,7 @@ pub struct ActivationIr {
     pub ir_hash: Option<String>,
 
     /// Name of the method a client calls to answer a server-to-client request
-    /// on a [`MethodShape::Bidirectional`] method.
+    /// declared in [`MethodIr::callbacks`].
     ///
     /// PLX-73 `q-ir-completeness` item 8: today this is a hard-coded `respond`
     /// convention on the client side. Declaring it makes the reply channel a

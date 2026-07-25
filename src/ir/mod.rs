@@ -50,9 +50,26 @@
 //! It replaces `BidirType::Custom`, which stored type *names* as strings and
 //! re-parsed them with a fallback that silently degraded an unresolvable type
 //! to `()`. A `SchemaRef` cannot be empty, cannot be uninformative, and can
-//! never denote `()` — which is what makes
-//! [`MethodShape::Bidirectional`]'s non-optional `request`/`response` fields a
-//! compile-time guarantee instead of a convention.
+//! never denote `()` — which is what makes [`CallbackIr`]'s non-optional
+//! `request`/`response` fields a compile-time guarantee instead of a
+//! convention, and what keeps `updates: None` / `terminal: None` meaning
+//! "nothing" rather than "unresolved".
+//!
+//! # The turn envelope (PLX-77)
+//!
+//! Adopting ACP turn semantics (PLX-73 `q-acp-as-communication-model`) made
+//! every call a **turn**: zero or more updates, then exactly one terminal value
+//! carrying a [`StopReason`]. So [`MethodIr`] carries
+//! [`updates`](MethodIr::updates), [`terminal`](MethodIr::terminal) and
+//! [`callbacks`](MethodIr::callbacks) rather than PLX-75's single `returns`
+//! plus a `MethodShape` enum. Streaming and bidirectionality were never
+//! alternatives — they are independent axes, and one method routinely issues
+//! several distinct callbacks. Classifiers like
+//! [`MethodIr::is_streaming`] are *derived* from those fields, never stored.
+//!
+//! The callback set is produced from a method signature's
+//! [`Client<C>`](crate::capability::Client) handle — see
+//! [`crate::capability`], where the handle's type *is* the declaration.
 //!
 //! # Example
 //!
@@ -74,13 +91,15 @@
 //! ```
 
 pub mod hash;
+mod stop;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
 pub use hash::Hasher;
+pub use stop::{StopDetail, StopKind, StopReason};
 pub use types::{
-    ActivationIr, AuthRequirementIr, ChildEdge, DeprecationIr, HttpMethodIr, MethodIr, MethodShape,
+    ActivationIr, AuthRequirementIr, CallbackIr, ChildEdge, DeprecationIr, HttpMethodIr, MethodIr,
     ParamIr, SchemaRef, SchemaRefError, IR_VERSION,
 };

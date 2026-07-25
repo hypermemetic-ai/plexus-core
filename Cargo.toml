@@ -37,6 +37,9 @@ schemars = { version = "1.1", features = ["derive", "uuid1"] }
 # HTTP types for RawRequestContext
 http = "1"
 
+# IR Merkle hashing (PLX-77 replaced PLX-75's hand-rolled SHA-256 with this)
+sha2 = "0.10"
+
 # Core types
 uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -62,6 +65,11 @@ plexus-auth-core = { path = "../plexus-auth-core", version = "0.2" }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
+
+# Compile-fail fixtures for the PLX-77 typed capability handle: membership
+# gating and marker-trait sealing are guarantees only if the wrong program
+# fails to COMPILE, so they are tested by `tests/compile_fail.rs`.
+trybuild = "1.0"
 
 # Enable the `test-support` feature for plexus-auth-core in test builds
 # only, so the end-to-end credential-envelope tests in

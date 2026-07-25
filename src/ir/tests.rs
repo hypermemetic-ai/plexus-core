@@ -7,6 +7,14 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::*;
+use crate::capability::{Capability, Client, FsRead, FsWrite, Permission, Terminal};
+
+/// The four callbacks an ACP `session/prompt`-shaped turn issues, derived from
+/// the capability markers themselves — the same objects `Client<C>` would
+/// declare, not a re-description of them.
+fn acp_prompt_callbacks() -> Vec<CallbackIr> {
+    Client::<(Permission, FsRead, FsWrite, Terminal)>::callbacks()
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -43,7 +51,7 @@ fn tree() -> ActivationIr {
         .with_method(
             MethodIr::new("history", "claudecode.session.history")
                 .with_description("replay the transcript")
-                .with_returns(schema("Transcript")),
+                .with_terminal(schema("Transcript")),
         )
         .with_method(
             MethodIr::new("close", "claudecode.session.close")
@@ -62,12 +70,9 @@ fn tree() -> ActivationIr {
                         .with_description("model override")
                         .optional(),
                 )
-                .with_returns(schema("ChatEvent"))
-                .with_shape(MethodShape::bidirectional(
-                    schema("PermissionRequest"),
-                    schema("PermissionOutcome"),
-                ))
-                .with_streaming(true)
+                .with_updates(schema("ChatEvent"))
+                .with_terminal(schema("ChatDone"))
+                .with_callbacks(acp_prompt_callbacks())
                 .with_auth(AuthRequirementIr::Required)
                 .with_extension("acp_role", json!("prompt"))
                 .with_extension("nostr_kind", json!(23194)),
@@ -75,7 +80,7 @@ fn tree() -> ActivationIr {
         .with_method(
             MethodIr::new("list", "claudecode.list")
                 .with_description("list sessions")
-                .with_returns(schema("SessionList"))
+                .with_terminal(schema("SessionList"))
                 .with_http_method(HttpMethodIr::Get)
                 .with_auth(AuthRequirementIr::Public),
         )
@@ -171,7 +176,7 @@ fn ac1_three_level_tree_round_trips_losslessly() {
     );
     let chat = cc.method("chat").unwrap();
     assert_eq!(chat.dotted_id, "claudecode.chat");
-    assert!(chat.streaming);
+    assert!(chat.is_streaming());
     assert_eq!(chat.http_method, HttpMethodIr::Post);
     assert_eq!(chat.auth, AuthRequirementIr::Required);
     assert_eq!(chat.params.len(), 2);
@@ -409,8 +414,8 @@ fn ac3_json_object_key_order_inside_a_schema_does_not_affect_hashes() {
     )
     .unwrap();
 
-    let mut m1 = MethodIr::new("m", "a.m").with_returns(SchemaRef::new("T", one).unwrap());
-    let mut m2 = MethodIr::new("m", "a.m").with_returns(SchemaRef::new("T", two).unwrap());
+    let mut m1 = MethodIr::new("m", "a.m").with_terminal(SchemaRef::new("T", one).unwrap());
+    let mut m2 = MethodIr::new("m", "a.m").with_terminal(SchemaRef::new("T", two).unwrap());
     m1.recompute_hash();
     m2.recompute_hash();
     assert_eq!(m1.hash, m2.hash);
@@ -432,31 +437,105 @@ fn ac3_sequence_order_is_significant() {
 }
 
 // ---------------------------------------------------------------------------
-// AC5 — Bidirectional is first class, with no silent-degradation path
+// PLX-77 AC1 — a turn can be streaming AND bidirectional, with many callbacks
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ac5_bidirectional_types_survive_a_round_trip() {
+fn ac1_turn_is_streaming_and_bidirectional_with_four_callbacks() {
+    // The `chat` method in the fixture is ACP `session/prompt`-shaped: it
+    // streams updates, resolves to a terminal value, AND issues four distinct
+    // server-to-client callbacks. PLX-75's `MethodShape` could express at most
+    // one of those three facts at a time.
     let ir = tree();
-    let json = serde_json::to_string(&ir).unwrap();
+    let json = serde_json::to_string_pretty(&ir).unwrap();
     let back: ActivationIr = serde_json::from_str(&json).unwrap();
 
     let chat = claudecode(&back).method("chat").unwrap();
-    let (req, resp) = chat
-        .shape
-        .bidir_types()
-        .expect("chat must still be Bidirectional after a round-trip");
 
-    assert_eq!(req.type_name(), "PermissionRequest");
-    assert_eq!(resp.type_name(), "PermissionOutcome");
-    assert_eq!(req.schema(), schema("PermissionRequest").schema());
-    assert_eq!(resp.schema(), schema("PermissionOutcome").schema());
+    // Streaming and bidirectional are independent axes, and both hold here.
+    assert!(chat.is_streaming(), "the turn emits updates");
+    assert!(chat.is_bidirectional(), "the turn issues callbacks");
 
-    // The type names are not merely echoed: the resolved schemas came with them.
+    // Both schemas survived, and they are two DIFFERENT types — the defect
+    // PLX-75's single `returns` field could not express.
+    let updates = chat.updates.as_ref().expect("updates survived");
+    let terminal = chat.terminal.as_ref().expect("terminal survived");
+    assert_eq!(updates.type_name(), "ChatEvent");
+    assert_eq!(terminal.type_name(), "ChatDone");
+    assert_ne!(updates.type_name(), terminal.type_name());
+    assert_eq!(updates.schema(), schema("ChatEvent").schema());
+    assert_eq!(terminal.schema(), schema("ChatDone").schema());
+
+    // All four callbacks survived, in order, with their names AND schemas.
+    assert_eq!(chat.callbacks.len(), 4);
     assert_eq!(
-        req.schema().as_value()["properties"]["value"]["type"],
+        chat.callbacks
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "session/request_permission",
+            "fs/read_text_file",
+            "fs/write_text_file",
+            "terminal/create",
+        ]
+    );
+    assert_eq!(chat.callbacks, acp_prompt_callbacks());
+
+    // Schemas are real, resolved schemas — not echoed type names.
+    let fs_read = chat.callback("fs/read_text_file").expect("looked up by name");
+    assert_eq!(fs_read.request.type_name(), "FsReadRequest");
+    assert_eq!(fs_read.response.type_name(), "FsReadResponse");
+    assert_eq!(
+        fs_read.request.schema().as_value()["properties"]["path"]["type"],
         json!("string")
     );
+}
+
+#[test]
+fn ac2_a_unary_method_carries_no_turn_ceremony_on_the_wire() {
+    let ir = tree();
+    let health = ir.method("health").expect("the unary fixture method");
+
+    assert!(health.updates.is_none());
+    assert!(health.callbacks.is_empty());
+    assert!(!health.is_streaming());
+    assert!(!health.is_bidirectional());
+
+    let v = serde_json::to_value(health).unwrap();
+    let obj = v.as_object().unwrap();
+    for absent in ["updates", "callbacks", "terminal"] {
+        assert!(
+            !obj.contains_key(absent),
+            "`{absent}` must be omitted for a unary method, got {v}"
+        );
+    }
+
+    // …and a document that never mentions them decodes to the same thing.
+    let decoded: MethodIr =
+        serde_json::from_value(json!({"name": "health", "dotted_id": "substrate.health"})).unwrap();
+    assert!(decoded.updates.is_none());
+    assert!(decoded.terminal.is_none());
+    assert!(decoded.callbacks.is_empty());
+}
+
+#[test]
+fn a_turn_may_have_callbacks_without_updates_and_updates_without_callbacks() {
+    // The two axes really are independent — "callbacks without updates" is the
+    // case `MethodShape` could not express at all.
+    let callbacks_only = MethodIr::new("elicit", "a.elicit")
+        .with_terminal(schema("Answer"))
+        .with_callbacks(Client::<(Permission,)>::callbacks());
+    assert!(!callbacks_only.is_streaming());
+    assert!(callbacks_only.is_bidirectional());
+
+    let updates_only = MethodIr::new("tail", "a.tail").with_updates(schema("LogLine"));
+    assert!(updates_only.is_streaming());
+    assert!(!updates_only.is_bidirectional());
+
+    let neither = MethodIr::new("ping", "a.ping");
+    assert!(!neither.is_streaming());
+    assert!(!neither.is_bidirectional());
 }
 
 #[test]
@@ -508,91 +587,193 @@ fn ac5_schema_ref_rejects_every_degenerate_form() {
 }
 
 #[test]
-fn ac5_deserialization_cannot_smuggle_in_a_degraded_bidir_method() {
+fn ac5_deserialization_cannot_smuggle_in_a_degraded_callback() {
     // There is no `SchemaRef::default`, no public field, and no `From<String>`,
     // so the only remaining route into an invalid value would be serde — and
     // `#[serde(try_from)]` closes it. A tampered document fails to decode
-    // rather than decoding into a `()`-typed bidir method.
+    // rather than decoding into a `()`-typed callback. PLX-75 proved this for
+    // `MethodShape::Bidirectional`; the property must survive the move to
+    // `callbacks` / `updates` / `terminal`.
     let ir = tree();
     let pristine = serde_json::to_value(&ir).unwrap();
 
     // The `chat` method lives on the Static `claudecode` child. `ChildEdge` is
     // internally tagged, so the child's own fields sit alongside `"edge"`.
-    fn chat_shape(v: &mut serde_json::Value) -> &mut serde_json::Value {
-        &mut v["children"][0]["methods"][0]["shape"]
+    fn first_callback(v: &mut serde_json::Value) -> &mut serde_json::Value {
+        &mut v["children"][0]["methods"][0]["callbacks"][0]
+    }
+    fn updates(v: &mut serde_json::Value) -> &mut serde_json::Value {
+        &mut v["children"][0]["methods"][0]["updates"]
     }
 
-    // Baseline: the pristine document decodes, and `chat` really is bidir.
+    // Baseline: the pristine document decodes, and `chat` really has callbacks.
     {
         let mut v = pristine.clone();
         assert_eq!(pristine["children"][0]["edge"], json!("static"));
-        assert_eq!(chat_shape(&mut v)["kind"], json!("bidirectional"));
+        assert_eq!(
+            first_callback(&mut v)["name"],
+            json!("session/request_permission")
+        );
         assert!(serde_json::from_value::<ActivationIr>(pristine.clone()).is_ok());
     }
 
-    // (a) blank the type name
+    // (a) blank a callback request's type name
     let mut v = pristine.clone();
-    chat_shape(&mut v)["request"]["type_name"] = json!("");
+    first_callback(&mut v)["request"]["type_name"] = json!("");
     let err = serde_json::from_value::<ActivationIr>(v).unwrap_err();
     assert!(err.to_string().contains("type name is empty"), "{err}");
 
-    // (b) degrade it to the unit type
+    // (b) degrade a callback response to the unit type
     let mut v = pristine.clone();
-    chat_shape(&mut v)["request"]["type_name"] = json!("()");
+    first_callback(&mut v)["response"]["type_name"] = json!("()");
     let err = serde_json::from_value::<ActivationIr>(v).unwrap_err();
     assert!(err.to_string().contains("unit type"), "{err}");
 
-    // (c) degrade the schema to `{}`
+    // (c) degrade a callback schema to `{}`
     let mut v = pristine.clone();
-    chat_shape(&mut v)["request"]["schema"] = json!({});
+    first_callback(&mut v)["request"]["schema"] = json!({});
     let err = serde_json::from_value::<ActivationIr>(v).unwrap_err();
     assert!(err.to_string().contains("no type information"), "{err}");
 
-    // (d) degrade the schema to the `()` schema
+    // (d) degrade the UPDATES schema to the `()` schema — "emits nothing" is
+    // `updates: null`, and is not reachable by degrading a real type.
     let mut v = pristine.clone();
-    chat_shape(&mut v)["request"]["schema"] = json!({"type": "null"});
+    updates(&mut v)["schema"] = json!({"type": "null"});
     let err = serde_json::from_value::<ActivationIr>(v).unwrap_err();
     assert!(err.to_string().contains("null schema"), "{err}");
 
-    // (e) drop the request entirely — bidir has no optional half, so there is
-    // no default to fall back to.
+    // (e) drop a callback's request entirely — a callback has no optional
+    // half, so there is no default to fall back to.
     let mut v = pristine.clone();
-    chat_shape(&mut v)
+    first_callback(&mut v)
         .as_object_mut()
         .unwrap()
         .remove("request");
     assert!(serde_json::from_value::<ActivationIr>(v).is_err());
 }
 
+// ---------------------------------------------------------------------------
+// PLX-77 AC6 — turn fields participate in Merkle hashing
+// ---------------------------------------------------------------------------
+
 #[test]
-fn ac5_bidir_participates_in_hashing_like_any_other_content() {
-    let base = tree();
-    let mut changed = base.clone();
+fn ac6_mutating_a_callback_changes_the_method_its_ancestors_and_ir_hash() {
+    let before = tree();
+
+    let root_hash = before.hash.clone();
+    let ir_hash = before.ir_hash.clone().unwrap();
+    let cc_hash = claudecode(&before).hash.clone();
+    let chat_hash = claudecode(&before).method("chat").unwrap().hash.clone();
+    let list_hash = claudecode(&before).method("list").unwrap().hash.clone();
+    let tmpl_hash = session_template(&before).hash.clone();
+    let dynamic_edge = before.children[1].edge_hash();
+
+    // Mutate exactly ONE callback of ONE method, deep in the tree.
+    let mut after = before.clone();
     {
-        let cc = claudecode_mut(&mut changed);
-        cc.methods[0].shape = MethodShape::bidirectional(
-            schema("PermissionRequestV2"),
-            schema("PermissionOutcome"),
+        let cc = claudecode_mut(&mut after);
+        let chat = cc.methods.iter_mut().find(|m| m.name == "chat").unwrap();
+        chat.callbacks[2] = CallbackIr::new(
+            "fs/write_text_file",
+            schema("FsWriteRequestV2"),
+            schema("FsWriteResponse"),
         );
     }
-    changed.recompute_hashes();
-    assert_ne!(changed.hash, base.hash);
+    after.recompute_hashes();
+
+    // The owning method, its ancestors, and the document digest all changed.
     assert_ne!(
-        claudecode(&changed).method("chat").unwrap().hash,
-        claudecode(&base).method("chat").unwrap().hash
+        claudecode(&after).method("chat").unwrap().hash,
+        chat_hash,
+        "the owning method hash must change"
+    );
+    assert_ne!(claudecode(&after).hash, cc_hash, "the parent must change");
+    assert_ne!(after.hash, root_hash, "the root must change");
+    assert_ne!(after.ir_hash.clone().unwrap(), ir_hash, "ir_hash must change");
+
+    // Sibling subtrees are byte-identical.
+    assert_eq!(
+        claudecode(&after).method("list").unwrap().hash,
+        list_hash,
+        "a sibling method must be byte-identical"
+    );
+    assert_eq!(
+        session_template(&after).hash,
+        tmpl_hash,
+        "the sibling indexed subtree must be byte-identical"
+    );
+    assert_eq!(
+        after.children[1].edge_hash(),
+        dynamic_edge,
+        "the sibling dynamic subtree must be byte-identical"
     );
 }
 
 #[test]
-fn ac5_shape_defaults_to_unary_and_survives_absence_on_the_wire() {
+fn ac6_updates_terminal_and_callback_count_all_participate() {
+    let base = || {
+        let mut m = MethodIr::new("m", "a.m")
+            .with_updates(schema("U"))
+            .with_terminal(schema("T"))
+            .with_callbacks(Client::<(Permission,)>::callbacks());
+        m.recompute_hash();
+        m
+    };
+    let baseline = base().hash;
+
+    // Different updates type.
+    let mut a = base();
+    a.updates = Some(schema("U2"));
+    a.recompute_hash();
+    assert_ne!(a.hash, baseline, "updates is content");
+
+    // Different terminal type.
+    let mut b = base();
+    b.terminal = Some(schema("T2"));
+    b.recompute_hash();
+    assert_ne!(b.hash, baseline, "terminal is content");
+
+    // An added callback.
+    let mut c = base();
+    c.callbacks.push(FsRead::descriptor());
+    c.recompute_hash();
+    assert_ne!(c.hash, baseline, "the callback set is content");
+
+    // A renamed callback (same schemas).
+    let mut d = base();
+    d.callbacks[0].name = "session/request_permission_v2".into();
+    d.recompute_hash();
+    assert_ne!(d.hash, baseline, "a callback name is content");
+
+    // Swapping updates and terminal is a real change, not a wash — the two
+    // fields are distinguishable in the hash stream.
+    let mut e = base();
+    e.updates = Some(schema("T"));
+    e.terminal = Some(schema("U"));
+    e.recompute_hash();
+    assert_ne!(e.hash, baseline);
+
+    // …and "absent" is distinguishable from "present".
+    let mut f = base();
+    f.updates = None;
+    f.recompute_hash();
+    assert_ne!(f.hash, baseline);
+    assert_ne!(f.hash, a.hash);
+}
+
+#[test]
+fn turn_fields_default_to_the_unary_shape_and_survive_absence_on_the_wire() {
     let m = MethodIr::new("m", "a.m");
-    assert_eq!(m.shape, MethodShape::Unary);
-    let v = json!({"name": "m", "dotted_id": "a.m"});
-    let decoded: MethodIr = serde_json::from_value(v).unwrap();
-    assert_eq!(decoded.shape, MethodShape::Unary);
+    assert!(m.updates.is_none());
+    assert!(m.terminal.is_none());
+    assert!(m.callbacks.is_empty());
+
+    let decoded: MethodIr = serde_json::from_value(json!({"name": "m", "dotted_id": "a.m"})).unwrap();
+    assert!(decoded.updates.is_none());
+    assert!(decoded.terminal.is_none());
+    assert!(decoded.callbacks.is_empty());
     assert_eq!(decoded.http_method, HttpMethodIr::Post);
     assert_eq!(decoded.auth, AuthRequirementIr::Required);
-    assert!(!decoded.streaming);
 }
 
 // ---------------------------------------------------------------------------
@@ -653,8 +834,82 @@ fn completeness_http_method_is_an_enum_end_to_end() {
 }
 
 #[test]
+fn completeness_item_7_streaming_is_now_derived_from_updates() {
+    // Inventory item 7 used to be carried by `MethodIr::streaming` (a stored
+    // client-presentation hint) alongside `MethodShape::Streaming`. PLX-77
+    // remaps it onto a single source of truth: `updates.is_some()`, exposed as
+    // the DERIVED classifier `is_streaming()`. There is no stored field to
+    // drift from it.
+    let ir = tree();
+    let chat = claudecode(&ir).method("chat").unwrap();
+    let list = claudecode(&ir).method("list").unwrap();
+
+    assert!(chat.is_streaming());
+    assert_eq!(chat.is_streaming(), chat.updates.is_some());
+    assert!(!list.is_streaming());
+    assert_eq!(list.is_streaming(), list.updates.is_some());
+
+    // The classifier is derived, never serialized: no `streaming` (and no
+    // `shape`) key exists on the wire for anything to disagree with.
+    let v = serde_json::to_value(chat).unwrap();
+    let obj = v.as_object().unwrap();
+    assert!(!obj.contains_key("streaming"), "{v}");
+    assert!(!obj.contains_key("shape"), "{v}");
+    assert!(obj.contains_key("updates"), "{v}");
+}
+
+#[test]
+fn completeness_item_8_the_reply_channel_is_declared_at_both_ends() {
+    // Inventory item 8 is the bidirectional reply channel, previously a
+    // hard-coded client-side `respond` convention plus a single
+    // `MethodShape::Bidirectional { request, response }` pair. PLX-77 splits it
+    // across two fields that together describe the whole channel:
+    //
+    //   * `ActivationIr::respond_method` — HOW the client answers (unchanged),
+    //   * `MethodIr::callbacks`          — WHAT it may be asked, as a SET.
+    let ir = tree();
+    assert_eq!(ir.respond_method.as_deref(), Some("respond"));
+
+    let chat = claudecode(&ir).method("chat").unwrap();
+    assert_eq!(chat.callbacks.len(), 4, "a set, not a single pair");
+    // Every callback names its own wire request and both of its types, so a
+    // client knows what it is being asked before the turn starts.
+    for c in &chat.callbacks {
+        assert!(!c.name.is_empty());
+        assert!(!c.request.type_name().is_empty());
+        assert!(!c.response.type_name().is_empty());
+    }
+    // The declaration is exactly what the typed handle would advertise.
+    assert_eq!(chat.callbacks, acp_prompt_callbacks());
+}
+
+#[test]
+fn completeness_the_turn_terminal_is_distinct_from_the_update_stream() {
+    // PLX-75's single `returns` field conflated the update-item type with the
+    // turn's final value; a streaming method had no way to describe what it
+    // resolved to. Both are present, and different.
+    let ir = tree();
+    let chat = claudecode(&ir).method("chat").unwrap();
+    assert_eq!(chat.updates.as_ref().unwrap().type_name(), "ChatEvent");
+    assert_eq!(chat.terminal.as_ref().unwrap().type_name(), "ChatDone");
+
+    // A unary method has a terminal and no updates…
+    let list = claudecode(&ir).method("list").unwrap();
+    assert_eq!(list.terminal.as_ref().unwrap().type_name(), "SessionList");
+    assert!(list.updates.is_none());
+
+    // …and "returns nothing meaningful" stays distinguishable from "failed to
+    // resolve", because a `SchemaRef` can never be `()` (PLX-75 residual #5).
+    let health = ir.method("health").unwrap();
+    assert!(health.terminal.is_none());
+}
+
+#[test]
 fn completeness_indexed_edge_answers_all_three_client_questions() {
     // Inventory items 16 and 17: enumerate, form a path, know the shape.
+    // Unchanged by PLX-77 — recorded here so the remap is explicit: items 16
+    // and 17 stay on `ChildEdge::Indexed`, items 7 and 8 moved onto the turn
+    // envelope (see the two tests above).
     let ir = tree();
     match claudecode(&ir).child("session").unwrap() {
         ChildEdge::Indexed {

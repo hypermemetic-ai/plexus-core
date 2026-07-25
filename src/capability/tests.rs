@@ -263,6 +263,150 @@ fn transport_failures_are_surfaced_not_swallowed() {
     assert!(matches!(err, CallbackError::Payload { .. }), "{err:?}");
 }
 
+// ---------------------------------------------------------------------------
+// PLX-78 — a capability set is a SET
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_capabilitys_identity_is_its_wire_name_and_the_names_are_distinct() {
+    // The *guarantee* that no two markers share a wire name is not this test —
+    // it is the crate-level `const _: () = assert!(!has_duplicate_names(..))`
+    // that `declare_capabilities!` emits, which fails `cargo build` of this
+    // crate. This test guards the thing that assertion cannot see: that the
+    // list it ranges over really is every marker. A marker declared outside the
+    // macro would slip past the proof, so pin the inventory.
+    assert_eq!(
+        ALL_CAPABILITY_NAMES,
+        [
+            Permission::NAME,
+            FsRead::NAME,
+            FsWrite::NAME,
+            Terminal::NAME
+        ],
+        "ALL_CAPABILITY_NAMES must list every marker; a marker declared outside \
+         `declare_capabilities!` would escape the compile-time distinctness proof"
+    );
+    assert!(!has_duplicate_names(ALL_CAPABILITY_NAMES));
+
+    // …and spelled out pairwise, so a failure names the colliding pair.
+    for (i, a) in ALL_CAPABILITY_NAMES.iter().enumerate() {
+        for b in &ALL_CAPABILITY_NAMES[i + 1..] {
+            assert_ne!(a, b, "two capability markers share the wire name {a:?}");
+        }
+    }
+}
+
+#[test]
+fn has_duplicate_names_is_exact() {
+    assert!(!has_duplicate_names(&[]));
+    assert!(!has_duplicate_names(&["a"]));
+    assert!(!has_duplicate_names(&["a", "b", "c"]));
+    assert!(has_duplicate_names(&["a", "a"]));
+    // Duplicates at either end and in the middle of a longer list.
+    assert!(has_duplicate_names(&["a", "b", "c", "a"]));
+    assert!(has_duplicate_names(&["a", "b", "b", "c"]));
+    // A prefix is not a duplicate — the comparison is on the whole string.
+    assert!(!has_duplicate_names(&["fs/read", "fs/read_text_file"]));
+    assert!(!has_duplicate_names(&["", "x"]));
+    assert!(has_duplicate_names(&["", ""]));
+}
+
+#[test]
+fn the_const_name_list_agrees_with_the_runtime_one() {
+    // `NAMES` is what the const check reads; `names()` is what callers read.
+    // If they ever disagree, the compile-time check is checking a fiction.
+    assert_eq!(<() as CapabilitySet>::NAMES, &[] as &[&str]);
+    assert_eq!(
+        <(Permission, FsRead, FsWrite, Terminal) as CapabilitySet>::NAMES,
+        <(Permission, FsRead, FsWrite, Terminal)>::names().as_slice()
+    );
+    type Eight = (
+        Permission,
+        FsRead,
+        FsWrite,
+        Terminal,
+        Permission,
+        FsRead,
+        FsWrite,
+        Terminal,
+    );
+    assert_eq!(<Eight as CapabilitySet>::NAMES.len(), 8);
+    // The tuple impls themselves are unchanged by PLX-78: `CapabilitySet` still
+    // describes any 0..=8 tuple of markers, duplicates included. It is the
+    // *handle* that must be well formed, which is where the assertion lives.
+    assert!(has_duplicate_names(<Eight as CapabilitySet>::NAMES));
+}
+
+#[test]
+fn well_formed_sets_pay_nothing_for_the_check() {
+    // Construction, derivation and gating for every distinct-marker arity the
+    // four-marker vocabulary allows. Each `Client::unwired()` here forces
+    // `NO_DUPLICATES`, so this test failing to *compile* would be the signal
+    // that the check has started rejecting well-formed sets.
+    assert!(Client::<()>::callbacks().is_empty());
+    let _: Client<()> = Client::unwired();
+
+    let one: Client<(Permission,)> = Client::unwired();
+    assert!(matches!(
+        one.request_permission(PermissionRequest {
+            operation: "x".into(),
+            rationale: None
+        }),
+        Err(CallbackError::NotWired(_))
+    ));
+    assert_eq!(Client::<(Permission,)>::callbacks().len(), 1);
+
+    let two: Client<(Permission, FsRead)> = Client::default();
+    assert!(matches!(
+        two.fs_read(FsReadRequest { path: "p".into() }),
+        Err(CallbackError::NotWired("fs/read_text_file"))
+    ));
+    assert_eq!(Client::<(Permission, FsRead)>::callbacks().len(), 2);
+
+    let four: Client<(Permission, FsRead, FsWrite, Terminal)> = Client::unwired();
+    assert!(matches!(
+        four.terminal_create(TerminalCreateRequest {
+            command: "ls".into(),
+            args: vec![]
+        }),
+        Err(CallbackError::NotWired("terminal/create"))
+    ));
+    assert_eq!(
+        Client::<(Permission, FsRead, FsWrite, Terminal)>::capability_names(),
+        [
+            "session/request_permission",
+            "fs/read_text_file",
+            "fs/write_text_file",
+            "terminal/create",
+        ]
+    );
+
+    // Forcing the assertion by hand is legal and is a no-op for a good set.
+    let () = Client::<(Permission, FsRead, FsWrite, Terminal)>::NO_DUPLICATES;
+}
+
+#[test]
+fn no_duplicates_is_exactly_the_predicate_the_client_asserts() {
+    // The runtime shadow of the compile-time claim: whatever `NO_DUPLICATES`
+    // asserts for a `C`, `has_duplicate_names(C::NAMES)` agrees with. The
+    // negative half cannot live here — a `C` that fails the assertion cannot be
+    // named in a compiling program — so it is
+    // `tests/ui/duplicate_capability.rs`.
+    for (label, names) in [
+        ("()", <() as CapabilitySet>::NAMES),
+        ("(Permission,)", <(Permission,) as CapabilitySet>::NAMES),
+        (
+            "(Permission, FsRead, FsWrite, Terminal)",
+            <(Permission, FsRead, FsWrite, Terminal) as CapabilitySet>::NAMES,
+        ),
+    ] {
+        assert!(
+            !has_duplicate_names(names),
+            "{label} is well formed but reads as duplicated"
+        );
+    }
+}
+
 #[test]
 fn payload_types_round_trip() {
     let outcome = PermissionOutcome::Deny {

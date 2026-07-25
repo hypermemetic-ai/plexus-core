@@ -13,7 +13,7 @@ use super::markers::{
     Permission, PermissionOutcome, PermissionRequest, Terminal, TerminalCreateRequest,
     TerminalCreateResponse,
 };
-use super::set::{CapabilitySet, Has};
+use super::set::{has_duplicate_names, CapabilitySet, Has};
 
 /// Why a callback could not be completed.
 ///
@@ -123,17 +123,40 @@ where
     }
 }
 
-impl<C> Default for Client<C> {
+impl<C: CapabilitySet> Default for Client<C> {
     fn default() -> Self {
         Self::unwired()
     }
 }
 
-impl<C> Client<C> {
+impl<C: CapabilitySet> Client<C> {
+    /// A capability set is a **set**: each capability at most once.
+    ///
+    /// This const is `()` for every well-formed `C` and *fails to evaluate*
+    /// for a `C` that lists the same marker twice. Every path that uses a set
+    /// — [`unwired`](Self::unwired), [`new`](Self::new),
+    /// [`callbacks`](Self::callbacks), [`capability_names`](Self::capability_names),
+    /// and every gated accessor — forces it with `let () = Self::NO_DUPLICATES;`,
+    /// so `Client<(FsRead, FsRead)>` is rejected at the first place an author
+    /// touches it, with a message that names the actual mistake.
+    ///
+    /// Without it, `Client<(FsRead, FsRead)>` still failed — two [`Has`] impls
+    /// match, so the position index is ambiguous — but it failed talking about
+    /// type inference (PLX-77 residual #3).
+    ///
+    /// It is `pub` so it can be forced deliberately (`let () =
+    /// Client::<C>::NO_DUPLICATES;`) at a site of one's choosing; its value
+    /// carries no information.
+    pub const NO_DUPLICATES: () = assert!(
+        !has_duplicate_names(C::NAMES),
+        "duplicate capability: this Client's capability set lists the same capability more than once. A capability set is a set — each capability may appear at most once in the tuple (e.g. write Client<(FsRead,)>, not Client<(FsRead, FsRead)>)."
+    );
+
     /// A handle with no transport. Every accessor returns
     /// [`CallbackError::NotWired`]; the *typing* is unaffected, which is the
     /// only thing PLX-77 claims.
     pub fn unwired() -> Self {
+        let () = Self::NO_DUPLICATES;
         Self {
             transport: None,
             _set: PhantomData,
@@ -142,6 +165,7 @@ impl<C> Client<C> {
 
     /// A handle backed by a transport.
     pub fn new(transport: Arc<dyn CallbackTransport>) -> Self {
+        let () = Self::NO_DUPLICATES;
         Self {
             transport: Some(transport),
             _set: PhantomData,
@@ -192,11 +216,13 @@ impl<C: CapabilitySet> Client<C> {
     /// Same names and schemas the markers declare, in `C`'s declaration order.
     /// `Client<()>::callbacks()` is empty.
     pub fn callbacks() -> Vec<CallbackIr> {
+        let () = Self::NO_DUPLICATES;
         C::callbacks()
     }
 
     /// The wire names this handle declares, in declaration order.
     pub fn capability_names() -> Vec<&'static str> {
+        let () = Self::NO_DUPLICATES;
         C::names()
     }
 }
@@ -219,6 +245,7 @@ impl<C> Client<C> {
     where
         C: Has<Permission, I>,
     {
+        let () = Self::NO_DUPLICATES;
         self.issue::<Permission, _, _>(request)
     }
 
@@ -229,6 +256,7 @@ impl<C> Client<C> {
     where
         C: Has<FsRead, I>,
     {
+        let () = Self::NO_DUPLICATES;
         self.issue::<FsRead, _, _>(request)
     }
 
@@ -239,6 +267,7 @@ impl<C> Client<C> {
     where
         C: Has<FsWrite, I>,
     {
+        let () = Self::NO_DUPLICATES;
         self.issue::<FsWrite, _, _>(request)
     }
 
@@ -252,6 +281,7 @@ impl<C> Client<C> {
     where
         C: Has<Terminal, I>,
     {
+        let () = Self::NO_DUPLICATES;
         self.issue::<Terminal, _, _>(request)
     }
 }

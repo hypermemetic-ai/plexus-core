@@ -41,6 +41,17 @@
 //! - [`client`] — [`Client<C>`](Client) itself, with one gated accessor per
 //!   capability.
 //!
+//! # A set is a set (PLX-78)
+//!
+//! `Client<(FsRead, FsRead)>` is a malformed declaration, and it now says so:
+//! [`Client::NO_DUPLICATES`] is a const assertion over
+//! [`CapabilitySet::NAMES`], forced on every path that uses a set, so the error
+//! an author sees names the duplication instead of complaining about an
+//! ambiguous position index. A capability's *identity* is its wire name, and
+//! `declare_capabilities!` proves every declared name pairwise distinct with a
+//! crate-level `const _` assertion — so there is no second id to keep in sync
+//! and no way to add a marker that escapes the check.
+//!
 //! # Scope (PLX-76 `q-acp-callbacks`, PLX-77)
 //!
 //! The **typing** is real. The **transport** is not: without a
@@ -61,6 +72,6 @@ pub use client::{CallbackError, CallbackTransport, Client};
 pub use markers::{
     Capability, FsRead, FsReadRequest, FsReadResponse, FsWrite, FsWriteRequest, FsWriteResponse,
     Permission, PermissionOutcome, PermissionRequest, Terminal, TerminalCreateRequest,
-    TerminalCreateResponse,
+    TerminalCreateResponse, ALL_CAPABILITY_NAMES,
 };
-pub use set::{CapabilitySet, Has, Here, There};
+pub use set::{has_duplicate_names, CapabilitySet, Has, Here, There};

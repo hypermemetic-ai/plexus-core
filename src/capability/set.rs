@@ -40,13 +40,28 @@
 //! and rustc infers `I` from whichever impl matches. This is the same
 //! index-disambiguated selector `frunk` uses for heterogeneous lists.
 //!
-//! ## The one honest edge
+//! ## Duplicates (PLX-78)
 //!
 //! A tuple that lists the same marker twice — `Client<(FsRead, FsRead)>` — has
-//! two applicable impls with different indices, so `I` is ambiguous and the
-//! call fails to compile with a type-annotation error. A duplicated capability
-//! is a malformed declaration, so failing is correct; it is recorded here
-//! because the *message* is about inference rather than about duplication.
+//! two applicable [`Has`] impls with different indices, so `I` is ambiguous and
+//! an accessor call fails with a type-annotation error. Failing is correct — a
+//! capability set is a *set* — but "cannot infer type" is not a message an
+//! author can act on.
+//!
+//! So the malformedness is now detected directly, using the identity a
+//! capability already has: its wire name. Every set exposes its members' names
+//! as [`CapabilitySet::NAMES`], [`has_duplicate_names`] scans that slice in a
+//! `const fn`, and `Client<C>` hangs a
+//! [`NO_DUPLICATES`](super::client::Client::NO_DUPLICATES) const assertion on
+//! the result, forcing its evaluation on every path that uses a set. A
+//! duplicated capability now fails at compile time with a message that says
+//! so.
+//!
+//! Names are a sound identity precisely because
+//! [`declare_capabilities!`](super::markers) proves them pairwise distinct with
+//! a crate-level `const _` assertion — so "same name" can only ever mean "same
+//! capability", never "two capabilities that were given the same id by
+//! accident".
 //!
 //! # Derivation
 //!
@@ -61,6 +76,58 @@ use std::marker::PhantomData;
 use crate::ir::CallbackIr;
 
 use super::markers::{sealed, Capability};
+
+/// Are two wire names the same string, comparable in a `const fn`?
+///
+/// `==` on `&str` is not const on stable; byte comparison is.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Does this list of wire names contain the same name twice?
+///
+/// A capability's identity *is* its wire name (see [`Capability::NAME`]), so
+/// this is the whole duplicate test. `const fn`, because the point is to run
+/// it during compilation — over [`CapabilitySet::NAMES`] for a set, and over
+/// every declared marker for the distinctness proof in
+/// [`super::markers`](super::markers).
+///
+/// Quadratic and allocation-free: sets are 0..=8 long, and a naive scan is
+/// both fast enough and the only shape expressible without sorting in a const
+/// context.
+///
+/// ```
+/// use plexus_core::capability::{has_duplicate_names, Capability, FsRead, Permission};
+///
+/// assert!(!has_duplicate_names(&[Permission::NAME, FsRead::NAME]));
+/// assert!(has_duplicate_names(&[FsRead::NAME, FsRead::NAME]));
+/// assert!(!has_duplicate_names(&[]));
+/// ```
+pub const fn has_duplicate_names(names: &[&str]) -> bool {
+    let mut i = 0;
+    while i < names.len() {
+        let mut j = i + 1;
+        while j < names.len() {
+            if str_eq(names[i], names[j]) {
+                return true;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    false
+}
 
 /// Type-level index: position zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -79,6 +146,15 @@ pub struct There<I>(PhantomData<I>);
 pub trait CapabilitySet: sealed::Sealed {
     /// How many capabilities are in the set.
     const ARITY: usize;
+
+    /// Every member's wire name, in declaration order — the `const` twin of
+    /// [`names`](Self::names).
+    ///
+    /// The raw material for the compile-time duplicate check: because it is a
+    /// `const` rather than a function, [`has_duplicate_names`] can be evaluated
+    /// over it before the program runs. Deliberately *not* deduplicated — its
+    /// job is to make a duplicate visible, not to hide one.
+    const NAMES: &'static [&'static str];
 
     /// The IR descriptors for every capability in the set, in declaration
     /// order. Each comes from that marker's own
@@ -103,6 +179,8 @@ macro_rules! set_impl {
 
         impl<$($name: Capability),*> CapabilitySet for ($($name,)*) {
             const ARITY: usize = <[()]>::len(&[$(set_impl!(@unit $name)),*]);
+
+            const NAMES: &'static [&'static str] = &[$($name::NAME),*];
 
             fn callbacks() -> Vec<CallbackIr> {
                 vec![$($name::descriptor()),*]

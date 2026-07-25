@@ -23,6 +23,18 @@ pub(crate) mod sealed {
 /// a capability the IR does not know about.
 pub trait Capability: sealed::Sealed + Copy + Send + Sync + 'static {
     /// Wire name of the server-to-client request, e.g. `"fs/read_text_file"`.
+    ///
+    /// This is also the marker's **identity**. A capability set is a set, and
+    /// what makes two members "the same capability" is that they name the same
+    /// wire request — something the protocol already requires to be unique.
+    /// Deliberately *not* a separate numeric id: a second identity is a second
+    /// thing to keep in sync, and a marker added with a copy-pasted id would
+    /// make two genuinely different capabilities look like a duplicate. There
+    /// is nothing to forget here, because there is nothing extra to assign.
+    ///
+    /// Distinctness across all markers is proven at compile time inside
+    /// [`declare_capabilities!`]; the set-level check is
+    /// [`has_duplicate_names`](super::set::has_duplicate_names).
     const NAME: &'static str;
 
     /// The IR descriptor for this callback: name plus request/response schemas.
@@ -127,56 +139,88 @@ pub struct TerminalCreateResponse {
 // Markers
 // ===========================================================================
 
-/// Declares a marker type, seals it, and gives it its [`CallbackIr`].
-macro_rules! declare_capability {
-    (
+/// Declares **every** capability marker in one invocation.
+///
+/// One invocation, not one per marker, and that is the load-bearing part. The
+/// macro sees the whole list at once, so besides declaring each marker type,
+/// sealing it and giving it its [`CallbackIr`], it can emit a single crate-level
+///
+/// ```text
+/// const _: () = assert!(!has_duplicate_names(&[ /* every wire name */ ]), "...");
+/// ```
+///
+/// A `const _` item is evaluated whenever the crate is compiled — it is not
+/// generic, so nothing has to *use* it. Adding a marker whose wire name
+/// collides with an existing one therefore fails `cargo build` of
+/// `plexus-core` itself, before any downstream crate is involved. There is no
+/// separate registry and no unit test that someone could add a marker without
+/// updating: the only way to declare a capability is to add a line here, and
+/// adding a line here is what feeds the assertion.
+///
+/// This is what lets [`Capability::NAME`] serve as the marker's identity for
+/// the set-level duplicate check in [`super::set`].
+macro_rules! declare_capabilities {
+    ( $(
         $(#[$meta:meta])*
-        $name:ident => $wire:literal, $req:ty as $req_name:literal, $resp:ty as $resp_name:literal
-    ) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-        pub struct $name;
+        $name:ident => $wire:literal, $req:ty as $req_name:literal, $resp:ty as $resp_name:literal;
+    )+ ) => {
+        $(
+            $(#[$meta])*
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+            pub struct $name;
 
-        impl sealed::Sealed for $name {}
+            impl sealed::Sealed for $name {}
 
-        impl Capability for $name {
-            const NAME: &'static str = $wire;
+            impl Capability for $name {
+                const NAME: &'static str = $wire;
 
-            fn descriptor() -> CallbackIr {
-                CallbackIr::new(
-                    $wire,
-                    schema_ref::<$req>($req_name),
-                    schema_ref::<$resp>($resp_name),
-                )
+                fn descriptor() -> CallbackIr {
+                    CallbackIr::new(
+                        $wire,
+                        schema_ref::<$req>($req_name),
+                        schema_ref::<$resp>($resp_name),
+                    )
+                }
             }
-        }
+        )+
+
+        /// Every declared marker's wire name, in declaration order.
+        ///
+        /// Exists so the distinctness proof below has something to range over,
+        /// and so tests can enumerate the marker set without a hand-maintained
+        /// second list.
+        pub const ALL_CAPABILITY_NAMES: &[&str] = &[$($wire),*];
+
+        // The proof. Not a test — a `const _` item, evaluated on every build of
+        // this crate. Two markers with the same wire name is a contradiction in
+        // terms (they would be the same callback), and it would additionally
+        // make two genuinely different capabilities read as a duplicate to the
+        // set-level check. So it cannot be allowed to compile.
+        const _: () = assert!(
+            !crate::capability::set::has_duplicate_names(ALL_CAPABILITY_NAMES),
+            "two capability markers declare the same wire name. A marker's wire name is its identity: it must be unique across every capability declared in `declare_capabilities!`."
+        );
     };
 }
 
-declare_capability! {
+declare_capabilities! {
     /// Ask the client to approve an operation (`session/request_permission`).
     Permission => "session/request_permission",
     PermissionRequest as "PermissionRequest",
-    PermissionOutcome as "PermissionOutcome"
-}
+    PermissionOutcome as "PermissionOutcome";
 
-declare_capability! {
     /// Read a text file through the client (`fs/read_text_file`).
     FsRead => "fs/read_text_file",
     FsReadRequest as "FsReadRequest",
-    FsReadResponse as "FsReadResponse"
-}
+    FsReadResponse as "FsReadResponse";
 
-declare_capability! {
     /// Write a text file through the client (`fs/write_text_file`).
     FsWrite => "fs/write_text_file",
     FsWriteRequest as "FsWriteRequest",
-    FsWriteResponse as "FsWriteResponse"
-}
+    FsWriteResponse as "FsWriteResponse";
 
-declare_capability! {
     /// Create a terminal on the client (`terminal/create`).
     Terminal => "terminal/create",
     TerminalCreateRequest as "TerminalCreateRequest",
-    TerminalCreateResponse as "TerminalCreateResponse"
+    TerminalCreateResponse as "TerminalCreateResponse";
 }

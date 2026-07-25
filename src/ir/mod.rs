@@ -1,0 +1,86 @@
+//! The plexus activation IR (PLX-75 / M1·A) — the vNext spine.
+//!
+//! # What this is
+//!
+//! One recursive, serializable document describing a whole activation tree:
+//! [`ActivationIr`] with [`MethodIr`]s and [`ChildEdge`]s, hashed as a Merkle
+//! tree so any node can be cached and invalidated independently.
+//!
+//! # What it replaces, and why
+//!
+//! `plexus::MethodSchema` / `plexus::PluginSchema` (`src/plexus/schema.rs`) are
+//! **shallow**: a child appears only as a `ChildSummary` of
+//! `{namespace, description, hash}`. A client that wants to know a child's
+//! methods must make another `.schema` call — one network round-trip *per tree
+//! level*. That is the drill-down bug class PLX-73 set out to delete, and it is
+//! why [`ChildEdge::Static`] embeds the whole subtree.
+//!
+//! The three recursion mechanisms that were previously indistinguishable on the
+//! wire — compile-time `#[child]`, runtime `DynamicHub::register`, and indexed
+//! `session/{id}` families — become three explicit [`ChildEdge`] variants, each
+//! carrying exactly what a client needs to act without another fetch.
+//!
+//! Similarly, the two distinct structs both named `HubMethodAttrs` plus
+//! `MethodInfo` collapse into one [`MethodIr`].
+//!
+//! # What this build deliberately does NOT do
+//!
+//! These are **inert data types**. There is no parser, no `quote!`, no codegen,
+//! no dispatch, and no auth wiring here — those are M1·B/C/D/E/J.
+//!
+//! There is also **no conversion to or from `MethodSchema`/`PluginSchema`**.
+//! The two representations coexist without adapters, on purpose: PLX-73
+//! `q-migration-bridge` decided against shims (the in-tree evidence being that
+//! plexus-macros 0.6 still ships `#[deprecated(since = "0.5.0")]` aliases a full
+//! generation later). `schema.rs` is untouched and keeps working for substrate
+//! and hyperforge until their own cuts in M2+.
+//!
+//! # Hashing
+//!
+//! See [`hash`] for the full algorithm. In one line: each node's `hash` is a
+//! SHA-256 over its own content folded with its methods' and children's hashes,
+//! so mutating a leaf changes that leaf, every ancestor, and the document's
+//! [`ActivationIr::ir_hash`] — and nothing else. Call
+//! [`ActivationIr::recompute_hashes`] on the root.
+//!
+//! # The no-silent-degradation rule
+//!
+//! Every type reference in the IR is a [`SchemaRef`]: a validated pair of
+//! canonical type name and resolved JSON Schema, with a private constructor.
+//! It replaces `BidirType::Custom`, which stored type *names* as strings and
+//! re-parsed them with a fallback that silently degraded an unresolvable type
+//! to `()`. A `SchemaRef` cannot be empty, cannot be uninformative, and can
+//! never denote `()` — which is what makes
+//! [`MethodShape::Bidirectional`]'s non-optional `request`/`response` fields a
+//! compile-time guarantee instead of a convention.
+//!
+//! # Example
+//!
+//! ```rust
+//! use plexus_core::ir::{ActivationIr, ChildEdge, MethodIr};
+//!
+//! let mut ir = ActivationIr::new("claudecode", "1.0.0")
+//!     .with_backend_name("substrate")
+//!     .with_respond_method("respond")
+//!     .with_method(MethodIr::new("list", "claudecode.list"))
+//!     .with_child(ChildEdge::Dynamic {
+//!         namespace: "jsexec".into(),
+//!         hash: "deadbeef".into(),
+//!         description: "runtime-registered".into(),
+//!     });
+//!
+//! ir.recompute_hashes();
+//! assert!(ir.ir_hash.is_some());
+//! ```
+
+pub mod hash;
+mod types;
+
+#[cfg(test)]
+mod tests;
+
+pub use hash::Hasher;
+pub use types::{
+    ActivationIr, AuthRequirementIr, ChildEdge, DeprecationIr, HttpMethodIr, MethodIr, MethodShape,
+    ParamIr, SchemaRef, SchemaRefError, IR_VERSION,
+};

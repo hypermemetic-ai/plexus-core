@@ -29,6 +29,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod activations;
 pub mod builder;
+/// Namespaced identity (`Principal`) — PLX-75.
+pub mod identity;
+/// The vNext activation IR (`ActivationIr` / `MethodIr` / `ChildEdge`) — PLX-75.
+pub mod ir;
 pub mod mcp_bridge;
 pub mod plexus;
 pub mod plugin_system;

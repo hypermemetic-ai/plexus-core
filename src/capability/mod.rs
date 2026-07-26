@@ -52,6 +52,17 @@
 //! crate-level `const _` assertion — so there is no second id to keep in sync
 //! and no way to add a marker that escapes the check.
 //!
+//! # Declaration is use (PLX-102)
+//!
+//! The set an author writes in a signature and the set their handler mints are
+//! now one type, not two that agree by convention: [`Declares`] is the
+//! identity bound that
+//! [`Turn<C>::client`](crate::runtime::Turn::client) carries, and
+//! [`DeclaredHandler`](crate::runtime::DeclaredHandler) is what derives both a
+//! method's [`CallbackIr`](crate::ir::CallbackIr)s and its handler's
+//! `Client<C>` from the same `C`. Read [`crate::runtime::declared`] for the
+//! seam this closed.
+//!
 //! # Scope (PLX-76 `q-acp-callbacks`, PLX-77)
 //!
 //! The **typing** is real. The **transport** is not: without a
@@ -74,4 +85,4 @@ pub use markers::{
     Permission, PermissionOutcome, PermissionRequest, Terminal, TerminalCreateRequest,
     TerminalCreateResponse, ALL_CAPABILITY_NAMES,
 };
-pub use set::{has_duplicate_names, CapabilitySet, Has, Here, There};
+pub use set::{has_duplicate_names, CapabilitySet, Declares, Has, Here, There};

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PLX-102: a handler may mint only the capability set its method declares.**
+  - `TurnContext::client<C: CapabilitySet>()` had `C` entirely free: a handler
+    serving a method that declared `(FsRead,)` could write
+    `turn.client::<(FsWrite,)>()` and get a working accessor. The callback then
+    failed at the transport (the runtime pre-flight had checked the peer against
+    the *declared* set), so this was a guarantee gap rather than a permission
+    hole — but a runtime one, in a design whose point is that this class of
+    mistake is a compile error. The guarantee was carried by a doc comment.
+  - **BREAKING**: `TurnContext::client` is gone. A capability handle now comes
+    from `Turn<C>::client()`, and the only way to obtain a `Turn<C>` is
+    `runtime::DeclaredHandler`, which derives the method's `MethodIr::callbacks`
+    *and* the handler's `Client<C>` from one `C` at one site. `turn.client()`
+    infers the declared set; naming any other set fails to compile with a
+    message that names both sets (`capability::Declares` +
+    `#[diagnostic::on_unimplemented]`), pinned by
+    `tests/ui/widened_capability_set.rs`.
+  - Migration: `ErasedHandler::new(|input| { let c = input.turn.client::<C>(); .. })`
+    plus `method.with_callbacks(Client::<C>::callbacks())` becomes
+    `let h = DeclaredHandler::new::<C, _, _>(|input| { let c = input.turn.client(); .. });`
+    with `h.declare(method)` and `h.into_handler()`. Handlers that issue no
+    callbacks are unaffected.
+
 - **PLX-101: `Cargo.lock` is now committed, and benchmarks print their resolution.**
   - `.gitignore` no longer ignores `Cargo.lock`. This crate's benchmarks are
     decision inputs (decision gate 2, PLX-88's attribution table), and until now

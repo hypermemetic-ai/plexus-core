@@ -32,7 +32,6 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::capability::{CapabilitySet, Client};
 use crate::ir::{MethodIr, StopDetail, StopReason};
 use crate::request::RawRequestContext;
 
@@ -272,20 +271,21 @@ impl TurnContext {
         self.inner.update_seq.load(Ordering::SeqCst)
     }
 
-    /// A capability handle wired to this turn's callback transport.
+    /// This turn's callback transport.
     ///
-    /// `C` is chosen **at the call site**, which is what preserves PLX-77's
-    /// guarantee end to end: the handler asks for exactly the capability set
-    /// its method signature declares, `Client<C>`'s gated accessors are the
-    /// only way to use them, and `Client::<C>::callbacks()` derives the very
-    /// same [`MethodIr::callbacks`] the runtime pre-flight-checked against the
-    /// peer. Nothing here erases or widens `C`.
+    /// Deliberately `pub(crate)` and deliberately *not* a `Client<C>` factory.
+    /// This accessor used to be `pub fn client<C: CapabilitySet>(&self) ->
+    /// Client<C>` with `C` free, and a doc comment claiming the guarantee
+    /// survived because "the handler asks for exactly the capability set its
+    /// method signature declares" — usage, not a constraint. A handler serving
+    /// a method that declared `(FsRead,)` could mint `Client<(FsWrite,)>` and
+    /// only find out at the transport.
     ///
-    /// Use the `*_async` accessors — see
-    /// [`CallbackTransport`](crate::capability::CallbackTransport) for why the
-    /// synchronous ones cannot serve a correlated response.
-    pub fn client<C: CapabilitySet>(&self) -> Client<C> {
-        Client::new(self.inner.transport.clone())
+    /// Minting is now [`Turn<C>::client`](super::Turn::client), where `C` is
+    /// the set the method declared and no other set typechecks. See
+    /// [`super::declared`] (PLX-102).
+    pub(crate) fn transport(&self) -> Arc<dyn crate::capability::CallbackTransport> {
+        self.inner.transport.clone()
     }
 }
 

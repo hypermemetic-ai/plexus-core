@@ -32,7 +32,9 @@ pub mod builder;
 /// Typed capability handles (`Client<C>`) — PLX-77. The handle's type is the
 /// method's callback declaration.
 pub mod capability;
-/// Namespaced identity (`Principal`) — PLX-75.
+/// Namespaced identity (`Principal`) — PLX-75, re-exported from
+/// `plexus_auth_core::identity` since PLX-87 collapsed the two definitions
+/// into one in the lower crate. The path is unchanged for consumers.
 pub mod identity;
 /// The vNext activation IR (`ActivationIr` / `MethodIr` / `ChildEdge`) — PLX-75.
 pub mod ir;

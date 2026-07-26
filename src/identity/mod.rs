@@ -1,4 +1,4 @@
-//! Namespaced identity for plexus vNext (PLX-75 / M1·A).
+//! Namespaced identity for plexus vNext (PLX-75 / M1·A, PLX-87).
 //!
 //! # Why a namespaced subject
 //!
@@ -18,15 +18,35 @@
 //! *admits* a principal to a tenant (membership as a record), not with who it
 //! is.
 //!
+//! # Where the type actually lives, and why this module is a re-export
+//!
+//! PLX-75 defined the type *here*, in plexus-core. PLX-82 then found that
+//! placement unusable where the type is most needed: **plexus-core depends on
+//! plexus-auth-core and never the reverse** — that inversion is the entire
+//! point of the auth-core crate — and [`AuthContext`] lives in auth-core, so
+//! auth-core could not name a plexus-core type. It mirrored the definition
+//! instead, and an equivalence test in plexus-idp held the two copies in step.
+//!
+//! Two definitions of one concept, kept in sync by a test, is a drift hazard:
+//! a test catches divergence only after someone writes it. PLX-87 therefore
+//! moved the single definition **down** to [`plexus_auth_core::identity`] —
+//! the lowest crate that everything else can see — and this module became a
+//! re-export of it. `plexus_core::identity::Principal` is unchanged as a
+//! public path and unchanged in grammar, validation, and wire form; it is now
+//! literally the same type as `plexus_auth_core::identity::Principal`, so
+//! they cannot disagree.
+//!
 //! # Naming note
 //!
-//! `plexus_core::plexus::Principal` (re-exported from `plexus-auth-core`) is a
+//! `plexus_core::plexus::Principal` (re-exported from plexus-auth-core) is a
 //! **different, pre-existing** type: a sealed `Anonymous | User | Service`
-//! caller-stamp enum. It is untouched by PLX-75. This one is reached as
-//! `plexus_core::identity::Principal` and is never re-exported at the crate
-//! root, so neither name shadows the other. Reconciling the two is M1·J's job
-//! (`AuthContext` carries a `Principal` instead of a bare `user_id`).
+//! caller-stamp enum, untouched by PLX-75, PLX-82, and PLX-87. The
+//! subject-name type is reached as `plexus_core::identity::Principal` and is
+//! never re-exported at the crate root, so neither name shadows the other.
+//! `plexus_auth_core::principal::Principal::subject()` is the bridge that
+//! states the relationship in code: a caller-stamp of `User(..)` names an
+//! actor whose subject is one of these.
+//!
+//! [`AuthContext`]: plexus_auth_core::AuthContext
 
-mod principal;
-
-pub use principal::{Issuer, Principal, PrincipalParseError};
+pub use plexus_auth_core::identity::{Issuer, Principal, PrincipalParseError};

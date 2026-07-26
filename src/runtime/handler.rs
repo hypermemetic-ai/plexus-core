@@ -306,24 +306,46 @@ pub struct HandlerInput {
 /// The future an [`ErasedHandler`] returns.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<TurnOutcome, TurnError>> + Send>>;
 
-/// One method's implementation, type-erased.
+/// One method's implementation, type-erased over the activation state `S`.
 ///
-/// The state a handler needs (`Arc<S>`, config, pools) is **captured** by the
-/// closure at table-construction time rather than threaded through this
-/// signature. That keeps the seam narrow — one parameter, one return type —
-/// and it is what makes the table buildable by a macro that knows nothing about
-/// the runtime beyond these two types.
-#[derive(Clone)]
-pub struct ErasedHandler(Arc<dyn Fn(HandlerInput) -> HandlerFuture + Send + Sync + 'static>);
+/// # State is a parameter, not a capture (PLX-97)
+///
+/// PLX-73's `q-dispatch-representation` specified
+/// `Fn(Arc<S>, Value, AuthCtxOpt, RawCtxOpt) -> …` — **state passed in**.
+/// PLX-80 narrowed that to captured state, which is a strictly narrower seam
+/// and works whenever the table is built from owned state. It does *not* work
+/// for the construction the macro switchover needs: a handler built inside
+/// `Activation::call(&self, …)` that calls `self.method(…)`. A closure
+/// capturing `&'a self` cannot produce the `'static` future the turn's stream
+/// outlives, so that construction fails with `E0521: borrowed data escapes
+/// outside of method` — and no amount of restructuring the turn loop changes
+/// it, because [`super::entry`] returns a stream that lives past the borrow.
+///
+/// Threading the state through the call restores PLX-73's shape and closes the
+/// seam: the closure captures **nothing**, so it is `'static` no matter where
+/// it is constructed, and the only owned thing anyone needs is one `Arc<S>` —
+/// obtained without requiring `S: Clone`.
+///
+/// `S` defaults to `()`, so a handler that needs no activation state is written
+/// exactly as before with [`ErasedHandler::new`].
+pub struct ErasedHandler<S = ()>(
+    Arc<dyn Fn(Arc<S>, HandlerInput) -> HandlerFuture + Send + Sync + 'static>,
+);
 
-impl std::fmt::Debug for ErasedHandler {
+impl<S> Clone for ErasedHandler<S> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<S> std::fmt::Debug for ErasedHandler<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ErasedHandler(..)")
     }
 }
 
-impl ErasedHandler {
-    /// Erase an async closure into a handler.
+impl ErasedHandler<()> {
+    /// Erase a stateless async closure into a handler.
     ///
     /// ```
     /// use plexus_core::runtime::{ErasedHandler, TurnOutcome};
@@ -340,13 +362,59 @@ impl ErasedHandler {
         F: Fn(HandlerInput) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<TurnOutcome, TurnError>> + Send + 'static,
     {
-        Self(Arc::new(move |input| Box::pin(f(input))))
+        Self(Arc::new(move |_state, input| Box::pin(f(input))))
     }
 
-    /// Invoke the handler.
+    /// Invoke a stateless handler.
     pub fn call(&self, input: HandlerInput) -> HandlerFuture {
-        (self.0)(input)
+        (self.0)(unit_state(), input)
     }
+}
+
+impl<S: Send + Sync + 'static> ErasedHandler<S> {
+    /// Erase an async closure that is handed the activation's state.
+    ///
+    /// The closure receives `Arc<S>` as its first argument, so it may be — and
+    /// for the macro switchover *is* — a closure that captures nothing at all.
+    /// That is what makes it constructible from inside `&self` methods.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use plexus_core::runtime::{ErasedHandler, TurnOutcome, decode_params};
+    ///
+    /// // Deliberately not `Clone`.
+    /// struct Service { factor: u32 }
+    /// impl Service {
+    ///     async fn scale(&self, n: u32) -> u32 { n * self.factor }
+    /// }
+    ///
+    /// let handler = ErasedHandler::<Service>::stateful(|me, input| async move {
+    ///     let n: u32 = decode_params(input.params)?;
+    ///     TurnOutcome::serialize(&me.scale(n).await)
+    /// });
+    /// # let _ = handler;
+    /// ```
+    pub fn stateful<F, Fut>(f: F) -> Self
+    where
+        F: Fn(Arc<S>, HandlerInput) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<TurnOutcome, TurnError>> + Send + 'static,
+    {
+        Self(Arc::new(move |state, input| Box::pin(f(state, input))))
+    }
+
+    /// Invoke the handler against a state handle.
+    pub fn call_with(&self, state: Arc<S>, input: HandlerInput) -> HandlerFuture {
+        (self.0)(state, input)
+    }
+}
+
+/// The shared `Arc<()>` every stateless turn passes.
+///
+/// `Arc::new(())` still allocates an `ArcInner`; a turn should not pay for a
+/// state it does not have, so the unit state is created once and cloned.
+pub(crate) fn unit_state() -> Arc<()> {
+    static UNIT: std::sync::OnceLock<Arc<()>> = std::sync::OnceLock::new();
+    UNIT.get_or_init(|| Arc::new(())).clone()
 }
 
 // ===========================================================================
@@ -355,22 +423,53 @@ impl ErasedHandler {
 
 /// Name → handler. The whole of dispatch.
 ///
-/// Built from `Vec<(&'static str, ErasedHandler)>` — the exact shape PLX-73's
+/// Built from `Vec<(&'static str, ErasedHandler<S>)>` — the exact shape PLX-73's
 /// sketch named — and indexed once at construction so lookup is a hash probe
 /// rather than a linear scan over method names.
-#[derive(Clone, Debug, Default)]
-pub struct HandlerTable {
-    by_name: HashMap<&'static str, ErasedHandler>,
+///
+/// `S` is the activation state the handlers are called with; it defaults to
+/// `()` for tables whose handlers need none.
+pub struct HandlerTable<S = ()> {
+    by_name: HashMap<&'static str, ErasedHandler<S>>,
     order: Vec<&'static str>,
 }
 
-impl HandlerTable {
+// Hand-written rather than derived: a derive would demand `S: Clone`/`S: Debug`
+// /`S: Default`, none of which a table actually needs — it only ever holds
+// `Arc`-shaped closures over `S`.
+impl<S> Clone for HandlerTable<S> {
+    fn clone(&self) -> Self {
+        Self {
+            by_name: self.by_name.clone(),
+            order: self.order.clone(),
+        }
+    }
+}
+
+impl<S> std::fmt::Debug for HandlerTable<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandlerTable")
+            .field("order", &self.order)
+            .finish()
+    }
+}
+
+impl<S> Default for HandlerTable<S> {
+    fn default() -> Self {
+        Self {
+            by_name: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+}
+
+impl<S> HandlerTable<S> {
     /// Build a table.
     ///
     /// A duplicate name keeps the **last** entry, matching how a `match` arm
     /// list would behave if it could contain duplicates at all; [`Self::order`]
     /// records each name once, in first-seen order.
-    pub fn new(entries: impl IntoIterator<Item = (&'static str, ErasedHandler)>) -> Self {
+    pub fn new(entries: impl IntoIterator<Item = (&'static str, ErasedHandler<S>)>) -> Self {
         let mut by_name = HashMap::new();
         let mut order = Vec::new();
         for (name, handler) in entries {
@@ -382,7 +481,7 @@ impl HandlerTable {
     }
 
     /// Look up a handler by method name.
-    pub fn get(&self, name: &str) -> Option<&ErasedHandler> {
+    pub fn get(&self, name: &str) -> Option<&ErasedHandler<S>> {
         self.by_name.get(name)
     }
 
@@ -407,14 +506,14 @@ impl HandlerTable {
     }
 }
 
-impl FromIterator<(&'static str, ErasedHandler)> for HandlerTable {
-    fn from_iter<T: IntoIterator<Item = (&'static str, ErasedHandler)>>(iter: T) -> Self {
+impl<S> FromIterator<(&'static str, ErasedHandler<S>)> for HandlerTable<S> {
+    fn from_iter<T: IntoIterator<Item = (&'static str, ErasedHandler<S>)>>(iter: T) -> Self {
         Self::new(iter)
     }
 }
 
-impl From<Vec<(&'static str, ErasedHandler)>> for HandlerTable {
-    fn from(v: Vec<(&'static str, ErasedHandler)>) -> Self {
+impl<S> From<Vec<(&'static str, ErasedHandler<S>)>> for HandlerTable<S> {
+    fn from(v: Vec<(&'static str, ErasedHandler<S>)>) -> Self {
         Self::new(v)
     }
 }

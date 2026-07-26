@@ -61,12 +61,31 @@ plexus-macros = { path = "../plexus-macros", version = "0.6.0" }
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.2" }
 
+[features]
+# PLX-88 measurement scaffolding only. Gates `runtime::profile`, the staged
+# ablation ladder that `benches/turn_profile.rs` and `examples/turn_alloc.rs`
+# need in order to build prefixes of `runtime::entry` out of its `pub(crate)`
+# components. Off by default; nothing in a shipped build compiles it.
+profiling = []
+
 [[bench]]
 # PLX-74 decision gate 2 / PLX-80: erased-closure dispatch vs the generated
 # string match on a ~19-method fixture. `harness = false` because criterion
 # supplies its own.
 name = "dispatch"
 harness = false
+
+[[bench]]
+# PLX-88: where the turn's ~7.5us goes. Needs the `profiling` feature for the
+# staged ladder.
+name = "turn_profile"
+harness = false
+required-features = ["profiling"]
+
+[[example]]
+# PLX-88: allocations per turn (count and bytes) under dhat.
+name = "turn_alloc"
+required-features = ["profiling"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -90,3 +109,4 @@ trybuild = "1.0"
 # values. Added by AUTHZ-CRED-CORE-1B as part of wiring CRED-CORE-2's
 # deferred end-to-end ACs (#1, #2 full, #4 end-to-end, #5 end-to-end).
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.2", features = ["test-support"] }
+dhat = "0.3"

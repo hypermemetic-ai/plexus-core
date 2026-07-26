@@ -50,12 +50,28 @@ pub enum CallbackError {
     },
 }
 
-/// The seam a later build fills in with real server-to-client correlation.
+/// The seam PLX-77 left open and PLX-80 filled: JSON-in/JSON-out delivery of
+/// one server-to-client request.
 ///
-/// Intentionally JSON-in/JSON-out and intentionally *not* async: PLX-77 must
-/// not decide the async shape of callback delivery, which belongs to build C
-/// along with the turn's cancellation token. Nothing in this crate implements
-/// it — `Client` works, and gates correctly, with no transport at all.
+/// # The two halves, and why there are two
+///
+/// [`call`](Self::call) is PLX-77's original synchronous seam. It is unchanged:
+/// every existing implementation, every `Client<C>` accessor built on it, and
+/// the trybuild fixtures that pin the compile-time capability gating keep
+/// working byte for byte.
+///
+/// [`call_async`](Self::call_async) is PLX-80's addition, and it is the shape
+/// real turn-scoped delivery needs — a callback *awaits* a correlated response
+/// that arrives on the turn's event stream, and there is no way to serve that
+/// from a `fn -> Result<..>` except by blocking a runtime worker. It has a
+/// default implementation that delegates to `call`, so a transport that really
+/// is synchronous (an in-memory test double, a stub) implements one method and
+/// gets both. `plexus_core::runtime::TurnTransport` overrides it.
+///
+/// The alternative — making the whole trait and every `Client<C>` accessor
+/// async — was rejected because it would have changed a compile-time surface
+/// that PLX-77/78 deliberately pinned with `.stderr` fixtures, for no gain
+/// beyond a nicer method name.
 pub trait CallbackTransport: Send + Sync + 'static {
     /// Issue one server-to-client request and return its response.
     fn call(
@@ -63,6 +79,18 @@ pub trait CallbackTransport: Send + Sync + 'static {
         callback: &CallbackIr,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, String>;
+
+    /// Issue one server-to-client request and **await** its response.
+    ///
+    /// The default delegates to [`call`](Self::call), which is correct for any
+    /// transport that can answer without waiting.
+    fn call_async<'a>(
+        &'a self,
+        callback: &'a CallbackIr,
+        request: serde_json::Value,
+    ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
+        Box::pin(async move { self.call(callback, request) })
+    }
 }
 
 /// The injected handle through which a method issues server-to-client requests.
@@ -207,6 +235,40 @@ impl<C: CapabilitySet> Client<C> {
             message: e.to_string(),
         })
     }
+
+    /// The awaiting twin of [`issue`](Self::issue) — identical encode/decode,
+    /// identical error mapping, delivery through
+    /// [`CallbackTransport::call_async`].
+    async fn issue_async<M, Req, Resp>(&self, request: Req) -> Result<Resp, CallbackError>
+    where
+        M: Capability,
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or(CallbackError::NotWired(M::NAME))?;
+
+        let payload = serde_json::to_value(request).map_err(|e| CallbackError::Payload {
+            callback: M::NAME,
+            message: e.to_string(),
+        })?;
+
+        let descriptor = M::descriptor();
+        let raw = transport
+            .call_async(&descriptor, payload)
+            .await
+            .map_err(|message| CallbackError::Transport {
+                callback: M::NAME,
+                message,
+            })?;
+
+        serde_json::from_value(raw).map_err(|e| CallbackError::Payload {
+            callback: M::NAME,
+            message: e.to_string(),
+        })
+    }
 }
 
 impl<C: CapabilitySet> Client<C> {
@@ -283,5 +345,78 @@ impl<C> Client<C> {
     {
         let () = Self::NO_DUPLICATES;
         self.issue::<Terminal, _, _>(request)
+    }
+}
+
+// ===========================================================================
+// The awaiting accessors (PLX-80)
+// ===========================================================================
+//
+// One per capability, carrying **exactly** the `Has<M, I>` bound its
+// synchronous twin carries. The capability typing is therefore identical: an
+// undeclared capability has no accessor in either flavour, and PLX-78's
+// duplicate-set assertion is forced on both.
+//
+// The `_async` suffix is a wart, and a deliberate one: the synchronous names
+// are load-bearing for PLX-77/78's compile-fail fixtures, so renaming or
+// re-signaturing them would have meant editing tests this build is required to
+// leave unmodified. See `CallbackTransport` for the full reasoning.
+
+impl<C> Client<C> {
+    /// Ask the client to approve an operation, awaiting its answer.
+    ///
+    /// Requires [`Permission`] in `C`. This is the accessor a turn-scoped
+    /// handler uses; see [`crate::runtime`].
+    pub async fn request_permission_async<I>(
+        &self,
+        request: PermissionRequest,
+    ) -> Result<PermissionOutcome, CallbackError>
+    where
+        C: Has<Permission, I>,
+    {
+        let () = Self::NO_DUPLICATES;
+        self.issue_async::<Permission, _, _>(request).await
+    }
+
+    /// Read a text file through the client, awaiting the content.
+    ///
+    /// Requires [`FsRead`] in `C`.
+    pub async fn fs_read_async<I>(
+        &self,
+        request: FsReadRequest,
+    ) -> Result<FsReadResponse, CallbackError>
+    where
+        C: Has<FsRead, I>,
+    {
+        let () = Self::NO_DUPLICATES;
+        self.issue_async::<FsRead, _, _>(request).await
+    }
+
+    /// Write a text file through the client, awaiting acknowledgement.
+    ///
+    /// Requires [`FsWrite`] in `C`.
+    pub async fn fs_write_async<I>(
+        &self,
+        request: FsWriteRequest,
+    ) -> Result<FsWriteResponse, CallbackError>
+    where
+        C: Has<FsWrite, I>,
+    {
+        let () = Self::NO_DUPLICATES;
+        self.issue_async::<FsWrite, _, _>(request).await
+    }
+
+    /// Create a terminal on the client, awaiting its handle.
+    ///
+    /// Requires [`Terminal`] in `C`.
+    pub async fn terminal_create_async<I>(
+        &self,
+        request: TerminalCreateRequest,
+    ) -> Result<TerminalCreateResponse, CallbackError>
+    where
+        C: Has<Terminal, I>,
+    {
+        let () = Self::NO_DUPLICATES;
+        self.issue_async::<Terminal, _, _>(request).await
     }
 }

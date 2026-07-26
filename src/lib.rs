@@ -40,6 +40,10 @@ pub mod mcp_bridge;
 pub mod plexus;
 pub mod plugin_system;
 pub mod request;
+/// The vNext turn runtime (`entry` / `ErasedHandler` / `TurnContext` /
+/// `CancellationToken`) — PLX-80. Additive alongside the existing
+/// `Activation`/`DynamicHub` dispatch path.
+pub mod runtime;
 pub mod serde_helpers;
 pub mod types;
 

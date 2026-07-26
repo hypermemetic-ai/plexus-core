@@ -61,8 +61,21 @@ plexus-macros = { path = "../plexus-macros", version = "0.6.0" }
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.2" }
 
+[[bench]]
+# PLX-74 decision gate 2 / PLX-80: erased-closure dispatch vs the generated
+# string match on a ~19-method fixture. `harness = false` because criterion
+# supplies its own.
+name = "dispatch"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
+
+# Decision gate 2's measurement harness (PLX-80 acceptance criterion 7). The
+# gate is stated as a p50 comparison against a reference method, which needs
+# real statistics rather than a wall-clock loop. dev-dependency only — nothing
+# in the shipped crate links it.
+criterion = { version = "0.5", features = ["async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
 

@@ -248,5 +248,15 @@ async fn non_schema_dispatch_passes_through() {
             _ => None,
         })
         .collect();
-    assert_eq!(data, vec![&serde_json::json!("plain")]);
+    // PLX-91 turn projection: a turn emits its updates and then exactly one
+    // terminal carrying a StopReason (RFC 002 §6.1). Before the switchover this
+    // method emitted one Data frame and Done; it now emits the update frame plus
+    // a terminal frame. Assert the update, and that the turn terminated cleanly.
+    assert_eq!(data.len(), 2, "update + terminal, per RFC 002 §6.1");
+    assert_eq!(data[0], &serde_json::json!("plain"));
+    assert_eq!(
+        data[1]["stop"]["kind"],
+        serde_json::json!("complete"),
+        "the terminal must report a StopReason"
+    );
 }

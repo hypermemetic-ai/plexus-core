@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PLX-101: `Cargo.lock` is now committed, and benchmarks print their resolution.**
+  - `.gitignore` no longer ignores `Cargo.lock`. This crate's benchmarks are
+    decision inputs (decision gate 2, PLX-88's attribution table), and until now
+    every one of them was measured against a resolution nobody recorded.
+  - Both bench binaries emit a resolution banner — lock fingerprint, toolchain,
+    host, profile, and the perf-relevant resolved versions — before the first
+    measurement, and write it to `target/criterion/resolution-<bench>.txt`. See
+    `benches/common/resolution.rs`.
+  - Committing the lock pins **only this crate's own** builds/tests/benches. The
+    manifest still declares `tokio = "1.0"`; cargo ignores a dependency's lock,
+    so nothing changes for consumers of `plexus-core`.
+  - New `docs/benchmarking.md` records the finding that prompted this: a
+    current-thread `block_on(yield_now())` costs 845 ns on tokio 1.49.0 and
+    12,736 ns on tokio 1.50.0 (upstream tokio#7834), which is the whole of the
+    5.3x `full_turn` cliff PLX-97 hit. Multi-thread is unaffected; no plexus
+    verdict changes; PLX-88's attribution *percentages* are resolution-bound.
+
 ### Changed
 
 - **BREAKING**: `DynamicHub::new()` now requires explicit namespace parameter

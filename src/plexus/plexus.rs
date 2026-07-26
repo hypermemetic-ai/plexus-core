@@ -214,6 +214,42 @@ pub trait Activation: Send + Sync + 'static {
         auth: Option<&super::auth::AuthContext>,
         raw_ctx: Option<&crate::request::RawRequestContext>,
     ) -> Result<PlexusStream, PlexusError>;
+
+    /// Dispatch with an owned handle on the activation (PLX-97).
+    ///
+    /// # Why this exists
+    ///
+    /// [`Activation::call`] lends `&self` for the duration of the *call*, but
+    /// the [`PlexusStream`] it returns outlives that borrow — the type is
+    /// `'static`. A vNext turn runs its handler inside that stream, so a
+    /// handler built from `&self` cannot call `self.method(…)`:
+    /// `E0521: borrowed data escapes outside of method`. The state has to be
+    /// owned, and the only owned handle that does not demand `Self: Clone`
+    /// (45 of 116 activation impls are not `Clone`) is the `Arc` the hub is
+    /// already holding.
+    ///
+    /// `DynamicHub` stores every registered activation as `Arc<A>` and routes
+    /// through here, so an implementation that overrides this method receives
+    /// exactly that `Arc<Self>` — no clone of `Self`, no extra allocation, no
+    /// `unsafe` lifetime widening. The turn runtime then takes it as
+    /// [`entry_with_state`](crate::runtime::entry_with_state)'s state
+    /// parameter.
+    ///
+    /// The default forwards to [`Activation::call`], so every existing
+    /// activation keeps working with no source change.
+    async fn call_arc(
+        self: Arc<Self>,
+        method: &str,
+        params: Value,
+        auth: Option<&super::auth::AuthContext>,
+        raw_ctx: Option<&crate::request::RawRequestContext>,
+    ) -> Result<PlexusStream, PlexusError>
+    where
+        Self: Sized,
+    {
+        self.call(method, params, auth, raw_ctx).await
+    }
+
     async fn resolve_handle(&self, _handle: &Handle) -> Result<PlexusStream, PlexusError> {
         Err(PlexusError::HandleNotSupported(self.namespace().to_string()))
     }
@@ -605,8 +641,13 @@ trait ActivationObject: Send + Sync + 'static {
     fn schema(&self) -> Schema;
 }
 
+/// The hub's owned handle on a registered activation.
+///
+/// `inner` is an `Arc<A>` rather than an `A` so that
+/// [`Activation::call_arc`] can be handed the activation without cloning it —
+/// see that method for why a turn-native activation needs an owned handle.
 struct ActivationWrapper<A: Activation> {
-    inner: A,
+    inner: Arc<A>,
 }
 
 #[async_trait]
@@ -620,7 +661,11 @@ impl<A: Activation> ActivationObject for ActivationWrapper<A> {
     fn plugin_id(&self) -> uuid::Uuid { self.inner.plugin_id() }
 
     async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
-        self.inner.call(method, params, auth, raw_ctx).await
+        // Routed through `call_arc` so a turn-native activation receives the
+        // hub's own `Arc<A>` (PLX-97). The default `call_arc` forwards straight
+        // back to `call`, so nothing changes for activations that do not
+        // override it.
+        Arc::clone(&self.inner).call_arc(method, params, auth, raw_ctx).await
     }
 
     async fn resolve_handle(&self, handle: &Handle) -> Result<PlexusStream, PlexusError> {
@@ -1249,7 +1294,7 @@ impl DynamicHub {
             namespace.clone(), // Use namespace as plugin_type for now
         );
 
-        inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
+        inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: Arc::new(activation) }));
         inner.child_routers.insert(namespace.clone(), Arc::new(activation_for_router));
         inner.pending_rpc.lock().unwrap()
             .push(Box::new(move || activation_for_rpc.into_rpc_methods()));
@@ -1283,7 +1328,7 @@ impl DynamicHub {
             namespace.clone(), // Use namespace as plugin_type for now
         );
 
-        inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
+        inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: Arc::new(activation) }));
         inner.child_routers.insert(namespace, Arc::new(activation_for_router));
         inner.pending_rpc.lock().unwrap()
             .push(Box::new(move || activation_for_rpc.into_rpc_methods()));

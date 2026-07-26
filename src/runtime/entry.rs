@@ -55,7 +55,7 @@ use super::callback::{CallbackRouter, PeerCapabilities};
 use super::cancel::CancellationToken;
 use super::error::{codes, EntryError, RespondError, TurnError};
 use super::event::{TurnEvent, TurnStream};
-use super::handler::{HandlerInput, HandlerTable, TurnContext};
+use super::handler::{unit_state, HandlerInput, HandlerTable, TurnContext};
 use super::ids::{CallbackId, TurnId};
 
 /// Buffer depth of a turn's event channel.
@@ -319,6 +319,67 @@ pub fn entry(
     handlers: &HandlerTable,
     request: TurnRequest,
 ) -> Result<TurnHandle, EntryError> {
+    entry_with_state(ir, handlers, unit_state(), request)
+}
+
+/// [`entry`], with the activation's state passed to the handler.
+///
+/// # Why state is a parameter (PLX-97)
+///
+/// This is PLX-73's specified dispatch shape,
+/// `Fn(Arc<S>, …) -> BoxFuture<…>`, restored. The handler table can then be
+/// built by closures that capture **nothing** — which is the only way a table
+/// can be constructed inside `Activation::call(&self, …)` and still hand the
+/// turn a `'static` future. See [`super::handler::ErasedHandler`] for the full
+/// argument, including why relocating the `tokio::spawn` does not substitute
+/// for it.
+///
+/// The `Arc<S>` is cloned once per turn and moved into the handler's future, so
+/// nothing here requires `S: Clone` — 45 of the 116 activation impls in the
+/// macro suite are not `Clone`, and this seam must not care.
+///
+/// ```
+/// use std::sync::Arc;
+/// use plexus_core::ir::{ActivationIr, MethodIr, AuthRequirementIr, StopKind};
+/// use plexus_core::runtime::{
+///     entry_with_state, decode_params, ErasedHandler, HandlerTable, TurnRequest, TurnOutcome,
+/// };
+///
+/// // No `Clone`, no `Arc` inside: an ordinary activation struct.
+/// struct Counter { step: u32 }
+/// impl Counter {
+///     async fn bump(&self, n: u32) -> u32 { n + self.step }
+/// }
+///
+/// # tokio_test::block_on(async {
+/// let ir = ActivationIr::new("counter", "1.0.0").with_method(
+///     MethodIr::new("bump", "counter.bump").with_auth(AuthRequirementIr::Public),
+/// );
+/// let handlers = HandlerTable::new([(
+///     "bump",
+///     ErasedHandler::<Counter>::stateful(|me, input| async move {
+///         let n: u32 = decode_params(input.params)?;
+///         TurnOutcome::serialize(&me.bump(n).await)
+///     }),
+/// )]);
+///
+/// let state = Arc::new(Counter { step: 5 });
+/// let turn = entry_with_state(&ir, &handlers, state, TurnRequest::new("bump").with_params(37.into())).unwrap();
+/// let events = turn.collect().await;
+/// assert_eq!(events[0].stop_reason().unwrap().kind(), StopKind::Complete);
+/// # });
+/// ```
+///
+/// # Panics
+///
+/// Panics if called outside a Tokio runtime — see the module docs on why the
+/// handler is a spawned task.
+pub fn entry_with_state<S: Send + Sync + 'static>(
+    ir: &ActivationIr,
+    handlers: &HandlerTable<S>,
+    state: Arc<S>,
+    request: TurnRequest,
+) -> Result<TurnHandle, EntryError> {
     // --- 1. Dispatch: name -> IR method. No enum, no generated match. -------
     let method = ir
         .method(&request.method)
@@ -370,10 +431,13 @@ pub fn entry(
         request.raw_ctx,
     );
 
-    let handler_task = tokio::spawn(handler.call(HandlerInput {
-        params: request.params,
-        turn: ctx,
-    }));
+    let handler_task = tokio::spawn(handler.call_with(
+        state,
+        HandlerInput {
+            params: request.params,
+            turn: ctx,
+        },
+    ));
 
     // --- 6. The turn loop. -------------------------------------------------
     let loop_cancel = cancel.clone();

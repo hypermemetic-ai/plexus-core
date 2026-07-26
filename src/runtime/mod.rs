@@ -42,6 +42,16 @@
 //! # });
 //! ```
 //!
+//! # Where a handler's state comes from (PLX-97)
+//!
+//! A handler that needs the activation itself takes it as a **parameter**:
+//! build the table with [`ErasedHandler::stateful`] and open the turn with
+//! [`entry_with_state`], which hands each handler an `Arc<S>`. The closures
+//! then capture nothing, so a table can be built inside `&self` methods — the
+//! construction the macro switchover needs and the reason this is a parameter
+//! rather than a capture. [`ErasedHandler`]'s docs carry the full argument,
+//! including why moving the `tokio::spawn` is not a substitute.
+//!
 //! # The turn contract
 //!
 //! Every call is a **turn**, not a stream that ends (PLX-73
@@ -148,7 +158,7 @@ mod tests;
 pub use bridge::{turn_stream_to_plexus_stream, IrActivation, IrMethods};
 pub use callback::{PeerCapabilities, TurnTransport};
 pub use cancel::CancellationToken;
-pub use entry::{entry, TurnControl, TurnHandle, TurnRequest};
+pub use entry::{entry, entry_with_state, TurnControl, TurnHandle, TurnRequest};
 pub use error::{
     codes, decode_param, decode_params, EntryError, RespondError, TurnError,
 };

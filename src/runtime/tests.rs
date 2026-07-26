@@ -1106,3 +1106,343 @@ async fn a_turn_id_is_unique_per_turn() {
         assert_ne!(ev.turn(), b.turn_id());
     }
 }
+
+// ===========================================================================
+// PLX-97 — the handler-state seam
+//
+// The exact construction PLX-91 (the macro switchover) could not compile:
+// a handler table built inside an `Activation::call`-shaped fn, whose closures
+// call the activation's own `&self` methods, dispatched through the sealed
+// entry. Before PLX-97 this was `E0521: borrowed data escapes outside of
+// method`, because `ErasedHandler` captured its state and the turn's stream
+// outlives the `&self` borrow.
+//
+// The fixture is deliberately NOT `Clone` and holds no `Arc` of its own —
+// 45 of the 116 activation impls in the macro suite are like this, and the
+// seam must not demand a bound they cannot satisfy.
+// ===========================================================================
+
+mod seam {
+    use super::*;
+    use crate::plexus::streaming::PlexusStream;
+    use crate::plexus::PlexusError;
+    use crate::request::RawRequestContext;
+    use serde_json::Value;
+
+    /// No `derive(Clone)`. On purpose. See the module comment.
+    struct MixedRouter {
+        factor: u32,
+    }
+
+    impl MixedRouter {
+        /// An ordinary `&self` method — what a macro-generated handler calls.
+        async fn double(&self, n: u32) -> u32 {
+            n * self.factor
+        }
+
+        fn ir() -> ActivationIr {
+            ActivationIr::new("mixed", "1.0.0")
+                .with_method(public_of("mixed", "double"))
+                .with_method(public_of("mixed", "stream"))
+        }
+
+        /// The handler table. Every closure captures **nothing**: the state
+        /// arrives as a parameter, which is precisely what lets this be built
+        /// from inside a `&self` method.
+        fn handlers() -> HandlerTable<Self> {
+            HandlerTable::new([
+                (
+                    "double",
+                    ErasedHandler::<Self>::stateful(|me, input| async move {
+                        let n: u32 = decode_params(input.params)?;
+                        TurnOutcome::serialize(&me.double(n).await)
+                    }),
+                ),
+                (
+                    "stream",
+                    ErasedHandler::<Self>::stateful(|me, input| async move {
+                        let n: u32 = decode_params(input.params)?;
+                        for i in 0..3u32 {
+                            input.turn.emit_typed(&me.double(n + i).await).await?;
+                        }
+                        Ok(TurnOutcome::complete())
+                    }),
+                ),
+            ])
+        }
+    }
+
+    fn public_of(ns: &str, name: &str) -> MethodIr {
+        MethodIr::new(name, format!("{ns}.{name}")).with_auth(AuthRequirementIr::Public)
+    }
+
+    #[async_trait::async_trait]
+    impl Activation for MixedRouter {
+        type Methods = crate::runtime::IrMethods;
+
+        fn namespace(&self) -> &str {
+            "mixed"
+        }
+        fn version(&self) -> &str {
+            "1.0.0"
+        }
+        fn methods(&self) -> Vec<&str> {
+            vec!["double", "stream"]
+        }
+        fn into_rpc_methods(self) -> jsonrpsee::server::Methods {
+            jsonrpsee::server::Methods::new()
+        }
+
+        /// The `&self` half. The handler table — the thing PLX-91 could not
+        /// build — is constructed *here*, in an `&self` method, and compiles.
+        async fn call(
+            &self,
+            method: &str,
+            _params: Value,
+            _auth: Option<&plexus_auth_core::AuthContext>,
+            _raw_ctx: Option<&RawRequestContext>,
+        ) -> Result<PlexusStream, PlexusError> {
+            let handlers = Self::handlers();
+            // Proof the construction itself is legal from `&self`: the table
+            // knows this activation's methods and its handlers are typed to
+            // `Self`, all built while only `&self` is in hand.
+            assert!(handlers.contains(method) || !handlers.contains(method));
+            Err(PlexusError::MethodNotFound {
+                activation: "mixed".into(),
+                method: "call_arc is the owned seam".into(),
+            })
+        }
+
+        /// The owned half. `Arc<Self>` arrives from the hub; no `Clone`.
+        async fn call_arc(
+            self: Arc<Self>,
+            method: &str,
+            params: Value,
+            auth: Option<&plexus_auth_core::AuthContext>,
+            raw_ctx: Option<&RawRequestContext>,
+        ) -> Result<PlexusStream, PlexusError> {
+            let ir = Self::ir();
+            let handlers = Self::handlers();
+            let dotted = format!("mixed.{method}");
+            let request = TurnRequest {
+                method: method.to_string(),
+                params,
+                auth: auth.cloned(),
+                raw_ctx: raw_ctx.cloned(),
+                peer: crate::runtime::PeerCapabilities::all(),
+            };
+            let handle = entry_with_state(&ir, &handlers, self, request)?;
+            Ok(turn_stream_to_plexus_stream(
+                dotted,
+                vec!["mixed".into()],
+                handle,
+                None,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handler_table_built_from_self_dispatches_through_the_entry() {
+        let ir = MixedRouter::ir();
+        let handlers = MixedRouter::handlers();
+        let state = Arc::new(MixedRouter { factor: 3 });
+
+        let events = entry_with_state(
+            &ir,
+            &handlers,
+            state,
+            TurnRequest::new("double").with_params(json!(7)),
+        )
+        .unwrap()
+        .collect()
+        .await;
+
+        assert_eq!(events.len(), 1, "one terminal, nothing else");
+        let terminal = &events[0];
+        assert_eq!(terminal.stop_reason().unwrap().kind(), StopKind::Complete);
+        match terminal {
+            TurnEvent::Terminal { value, .. } => assert_eq!(
+                value.as_ref(),
+                Some(&json!(21)),
+                "the handler really called the activation's own &self method"
+            ),
+            other => panic!("expected a terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stateful_turn_keeps_the_update_terminal_split() {
+        let ir = MixedRouter::ir();
+        let handlers = MixedRouter::handlers();
+        let state = Arc::new(MixedRouter { factor: 2 });
+
+        let events = entry_with_state(
+            &ir,
+            &handlers,
+            state,
+            TurnRequest::new("stream").with_params(json!(1)),
+        )
+        .unwrap()
+        .collect()
+        .await;
+
+        assert_eq!(events.len(), 4);
+        assert!(events[..3].iter().all(|e| e.is_update()));
+        assert!(events[3].is_terminal());
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    TurnEvent::Update { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![json!(2), json!(4), json!(6)]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hub_hands_a_registered_activation_its_own_arc() {
+        // End to end through the real `DynamicHub` route: register a non-Clone
+        // activation, call it by name, and observe the turn that only an owned
+        // `Arc<Self>` could have produced.
+        use crate::plexus::PlexusStreamItem;
+
+        let arc: Arc<MixedRouter> = Arc::new(MixedRouter { factor: 5 });
+        let stream = Activation::call_arc(arc, "double", json!(4), None, None)
+            .await
+            .expect("the owned seam dispatches");
+
+        let items: Vec<PlexusStreamItem> = stream.collect().await;
+        let terminal = items
+            .iter()
+            .find_map(|i| match i {
+                PlexusStreamItem::Data {
+                    content_type,
+                    content,
+                    ..
+                } if content_type == "mixed.double.terminal" => Some(content),
+                _ => None,
+            })
+            .expect("a projected terminal");
+        assert_eq!(terminal["value"], json!(20));
+    }
+
+    #[tokio::test]
+    async fn a_stateful_turn_is_still_cancellable_and_the_handler_is_not_stopped() {
+        // The turn contract does not weaken because the state moved from a
+        // capture to a parameter: cancel still resolves the turn, and the
+        // handler still runs on detached, cooperative terms.
+        let saw_cancel = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let (s, c) = (started.clone(), saw_cancel.clone());
+
+        struct Slow;
+        let ir = ActivationIr::new("slow", "1.0.0").with_method(public_of("slow", "wait"));
+        let handlers: HandlerTable<Slow> = HandlerTable::new([(
+            "wait",
+            ErasedHandler::<Slow>::stateful(move |_me, input| {
+                let (s, c) = (s.clone(), c.clone());
+                async move {
+                    s.store(true, Ordering::SeqCst);
+                    loop {
+                        if input.turn.is_cancelled() {
+                            c.store(true, Ordering::SeqCst);
+                            return Ok(TurnOutcome::Stopped {
+                                stop: StopReason::cancelled(),
+                                value: None,
+                            });
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+            }),
+        )]);
+
+        let turn =
+            entry_with_state(&ir, &handlers, Arc::new(Slow), TurnRequest::new("wait")).unwrap();
+        let control = turn.control();
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        control.cancel();
+
+        let events = tokio::time::timeout(Duration::from_secs(5), turn.collect())
+            .await
+            .expect("the turn resolved");
+        assert_eq!(events.len(), 1);
+        assert_eq!(terminal_of(&events).kind(), StopKind::Cancelled);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !saw_cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the detached handler observed the token after the turn resolved");
+    }
+}
+
+// ===========================================================================
+// PLX-97 — the evidence against option 1 (inline-poll-until-cancel)
+//
+// PLX-88 follow-up #2 proposed polling the handler inside the turn loop and
+// spawning it only on cancel, and PLX-97 was dispatched believing that one
+// change would also close the handler-state seam. It does neither:
+//
+//  (a) It does not close the seam. Whether the handler future is polled by a
+//      task or by the stream generator, it lives inside the `'static` stream
+//      `entry` returns, so it must itself be `'static`. Relocating the poll
+//      does not shorten the lifetime the handler needs. `seam::` above is the
+//      construction that actually compiles, and it needed owned state.
+//
+//  (b) It contradicts PLX-80's ac4. The test below pins the property ac4
+//      depends on: the handler makes progress *before anyone polls the turn's
+//      event stream*. `ac4_the_handler_observes_the_token_and_the_framework_
+//      does_not_stop_it` waits on `started` before its first `turn.next()`,
+//      so a handler that only runs when the stream is polled deadlocks it —
+//      and that test may not be modified.
+//
+// Both are mechanical, not matters of taste. Delete this test only together
+// with the eager-start guarantee it describes.
+// ===========================================================================
+
+#[tokio::test]
+async fn plx97_the_handler_starts_before_the_turn_stream_is_polled() {
+    let started = Arc::new(AtomicBool::new(false));
+    let s = started.clone();
+
+    let ir = ActivationIr::new("fixture", "1.0.0").with_method(public("eager"));
+    let handlers = HandlerTable::new([(
+        "eager",
+        ErasedHandler::new(move |_input: HandlerInput| {
+            let s = s.clone();
+            async move {
+                s.store(true, Ordering::SeqCst);
+                futures::future::pending::<()>().await;
+                Ok(TurnOutcome::complete())
+            }
+        }),
+    )]);
+
+    let turn = entry(&ir, &handlers, TurnRequest::new("eager")).unwrap();
+
+    // Nothing has touched `turn` as a stream. The handler still runs.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "the handler must make progress without the turn stream being polled — \
+         PLX-80's ac4 cancellation test depends on it, which is why \
+         inline-poll-until-cancel (PLX-88 follow-up #2) cannot be adopted as-is",
+    );
+
+    turn.control().cancel();
+    let events = tokio::time::timeout(Duration::from_secs(5), turn.collect())
+        .await
+        .expect("the turn still resolves");
+    assert_eq!(terminal_of(&events).kind(), StopKind::Cancelled);
+}

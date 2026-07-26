@@ -48,9 +48,21 @@
 //! never polled inside the iteration and pile up. The multi-thread column of
 //! that row is the usable one.
 
+//!
+//! # One reading is known dependency-bound (PLX-101)
+//!
+//! `ladder_current/*` was PLX-88's usable column precisely because a
+//! current-thread spawn was a local enqueue at ~940 ns. That stopped being true
+//! at **tokio 1.50.0**: `block_on(yield_now())` on a current-thread runtime
+//! costs 845 ns on 1.49.0 and 12,736 ns on 1.50.0, so `spawn_noop_join` and
+//! everything above it in the ladder move by ~+11.5 us with no source change.
+//! `main` therefore prints the resolved dependency versions before the first
+//! measurement — see `benches/common/resolution.rs`. A rung from this ladder is
+//! meaningless without the lock-fingerprint it was measured under.
+
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, BenchmarkId, Criterion};
 use futures::StreamExt;
 use serde_json::json;
 use tokio::runtime::Runtime;
@@ -421,4 +433,14 @@ criterion_group!(
     bench_in_process,
     bench_micro
 );
-criterion_main!(benches);
+
+/// Hand-written rather than `criterion_main!` so the resolution banner is
+/// emitted before the first rung is timed. See `benches/dispatch.rs`.
+fn main() {
+    resolution::emit("turn_profile");
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
+
+#[path = "common/resolution.rs"]
+mod resolution;

@@ -32,9 +32,18 @@
 //! whole legacy path, which is a different question from the representation of
 //! dispatch.
 
+//!
+//! # The resolution this bench ran under (PLX-101)
+//!
+//! Every number below is a function of the resolved dependency set as much as
+//! of the source. `main` prints the resolution banner before criterion starts —
+//! see [`benches/common/resolution.rs`]. Two numbers with different
+//! lock-fingerprints are not comparable, and the gate this bench decides is not
+//! re-decidable from a number quoted without one.
+
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, Criterion};
 use futures::future::BoxFuture;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -297,4 +306,16 @@ criterion_group!(
     bench_reference_bar,
     bench_turn_overhead
 );
-criterion_main!(benches);
+
+/// Hand-written rather than `criterion_main!` for exactly one reason: the
+/// resolution banner must be emitted **before** the first measurement, so that
+/// a copy-pasted run always carries the lock it was measured against. The rest
+/// of the body is what `criterion_main!` expands to.
+fn main() {
+    resolution::emit("dispatch");
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
+
+#[path = "common/resolution.rs"]
+mod resolution;

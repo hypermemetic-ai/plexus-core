@@ -1,7 +1,16 @@
 # Rust
 target/
-Cargo.lock
 *.rs.bk
+
+# NOTE (PLX-101): `Cargo.lock` is deliberately NOT ignored, against the usual
+# convention for a library. This crate's benchmarks are decision inputs, not
+# diagnostics: decision gate 2 (PLX-74/PLX-80) passed on a measured dispatch
+# delta and PLX-88's attribution table produced a "leave it" verdict, both on an
+# unrecorded resolution. PLX-101 measured what that costs: a routine re-resolve
+# from tokio 1.48.0 to 1.53.1 moves `ladder_current/full_turn` 2.63 us -> 14.0 us
+# (5.3x) with no source change. Committing the lock only pins THIS crate's own
+# builds, tests and benches — a `tokio = "1.0"` caret dependency still resolves
+# freely for anyone who depends on plexus-core. See benches/common/resolution.rs.
 
 # Haskell
 dist/

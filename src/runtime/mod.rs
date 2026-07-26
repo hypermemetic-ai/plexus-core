@@ -135,6 +135,13 @@ pub mod event;
 pub mod handler;
 pub mod ids;
 
+/// PLX-88 measurement scaffolding. Not part of the runtime; compiled only under
+/// the `profiling` feature, which only `benches/turn_profile.rs` and
+/// `examples/turn_alloc.rs` enable.
+#[cfg(feature = "profiling")]
+#[doc(hidden)]
+pub mod profile;
+
 #[cfg(test)]
 mod tests;
 

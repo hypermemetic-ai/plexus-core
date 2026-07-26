@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::hash::Hasher;
+use super::hash::{
+    text_or_absent, Encoder, DOMAIN_ACTIVATION, DOMAIN_CAPABILITY, DOMAIN_DEPRECATION,
+    DOMAIN_DOCUMENT, DOMAIN_METHOD, DOMAIN_PARAM, DOMAIN_TYPEREF, HASH_ALGORITHM,
+};
 
 /// Version of the IR *document format* itself.
 ///
@@ -18,15 +21,12 @@ use super::hash::Hasher;
 /// *service* being described. PLX-73 `q-ir-completeness` item 18: there is no
 /// handshake — a client reads this field plus [`ActivationIr::ir_hash`] and
 /// decides for itself.
+///
+/// RFC 002 §3.3 makes this a **mandatory** root fact that MUST be emitted even
+/// at its default; §3.5 (omit absent optionals) does not apply to it. That is
+/// the resolution of finding F-01, where §3.3 and §3.5 contradicted each other
+/// and this encoder obeyed §3.5.
 pub const IR_VERSION: u32 = 1;
-
-fn default_ir_version() -> u32 {
-    IR_VERSION
-}
-
-fn is_default_ir_version(v: &u32) -> bool {
-    *v == IR_VERSION
-}
 
 // ===========================================================================
 // SchemaRef — a type reference that cannot degrade
@@ -178,10 +178,30 @@ impl SchemaRef {
         &self.schema
     }
 
-    fn hash_into(&self, h: &mut Hasher) {
-        h.tag("plexus.ir.schema_ref.v1");
-        h.str(&self.type_name);
-        h.json(self.schema.as_value());
+    /// RFC 002 §4.6 — `typeref := domain("connectome/1:typeref") ‖ text(name) ‖
+    /// json(schema)`.
+    pub(crate) fn encode_into(&self, e: &mut Encoder) {
+        e.domain(DOMAIN_TYPEREF);
+        e.text(&self.type_name);
+        e.json(self.schema.as_value());
+    }
+}
+
+/// RFC 002 §6.4 — the declaration tri-state, as a preimage component.
+///
+/// `NotDeclared` is tag 0, `Unresolved` is tag 1 (which this implementation
+/// never produces — it cannot construct a degraded [`SchemaRef`] — but which
+/// the tag space reserves so the three states can never collide), and
+/// `Declared` is tag 2.
+fn encode_declared(e: &mut Encoder, r: Option<&SchemaRef>) {
+    match r {
+        None => {
+            e.tag(0);
+        }
+        Some(t) => {
+            e.tag(2);
+            t.encode_into(e);
+        }
     }
 }
 
@@ -286,11 +306,18 @@ impl DeprecationIr {
         self
     }
 
-    fn hash_into(&self, h: &mut Hasher) {
-        h.tag("plexus.ir.deprecation.v1");
-        h.str(&self.since);
-        h.opt_str(self.removed_in.as_deref());
-        h.str(&self.message);
+    /// RFC 002 §4.6 — `deprecation := domain("connectome/1:deprecation") ‖
+    /// opt(since) ‖ opt(removed_in) ‖ opt(message)`.
+    ///
+    /// `since` and `message` are REQUIRED fields of the record (§3.6) and so are
+    /// always present; they are nonetheless framed as optionals because the
+    /// record's three fields share one shape, and a reader that models all three
+    /// as optional must reach the same preimage.
+    fn encode_into(&self, e: &mut Encoder) {
+        e.domain(DOMAIN_DEPRECATION);
+        e.opt_text(Some(self.since.as_str()));
+        e.opt_text(self.removed_in.as_deref());
+        e.opt_text(Some(self.message.as_str()));
     }
 }
 
@@ -334,11 +361,16 @@ impl CallbackIr {
         }
     }
 
-    pub(crate) fn hash_into(&self, h: &mut Hasher) {
-        h.tag("plexus.ir.callback.v1");
-        h.str(&self.name);
-        self.request.hash_into(h);
-        self.response.hash_into(h);
+    /// RFC 002 §4.6 — `capability := domain("connectome/1:capability") ‖
+    /// text(wire name) ‖ typeref(request) ‖ typeref(response)`.
+    ///
+    /// §7.2 makes the wire name the capability's identity, so it is what the
+    /// preimage leads with and therefore what the §4.6 set ordering sorts on.
+    pub(crate) fn encode_into(&self, e: &mut Encoder) {
+        e.domain(DOMAIN_CAPABILITY);
+        e.text(&self.name);
+        self.request.encode_into(e);
+        self.response.encode_into(e);
     }
 }
 
@@ -352,7 +384,13 @@ pub struct ParamIr {
     /// Parameter name, matching the identifier in the method signature.
     pub name: String,
     /// Human-readable description. Empty when undocumented.
-    #[serde(default)]
+    ///
+    /// RFC 002 §3.5 — an absent optional MUST be omitted rather than emitted as
+    /// an empty placeholder, so an empty description does not reach the wire at
+    /// all. (The §3.5 non-conformance found by PLX-86: this encoder used to emit
+    /// `""` on every activation, method and param while correctly omitting
+    /// `long_description`.)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     /// The parameter's type reference.
     pub schema: SchemaRef,
@@ -389,12 +427,14 @@ impl ParamIr {
         self
     }
 
-    fn hash_into(&self, h: &mut Hasher) {
-        h.tag("plexus.ir.param.v1");
-        h.str(&self.name);
-        h.str(&self.description);
-        self.schema.hash_into(h);
-        h.bool(self.required);
+    /// RFC 002 §4.6 — `param := domain("connectome/1:param") ‖ text(name) ‖
+    /// opt(description) ‖ typeref(schema) ‖ bool(required)`.
+    fn encode_into(&self, e: &mut Encoder) {
+        e.domain(DOMAIN_PARAM);
+        e.text(&self.name);
+        e.opt_text(text_or_absent(&self.description));
+        self.schema.encode_into(e);
+        e.bool(self.required);
     }
 }
 
@@ -417,7 +457,9 @@ pub struct MethodIr {
     pub dotted_id: String,
 
     /// Human-readable description.
-    #[serde(default)]
+    ///
+    /// RFC 002 §3.5 — omitted from the wire when empty, never emitted as `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
 
     /// Merkle content hash of this method. Filled by
@@ -428,6 +470,32 @@ pub struct MethodIr {
     /// Declared parameters, in signature order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<ParamIr>,
+
+    /// The **request context** this method depends on — RFC 002 §6.9.
+    ///
+    /// PLX-89 §2b. This is the IR's rendering of what plexus already had and
+    /// the Connectome silently dropped: `MethodSchema::request_type`, the
+    /// per-method override of the activation-level
+    /// [`ActivationIr::request_context`], itself the IR rendering of
+    /// `PluginSchema::request` and the `#[derive(PlexusRequest)]` type extracted
+    /// from [`crate::request::RawRequestContext`].
+    ///
+    /// It is the transport-observable half of a call: headers, origin, peer
+    /// address, trace identifiers, idempotency keys — the facts the *transport*
+    /// knows, as opposed to [`params`](Self::params), which the caller sends
+    /// deliberately. Declaring it is how a caller is told what to send: without
+    /// it in the document, a generated client cannot know a method needs the
+    /// `Origin` header and the transport contract lives only in Rust types.
+    ///
+    /// **Absent means "needs nothing", not "unspecified"** (§6.9): a method with
+    /// no declaration of its own and on an activation with no declaration
+    /// depends on no transport-observable fact. A declaration that was intended
+    /// but could not be resolved is *not* expressible as absence — a
+    /// [`SchemaRef`] can never denote `()`, so a failure to resolve is a
+    /// construction error here, exactly as for
+    /// [`updates`](Self::updates)/[`terminal`](Self::terminal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_context: Option<SchemaRef>,
 
     /// Type of the items the turn streams *before* it terminates.
     ///
@@ -507,6 +575,7 @@ impl MethodIr {
             description: String::new(),
             hash: String::new(),
             params: Vec::new(),
+            request_context: None,
             updates: None,
             terminal: None,
             callbacks: Vec::new(),
@@ -526,6 +595,13 @@ impl MethodIr {
     /// Append a parameter.
     pub fn with_param(mut self, p: ParamIr) -> Self {
         self.params.push(p);
+        self
+    }
+
+    /// Declare this method's request context (RFC 002 §6.9), overriding any
+    /// declaration on its activation.
+    pub fn with_request_context(mut self, r: SchemaRef) -> Self {
+        self.request_context = Some(r);
         self
     }
 
@@ -611,50 +687,54 @@ impl MethodIr {
     }
 
     /// The method's content hash, computed without mutating it.
+    ///
+    /// RFC 002 §4.6:
+    ///
+    /// ```text
+    /// method := SHA-256( domain("connectome/1:method")
+    ///                  ‖ text(name) ‖ text(dotted_id) ‖ opt(description)
+    ///                  ‖ seq(param, params)
+    ///                  ‖ declared(request_context)
+    ///                  ‖ declared(updates) ‖ declared(terminal)
+    ///                  ‖ set(capability, callbacks)
+    ///                  ‖ opt(http_method) ‖ opt(auth)
+    ///                  ‖ opt(deprecation) ‖ map(extensions) )
+    /// ```
+    ///
+    /// `params` is a **sequence** (position is meaningful to a positional
+    /// caller) and `callbacks` is a **set** (§7.1 says the declaration is a SET,
+    /// and a set has no canonical order, so §4.4 applies). Declaring the same
+    /// two capabilities in the opposite order therefore produces the same hash —
+    /// the §4.4+§7.1 non-conformance PLX-86 recorded, fixed here.
     pub fn content_hash(&self) -> String {
-        let mut h = Hasher::new();
-        h.tag("plexus.ir.method.v1");
-        h.str(&self.name);
-        h.str(&self.dotted_id);
-        h.str(&self.description);
-        h.seq(&self.params, |h, p| p.hash_into(h));
+        let mut e = Encoder::with_domain(DOMAIN_METHOD);
+        e.text(&self.name);
+        e.text(&self.dotted_id);
+        e.opt_text(text_or_absent(&self.description));
+        e.seq(&self.params, |e, p| p.encode_into(e));
+        // §6.9 — what the transport knows about the call, beside what the caller
+        // sends deliberately.
+        encode_declared(&mut e, self.request_context.as_ref());
         // Turn envelope: updates, terminal, callbacks. Each is content, so
         // mutating any of them changes this method's hash and every ancestor's.
-        h.tag("plexus.ir.turn.v1");
-        match &self.updates {
-            None => {
-                h.bool(false);
+        encode_declared(&mut e, self.updates.as_ref());
+        encode_declared(&mut e, self.terminal.as_ref());
+        e.set(&self.callbacks, |e, c| c.encode_into(e));
+        e.opt_text(Some(self.http_method.as_str()));
+        e.opt_text(Some(self.auth.tag()));
+        e.opt_with(self.deprecation.is_some(), |e| {
+            if let Some(d) = &self.deprecation {
+                d.encode_into(e);
             }
-            Some(u) => {
-                h.bool(true);
-                u.hash_into(&mut h);
-            }
-        }
-        match &self.terminal {
-            None => {
-                h.bool(false);
-            }
-            Some(t) => {
-                h.bool(true);
-                t.hash_into(&mut h);
-            }
-        }
-        h.seq(&self.callbacks, |h, c| c.hash_into(h));
-        h.str(self.http_method.as_str());
-        h.str(self.auth.tag());
-        match &self.deprecation {
-            None => {
-                h.bool(false);
-            }
-            Some(d) => {
-                h.bool(true);
-                d.hash_into(&mut h);
-            }
-        }
-        h.map(&self.extensions, |h, v| {
-            h.json(v);
         });
-        h.finish()
+        // §9.1 extensions are keyed metadata: a map, canonicalized by key.
+        // `BTreeMap` already iterates in ascending key order.
+        let entries: Vec<(&String, &serde_json::Value)> = self.extensions.iter().collect();
+        e.seq(&entries, |e, (k, v)| {
+            e.text(k);
+            e.json(v);
+        });
+        e.digest()
     }
 }
 
@@ -751,22 +831,42 @@ impl ChildEdge {
     /// For [`ChildEdge::Static`] this is exactly the embedded subtree's hash —
     /// which is what makes the fold a Merkle fold rather than a re-hash.
     pub fn edge_hash(&self) -> String {
-        let mut h = Hasher::new();
-        h.tag("plexus.ir.edge.v1");
+        let mut e = Encoder::new();
+        self.encode_into(&mut e);
+        e.digest()
+    }
+
+    /// RFC 002 §4.6 — an edge's preimage component. Three kinds, three tags:
+    ///
+    /// ```text
+    /// static  := tag(1) ‖ hash(child activation hash)
+    /// dynamic := tag(2) ‖ text(namespace) ‖ hash(advertised) ‖ opt(description)
+    /// indexed := tag(3) ‖ text(namespace) ‖ text(list_method)
+    ///                   ‖ opt(search_method) ‖ text(id_field)
+    ///                   ‖ text(path_template) ‖ hash(template hash)
+    ///                   ‖ opt(description)
+    /// ```
+    ///
+    /// A Static edge contributes exactly the embedded subtree's stored hash —
+    /// that is what makes the fold a Merkle fold rather than a re-hash. A
+    /// Dynamic edge contributes its **advertised** hash and never a
+    /// recomputation: recomputing would be the fabrication §5.2 forbids, and
+    /// there is nothing here to recompute from.
+    pub(crate) fn encode_into(&self, e: &mut Encoder) {
         match self {
             Self::Static(ir) => {
-                h.str("static");
-                h.str(&ir.hash);
+                e.tag(1);
+                e.hash_ref(&ir.hash);
             }
             Self::Dynamic {
                 namespace,
                 hash,
                 description,
             } => {
-                h.str("dynamic");
-                h.str(namespace);
-                h.str(hash);
-                h.str(description);
+                e.tag(2);
+                e.text(namespace);
+                e.hash_ref(hash);
+                e.opt_text(text_or_absent(description));
             }
             Self::Indexed {
                 namespace,
@@ -777,17 +877,16 @@ impl ChildEdge {
                 template,
                 description,
             } => {
-                h.str("indexed");
-                h.str(namespace);
-                h.str(list_method);
-                h.opt_str(search_method.as_deref());
-                h.str(id_field);
-                h.str(path_template);
-                h.str(&template.hash);
-                h.str(description);
+                e.tag(3);
+                e.text(namespace);
+                e.text(list_method);
+                e.opt_text(search_method.as_deref());
+                e.text(id_field);
+                e.text(path_template);
+                e.hash_ref(&template.hash);
+                e.opt_text(text_or_absent(description));
             }
         }
-        h.finish()
     }
 
     fn recompute_hashes(&mut self) {
@@ -795,6 +894,16 @@ impl ChildEdge {
             Self::Static(ir) => ir.recompute_node_hashes(),
             Self::Dynamic { .. } => {}
             Self::Indexed { template, .. } => template.recompute_node_hashes(),
+        }
+    }
+
+    /// §3.3 — strip the root facts from an embedded node and everything under
+    /// it.
+    fn strip_root_facts(&mut self) {
+        match self {
+            Self::Static(ir) => ir.strip_root_facts(),
+            Self::Dynamic { .. } => {}
+            Self::Indexed { template, .. } => template.strip_root_facts(),
         }
     }
 }
@@ -810,8 +919,22 @@ impl ChildEdge {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivationIr {
     /// Version of the IR document format. See [`IR_VERSION`].
-    #[serde(default = "default_ir_version", skip_serializing_if = "is_default_ir_version")]
-    pub ir_version: u32,
+    ///
+    /// A **root fact** (RFC 002 §3.3): `Some` on the document root, `None` on
+    /// every embedded node, which §3.3 forbids from carrying it.
+    /// [`recompute_hashes`](Self::recompute_hashes) establishes both halves.
+    /// §3.5 does not apply — once present it is emitted even at its default,
+    /// which is finding F-01's resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir_version: Option<u32>,
+
+    /// The identifier of the hash construction that produced this document's
+    /// hashes — RFC 002 §4.7, always [`HASH_ALGORITHM`](super::hash::HASH_ALGORITHM).
+    ///
+    /// A root fact. Without it, "hashed differently" and "changed" are
+    /// indistinguishable and there is no migration path off a construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_algorithm: Option<String>,
 
     /// The **backend identity** of the document — the root activation's name.
     ///
@@ -849,8 +972,25 @@ pub struct ActivationIr {
     pub version: String,
 
     /// One-line description.
-    #[serde(default)]
+    ///
+    /// RFC 002 §3.5 — omitted from the wire when empty, never emitted as `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+
+    /// The **request context** every method on this activation depends on
+    /// unless it declares its own — RFC 002 §6.9.
+    ///
+    /// PLX-89 §2b: the IR rendering of `PluginSchema::request`, the
+    /// activation-level `request = MyRequest` declaration whose schema carries
+    /// the `x-plexus-source` annotations naming where each field is extracted
+    /// from (cookie, header, query, peer address, auth context). A method's own
+    /// [`MethodIr::request_context`] REPLACES this for that method; there is no
+    /// merge, mirroring the override `MethodSchema::request_type` already is.
+    ///
+    /// Absent at both levels means the method depends on no transport-observable
+    /// fact (§6.9: absence is "needs nothing", not "unspecified").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_context: Option<SchemaRef>,
 
     /// Long-form documentation, when the source carries doc comments beyond
     /// the summary line.
@@ -885,13 +1025,15 @@ impl ActivationIr {
     /// A leaf node with no methods and no children.
     pub fn new(namespace: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
-            ir_version: IR_VERSION,
+            ir_version: None,
+            hash_algorithm: None,
             backend_name: None,
             ir_hash: None,
             respond_method: None,
             namespace: namespace.into(),
             version: version.into(),
             description: String::new(),
+            request_context: None,
             long_description: None,
             hash: String::new(),
             methods: Vec::new(),
@@ -924,6 +1066,23 @@ impl ActivationIr {
         self
     }
 
+    /// Declare the activation-level request context (RFC 002 §6.9).
+    pub fn with_request_context(mut self, r: SchemaRef) -> Self {
+        self.request_context = Some(r);
+        self
+    }
+
+    /// The request context a method on this activation actually depends on —
+    /// RFC 002 §6.9's resolution rule, in one place.
+    ///
+    /// The method's own declaration if it has one, otherwise this activation's,
+    /// otherwise `None` meaning the method needs nothing. Resolution does NOT
+    /// walk to ancestors: the declaration belongs to the activation that owns
+    /// the method, mirroring `PluginSchema::request`.
+    pub fn effective_request_context<'a>(&'a self, m: &'a MethodIr) -> Option<&'a SchemaRef> {
+        m.request_context.as_ref().or(self.request_context.as_ref())
+    }
+
     /// Append a method.
     pub fn with_method(mut self, m: MethodIr) -> Self {
         self.methods.push(m);
@@ -950,12 +1109,46 @@ impl ActivationIr {
     /// hashes on all of its ancestors, a changed `ir_hash`, and byte-identical
     /// hashes on every subtree that did not change.
     pub fn recompute_hashes(&mut self) {
+        // §3.3 — the root carries the document-level facts and no other node
+        // may. Both halves are established here rather than trusted, so a
+        // `Static` child built with the same builder as a root cannot smuggle a
+        // root fact into an embedded position.
+        if self.ir_version.is_none() {
+            self.ir_version = Some(IR_VERSION);
+        }
+        // §4.7 — a document MUST declare the construction that produced its
+        // hashes.
+        self.hash_algorithm = Some(HASH_ALGORITHM.to_string());
+        for c in &mut self.children {
+            c.strip_root_facts();
+        }
+
         self.recompute_node_hashes();
-        let mut h = Hasher::new();
-        h.tag("plexus.ir.document.v1");
-        h.u64(self.ir_version as u64);
-        h.str(&self.hash);
-        self.ir_hash = Some(h.finish());
+        self.ir_hash = Some(self.document_hash());
+    }
+
+    /// RFC 002 §4.6 — the document preimage:
+    ///
+    /// ```text
+    /// document := SHA-256( domain("connectome/1:document")
+    ///                    ‖ opt(hash_algorithm) ‖ opt(backend_name)
+    ///                    ‖ opt(ir_version) ‖ opt(respond_method)
+    ///                    ‖ hash(root activation hash) )
+    /// ```
+    ///
+    /// The §3.3 root facts enter the *document* hash and not the *activation*
+    /// hash. That is what keeps an activation's hash identical whether it is
+    /// read as a root or as an embedded subtree — and therefore what makes a
+    /// Static child's advertised hash comparable with the hash it reports when
+    /// fetched on its own.
+    pub fn document_hash(&self) -> String {
+        let mut e = Encoder::with_domain(DOMAIN_DOCUMENT);
+        e.opt_text(self.hash_algorithm.as_deref());
+        e.opt_text(self.backend_name.as_deref());
+        e.opt_u64(self.ir_version.map(u64::from));
+        e.opt_text(self.respond_method.as_deref());
+        e.hash_ref(&self.hash);
+        e.digest()
     }
 
     /// Bottom-up hash fold for this node and everything under it.
@@ -972,36 +1165,56 @@ impl ActivationIr {
         self.hash = self.node_hash();
     }
 
+    /// §3.3 — "non-root activations MUST NOT carry these".
+    fn strip_root_facts(&mut self) {
+        self.ir_version = None;
+        self.hash_algorithm = None;
+        self.ir_hash = None;
+        self.backend_name = None;
+        self.respond_method = None;
+        for c in &mut self.children {
+            c.strip_root_facts();
+        }
+    }
+
     /// This node's Merkle hash, computed from already-current method and child
     /// hashes without mutating anything.
+    ///
+    /// RFC 002 §4.6:
+    ///
+    /// ```text
+    /// activation := SHA-256( domain("connectome/1:activation")
+    ///                      ‖ text(namespace) ‖ text(version)
+    ///                      ‖ opt(description) ‖ opt(long_description)
+    ///                      ‖ declared(request_context)
+    ///                      ‖ opt(deprecation)
+    ///                      ‖ set(hash(method), methods)
+    ///                      ‖ set(edge, children) )
+    /// ```
+    ///
+    /// Methods and child edges are **sets** (§4.8): §3.7 makes a method's local
+    /// name and a child's namespace unique within an activation, so both
+    /// collections are keyed, and a keyed collection's declaration order is
+    /// exactly the "non-canonical ordering" §4.4 forbids the hash from
+    /// depending on. Methods and children contribute only their hashes, which is
+    /// what makes this a Merkle fold rather than a full re-serialization.
     pub fn node_hash(&self) -> String {
-        let mut h = Hasher::new();
-        h.tag("plexus.ir.activation.v1");
-        h.u64(self.ir_version as u64);
-        h.opt_str(self.backend_name.as_deref());
-        h.opt_str(self.respond_method.as_deref());
-        h.str(&self.namespace);
-        h.str(&self.version);
-        h.str(&self.description);
-        h.opt_str(self.long_description.as_deref());
-        // Methods and children contribute only their hashes: that is what makes
-        // this a Merkle fold rather than a full re-serialization.
-        h.seq(&self.methods, |h, m| {
-            h.str(&m.hash);
-        });
-        h.seq(&self.children, |h, c| {
-            h.str(&c.edge_hash());
-        });
-        match &self.deprecation {
-            None => {
-                h.bool(false);
+        let mut e = Encoder::with_domain(DOMAIN_ACTIVATION);
+        e.text(&self.namespace);
+        e.text(&self.version);
+        e.opt_text(text_or_absent(&self.description));
+        e.opt_text(self.long_description.as_deref());
+        encode_declared(&mut e, self.request_context.as_ref());
+        e.opt_with(self.deprecation.is_some(), |e| {
+            if let Some(d) = &self.deprecation {
+                d.encode_into(e);
             }
-            Some(d) => {
-                h.bool(true);
-                d.hash_into(&mut h);
-            }
-        }
-        h.finish()
+        });
+        e.set(&self.methods, |e, m| {
+            e.hash_ref(&m.hash);
+        });
+        e.set(&self.children, |e, c| c.encode_into(e));
+        e.digest()
     }
 
     /// Look up a direct child edge by namespace segment.

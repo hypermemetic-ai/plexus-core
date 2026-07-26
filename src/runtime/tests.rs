@@ -52,14 +52,27 @@ fn upstream_refused() -> UpstreamRefused {
 /// method, one failing method, one refusing method, and one that issues a
 /// callback.
 fn fixture() -> (ActivationIr, HandlerTable) {
+    // PLX-102: one `C` produces both the method's declaration and the handler's
+    // client. `input.turn.client()` infers `(Permission,)` and cannot name any
+    // other set.
+    let ask = DeclaredHandler::new::<(Permission,), _, _>(|input| async move {
+        let client = input.turn.client();
+        let outcome = client
+            .request_permission_async(PermissionRequest {
+                operation: "fs/write_text_file".into(),
+                rationale: Some("write a file".into()),
+            })
+            .await
+            .map_err(|e| TurnError::callback_failed(e.to_string()))?;
+        TurnOutcome::serialize(&outcome)
+    });
+
     let ir = ActivationIr::new("fixture", "1.0.0")
         .with_method(public("double"))
         .with_method(public("stream"))
         .with_method(public("fail"))
         .with_method(public("refuse"))
-        .with_method(
-            public("ask").with_callbacks(Client::<(Permission,)>::callbacks()),
-        )
+        .with_method(ask.declare(public("ask")))
         .with_method(MethodIr::new("guarded", "fixture.guarded").with_auth(AuthRequirementIr::Required));
 
     let handlers = HandlerTable::new([
@@ -99,20 +112,7 @@ fn fixture() -> (ActivationIr, HandlerTable) {
                 ))
             }),
         ),
-        (
-            "ask",
-            ErasedHandler::new(|input: HandlerInput| async move {
-                let client = input.turn.client::<(Permission,)>();
-                let outcome = client
-                    .request_permission_async(PermissionRequest {
-                        operation: "fs/write_text_file".into(),
-                        rationale: Some("write a file".into()),
-                    })
-                    .await
-                    .map_err(|e| TurnError::callback_failed(e.to_string()))?;
-                TurnOutcome::serialize(&outcome)
-            }),
-        ),
+        ("ask", ask.into_handler()),
         (
             "guarded",
             ErasedHandler::new(|input: HandlerInput| async move {
@@ -471,29 +471,26 @@ async fn ac4_cancelling_mid_flight_resolves_the_turn_and_its_callbacks() {
         Arc::new(tokio::sync::Mutex::new(None));
     let sink = recorded.clone();
 
-    let ir = ActivationIr::new("fixture", "1.0.0").with_method(
-        public("park").with_callbacks(Client::<(Permission,)>::callbacks()),
-    );
-    let handlers = HandlerTable::new([(
-        "park",
-        ErasedHandler::new(move |input: HandlerInput| {
-            let sink = sink.clone();
-            async move {
-                let client = input.turn.client::<(Permission,)>();
-                let outcome = client
-                    .request_permission_async(PermissionRequest {
-                        operation: "t".into(),
-                        rationale: None,
-                    })
-                    .await;
-                *sink.lock().await = Some(match outcome {
-                    Ok(o) => Ok(format!("{o:?}")),
-                    Err(e) => Err(e.to_string()),
-                });
-                Ok(TurnOutcome::complete())
-            }
-        }),
-    )]);
+    let park = DeclaredHandler::new::<(Permission,), _, _>(move |input| {
+        let sink = sink.clone();
+        async move {
+            let client = input.turn.client();
+            let outcome = client
+                .request_permission_async(PermissionRequest {
+                    operation: "t".into(),
+                    rationale: None,
+                })
+                .await;
+            *sink.lock().await = Some(match outcome {
+                Ok(o) => Ok(format!("{o:?}")),
+                Err(e) => Err(e.to_string()),
+            });
+            Ok(TurnOutcome::complete())
+        }
+    });
+
+    let ir = ActivationIr::new("fixture", "1.0.0").with_method(park.declare(public("park")));
+    let handlers = HandlerTable::new([("park", park.into_handler())]);
 
     let mut turn = entry(&ir, &handlers, TurnRequest::new("park")).unwrap();
     let control = turn.control();

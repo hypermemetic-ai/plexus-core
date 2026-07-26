@@ -1,0 +1,16 @@
+error[E0277]: capability set widening: this handler's method declares `(FsRead,)`, so it may mint only `Client<(FsRead,)>` — `(FsWrite,)` is a different capability set
+  --> tests/ui/widened_capability_set.rs:33:33
+   |
+33 |         let client = input.turn.client::<(FsWrite,)>();
+   |                                 ^^^^^^ `(FsWrite,)` is not the declared set `(FsRead,)`
+   |
+   = help: the trait `Declares<(FsWrite,)>` is not implemented for `(FsRead,)`
+   = note: a handler may use exactly the set its method declares. Write `turn.client()` and let the declared set be inferred; to use another capability, add it to the method's `Client<..>` declaration so the runtime's pre-flight check can verify the peer serves it (PLX-102).
+note: required by a bound in `Turn::<C>::client`
+  --> src/runtime/declared.rs
+   |
+   |     pub fn client<D>(&self) -> Client<D>
+   |            ------ required by a bound in this associated function
+...
+   |         C: Declares<D>,
+   |            ^^^^^^^^^^^ required by this bound in `Turn::<C>::client`

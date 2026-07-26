@@ -166,6 +166,49 @@ pub trait CapabilitySet: sealed::Sealed {
     fn names() -> Vec<&'static str>;
 }
 
+/// The declared set `Self` covers the requested set `Requested` — which, a set
+/// being its own and only cover, means they are the same set (PLX-102).
+///
+/// Identity, expressed as a bound. The only implementation is the blanket
+/// `impl<C: CapabilitySet> Declares<C> for C`, so `C: Declares<D>` holds
+/// exactly when `D` and `C` are the same set.
+///
+/// # The direction is load-bearing
+///
+/// The bound is written `C: Declares<D>` — *declared* set in self position,
+/// *requested* set as the parameter — and not the mirror image `D:
+/// DeclaredAs<C>`, because only this direction infers. With the declared set
+/// concrete in self position, rustc resolves `(FsRead,): Declares<?D>` against
+/// the single blanket impl and gets `?D = (FsRead,)`; with the unknown in self
+/// position it reports `E0283: cannot satisfy _: DeclaredAs<(FsRead,)>` and
+/// demands an annotation — which would have forced every handler to name its
+/// set by hand, reintroducing at the call site the very restatement this build
+/// removes.
+///
+/// # Why a trait and not just `-> Client<C>`
+///
+/// A method with no type parameter (`fn client(&self) -> Client<C>`) would
+/// also be unwidenable, but `turn.client::<(FsWrite,)>()` would then fail with
+/// *"this method takes 0 generic arguments but 1 was supplied"* — a message
+/// about turbofish syntax, not about capabilities. Routing the widening
+/// through an unsatisfiable bound lets
+/// [`#[diagnostic::on_unimplemented]`](https://doc.rust-lang.org/reference/attributes/diagnostics.html)
+/// name both sets and say what the author actually did wrong. PLX-78's
+/// standard: for a guarantee expressed as a compile error, the message *is*
+/// the deliverable.
+///
+/// Sealed through its [`CapabilitySet`] supertrait, exactly as [`Has`] is: no
+/// downstream crate can add an impl that makes two different sets
+/// interchangeable.
+#[diagnostic::on_unimplemented(
+    message = "capability set widening: this handler's method declares `{Self}`, so it may mint only `Client<{Self}>` — `{Requested}` is a different capability set",
+    label = "`{Requested}` is not the declared set `{Self}`",
+    note = "a handler may use exactly the set its method declares. Write `turn.client()` and let the declared set be inferred; to use another capability, add it to the method's `Client<..>` declaration so the runtime's pre-flight check can verify the peer serves it (PLX-102)."
+)]
+pub trait Declares<Requested: CapabilitySet>: CapabilitySet {}
+
+impl<C: CapabilitySet> Declares<C> for C {}
+
 /// `C` contains marker `M` at position `I`.
 ///
 /// Never written by hand: it appears only as a bound on `Client<C>`'s

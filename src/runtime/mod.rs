@@ -72,6 +72,17 @@
 //! - **callbacks are capability-gated**, and checked against the peer
 //!   *pre-flight* rather than discovered mid-turn. See [`PeerCapabilities`].
 //!
+//! # A handler may call only what its method declares (PLX-102)
+//!
+//! A turn's capability handle comes from [`DeclaredHandler`], which derives the
+//! method's declared [`CallbackIr`](crate::ir::CallbackIr)s *and* the handler's
+//! `Client<C>` from a single `C`. Inside such a handler `input.turn` is a
+//! [`Turn<C>`], and `turn.client()` infers exactly that set — asking for any
+//! other set does not compile. [`TurnContext`] itself cannot mint a client at
+//! all, which is what keeps the guarantee from depending on which constructor
+//! an author picked. See [`declared`] for the seam this closed and for the one
+//! piece that is still convention.
+//!
 //! # Cancellation is cooperative — read this before relying on it
 //!
 //! This is the single most over-claimable thing in the runtime, so it is
@@ -138,6 +149,7 @@
 
 pub mod bridge;
 pub mod callback;
+pub mod declared;
 pub mod cancel;
 pub mod entry;
 pub mod error;
@@ -158,6 +170,7 @@ mod tests;
 pub use bridge::{turn_stream_to_plexus_stream, IrActivation, IrMethods};
 pub use callback::{PeerCapabilities, TurnTransport};
 pub use cancel::CancellationToken;
+pub use declared::{CapabilityInput, DeclaredHandler, Turn};
 pub use entry::{entry, entry_with_state, TurnControl, TurnHandle, TurnRequest};
 pub use error::{
     codes, decode_param, decode_params, EntryError, RespondError, TurnError,

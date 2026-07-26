@@ -166,7 +166,9 @@ fn ac1_three_level_tree_round_trips_losslessly() {
     assert_eq!(back.backend_name.as_deref(), Some("substrate"));
     assert_eq!(back.respond_method.as_deref(), Some("respond"));
     assert_eq!(back.ir_hash, ir.ir_hash);
-    assert_eq!(back.ir_version, IR_VERSION);
+    assert_eq!(back.ir_version, Some(IR_VERSION));
+    // §4.7 — the construction identifier rides on the wire with the hashes.
+    assert_eq!(back.hash_algorithm.as_deref(), Some(HASH_ALGORITHM));
     assert!(back.deprecation.is_some());
 
     let cc = claudecode(&back);
@@ -214,13 +216,17 @@ fn ac1_empty_optional_fields_are_omitted_from_the_wire() {
         "backend_name",
         "respond_method",
         "long_description",
+        "description",
+        "request_context",
         "methods",
         "children",
         "deprecation",
-        "ir_version",
     ] {
         assert!(!obj.contains_key(absent), "`{absent}` should be omitted");
     }
+    // §3.3 — the two MANDATORY root facts are the exception §3.5 does not reach.
+    assert!(obj.contains_key("ir_version"));
+    assert!(obj.contains_key("hash_algorithm"));
     let back: ActivationIr = serde_json::from_value(v).unwrap();
     assert_eq!(back, ir);
 }
@@ -423,8 +429,28 @@ fn ac3_json_object_key_order_inside_a_schema_does_not_affect_hashes() {
 
 #[test]
 fn ac3_sequence_order_is_significant() {
-    // Not an insertion-order artifact: reordering a method LIST is a real
-    // content change and must be visible in the hash.
+    // RFC 002 §4.8 rules on which of the document's collections are sequences.
+    // PARAMETERS are: a parameter is identified by its position to a positional
+    // caller, so reordering them is a real content change.
+    let mut a = MethodIr::new("m", "n.m")
+        .with_param(ParamIr::new("x", string_schema("S")))
+        .with_param(ParamIr::new("y", string_schema("T")));
+    let mut b = MethodIr::new("m", "n.m")
+        .with_param(ParamIr::new("y", string_schema("T")))
+        .with_param(ParamIr::new("x", string_schema("S")));
+    a.recompute_hash();
+    b.recompute_hash();
+    assert_ne!(a.hash, b.hash);
+}
+
+#[test]
+fn rfc002_4_8_methods_and_child_edges_are_sets_not_sequences() {
+    // The other half of §4.8, and a deliberate change from the pre-RFC-002
+    // behaviour (finding F-15, on which "both readings are defensible").
+    // §3.7 makes a method's local name and a child's namespace unique within an
+    // activation, which makes both collections KEYED; a keyed collection's
+    // declaration order is exactly the "non-canonical ordering" §4.4 forbids the
+    // hash from depending on.
     let mut a = ActivationIr::new("n", "1")
         .with_method(MethodIr::new("x", "n.x"))
         .with_method(MethodIr::new("y", "n.y"));
@@ -433,7 +459,20 @@ fn ac3_sequence_order_is_significant() {
         .with_method(MethodIr::new("x", "n.x"));
     a.recompute_hashes();
     b.recompute_hashes();
-    assert_ne!(a.hash, b.hash);
+    assert_eq!(a.hash, b.hash, "method declaration order is not content");
+
+    let k = || ChildEdge::Static(ActivationIr::new("k", "1"));
+    let z = || ChildEdge::Static(ActivationIr::new("z", "1"));
+    let mut kz = ActivationIr::new("n", "1").with_child(k()).with_child(z());
+    let mut zk = ActivationIr::new("n", "1").with_child(z()).with_child(k());
+    kz.recompute_hashes();
+    zk.recompute_hashes();
+    assert_eq!(kz.hash, zk.hash, "child edge order is not content");
+
+    // Not vacuous: a different SET is still a different hash.
+    let mut k_only = ActivationIr::new("n", "1").with_child(k());
+    k_only.recompute_hashes();
+    assert_ne!(kz.hash, k_only.hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -937,11 +976,216 @@ fn completeness_indexed_edge_answers_all_three_client_questions() {
 #[test]
 fn completeness_ir_version_is_carried_and_defaults_on_decode() {
     // Inventory item 18: no handshake, just a declared document version.
+    //
+    // RFC 002 §3.3 makes it a root fact rather than a field with a silent
+    // default: a document that does not declare one has not declared one, and a
+    // reader can tell. `recompute_hashes` is what establishes it on a root, and
+    // §3.5 does not apply to it thereafter (finding F-01).
     let decoded: ActivationIr =
         serde_json::from_value(json!({"namespace": "n"})).expect("minimal document decodes");
-    assert_eq!(decoded.ir_version, IR_VERSION);
+    assert_eq!(decoded.ir_version, None);
     assert_eq!(decoded.version, "");
     assert!(decoded.methods.is_empty());
+
+    let mut root = decoded;
+    root.recompute_hashes();
+    assert_eq!(root.ir_version, Some(IR_VERSION));
+    let wire = serde_json::to_value(&root).unwrap();
+    assert_eq!(
+        wire.get("ir_version"),
+        Some(&json!(IR_VERSION)),
+        "§3.3: a mandatory root fact is emitted even at its default"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 002 §3.3 / §3.5 — the two clauses stop contradicting each other
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rfc002_3_5_an_absent_description_is_omitted_not_emitted_as_an_empty_string() {
+    // The §3.5 non-conformance PLX-86 found: `description` was emitted as `""`
+    // on every activation, method and param, while the same encoder correctly
+    // omitted `long_description` and `backend_name`. §3.5 forbids "an empty
+    // placeholder".
+    let mut ir = ActivationIr::new("leaf", "1.0.0").with_method(
+        MethodIr::new("m", "leaf.m").with_param(ParamIr::new("p", string_schema("S"))),
+    );
+    ir.recompute_hashes();
+    let v = serde_json::to_value(&ir).unwrap();
+
+    assert!(
+        !v.as_object().unwrap().contains_key("description"),
+        "activation description must be omitted, not emitted as \"\""
+    );
+    let m = &v["methods"][0];
+    assert!(
+        !m.as_object().unwrap().contains_key("description"),
+        "method description must be omitted, not emitted as \"\""
+    );
+    let p = &m["params"][0];
+    assert!(
+        !p.as_object().unwrap().contains_key("description"),
+        "param description must be omitted, not emitted as \"\""
+    );
+
+    // The whole document contains no empty string anywhere.
+    assert!(
+        !serde_json::to_string(&ir).unwrap().contains(":\"\""),
+        "no field may be emitted as an empty placeholder"
+    );
+
+    // And a described document still says so.
+    let mut described = ActivationIr::new("leaf", "1.0.0").with_description("d");
+    described.recompute_hashes();
+    assert_eq!(
+        serde_json::to_value(&described).unwrap()["description"],
+        json!("d")
+    );
+}
+
+#[test]
+fn rfc002_3_3_root_facts_are_on_the_root_and_nowhere_else() {
+    let ir = tree();
+    assert_eq!(ir.ir_version, Some(IR_VERSION));
+    assert_eq!(ir.hash_algorithm.as_deref(), Some(HASH_ALGORITHM));
+    assert!(ir.ir_hash.is_some());
+
+    // A Static child built by the same builder as a root must not carry any of
+    // them, whatever it was constructed with.
+    let mut root = ActivationIr::new("r", "1")
+        .with_child(ChildEdge::Static(
+            ActivationIr::new("c", "1")
+                .with_backend_name("smuggled")
+                .with_respond_method("smuggled"),
+        ));
+    root.recompute_hashes();
+    let ChildEdge::Static(child) = &root.children[0] else {
+        panic!("expected a static child")
+    };
+    assert_eq!(child.ir_version, None);
+    assert_eq!(child.hash_algorithm, None);
+    assert_eq!(child.ir_hash, None);
+    assert_eq!(child.backend_name, None);
+    assert_eq!(child.respond_method, None);
+}
+
+#[test]
+fn rfc002_4_6_an_activation_hash_does_not_depend_on_the_root_facts() {
+    // The property that makes a Static child's advertised hash comparable with
+    // the hash it reports when fetched on its own: root facts belong to the
+    // DOCUMENT hash, not the activation hash.
+    let mut plain = ActivationIr::new("n", "1");
+    plain.recompute_hashes();
+    let mut identified = ActivationIr::new("n", "1")
+        .with_backend_name("b")
+        .with_respond_method("respond");
+    identified.recompute_hashes();
+
+    assert_eq!(plain.hash, identified.hash, "activation hash is unchanged");
+    assert_ne!(
+        plain.ir_hash, identified.ir_hash,
+        "§4.5: the document hash still changes, so a consumer invalidates"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 002 §4.4 + §7.1 — a capability SET has no order
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rfc002_7_1_capability_declaration_order_does_not_change_the_hash() {
+    // The second Rust non-conformance PLX-86 found (fixtures b09/b10): §7.1
+    // states the callback declaration is a SET, a set has no canonical order,
+    // so §4.4's ban on depending on a non-canonical ordering applies.
+    let cb1 = CallbackIr::new("cb1", string_schema("Q"), string_schema("A"));
+    let cb2 = CallbackIr::new("cb2", string_schema("Q2"), string_schema("A2"));
+
+    let mut forward = MethodIr::new("m", "a.m").with_callbacks([cb1.clone(), cb2.clone()]);
+    let mut reverse = MethodIr::new("m", "a.m").with_callbacks([cb2, cb1]);
+    forward.recompute_hash();
+    reverse.recompute_hash();
+
+    assert_eq!(
+        forward.hash, reverse.hash,
+        "two declaration orders of one capability SET must hash identically"
+    );
+
+    // Not vacuous: a genuinely different set still hashes differently.
+    let mut one = MethodIr::new("m", "a.m")
+        .with_callback(CallbackIr::new("cb1", string_schema("Q"), string_schema("A")));
+    one.recompute_hash();
+    assert_ne!(forward.hash, one.hash);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 002 §6.9 — the request context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rfc002_6_9_request_context_is_declared_overridden_and_hashed() {
+    let activation_ctx = schema("SessionRequest");
+    let method_ctx = schema("UploadRequest");
+
+    let inherits = MethodIr::new("read", "n.read");
+    let overrides = MethodIr::new("upload", "n.upload").with_request_context(method_ctx.clone());
+    let mut ir = ActivationIr::new("n", "1")
+        .with_request_context(activation_ctx.clone())
+        .with_method(inherits)
+        .with_method(overrides);
+    ir.recompute_hashes();
+
+    // §6.9 resolution: the method's own declaration replaces the activation's;
+    // a method without one takes the activation's; there is no merge.
+    let read = ir.method("read").unwrap();
+    let upload = ir.method("upload").unwrap();
+    assert_eq!(
+        ir.effective_request_context(read),
+        Some(&activation_ctx),
+        "a method with no declaration of its own takes the activation's"
+    );
+    assert_eq!(
+        ir.effective_request_context(upload),
+        Some(&method_ctx),
+        "a method's own declaration replaces the activation's"
+    );
+
+    // §6.9 absence: no declaration anywhere means the method needs nothing.
+    let bare = ActivationIr::new("n", "1").with_method(MethodIr::new("read", "n.read"));
+    assert_eq!(
+        bare.effective_request_context(bare.method("read").unwrap()),
+        None
+    );
+
+    // It is content: it round-trips and it participates in the hashes.
+    let json = serde_json::to_string(&ir).unwrap();
+    let back: ActivationIr = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, ir);
+    assert_eq!(
+        back.request_context.as_ref().map(|r| r.type_name()),
+        Some("SessionRequest")
+    );
+
+    let mut without = ActivationIr::new("n", "1")
+        .with_method(MethodIr::new("read", "n.read"))
+        .with_method(MethodIr::new("upload", "n.upload").with_request_context(method_ctx));
+    without.recompute_hashes();
+    assert_ne!(
+        ir.hash, without.hash,
+        "dropping the activation-level declaration is a content change"
+    );
+
+    let mut method_only_changed = ActivationIr::new("n", "1")
+        .with_method(MethodIr::new("upload", "n.upload"));
+    method_only_changed.recompute_hashes();
+    let mut method_only_declared = ActivationIr::new("n", "1")
+        .with_method(MethodIr::new("upload", "n.upload").with_request_context(schema("Other")));
+    method_only_declared.recompute_hashes();
+    assert_ne!(
+        method_only_changed.method("upload").unwrap().hash,
+        method_only_declared.method("upload").unwrap().hash,
+        "a method's request context participates in its own hash"
+    );
 }
 
 #[test]
@@ -957,4 +1201,65 @@ fn navigation_helpers_find_children_across_all_edge_kinds() {
         Some(ChildEdge::Indexed { .. })
     ));
     assert!(ir.child("nope").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Fixture regeneration for the independent Haskell implementation
+// ---------------------------------------------------------------------------
+
+/// Re-emit the `connectome-hs` fixture corpus from this implementation.
+///
+/// The corpus in `connectome-hs/fixtures/rust/` is the only thing the Haskell
+/// implementation ever learned from the Rust side, and RFC 002 changed both the
+/// wire (§3.3 root facts, §3.5 omitted descriptions, §4.7 the construction
+/// identifier) and every hash (§4.6 `CONNECTOME-HASH/1`). Rather than
+/// hand-writing 40 documents again, each fixture is decoded into the model and
+/// re-encoded, which preserves exactly the content the corpus was commissioned
+/// to probe and updates only what RFC 002 changed.
+///
+/// Inert unless `CONNECTOME_FIXTURE_DIR` is set, so a normal `cargo test` never
+/// writes to another repository:
+///
+/// ```sh
+/// CONNECTOME_FIXTURE_DIR=../connectome-hs/fixtures/rust \
+///   cargo test --lib regenerate_connectome_fixtures -- --nocapture
+/// ```
+#[test]
+fn regenerate_connectome_fixtures() {
+    let Ok(dir) = std::env::var("CONNECTOME_FIXTURE_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(dir);
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for d in [root.clone(), root.join("ablation")] {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            // 07 is a bag of stop reasons and 90 is a pre-IR golden; neither is
+            // a document.
+            if name.starts_with("07_") || name.starts_with("90_") {
+                continue;
+            }
+            files.push(p);
+        }
+    }
+    files.sort();
+    assert!(files.len() > 30, "expected the whole corpus, found {}", files.len());
+
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut ir: ActivationIr = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        ir.recompute_hashes();
+        let mut out = serde_json::to_string_pretty(&ir).unwrap();
+        out.push('\n');
+        std::fs::write(&path, out).unwrap();
+        println!("regenerated {}", path.display());
+    }
 }

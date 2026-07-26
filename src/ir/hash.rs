@@ -1,233 +1,354 @@
-//! Deterministic content hashing for the activation IR (PLX-75).
+//! `CONNECTOME-HASH/1` — the normative content-hash construction of
+//! CONNECTOME RFC 002 §4.6 (PLX-89).
 //!
-//! # The algorithm
+//! # Why this module was rewritten
 //!
-//! Every IR node carries a `hash: String` — the lowercase hex SHA-256 digest of
-//! a *canonical byte encoding* of that node's own content **folded together with
-//! its children's hashes**. That makes the tree a Merkle tree:
+//! RFC 001 §4 constrained hashing's *properties* (Merkle-ness, determinism,
+//! order-canonicality) and named no *construction*: no hash function, no
+//! preimage, no digest encoding. An independent Haskell implementation
+//! (`connectome-hs`, PLX-86) written from RFC 001 alone searched ~26 million
+//! candidate preimages across five digest functions and matched none of this
+//! crate's hashes — proof that two implementations could satisfy every §4 MUST
+//! and disagree on every digest (finding F-06).
 //!
-//! - mutating a leaf changes that leaf's hash,
-//! - which changes every ancestor's hash (each parent hashes its children's
-//!   hashes as content),
-//! - while leaving sibling subtrees byte-identical (a sibling's hash never
-//!   depends on anything outside its own subtree).
+//! RFC 002 closes that by specifying `CONNECTOME-HASH/1` normatively. This
+//! module is its Rust implementation; `Plexus.Connectome.Hash` in
+//! `connectome-hs` is its Haskell implementation, and the two produce
+//! byte-identical digests. The previous, unspecified framing (little-endian
+//! lengths, `plexus.ir.*.v1` tags, root facts inside the activation preimage,
+//! declaration-ordered method/child/capability folds) is gone.
 //!
-//! ## Canonical encoding
+//! # The construction
 //!
-//! Hash inputs are built by [`Hasher`], which is a thin, *unambiguous* framing
-//! layer over SHA-256. Every value written is length-prefixed and type-tagged,
-//! so no two structurally different node contents can produce the same byte
-//! stream (no `"ab" + "c"` == `"a" + "bc"` collisions):
+//! Digest: **SHA-256**, rendered as 64 lowercase hex characters.
+//!
+//! Primitives — every variable-length component is length-prefixed with a
+//! **64-bit big-endian** count and every sum is one-byte tagged, so the preimage
+//! is injective (without the prefix a namespace could borrow a character from a
+//! version):
 //!
 //! | writer | emitted bytes |
 //! |---|---|
-//! | [`Hasher::tag`] | `b'T'`, u64-LE length, UTF-8 bytes — a domain separator |
-//! | [`Hasher::str`] | `b'S'`, u64-LE length, UTF-8 bytes |
-//! | [`Hasher::opt_str`] | `b'0'` for `None`; `b'1'` + `str` encoding for `Some` |
-//! | [`Hasher::bool`] | `b'B'`, `0x00` / `0x01` |
-//! | [`Hasher::u64`] | `b'U'`, u64-LE |
-//! | [`Hasher::seq`] | `b'L'`, u64-LE element count, then each element |
-//! | [`Hasher::json`] | see below |
+//! | [`Encoder::u64`] | 8 bytes, big-endian |
+//! | [`Encoder::bytes`] | `u64be(len)`, then the bytes |
+//! | [`Encoder::text`] | `bytes(utf8(s))` |
+//! | [`Encoder::bool`] | one byte, `0x00` / `0x01` |
+//! | [`Encoder::tag`] | one byte |
+//! | [`Encoder::opt_text`] | `tag(0)` for absent; `tag(1)` + `text` for present |
+//! | [`Encoder::domain`] | `text(domain-string)` — leads every node preimage |
+//! | [`Encoder::json`] | `bytes(canonical_json(v))` — see [`canonical_json`] |
+//! | [`Encoder::seq`] | `u64be(count)`, then each element in order |
+//! | [`Encoder::set`] | `u64be(count)`, then each element's encoded bytes, **sorted** |
 //!
-//! ## Determinism rules (the two failure modes this must not have)
+//! Each node's preimage is prefixed with a domain string
+//! (`connectome/1:activation`, `:method`, `:document`, …), a node's own stored
+//! hash is never part of its own preimage, and a Dynamic edge contributes its
+//! namespace and its *advertised* hash — never a recomputation, which would be
+//! the fabrication RFC §5.2 forbids.
 //!
-//! 1. **No unordered iteration is ever hashed.** Every map in the IR is a
-//!    [`std::collections::BTreeMap`], and `serde_json::Map` is a `BTreeMap` in
-//!    this build (the `preserve_order` feature is off), so JSON object keys are
-//!    visited in sorted order regardless of the order they were inserted in.
-//!    [`Hasher::json`] additionally sorts defensively rather than trusting the
-//!    map type. `HashMap` is never hashed.
-//! 2. **No non-reproducible hasher.** `std::collections::hash_map::DefaultHasher`
-//!    (used by the legacy `PluginSchema::compute_hashes`) is explicitly *not*
-//!    guaranteed stable across Rust releases. The IR therefore hashes with
-//!    SHA-256 (the [`sha2`] crate), verified against the FIPS 180-4 test vectors
-//!    in the unit tests below. The digest is stable across runs, across
-//!    processes, across toolchains, and across serialize/deserialize — every
-//!    hash input is a field that survives serde round-tripping.
+//! Unordered collections ([`set`](Encoder::set)) are canonicalized by sorting
+//! members' **encoded bytes**, so no two distinct members can compare equal and
+//! be reordered unstably. RFC 002 §4.8 rules on which collections those are:
+//! callbacks (§7.1 says SET), extensions (a map), methods and child edges (§3.7
+//! makes both keyed, hence maps) are unordered; parameters and turn updates are
+//! sequences.
 //!
-//!    PLX-75 shipped a hand-rolled SHA-256 here purely because that ticket
-//!    forbade a `Cargo.toml` edit (its residual #3). PLX-77 lifted that
-//!    restriction and the hand-rolled compression function is gone; the framing
-//!    layer is byte-for-byte unchanged, which the unit test
-//!    `golden_digest_is_unchanged_by_the_sha2_swap` pins against a digest
-//!    produced by the old implementation.
+//! # Canonical JSON
 //!
-//! ## JSON canonicalization
-//!
-//! [`Hasher::json`] encodes a [`serde_json::Value`] with a type tag per node:
-//! `n` null, `b` bool, `i` u64 / `I` i64 / `d` f64-bits for numbers, `s`
-//! strings, `a` arrays (length-prefixed, order preserved — array order is
-//! meaningful), `o` objects (length-prefixed, keys sorted, each key hashed as a
-//! string before its value). Numbers are discriminated by their concrete JSON
-//! representation, so `1` and `1.0` hash differently — matching the fact that
-//! serde_json round-trips them differently.
-//!
-//! Sequence order in the IR itself (`methods`, `children`, `params`) is
-//! declaration order and *is* load-bearing: reordering a method list is a real
-//! change to the document and correctly changes the hash.
+//! [`canonical_json`] is `CONNECTOME-JCS/1` (RFC 002 §4.3): object keys sorted
+//! by their UTF-8 bytes, no insignificant whitespace, integral numbers rendered
+//! without a decimal point.
 
-use std::collections::BTreeMap;
-
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// Domain-separated, length-prefixed SHA-256 accumulator for IR hashing.
+/// The identifier a document declares under RFC 002 §4.7 to say which
+/// construction produced its hashes.
+pub const HASH_ALGORITHM: &str = "CONNECTOME-HASH/1";
+
+/// Domain string leading an activation preimage.
+pub(crate) const DOMAIN_ACTIVATION: &str = "connectome/1:activation";
+/// Domain string leading a method preimage.
+pub(crate) const DOMAIN_METHOD: &str = "connectome/1:method";
+/// Domain string leading a document preimage.
+pub(crate) const DOMAIN_DOCUMENT: &str = "connectome/1:document";
+/// Domain string leading a type-reference encoding.
+pub(crate) const DOMAIN_TYPEREF: &str = "connectome/1:typeref";
+/// Domain string leading a parameter encoding.
+pub(crate) const DOMAIN_PARAM: &str = "connectome/1:param";
+/// Domain string leading a capability encoding.
+pub(crate) const DOMAIN_CAPABILITY: &str = "connectome/1:capability";
+/// Domain string leading a deprecation-record encoding.
+pub(crate) const DOMAIN_DEPRECATION: &str = "connectome/1:deprecation";
+
+/// The canonical byte encoder of `CONNECTOME-HASH/1`.
 ///
-/// See the [module docs](self) for the canonical encoding table.
-#[derive(Debug, Clone)]
-pub struct Hasher {
-    inner: Sha256,
+/// It accumulates *bytes* rather than digest state, because
+/// [`set`](Encoder::set) has to sort its members' encodings before they are
+/// hashed. Call [`digest`](Encoder::digest) to finish.
+#[derive(Debug, Clone, Default)]
+pub struct Encoder {
+    buf: Vec<u8>,
 }
 
-impl Default for Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Hasher {
-    /// Start an empty hash accumulator.
+impl Encoder {
+    /// A fresh, empty encoder.
     pub fn new() -> Self {
-        Self {
-            inner: Sha256::new(),
-        }
+        Self { buf: Vec::new() }
     }
 
-    /// Write a domain-separation tag (e.g. `"plexus.ir.method.v1"`).
-    pub fn tag(&mut self, tag: &str) -> &mut Self {
-        self.framed(b'T', tag.as_bytes())
+    /// Start an encoder whose first component is a domain string.
+    pub fn with_domain(domain: &str) -> Self {
+        let mut e = Self::new();
+        e.domain(domain);
+        e
     }
 
-    /// Write a string field.
-    pub fn str(&mut self, s: &str) -> &mut Self {
-        self.framed(b'S', s.as_bytes())
+    /// The bytes written so far.
+    pub fn bytes_written(&self) -> &[u8] {
+        &self.buf
     }
 
-    /// Write an optional string field (present/absent are distinguishable).
-    pub fn opt_str(&mut self, s: Option<&str>) -> &mut Self {
-        match s {
-            None => {
-                self.inner.update(&[b'0']);
-                self
-            }
-            Some(v) => {
-                self.inner.update(&[b'1']);
-                self.str(v)
-            }
-        }
+    /// Consume the encoder, returning its bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
     }
 
-    /// Write a boolean field.
-    pub fn bool(&mut self, b: bool) -> &mut Self {
-        self.inner.update(&[b'B', u8::from(b)]);
-        self
-    }
-
-    /// Write an unsigned integer field.
+    /// A 64-bit big-endian integer. Big-endian so the encoding does not depend
+    /// on host architecture — §4.3 requires determinism across processes.
     pub fn u64(&mut self, v: u64) -> &mut Self {
-        self.inner.update(&[b'U']);
-        self.inner.update(&v.to_le_bytes());
+        self.buf.extend_from_slice(&v.to_be_bytes());
         self
     }
 
-    /// Write a length-prefixed sequence, hashing each element with `f`.
+    /// Length-prefixed raw bytes. The prefix is what makes the encoding
+    /// injective.
+    pub fn bytes(&mut self, b: &[u8]) -> &mut Self {
+        self.u64(b.len() as u64);
+        self.buf.extend_from_slice(b);
+        self
+    }
+
+    /// Length-prefixed UTF-8 text.
+    pub fn text(&mut self, s: &str) -> &mut Self {
+        self.bytes(s.as_bytes())
+    }
+
+    /// A one-byte sum discriminant.
+    pub fn tag(&mut self, t: u8) -> &mut Self {
+        self.buf.push(t);
+        self
+    }
+
+    /// A boolean, one byte.
+    pub fn bool(&mut self, b: bool) -> &mut Self {
+        self.buf.push(u8::from(b));
+        self
+    }
+
+    /// The domain string that leads a node preimage. It is ordinary
+    /// length-prefixed text; the name records the intent.
+    pub fn domain(&mut self, s: &str) -> &mut Self {
+        self.text(s)
+    }
+
+    /// An optional string: absent and present-but-empty are distinguishable.
     ///
-    /// Element order is preserved — IR sequences are declaration-ordered and
-    /// reordering them is a genuine content change.
+    /// §3.5 makes an empty optional and an absent optional the *same* document
+    /// on the wire, so callers pass [`text_or_absent`] rather than
+    /// `Some("")`.
+    pub fn opt_text(&mut self, s: Option<&str>) -> &mut Self {
+        match s {
+            None => self.tag(0),
+            Some(v) => {
+                self.tag(1);
+                self.text(v)
+            }
+        }
+    }
+
+    /// An optional 64-bit integer.
+    pub fn opt_u64(&mut self, v: Option<u64>) -> &mut Self {
+        match v {
+            None => self.tag(0),
+            Some(n) => {
+                self.tag(1);
+                self.u64(n)
+            }
+        }
+    }
+
+    /// An optional sub-encoding.
+    pub fn opt_with(&mut self, present: bool, f: impl FnOnce(&mut Self)) -> &mut Self {
+        if present {
+            self.tag(1);
+            f(self);
+        } else {
+            self.tag(0);
+        }
+        self
+    }
+
+    /// A JSON value in canonical form ([`canonical_json`]), length-prefixed.
+    pub fn json(&mut self, v: &Value) -> &mut Self {
+        let s = canonical_json(v);
+        self.bytes(s.as_bytes())
+    }
+
+    /// An ordered collection: count, then each element in declaration order.
     pub fn seq<T>(&mut self, items: &[T], mut f: impl FnMut(&mut Self, &T)) -> &mut Self {
-        self.inner.update(&[b'L']);
-        self.inner.update(&(items.len() as u64).to_le_bytes());
+        self.u64(items.len() as u64);
         for item in items {
             f(self, item);
         }
         self
     }
 
-    /// Write a string-keyed map, keys visited in sorted order.
-    pub fn map<V>(
-        &mut self,
-        map: &BTreeMap<String, V>,
-        mut f: impl FnMut(&mut Self, &V),
-    ) -> &mut Self {
-        self.inner.update(&[b'M']);
-        self.inner.update(&(map.len() as u64).to_le_bytes());
-        // BTreeMap already iterates in sorted key order; insertion order is
-        // therefore structurally unobservable here.
-        for (k, v) in map {
-            self.str(k);
-            f(self, v);
+    /// An **unordered** collection: count, then each element's encoded bytes in
+    /// ascending byte order.
+    ///
+    /// Sorting the encodings (rather than a chosen key) is what makes the
+    /// canonicalization total: two distinct members can never compare equal and
+    /// be reordered unstably.
+    pub fn set<T>(&mut self, items: &[T], mut f: impl FnMut(&mut Self, &T)) -> &mut Self {
+        let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+        for item in items {
+            let mut e = Encoder::new();
+            f(&mut e, item);
+            encoded.push(e.into_bytes());
+        }
+        encoded.sort();
+        self.u64(encoded.len() as u64);
+        for e in encoded {
+            self.buf.extend_from_slice(&e);
         }
         self
     }
 
-    /// Write a JSON value in canonical form (object keys sorted).
-    pub fn json(&mut self, value: &serde_json::Value) -> &mut Self {
-        use serde_json::Value;
-        match value {
-            Value::Null => {
-                self.inner.update(&[b'n']);
-            }
-            Value::Bool(b) => {
-                self.inner.update(&[b'b', u8::from(*b)]);
-            }
-            Value::Number(n) => {
-                if let Some(u) = n.as_u64() {
-                    self.inner.update(&[b'i']);
-                    self.inner.update(&u.to_le_bytes());
-                } else if let Some(i) = n.as_i64() {
-                    self.inner.update(&[b'I']);
-                    self.inner.update(&i.to_le_bytes());
-                } else {
-                    // f64 bit pattern: exact, and stable for any value
-                    // serde_json can round-trip.
-                    let f = n.as_f64().unwrap_or(f64::NAN);
-                    self.inner.update(&[b'd']);
-                    self.inner.update(&f.to_bits().to_le_bytes());
+    /// A 64-hex digest embedded in a parent's preimage — §4.2's Merkle fold.
+    pub fn hash_ref(&mut self, h: &str) -> &mut Self {
+        self.text(h)
+    }
+
+    /// Finish: the lowercase hex SHA-256 of everything written.
+    pub fn digest(&self) -> String {
+        sha256_hex(&self.buf)
+    }
+}
+
+/// Backwards-compatible alias for the encoder.
+pub type Hasher = Encoder;
+
+/// §3.5 — an empty string on the wire *is* absence, so it hashes as absence.
+///
+/// This is the rule that makes `description: ""` (which RFC 002 §3.5 forbids
+/// emitting) indistinguishable from an omitted `description`, and therefore the
+/// rule that lets a Rust document and a Haskell document of the same content
+/// agree.
+pub fn text_or_absent(s: &str) -> Option<&str> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// The lowercase hex SHA-256 of `input`.
+pub fn sha256_hex(input: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(input);
+    to_hex(h.finalize().as_slice())
+}
+
+/// `CONNECTOME-JCS/1` (RFC 002 §4.3): a deterministic serialization of an
+/// arbitrary JSON value.
+///
+/// - object keys sorted ascending by their UTF-8 bytes;
+/// - no insignificant whitespace;
+/// - an integral number rendered as a decimal integer with no decimal point or
+///   exponent, so `1` and `1.0` canonicalize identically;
+/// - a non-integral number rendered as the shortest decimal that round-trips;
+/// - strings escaped with the two-character forms for `"` `\` `\b` `\f` `\n`
+///   `\r` `\t`, `\u00XX` for the remaining control characters, and the literal
+///   UTF-8 character otherwise.
+pub fn canonical_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_canonical(v, &mut out);
+    out
+}
+
+fn write_canonical(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::Number(n) => write_number(n, out),
+        Value::String(s) => write_string(s, out),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
                 }
+                write_canonical(item, out);
             }
-            Value::String(s) => {
-                self.inner.update(&[b's']);
-                self.framed_raw(s.as_bytes());
-            }
-            Value::Array(items) => {
-                self.inner.update(&[b'a']);
-                self.inner.update(&(items.len() as u64).to_le_bytes());
-                for item in items {
-                    self.json(item);
-                }
-            }
-            Value::Object(obj) => {
-                self.inner.update(&[b'o']);
-                self.inner.update(&(obj.len() as u64).to_le_bytes());
-                // `serde_json::Map` is a BTreeMap here (no `preserve_order`),
-                // but sort explicitly so this stays correct even if a future
-                // dependency turns that feature on.
-                let mut keys: Vec<&String> = obj.keys().collect();
-                keys.sort_unstable();
-                for k in keys {
-                    self.inner.update(&[b's']);
-                    self.framed_raw(k.as_bytes());
-                    self.json(&obj[k]);
-                }
-            }
+            out.push(']');
         }
-        self
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            out.push('{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_string(k, out);
+                out.push(':');
+                write_canonical(&map[k], out);
+            }
+            out.push('}');
+        }
     }
+}
 
-    /// Finish and return the lowercase hex digest.
-    pub fn finish(&self) -> String {
-        to_hex(self.inner.clone().finalize().as_slice())
+fn write_number(n: &serde_json::Number, out: &mut String) {
+    if let Some(u) = n.as_u64() {
+        out.push_str(&u.to_string());
+        return;
     }
+    if let Some(i) = n.as_i64() {
+        out.push_str(&i.to_string());
+        return;
+    }
+    let f = n.as_f64().unwrap_or(f64::NAN);
+    // An integral float is an integral number: `1.0` and `1` canonicalize the
+    // same way, which is what makes the encoding independent of whether a
+    // producer's JSON reader kept the decimal point.
+    if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.007_199_254_740_992e15 {
+        out.push_str(&(f as i64).to_string());
+        return;
+    }
+    out.push_str(&f.to_string());
+}
 
-    fn framed(&mut self, tag: u8, bytes: &[u8]) -> &mut Self {
-        self.inner.update(&[tag]);
-        self.framed_raw(bytes);
-        self
+fn write_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < ' ' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
     }
-
-    fn framed_raw(&mut self, bytes: &[u8]) {
-        self.inner.update(&(bytes.len() as u64).to_le_bytes());
-        self.inner.update(bytes);
-    }
+    out.push('"');
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -243,12 +364,7 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sha256_hex(input: &[u8]) -> String {
-        let mut h = Sha256::new();
-        h.update(input);
-        to_hex(h.finalize().as_slice())
-    }
+    use serde_json::json;
 
     /// FIPS 180-4 published vectors — this pins the digest so an IR hash
     /// computed today is reproducible by any other SHA-256 implementation.
@@ -268,87 +384,122 @@ mod tests {
         );
     }
 
-    /// Multi-block input exercising the buffering path.
+    /// RFC 002 §4.6: lengths are 64-bit **big-endian**. This is the single fact
+    /// that made the two implementations disagree, so it is pinned literally.
     #[test]
-    fn sha256_handles_multi_block_and_chunked_input() {
-        let million_a = vec![b'a'; 1_000_000];
-        assert_eq!(
-            sha256_hex(&million_a),
-            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
-        );
-
-        // Same bytes fed in irregular chunks must give the same digest.
-        let mut chunked = Sha256::new();
-        for chunk in million_a.chunks(7) {
-            chunked.update(chunk);
-        }
-        assert_eq!(to_hex(chunked.finalize().as_slice()), sha256_hex(&million_a));
-    }
-
-    /// PLX-77 AC8: the `sha2` swap must be digest-neutral.
-    ///
-    /// This golden was produced by PLX-75's hand-rolled SHA-256 *before* the
-    /// crate was replaced, over an input that exercises every writer in the
-    /// framing table. If a future change to the framing layer (or to `sha2`)
-    /// moved a byte, this fails — which is the only mechanical way to state
-    /// "byte-identical digests" once the old implementation is deleted.
-    #[test]
-    fn golden_digest_is_unchanged_by_the_sha2_swap() {
-        let mut h = Hasher::new();
-        h.tag("plexus.ir.golden.v1")
-            .str("abc")
-            .bool(true)
-            .u64(7)
-            .opt_str(None)
-            .opt_str(Some("x"));
-        h.map(&BTreeMap::from([("k".to_string(), 1u8)]), |h, v| {
-            h.u64(*v as u64);
-        });
-        h.json(&serde_json::json!({"b":[1,2.5,"s",null,true],"a":{"z":1}}));
-        assert_eq!(
-            h.finish(),
-            "aad0470ba1c1d7258d108a38d7800cb6fd9b695bc905270426d843406d685c94"
-        );
+    fn length_prefixes_are_64_bit_big_endian() {
+        let mut e = Encoder::new();
+        e.text("ab");
+        assert_eq!(e.bytes_written(), b"\x00\x00\x00\x00\x00\x00\x00\x02ab");
     }
 
     #[test]
     fn framing_is_unambiguous() {
-        let mut a = Hasher::new();
-        a.str("ab").str("c");
-        let mut b = Hasher::new();
-        b.str("a").str("bc");
-        assert_ne!(a.finish(), b.finish());
+        let mut a = Encoder::new();
+        a.text("ab").text("c");
+        let mut b = Encoder::new();
+        b.text("a").text("bc");
+        assert_ne!(a.digest(), b.digest());
     }
 
     #[test]
-    fn none_and_empty_string_differ() {
-        let mut a = Hasher::new();
-        a.opt_str(None);
-        let mut b = Hasher::new();
-        b.opt_str(Some(""));
-        assert_ne!(a.finish(), b.finish());
+    fn absent_and_empty_string_hash_alike_because_the_wire_cannot_tell_them_apart() {
+        // §3.5: an empty optional MUST NOT be emitted, so `Some("")` is not a
+        // document a conformant encoder can produce. `text_or_absent` maps it
+        // onto absence, which is what keeps Rust and Haskell in agreement.
+        let mut a = Encoder::new();
+        a.opt_text(None);
+        let mut b = Encoder::new();
+        b.opt_text(text_or_absent(""));
+        assert_eq!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn a_set_is_order_independent_and_a_seq_is_not() {
+        let items = ["b".to_string(), "a".to_string()];
+        let reversed = ["a".to_string(), "b".to_string()];
+
+        let mut s1 = Encoder::new();
+        s1.set(&items, |e, s| {
+            e.text(s);
+        });
+        let mut s2 = Encoder::new();
+        s2.set(&reversed, |e, s| {
+            e.text(s);
+        });
+        assert_eq!(s1.digest(), s2.digest());
+
+        let mut q1 = Encoder::new();
+        q1.seq(&items, |e, s| {
+            e.text(s);
+        });
+        let mut q2 = Encoder::new();
+        q2.seq(&reversed, |e, s| {
+            e.text(s);
+        });
+        assert_ne!(q1.digest(), q2.digest());
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_and_drops_whitespace() {
+        assert_eq!(
+            canonical_json(&json!({"z": 1, "a": {"y": 2, "b": [1, 2]}})),
+            r#"{"a":{"b":[1,2],"y":2},"z":1}"#
+        );
+    }
+
+    #[test]
+    fn canonical_json_renders_integral_numbers_without_a_decimal_point() {
+        assert_eq!(canonical_json(&json!(1)), "1");
+        assert_eq!(canonical_json(&json!(1.0)), "1");
+        assert_eq!(canonical_json(&json!(-3)), "-3");
+        assert_eq!(canonical_json(&json!(2.5)), "2.5");
+    }
+
+    #[test]
+    fn canonical_json_escapes_control_characters() {
+        assert_eq!(canonical_json(&json!("a\nb\u{1}")), "\"a\\nb\\u0001\"");
     }
 
     #[test]
     fn json_object_key_order_is_irrelevant() {
-        let a: serde_json::Value = serde_json::json!({"z": 1, "a": 2, "m": {"y": 3, "b": 4}});
-        let b: serde_json::Value = serde_json::json!({"a": 2, "m": {"b": 4, "y": 3}, "z": 1});
-        let mut ha = Hasher::new();
+        let a = json!({"z": 1, "a": 2, "m": {"y": 3, "b": 4}});
+        let b = json!({"a": 2, "m": {"b": 4, "y": 3}, "z": 1});
+        let mut ha = Encoder::new();
         ha.json(&a);
-        let mut hb = Hasher::new();
+        let mut hb = Encoder::new();
         hb.json(&b);
-        assert_eq!(ha.finish(), hb.finish());
+        assert_eq!(ha.digest(), hb.digest());
     }
 
     #[test]
     fn json_array_order_is_significant() {
-        let a = serde_json::json!([1, 2]);
-        let b = serde_json::json!([2, 1]);
-        let mut ha = Hasher::new();
-        ha.json(&a);
-        let mut hb = Hasher::new();
-        hb.json(&b);
-        assert_ne!(ha.finish(), hb.finish());
+        let mut ha = Encoder::new();
+        ha.json(&json!([1, 2]));
+        let mut hb = Encoder::new();
+        hb.json(&json!([2, 1]));
+        assert_ne!(ha.digest(), hb.digest());
+    }
+
+    /// A golden over every writer in the framing table. If a future change moved
+    /// a byte, this fails — and any implementation claiming
+    /// `CONNECTOME-HASH/1` must reproduce it.
+    #[test]
+    fn connectome_hash_1_framing_golden() {
+        let mut e = Encoder::with_domain("connectome/1:golden");
+        e.text("abc")
+            .bool(true)
+            .u64(7)
+            .opt_text(None)
+            .opt_text(Some("x"))
+            .tag(2);
+        e.json(&json!({"b":[1,2.5,"s",null,true],"a":{"z":1}}));
+        e.set(&["z".to_string(), "a".to_string()], |e, s| {
+            e.text(s);
+        });
+        assert_eq!(
+            e.digest(),
+            "5fca38cf1d31f22b10d839623ea739f768ee1cba812bf8c7ab9e44ca7543312c"
+        );
     }
 }
-

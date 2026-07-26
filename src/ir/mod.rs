@@ -37,11 +37,28 @@
 //!
 //! # Hashing
 //!
-//! See [`hash`] for the full algorithm. In one line: each node's `hash` is a
-//! SHA-256 over its own content folded with its methods' and children's hashes,
+//! See [`hash`] for the full algorithm, which is **`CONNECTOME-HASH/1`**, the
+//! construction CONNECTOME RFC 002 §4.6 specifies normatively (PLX-89). In one
+//! line: each node's `hash` is a SHA-256 over a length-prefixed, domain-tagged
+//! encoding of its own content folded with its methods' and children's hashes,
 //! so mutating a leaf changes that leaf, every ancestor, and the document's
 //! [`ActivationIr::ir_hash`] — and nothing else. Call
-//! [`ActivationIr::recompute_hashes`] on the root.
+//! [`ActivationIr::recompute_hashes`] on the root; it also establishes the §3.3
+//! root facts and the §4.7 [`ActivationIr::hash_algorithm`] declaration.
+//!
+//! The construction is shared with the independent Haskell implementation
+//! (`connectome-hs`), and the two produce byte-identical digests. Before RFC 002
+//! they could not: §4 named no construction at all, so the two implementations'
+//! digests had nothing to agree on (finding F-06).
+//!
+//! # The request context (RFC 002 §6.9)
+//!
+//! [`ActivationIr::request_context`] and [`MethodIr::request_context`] declare
+//! what the *transport* knows about a call — headers, origin, peer address,
+//! trace identifiers — as opposed to [`MethodIr::params`], which is what the
+//! caller sends deliberately. The method-level declaration overrides the
+//! activation-level one; see [`ActivationIr::effective_request_context`].
+//! Absence at both levels means the method needs nothing.
 //!
 //! # The no-silent-degradation rule
 //!
@@ -97,7 +114,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use hash::Hasher;
+pub use hash::{canonical_json, Encoder, Hasher, HASH_ALGORITHM};
 pub use stop::{StopDetail, StopKind, StopReason};
 pub use types::{
     ActivationIr, AuthRequirementIr, CallbackIr, ChildEdge, DeprecationIr, HttpMethodIr, MethodIr,

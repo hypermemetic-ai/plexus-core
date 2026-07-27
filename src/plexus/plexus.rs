@@ -1019,6 +1019,48 @@ struct DynamicHubInner {
     /// (today: [`IrActivation`](crate::runtime::IrActivation)) needs no entry
     /// here; the erased trait method is consulted first.
     declared_irs: HashMap<String, Arc<crate::ir::ActivationIr>>,
+    /// PLX-148 — Connectome documents this hub **has** and will serve on
+    /// request, but deliberately does not embed. Keyed by the path a client
+    /// reads off the served document: `"health"`, `"claudecode/session"`.
+    ///
+    /// # The gap this exists to close
+    ///
+    /// PLX-142 shipped the document and PLX-121 was the first client to walk
+    /// it, and found **0 of 5** Dynamic edges fetchable. The cause was not a
+    /// missing route — it was that `Dynamic` had come to mean two different
+    /// things at once:
+    ///
+    /// 1. *"the hub does not have this subtree"* — the condition
+    ///    [`connectome`](DynamicHub::connectome) actually emitted it for, and
+    /// 2. *"the hub has it and will hand it over lazily"* — the condition RFC
+    ///    002 §5.1 describes when it says the edge must be **sufficient to
+    ///    fetch and cache the child lazily**.
+    ///
+    /// Under (1) a Dynamic edge is *by construction* unfetchable: the only way
+    /// for the hub to be able to answer for a child is to hold its document,
+    /// and holding it made the edge `Static`. §5.1's sufficiency clause could
+    /// never be satisfied. This map is (2), separated out: a declaration that
+    /// says *serve this, do not embed it*.
+    ///
+    /// It changes what a Dynamic edge **advertises**, not what it is — the
+    /// hash becomes the child's real `CONNECTOME-HASH/1` node hash instead of
+    /// its 16-hex legacy `PluginSchema::hash`, which is the second residual
+    /// PLX-142 recorded ("never compare a Dynamic edge's hash against a
+    /// Connectome node hash"). With a lazy declaration the comparison is not
+    /// merely safe, it is the point: the advertised hash is exactly the hash
+    /// of the document the client gets back.
+    ///
+    /// # Why the key is a path and not a namespace
+    ///
+    /// Three of substrate's five Dynamic edges are **nested** —
+    /// `claudecode/session`, `cone/of`, `solar/body` — and the wire's
+    /// `namespace` parameter resolved hub-level activations only, so they had
+    /// no route at all. A nested child's document is reachable from the
+    /// composition root (the concrete type is in scope there) and from nowhere
+    /// else, for the same erasure reason
+    /// [`declared_irs`](DynamicHubInner::declared_irs) records. So the key is
+    /// the path the client already holds.
+    lazy_irs: HashMap<String, Arc<crate::ir::ActivationIr>>,
     /// RFC 002 §3.3 `backend_name` — the root fact this hub declares.
     ///
     /// PLX-157. PLX-113 made this declarable on `#[activation]`, and
@@ -1110,6 +1152,7 @@ impl DynamicHub {
                 audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
                 gate_index: std::sync::OnceLock::new(),
                 declared_irs: HashMap::new(),
+                lazy_irs: HashMap::new(),
                 backend_name: None,
                 respond_method: None,
             }),
@@ -1738,6 +1781,84 @@ impl DynamicHub {
         self
     }
 
+    /// PLX-148 — declare a document the hub will **serve but not embed**.
+    ///
+    /// The registered activation `ir.namespace` keeps its
+    /// [`ChildEdge::Dynamic`](crate::ir::ChildEdge::Dynamic) edge — the subtree
+    /// stays out of the parent document, which is the whole point of §5.1's
+    /// Dynamic kind — but two things change:
+    ///
+    /// - the edge advertises `ir.hash`, a real `CONNECTOME-HASH/1` node hash,
+    ///   rather than the child's 16-hex legacy `PluginSchema::hash`; and
+    /// - `{ns}.connectome {"namespace": "<ns>"}` **answers**, with a document
+    ///   whose node hash is the one the edge advertised.
+    ///
+    /// That second half is §5.1's sufficiency clause, which
+    /// [`declare_ir`](Self::declare_ir)'s alternative cannot satisfy and
+    /// silence certainly cannot: PLX-121 measured 0 of 5 Dynamic edges
+    /// fetchable, and every one of them answered *"no Connectome document is
+    /// declared."*
+    ///
+    /// Nothing is synthesized (§5.2): the document handed over here is the
+    /// child's own, built by the same `#[activation]` macro that builds an
+    /// embedded one. The only decision this makes is *embed or advertise*.
+    ///
+    /// Declaring the same namespace both ways is not a conflict a caller can
+    /// create by accident — [`declare_ir`](Self::declare_ir) wins the edge
+    /// (embedding is strictly more information) and this one is then only a
+    /// fetch route, which the embedded path already provides.
+    pub fn declare_ir_lazy(self, ir: crate::ir::ActivationIr) -> Self {
+        let path = ir.namespace.clone();
+        self.declare_ir_at(path, ir)
+    }
+
+    /// PLX-148 — declare a document reachable at `path`, a `/`-separated path
+    /// into this hub's served document.
+    ///
+    /// This is the supply side for a **nested** Dynamic edge. `claudecode`'s
+    /// `session`, `cone`'s `of` and `solar`'s `body` are `#[child]` gates whose
+    /// edges the `#[activation]` macro emits as `Dynamic` — correctly, since
+    /// the *registrations* are a runtime fact — carrying the child type's own
+    /// node hash. The macro computes that hash from
+    /// `<ChildTy>::__plexus_activation_ir()` and then keeps only the hash, so
+    /// the shape exists at compile time and reaches no wire.
+    ///
+    /// The hub cannot recover it: it stores children as
+    /// `Arc<dyn ActivationObject>` and a nested child is not registered at all.
+    /// The composition root is the only place the concrete type is still in
+    /// scope — the same reason
+    /// [`declared_irs`](DynamicHubInner::declared_irs) exists — so it is the
+    /// place that declares it.
+    ///
+    /// ```
+    /// use plexus_core::ir::ActivationIr;
+    /// use plexus_core::plexus::DynamicHub;
+    ///
+    /// let hub = DynamicHub::new("substrate")
+    ///     .declare_ir_at("solar/body", ActivationIr::new("body", "1.0.0"));
+    /// let doc = hub.child_connectome("solar/body").expect("the child answers");
+    /// assert_eq!(doc.namespace, "body");
+    /// // A document, not an embedded node: §3.3's mandatory root facts are on it.
+    /// assert_eq!(doc.hash_algorithm.as_deref(), Some("CONNECTOME-HASH/1"));
+    /// ```
+    pub fn declare_ir_at(
+        mut self,
+        path: impl Into<String>,
+        mut ir: crate::ir::ActivationIr,
+    ) -> Self {
+        // Folded on the way in, because the advertised hash is read straight
+        // off this value and an IR nobody folded carries an **empty** one. An
+        // empty advertised hash is the defect PLX-90 fixed on the IR path and
+        // PLX-150 fixed on the legacy one — a cache key that can never hit,
+        // and, with two of them on one descent, a false cycle report. It does
+        // not get a third chance here.
+        ir.recompute_hashes();
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot declare_ir_at: DynamicHub has multiple references");
+        inner.lazy_irs.insert(path.into(), Arc::new(ir));
+        self
+    }
+
     /// This hub's Connectome document — the whole tree, in one value.
     ///
     /// Served on `{ns}.connectome`. This is the method PLX-142 exists to add:
@@ -1852,14 +1973,27 @@ impl DynamicHub {
             });
             root = match subtree {
                 Some(ir) => root.with_child(ChildEdge::Static(ir)),
-                None => {
-                    let schema = activation.plugin_schema();
-                    root.with_child(ChildEdge::Dynamic {
-                        namespace: schema.namespace,
-                        hash: schema.hash,
-                        description: schema.description,
-                    })
-                }
+                // PLX-148: a lazily-declared document — the hub HAS this
+                // child and will serve it at `{"namespace": ns}`, so the edge
+                // advertises the child's real CONNECTOME-HASH/1 node hash and
+                // §5.1's "sufficient to fetch and cache it lazily" holds. The
+                // subtree stays out of this document by choice, which is the
+                // difference between a Dynamic edge and a Static one.
+                None => match self.inner.lazy_irs.get(ns) {
+                    Some(ir) => root.with_child(ChildEdge::Dynamic {
+                        namespace: ns.to_string(),
+                        hash: ir.hash.clone(),
+                        description: ir.description.clone(),
+                    }),
+                    None => {
+                        let schema = activation.plugin_schema();
+                        root.with_child(ChildEdge::Dynamic {
+                            namespace: schema.namespace,
+                            hash: schema.hash,
+                            description: schema.description,
+                        })
+                    }
+                },
             };
         }
 
@@ -1874,16 +2008,115 @@ impl DynamicHub {
     /// consumer that meets a [`ChildEdge`](crate::ir::ChildEdge) it wants to
     /// descend into fetches exactly this, keyed by the hash the edge
     /// advertised.
-    pub fn child_connectome(&self, namespace: &str) -> Option<crate::ir::ActivationIr> {
-        let activation = self.inner.activations.get(namespace)?;
-        let mut ir = activation.connectome_subtree().or_else(|| {
-            self.inner
-                .declared_irs
-                .get(namespace)
-                .map(|ir| (**ir).clone())
-        })?;
+    ///
+    /// # `path`, not `namespace` (PLX-148)
+    ///
+    /// The argument is a `/`-separated **path into the served document**, and
+    /// a single segment is the ordinary case. It had to widen: three of
+    /// substrate's five Dynamic edges are nested one level down
+    /// (`claudecode/session`, `cone/of`, `solar/body`), and while a client
+    /// reads them straight off the document it held no way to ask for them.
+    /// PLX-121 measured the result as 0 of 5 fetchable and PLX-124 re-measured
+    /// it on the wire as 9 attempts, 9 unfetchable, 0 cache hits.
+    ///
+    /// Resolution is in three steps, cheapest first:
+    ///
+    /// 1. a registered activation whose subtree the hub embeds — the original
+    ///    behaviour, byte-for-byte, for every single-segment path that
+    ///    resolved before;
+    /// 2. a document declared for exactly this path by
+    ///    [`declare_ir_at`](Self::declare_ir_at) /
+    ///    [`declare_ir_lazy`](Self::declare_ir_lazy) — the supply side for a
+    ///    Dynamic edge;
+    /// 3. a walk of this hub's own document, so any node it already embeds is
+    ///    addressable by the path it appears at (`orcha/pm`), including the
+    ///    template subtree of an Indexed edge (`tenants/echo`).
+    ///
+    /// Step 3 deliberately answers only from what the document **already
+    /// says**. Nothing is manufactured for a path the document does not
+    /// contain, and in particular there is no `{ns}.schema` fallback: a lifted
+    /// legacy schema is *conformant-looking*, which PLX-119 measured as the
+    /// expensive kind of wrong. An unfetchable child stays visibly unfetchable.
+    ///
+    /// The returned value is a **document**, not an embedded node: §3.3's
+    /// mandatory root facts are established on it, which is what makes its own
+    /// `ir_hash` meaningful. Its node `hash` is unchanged by that — the same
+    /// digest the edge advertised — because §4.7 excludes the root facts from
+    /// a node's preimage.
+    ///
+    /// # The optional root facts travel with it (PLX-148)
+    ///
+    /// `backend_name` (§3.3) and `respond_method` (§7.6) are stamped from this
+    /// hub's own declarations. They are properties of *the backend that served
+    /// the document*, and this hub is that backend for every path it answers —
+    /// the same fact PLX-157 established at the root, reaching the documents
+    /// the same hub hands out.
+    ///
+    /// Without it, every newly-reachable child document came back with exactly
+    /// PLX-157's two advisories: *"a client must still probe for it"* and *"a
+    /// consumer cannot determine before invoking whether it can serve a
+    /// declared callback"*. Those were invisible while nothing could be
+    /// fetched. Making the children fetchable is what made them appear, and
+    /// answering them here is cheaper than re-deriving the identity per child.
+    pub fn child_connectome(&self, path: &str) -> Option<crate::ir::ActivationIr> {
+        // The root is asked for by sending no `namespace` at all; an empty one
+        // is a malformed request, not a second spelling of the root.
+        if path.is_empty() {
+            return None;
+        }
+
+        // 1. The original single-segment path: a registered activation whose
+        //    subtree this hub embeds.
+        if let Some(activation) = self.inner.activations.get(path) {
+            let embedded = activation.connectome_subtree().or_else(|| {
+                self.inner
+                    .declared_irs
+                    .get(path)
+                    .map(|ir| (**ir).clone())
+            });
+            if let Some(ir) = embedded {
+                return Some(self.as_served_document(ir));
+            }
+        }
+
+        // 2. PLX-148 — a document declared for this exact path.
+        if let Some(ir) = self.inner.lazy_irs.get(path) {
+            return Some(self.as_served_document((**ir).clone()));
+        }
+
+        // 3. PLX-148 — any node the served document already carries, at the
+        //    path it carries it at.
+        let mut node = self.connectome();
+        for segment in path.split('/').filter(|s| !s.is_empty()) {
+            node = match node.child(segment)? {
+                crate::ir::ChildEdge::Static(sub) => sub.clone(),
+                crate::ir::ChildEdge::Indexed { template, .. } => (**template).clone(),
+                // A Dynamic edge is a hash and nothing else. If step 2 did not
+                // supply it, the honest answer is that this hub cannot serve
+                // it — not a document assembled from the legacy schema.
+                crate::ir::ChildEdge::Dynamic { .. } => return None,
+            };
+        }
+        Some(self.as_served_document(node))
+    }
+
+    /// PLX-148 — turn a node into the document this hub serves for it.
+    ///
+    /// One place, so the three resolution steps above cannot drift into three
+    /// slightly different documents for the same subtree.
+    fn as_served_document(&self, mut ir: crate::ir::ActivationIr) -> crate::ir::ActivationIr {
+        if let Some(name) = &self.inner.backend_name {
+            ir = ir.with_backend_name(name.clone());
+        }
+        if let Some(method) = &self.inner.respond_method {
+            ir = ir.with_respond_method(method.clone());
+        }
+        // Last, so the two facts above are inside the document preimage (§4.6)
+        // and `ir_hash` covers them. The node hash is untouched either way —
+        // §4.7 keeps the root facts out of a node's preimage, which is what
+        // lets the advertised hash and the fetched hash be compared at all.
         ir.recompute_hashes();
-        Some(ir)
+        ir
     }
 
     /// Convert to RPC module
@@ -2412,6 +2645,14 @@ struct SchemaParams {
 /// "one fetch plus K edge fetches": a consumer that meets an edge it wants to
 /// descend into fetches exactly that child, keyed by the hash the edge
 /// advertised.
+///
+/// **PLX-148**: the value is a `/`-separated **path into the document**, so a
+/// nested edge is addressable too — `{"namespace": "claudecode/session"}`.
+/// Before that it resolved hub-level activations only, and substrate's three
+/// nested Dynamic edges (`claudecode/session`, `cone/of`, `solar/body`) had no
+/// wire route at all. The parameter kept its name deliberately: a second
+/// spelling for the same argument is a second vocabulary, and a single segment
+/// still means exactly what it always meant.
 #[derive(Debug, Default, serde::Deserialize)]
 struct ConnectomeParams {
     #[serde(default)]

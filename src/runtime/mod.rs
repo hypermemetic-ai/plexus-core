@@ -167,7 +167,7 @@ pub mod profile;
 #[cfg(test)]
 mod tests;
 
-pub use bridge::{turn_stream_to_plexus_stream, IrActivation, IrMethods};
+pub use bridge::{turn_stream_to_plexus_stream, IrActivation, IrMethods, LiveTurns};
 pub use callback::{PeerCapabilities, TurnTransport};
 pub use cancel::CancellationToken;
 pub use declared::{CapabilityInput, DeclaredHandler, Turn};

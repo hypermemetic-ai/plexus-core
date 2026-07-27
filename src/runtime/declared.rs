@@ -148,6 +148,27 @@ impl<C: CapabilitySet> Turn<C> {
         }
     }
 
+    /// PLX-146 — the generated-dispatch seam. **Not public API; call
+    /// [`DeclaredHandler`] instead.**
+    ///
+    /// This is deliberately *not* the free `TurnContext::client::<C>()` that
+    /// the module header (see "Why the free minter went away") records as
+    /// removed. There, `C` was chosen by the caller with nothing tying it to
+    /// what the method declared, so a handler could mint a capability its IR
+    /// never advertised. Here `C` is not free either: a
+    /// `#[plexus_macros::activation]` reads it out of the method's
+    /// `client: Client<C>` parameter, and **the same `C` tokens** are what
+    /// `ir_parse` turns into `MethodIr::callbacks` — one signature, one source,
+    /// so the minted handle and the declared callbacks cannot disagree.
+    ///
+    /// The invariant is therefore held by the macro rather than by this
+    /// function, which is why it is `#[doc(hidden)]` and why hand-written
+    /// handlers must keep going through [`DeclaredHandler`].
+    #[doc(hidden)]
+    pub fn __declared_by_macro(ctx: TurnContext) -> Self {
+        Self::new(ctx)
+    }
+
     /// A capability handle wired to this turn's callback transport.
     ///
     /// `D` is not free: [`Declares`] has exactly one impl — the identity — so

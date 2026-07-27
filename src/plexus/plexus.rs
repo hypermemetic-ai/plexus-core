@@ -309,6 +309,28 @@ pub trait Activation: Send + Sync + 'static {
     fn connectome_subtree(&self) -> Option<crate::ir::ActivationIr> {
         None
     }
+
+    /// PLX-127 — the [`ChildEdge`](crate::ir::ChildEdge) this activation
+    /// occupies under its parent, when it is not a plain child.
+    ///
+    /// [`connectome_subtree`](Self::connectome_subtree) answers "what is my
+    /// document"; this answers "what *kind of edge* am I". They are different
+    /// questions, and only the second one can produce
+    /// [`ChildEdge::Indexed`](crate::ir::ChildEdge::Indexed): an indexed
+    /// family is not one node, it is a `path_template` plus a `list_method`
+    /// plus one `template` standing for every instance.
+    ///
+    /// Before this existed, [`DynamicHub::connectome`] could emit only
+    /// `Static` and `Dynamic`, so RFC 002 §5.1's Indexed facts were vocabulary
+    /// with no producer — a `tenants/<id>` (or `session/<id>`) mount had no
+    /// way to render as what it actually is.
+    ///
+    /// Defaults to `None`, and the hub then falls back to exactly its previous
+    /// `Static`-or-`Dynamic` behaviour, so every existing activation renders
+    /// byte-identically.
+    fn connectome_edge(&self) -> Option<crate::ir::ChildEdge> {
+        None
+    }
 }
 
 // ============================================================================
@@ -662,6 +684,8 @@ trait ActivationObject: Send + Sync + 'static {
     fn schema(&self) -> Schema;
     /// PLX-142 — forward [`Activation::activation_ir`] through the erasure.
     fn connectome_subtree(&self) -> Option<crate::ir::ActivationIr>;
+    /// PLX-127 — forward [`Activation::connectome_edge`] through the erasure.
+    fn connectome_edge(&self) -> Option<crate::ir::ChildEdge>;
 }
 
 /// The hub's owned handle on a registered activation.
@@ -698,6 +722,8 @@ impl<A: Activation> ActivationObject for ActivationWrapper<A> {
     fn plugin_schema(&self) -> PluginSchema { self.inner.plugin_schema() }
 
     fn connectome_subtree(&self) -> Option<crate::ir::ActivationIr> { self.inner.connectome_subtree() }
+
+    fn connectome_edge(&self) -> Option<crate::ir::ChildEdge> { self.inner.connectome_edge() }
 
     fn schema(&self) -> Schema {
         let schema = schemars::schema_for!(A::Methods);
@@ -1709,6 +1735,15 @@ impl DynamicHub {
             let Some(activation) = self.inner.activations.get(ns) else {
                 continue;
             };
+            // PLX-127: an activation that IS an edge kind (an indexed family,
+            // e.g. the `tenants/<id>` mount) says so directly. Consulted
+            // first; `None` — every activation that predates this — falls
+            // through to the unchanged Static/Dynamic path below.
+            if let Some(edge) = activation.connectome_edge() {
+                root = root.with_child(edge);
+                continue;
+            }
+
             let subtree = activation.connectome_subtree().or_else(|| {
                 self.inner
                     .declared_irs

@@ -420,3 +420,85 @@ impl<C> Client<C> {
         self.issue_async::<Terminal, _, _>(request).await
     }
 }
+
+// ===========================================================================
+// The protocol-typed accessor (PLX-137)
+// ===========================================================================
+
+impl<C> Client<C> {
+    /// Issue the callback that capability `M` names, carrying a **protocol's
+    /// own** request and response types instead of `M`'s built-in payloads.
+    ///
+    /// # Why this exists
+    ///
+    /// A capability marker's identity is its **wire name** — that is stated in
+    /// [`Capability::NAME`]'s own docs, and it is what the duplicate check and
+    /// the peer pre-flight both key on. Its payload structs
+    /// ([`PermissionRequest`], [`FsReadRequest`], …) are this crate's minimum
+    /// shape for that wire name; they were written before any protocol
+    /// vocabulary existed and they are deliberately small.
+    ///
+    /// A protocol crate that owns the *real* vocabulary for the same wire name
+    /// needs to send it. `plexus-acp` is the motivating case: ACP's
+    /// `session/request_permission` carries a tool call and a list of
+    /// selectable options, and its response is an option **id**, none of which
+    /// fits [`PermissionOutcome`]'s `Allow`/`Deny`. Projecting ACP onto that
+    /// shape would lose the option id, and inventing a second permission model
+    /// in `plexus-acp` is the failure PLX-135 records as already deleted three
+    /// times.
+    ///
+    /// # What this does NOT relax
+    ///
+    /// The gate. `C: Has<M, I>` is character-for-character the bound the
+    /// built-in accessors carry, [`Capability`] is sealed so `M` can only be
+    /// one of this crate's markers, and `NO_DUPLICATES` is forced here as
+    /// everywhere else. A handler still cannot reach a capability its method
+    /// did not declare, and the wire name still comes from `M::descriptor()`
+    /// rather than from the caller.
+    ///
+    /// # The residual, stated rather than hidden
+    ///
+    /// [`CallbackIr`]'s *schemas* still come from `M::descriptor()`, so a
+    /// method using this accessor advertises `M`'s built-in schema in the IR
+    /// while putting the protocol's shape on the wire. The **name** cannot
+    /// disagree; the **schema** can. Closing that needs per-declaration schema
+    /// override on `CallbackIr`, which is a change to what an activation
+    /// advertises and is not in PLX-137's scope. `plexus-acp` pins the
+    /// disagreement with a test so it is recorded, not discovered.
+    ///
+    /// ```
+    /// use plexus_core::capability::{Client, Permission};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize)]
+    /// struct AcpShapedRequest { session_id: String, options: Vec<String> }
+    /// #[derive(Deserialize, Debug)]
+    /// struct AcpShapedResponse { outcome: String }
+    ///
+    /// # tokio_test::block_on(async {
+    /// let client = Client::<(Permission,)>::unwired();
+    /// let out: Result<AcpShapedResponse, _> = client
+    ///     .issue_as_async::<Permission, _, _, _>(AcpShapedRequest {
+    ///         session_id: "s1".into(),
+    ///         options: vec!["allow".into()],
+    ///     })
+    ///     .await;
+    /// // Unwired, so it reports rather than panics — and it reports under the
+    /// // marker's wire name, which is the identity this accessor preserves.
+    /// assert!(format!("{}", out.unwrap_err()).contains("session/request_permission"));
+    /// # });
+    /// ```
+    pub async fn issue_as_async<M, I, Req, Resp>(
+        &self,
+        request: Req,
+    ) -> Result<Resp, CallbackError>
+    where
+        C: Has<M, I>,
+        M: Capability,
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let () = Self::NO_DUPLICATES;
+        self.issue_async::<M, _, _>(request).await
+    }
+}

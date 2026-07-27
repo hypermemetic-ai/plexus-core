@@ -17,6 +17,7 @@ pub mod plexus;
 pub mod schema;
 pub(crate) mod scope_gate;
 pub mod streaming;
+pub mod tenant_mount;
 pub mod types;
 
 // AuthContext + SessionValidator + the sealed Principal / VerifiedUser /
@@ -34,6 +35,11 @@ pub use middleware::{ActivationRegistry, GuidedErrorMiddleware};
 pub use path::Provenance;
 #[allow(deprecated)]
 pub use plexus::{Activation, ActivationInfo, AuthzDenyReason, ChildCapabilities, ChildRouter, DynamicHub, PlexusError, TransportErrorKind, route_to_child, PLEXUS_NOTIF_METHOD};
+// PLX-127 (M4·C) — the tenants mount and its gate.
+pub use tenant_mount::{
+    mount_segment_is_safe, AdmittedTenant, MountRefusal, TenantMount, TenantMountGate,
+    TenantSubtreeFactory,
+};
 pub use crate::types::Handle;
 pub use schema::{
     AuthPosture, ChildHashes, ChildSummary, DeprecationInfo, MethodRole, MethodSchema,

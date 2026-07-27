@@ -177,6 +177,7 @@ pub use error::{
 };
 pub use event::{TurnEvent, TurnStream};
 pub use handler::{
-    ErasedHandler, HandlerFuture, HandlerInput, HandlerTable, TurnClosed, TurnContext, TurnOutcome,
+    ErasedHandler, HandlerFuture, HandlerInput, HandlerTable, IntoTurnStop, TurnClosed, TurnContext,
+    TurnOutcome, TurnStop,
 };
 pub use ids::{CallbackId, TurnId};

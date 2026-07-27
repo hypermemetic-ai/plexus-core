@@ -42,6 +42,115 @@ use super::event::TurnEvent;
 use super::ids::TurnId;
 
 // ===========================================================================
+// TurnStop — how an `Err` chooses its stop kind (PLX-112)
+// ===========================================================================
+
+/// What a handler's `Err` value means in [`StopKind`](crate::ir::StopKind)
+/// terms.
+///
+/// # Why this type exists
+///
+/// PLX-110 made `#[method] -> Result<T, E>` compile and bound `E` with
+/// `E: Into<TurnError>`, which *defines* `Err` as
+/// [`Failed`](crate::ir::StopKind::Failed). RFC 002 §6.6 says a considered
+/// "no" is [`Refused`](crate::ir::StopKind::Refused) and MUST NOT be conflated
+/// with `Failed` — and until this type existed no generated handler could emit
+/// one, because the only channel out of the error position was a `TurnError`
+/// and `TurnError::into_stop_reason` is `Failed` by construction. A refusal had
+/// no spelling at all.
+///
+/// `TurnStop` is that spelling. It is deliberately **not** a field on
+/// `TurnError`: RFC 002 §6.7.1 says a terminal whose kind is not `Failed` MUST
+/// NOT carry a structured error, so a "refused error" is a contradiction the
+/// checker is required to reject. A refusal carries [`StopDetail`] — §6.5's
+/// open domain vocabulary — and nothing else.
+///
+/// # What is NOT here, and why
+///
+/// - **`Cancelled` is not a variant.** RFC 002 §6.8 makes cancellation
+///   *cooperative*: a cancel signal MUST be delivered to the turn and the turn
+///   resolves `Cancelled`. Letting a handler's `Err` claim `Cancelled` would
+///   let a turn assert a signal that was never delivered, making the kind
+///   unfalsifiable. `Cancelled` stays the runtime's to emit — which is the same
+///   call [`TurnOutcome`] already made, and why it has no `Cancelled` variant
+///   either. A handler that genuinely must spell one has
+///   [`TurnOutcome::Stopped`] on the success side.
+/// - **No `Complete` variant.** An `Err` that means success is a bug in the
+///   signature, not a stop kind.
+///
+/// # The default is unchanged
+///
+/// The blanket [`IntoTurnStop`] impl maps every `E: Into<TurnError>` to
+/// [`TurnStop::Failed`], so PLX-110's bound and behaviour survive untouched. An
+/// error type that says nothing about kind terminates exactly as it did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnStop {
+    /// The default: a structured error, [`StopKind::Failed`](crate::ir::StopKind::Failed).
+    Failed(TurnError),
+    /// A considered NO: policy, denied permission, guardrail. Not an error.
+    Refused(StopDetail),
+    /// A bound was hit: tokens, turns, time, size, rate. Not an error.
+    Limited(StopDetail),
+}
+
+impl TurnStop {
+    /// A refusal carrying only its domain code.
+    pub fn refused(code: impl Into<String>) -> Self {
+        Self::Refused(StopDetail::new(code))
+    }
+
+    /// A limit stop carrying only its domain code.
+    pub fn limited(code: impl Into<String>) -> Self {
+        Self::Limited(StopDetail::new(code))
+    }
+
+    /// Project onto what a handler closure returns.
+    ///
+    /// `Failed` is the `Err` half; the non-error kinds ride the `Ok` half as a
+    /// [`TurnOutcome`], because they are not errors and the runtime must not
+    /// render them through [`TurnError::into_stop_reason`].
+    pub fn into_handler_result(self) -> Result<TurnOutcome, TurnError> {
+        match self {
+            Self::Failed(e) => Err(e),
+            Self::Refused(d) => Ok(TurnOutcome::Refused(d)),
+            Self::Limited(d) => Ok(TurnOutcome::Limited(d)),
+        }
+    }
+}
+
+/// How an error type says which [`StopKind`](crate::ir::StopKind) it means.
+///
+/// This is the bound a generated handler's `Err` arm goes through. **The macro
+/// guesses nothing**: it names no kind, inspects no type, and reads no
+/// attribute — it calls one trait method and the author's own impl decides.
+/// That is the same posture as PLX-110's `E: Into<TurnError>`, one level up.
+///
+/// # Which impl an author writes
+///
+/// | the author wants | the impl to write |
+/// |---|---|
+/// | `Failed` (the default) | `impl From<MyError> for TurnError` — nothing else |
+/// | `Refused` / `Limited` | `impl IntoTurnStop for MyError` |
+///
+/// The blanket impl below covers the first row, so **no existing code changes**
+/// and `E = TurnError` still needs no impl at all. Writing *both* for one type
+/// is a coherence conflict (E0119) rather than a silent precedence rule — the
+/// error names both impls, which is the loud failure this design wants.
+///
+/// `String` is still refused, exactly as under PLX-110: it implements neither
+/// side, so the flattened-error back door stays shut.
+pub trait IntoTurnStop {
+    /// Which stop kind this error means.
+    fn into_turn_stop(self) -> TurnStop;
+}
+
+impl<E: Into<TurnError>> IntoTurnStop for E {
+    fn into_turn_stop(self) -> TurnStop {
+        TurnStop::Failed(self.into())
+    }
+}
+
+// ===========================================================================
 // TurnOutcome
 // ===========================================================================
 
@@ -614,5 +723,95 @@ mod tests {
             .into_terminal();
         assert!(stop.is_success());
         assert_eq!(stop.detail().unwrap().code, "acp:end_turn");
+    }
+
+    // -----------------------------------------------------------------------
+    // PLX-112 — TurnStop / IntoTurnStop
+    // -----------------------------------------------------------------------
+
+    /// The ordinary error type: a `From` impl and nothing else.
+    #[derive(Debug)]
+    struct Boom;
+
+    impl From<Boom> for TurnError {
+        fn from(_: Boom) -> Self {
+            TurnError::new("app.boom", "boom")
+        }
+    }
+
+    /// The considered "no": implements `IntoTurnStop` directly and deliberately
+    /// has **no** `Into<TurnError>` impl, so the two can never both apply.
+    #[derive(Debug)]
+    struct Denied {
+        who: &'static str,
+    }
+
+    impl IntoTurnStop for Denied {
+        fn into_turn_stop(self) -> TurnStop {
+            TurnStop::Refused(
+                StopDetail::new("app.denied")
+                    .with_message("the user said no")
+                    .with_data("who", json!(self.who)),
+            )
+        }
+    }
+
+    #[test]
+    fn plx112_failed_stays_the_default_for_an_error_that_says_nothing_about_kind() {
+        // The blanket impl. This is PLX-110's behaviour, unchanged.
+        let stop = Boom.into_turn_stop();
+        assert_eq!(stop, TurnStop::Failed(TurnError::new("app.boom", "boom")));
+
+        let e = stop.into_handler_result().unwrap_err();
+        let reason = e.into_stop_reason();
+        assert_eq!(reason.kind(), crate::ir::StopKind::Failed);
+        assert!(reason.error().is_some(), "Failed carries its structured error");
+    }
+
+    #[test]
+    fn plx112_turn_error_itself_needs_no_impl() {
+        let stop = TurnError::new("app.x", "x").into_turn_stop();
+        assert!(matches!(stop, TurnStop::Failed(_)));
+    }
+
+    #[test]
+    fn plx112_a_refusal_lands_as_refused_and_carries_no_error() {
+        let outcome = Denied { who: "operator" }
+            .into_turn_stop()
+            .into_handler_result()
+            .expect("a refusal is not an error, so it rides the Ok half");
+
+        let (stop, value) = outcome.into_terminal();
+        assert_eq!(stop.kind(), crate::ir::StopKind::Refused);
+        // RFC 002 §6.7.1: a non-Failed terminal MUST NOT carry a structured error.
+        assert!(stop.error().is_none());
+        assert!(value.is_none());
+
+        let d = stop.detail().expect("§6.5: the domain vocabulary rides in detail");
+        assert_eq!(d.code, "app.denied");
+        assert_eq!(d.message.as_deref(), Some("the user said no"));
+        assert_eq!(d.data.get("who"), Some(&json!("operator")));
+    }
+
+    #[test]
+    fn plx112_a_limit_lands_as_limited_and_carries_no_error() {
+        let (stop, value) = TurnStop::limited("acp:max_tokens")
+            .into_handler_result()
+            .expect("a bound is not an error")
+            .into_terminal();
+        assert_eq!(stop.kind(), crate::ir::StopKind::Limited);
+        assert!(stop.error().is_none());
+        assert!(value.is_none());
+        assert_eq!(stop.detail().unwrap().code, "acp:max_tokens");
+    }
+
+    #[test]
+    fn plx112_refused_is_neither_success_nor_error() {
+        let (stop, _) = TurnStop::refused("policy:denied")
+            .into_handler_result()
+            .unwrap()
+            .into_terminal();
+        assert!(!stop.is_success());
+        assert!(stop.error().is_none());
     }
 }

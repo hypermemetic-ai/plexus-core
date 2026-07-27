@@ -783,11 +783,23 @@ impl PluginSchema {
         }
         let self_hash = format!("{:016x}", self_hasher.finish());
 
-        // Compute children_hash (children only)
+        // Compute children_hash (children only).
+        //
+        // PLX-142/PLX-146: children arrive in `HashMap` iteration order, so folding
+        // them in arrival order made this hash — and every composite hash above it —
+        // vary between boots of byte-identical code. Measured: four consecutive boots
+        // of the same binary produced four different hub hashes, so every substrate
+        // start logged a spurious `UNDOCUMENTED PLEXUS CHANGE`, and a plexus-core test
+        // flaked on it. Sorting makes the fold order-independent, which is the same
+        // rule RFC 002 §4.8 imposes on the Connectome: child edges are a SET, and a
+        // declaration order must not change a hash. No stable value is broken here
+        // because there was no stable value.
         let children_hash = children.map(|kids| {
+            let mut hashes: Vec<&str> = kids.iter().map(|c| c.hash.as_str()).collect();
+            hashes.sort_unstable();
             let mut children_hasher = DefaultHasher::new();
-            for c in kids {
-                c.hash.hash(&mut children_hasher);
+            for h in hashes {
+                h.hash(&mut children_hasher);
             }
             format!("{:016x}", children_hasher.finish())
         });

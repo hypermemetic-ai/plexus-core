@@ -1581,7 +1581,17 @@ impl DynamicHub {
     /// Get child activation summaries (for hub functionality)
     /// Called by hub-macro when `hub` flag is set
     pub fn plugin_children(&self) -> Vec<ChildSummary> {
-        self.inner.activations.values()
+        // PLX-142/PLX-146: `activations` is a HashMap, so this collected in
+        // iteration order and the resulting list — and the composite hash folded
+        // from it — differed between boots of byte-identical code. Measured: four
+        // consecutive boots produced four different hub hashes, so every substrate
+        // start logged a spurious `UNDOCUMENTED PLEXUS CHANGE`, and a plexus-core
+        // test flaked on the ordering roughly one run in three. Sorting by namespace
+        // makes the list a deterministic function of content, which is the same rule
+        // RFC 002 §4.8 imposes on the Connectome: child edges are a SET, and
+        // declaration order must not change a hash. No stable value is broken,
+        // because there was no stable value.
+        let mut children: Vec<ChildSummary> = self.inner.activations.values()
             .map(|a| {
                 let schema = a.plugin_schema();
                 ChildSummary {
@@ -1590,7 +1600,9 @@ impl DynamicHub {
                     hash: schema.hash,
                 }
             })
-            .collect()
+            .collect();
+        children.sort_unstable_by(|a, b| a.namespace.cmp(&b.namespace));
+        children
     }
 
     // ========================================================================

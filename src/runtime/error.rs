@@ -93,6 +93,10 @@ pub mod codes {
     pub const UPDATE_UNSERIALIZABLE: &str = "plexus.update_unserializable";
     /// An update was emitted after the turn's channel had closed.
     pub const TURN_CLOSED: &str = "plexus.turn_closed";
+    /// The error envelope itself could not be serialized when rendering the
+    /// terminal's [`super::StopReason`]. Not named by PLX-133, but found by its
+    /// own criterion-6 grep and in exactly the same class as the four above.
+    pub const ERROR_ENVELOPE_UNSERIALIZABLE: &str = "plexus.error_envelope_unserializable";
 }
 
 // ===========================================================================
@@ -212,7 +216,7 @@ impl TurnError {
         let detail = StopDetail::new(self.code.clone()).with_message(self.message.clone());
         let error = serde_json::to_value(&self).unwrap_or_else(|e| {
             serde_json::json!({
-                "code": "plexus.error_envelope_unserializable",
+                "code": codes::ERROR_ENVELOPE_UNSERIALIZABLE,
                 "message": e.to_string(),
             })
         });

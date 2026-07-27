@@ -17,6 +17,7 @@
 
 use plexus_core::activations::health::Health;
 use plexus_core::ir::{
+    ChildShape,
     ActivationIr, AuthRequirementIr, ChildEdge, MethodIr, SchemaRef,
 };
 use plexus_core::plexus::DynamicHub;
@@ -57,23 +58,24 @@ fn subtree() -> ActivationIr {
                 .with_auth(AuthRequirementIr::Public)
                 .with_terminal(schema_ref("WidgetList")),
         )
-        .with_child(ChildEdge::Static(grandchild))
-        .with_child(ChildEdge::Indexed {
-            namespace: "item".into(),
-            list_method: "widgets.list".into(),
-            search_method: Some("widgets.search".into()),
-            id_field: "widget_id".into(),
-            path_template: "item/{id}".into(),
-            template: Box::new(instance),
-            description: "a family of widgets".into(),
-        })
-        .with_child(ChildEdge::Dynamic {
-            namespace: "plugin".into(),
+        .with_child(ChildEdge::embedded(grandchild))
+        .with_child(
+            ChildEdge::embedded(instance)
+                .with_namespace("item")
+                .indexed(
+                    "widgets.list",
+                    Some("widgets.search".into()),
+                    "widget_id",
+                    "item/{id}",
+                )
+                .with_description("a family of widgets"),
+        )
+        .with_child(
             // A hash, not a placeholder: §5.1 requires the edge to advertise
             // the child's identity, and §5.2 forbids recomputing one.
-            hash: "a".repeat(64),
-            description: "registered at runtime".into(),
-        })
+            ChildEdge::lazy("plugin", "a".repeat(64))
+                .with_description("registered at runtime"),
+        )
 }
 
 fn widgets() -> IrActivation {
@@ -117,7 +119,7 @@ fn a_child_with_a_connectome_is_embedded_and_one_without_is_advertised() {
 
     // §5.1 Static — the subtree is embedded, so descending needs no round trip.
     let widgets = doc.child("widgets").expect("widgets is a child edge");
-    let ChildEdge::Static(embedded) = widgets else {
+    let Some(embedded) = widgets.child() else {
         panic!("a child whose Connectome the hub holds must be embedded, got {widgets:?}");
     };
     assert_eq!(embedded.methods.len(), 1);
@@ -126,42 +128,46 @@ fn a_child_with_a_connectome_is_embedded_and_one_without_is_advertised() {
     // §5.1 Dynamic + §5.2 — a child with no Connectome gets identity and
     // nothing else. Nothing is manufactured from its legacy schema.
     let health = doc.child("health").expect("health is a child edge");
-    let ChildEdge::Dynamic { hash, .. } = health else {
-        panic!("a child with no Connectome must not be embedded, got {health:?}");
-    };
-    assert!(!hash.is_empty(), "§5.1 — the edge advertises the child's hash");
+    assert!(
+        health.is_lazy(),
+        "a child with no Connectome must not be embedded, got {health:?}"
+    );
+    assert!(
+        !health.advertised_hash().is_empty(),
+        "§5.1 — the edge advertises the child's hash"
+    );
 }
 
 #[test]
 fn all_three_edge_kinds_survive_the_embedding() {
     let doc = hub().connectome();
-    let ChildEdge::Static(widgets) = doc.child("widgets").unwrap() else {
-        unreachable!()
-    };
+    let widgets = doc.child("widgets").unwrap().child().unwrap();
 
-    assert!(matches!(widgets.child("leaf"), Some(ChildEdge::Static(_))));
-    assert!(matches!(
-        widgets.child("plugin"),
-        Some(ChildEdge::Dynamic { .. })
-    ));
-    let Some(ChildEdge::Indexed {
+    assert!(widgets
+        .child("leaf")
+        .is_some_and(|c| !c.is_lazy() && !c.is_indexed()));
+    assert!(widgets
+        .child("plugin")
+        .is_some_and(|c| c.is_lazy() && !c.is_indexed()));
+    let item = widgets.child("item").expect("the Indexed edge did not survive");
+    let ChildShape::Indexed {
         list_method,
         search_method,
         id_field,
         path_template,
-        template,
-        ..
-    }) = widgets.child("item")
+    } = &item.shape
     else {
-        panic!("the Indexed edge did not survive")
+        panic!("the Indexed SHAPE did not survive")
     };
     // §5.1's five facts, all present — this is what the legacy wire cannot
-    // carry and what §5.2 forbids a client from inventing.
+    // carry and what §5.2 forbids a client from inventing. Four of the five
+    // are shape facts; the fifth, the template, is the DELIVERY payload, and
+    // PLX-160 is the build that stopped pretending they were one thing.
     assert_eq!(list_method, "widgets.list");
     assert_eq!(search_method.as_deref(), Some("widgets.search"));
     assert_eq!(id_field, "widget_id");
     assert_eq!(path_template, "item/{id}");
-    assert!(!template.hash.is_empty());
+    assert!(!item.child().expect("embedded template").hash.is_empty());
 }
 
 #[test]
@@ -169,13 +175,10 @@ fn a_dynamic_edge_advertised_hash_is_folded_and_never_recomputed() {
     // §5.2 — "a parent MUST fold a Dynamic child's advertised hash and MUST NOT
     // recompute one". The hub round-trips it verbatim.
     let doc = hub().connectome();
-    let ChildEdge::Static(widgets) = doc.child("widgets").unwrap() else {
-        unreachable!()
-    };
-    let Some(ChildEdge::Dynamic { hash, .. }) = widgets.child("plugin") else {
-        unreachable!()
-    };
-    assert_eq!(hash, &"a".repeat(64));
+    let widgets = doc.child("widgets").unwrap().child().unwrap();
+    let plugin = widgets.child("plugin").unwrap();
+    assert!(plugin.is_lazy());
+    assert_eq!(plugin.advertised_hash(), "a".repeat(64));
 }
 
 // ===========================================================================
@@ -186,9 +189,7 @@ fn a_dynamic_edge_advertised_hash_is_folded_and_never_recomputed() {
 fn root_facts_live_on_the_root_and_on_no_embedded_node() {
     let hub = hub();
     let doc = hub.connectome();
-    let ChildEdge::Static(embedded) = doc.child("widgets").unwrap() else {
-        unreachable!()
-    };
+    let embedded = doc.child("widgets").unwrap().child().unwrap();
 
     // §3.3 — "non-root activations MUST NOT carry any of them; their presence
     // is what distinguishes a root from an embedded node."
@@ -217,9 +218,7 @@ fn the_same_subtree_hashes_identically_embedded_and_standalone() {
     // hash it reports when fetched on its own". This is that property, on the
     // two values a client can actually obtain.
     let hub = hub();
-    let ChildEdge::Static(embedded) = hub.connectome().child("widgets").unwrap().clone() else {
-        unreachable!()
-    };
+    let embedded = hub.connectome().child("widgets").unwrap().child().unwrap().clone();
     let standalone = hub.child_connectome("widgets").unwrap();
 
     assert_eq!(embedded.hash, standalone.hash);
@@ -233,22 +232,16 @@ fn no_method_hash_moves_when_a_subtree_is_embedded() {
             out.push((format!("{path}/{}", m.name), m.hash.clone()));
         }
         for c in &ir.children {
-            match c {
-                ChildEdge::Static(child) => {
-                    method_hashes(child, &format!("{path}/{}", c.namespace()), out);
-                }
-                ChildEdge::Indexed { template, .. } => {
-                    method_hashes(template, &format!("{path}/{}", c.namespace()), out);
-                }
-                ChildEdge::Dynamic { .. } => {}
+            // One arm where three used to be: whether there are methods under
+            // an edge is a DELIVERY question (PLX-160).
+            if let Some(child) = c.child() {
+                method_hashes(child, &format!("{path}/{}", c.namespace()), out);
             }
         }
     }
 
     let hub = hub();
-    let ChildEdge::Static(embedded) = hub.connectome().child("widgets").unwrap().clone() else {
-        unreachable!()
-    };
+    let embedded = hub.connectome().child("widgets").unwrap().child().unwrap().clone();
     let standalone = hub.child_connectome("widgets").unwrap();
 
     let mut a = Vec::new();
@@ -419,20 +412,13 @@ fn declaring_root_facts_moves_the_document_hash_and_no_other_hash() {
             out.push((m.dotted_id.clone(), m.hash.clone()));
         }
         for c in &a.children {
-            match c {
-                ChildEdge::Static(child) => {
-                    out.push((child.namespace.clone(), child.hash.clone()));
-                    edge_hashes(child, out);
-                }
-                ChildEdge::Dynamic { namespace, hash, .. } => {
-                    out.push((namespace.clone(), hash.clone()));
-                }
-                ChildEdge::Indexed {
-                    namespace, template, ..
-                } => {
-                    out.push((namespace.clone(), template.hash.clone()));
-                    edge_hashes(template, out);
-                }
+            out.push((c.namespace.clone(), c.advertised_hash().to_string()));
+            if let Some(child) = c.child() {
+                edge_hashes(child, out);
+            }
+            #[allow(clippy::match_single_binding)]
+            match () {
+                () => {}
             }
         }
     }
@@ -455,14 +441,14 @@ fn a_root_fact_declared_on_a_child_is_erased() {
     assert_eq!(child.backend_name.as_deref(), Some("i-will-not-survive"));
 
     let mut root = ActivationIr::new("substrate", "1.0.0");
-    root = root.with_child(ChildEdge::Static(child));
+    root = root.with_child(ChildEdge::embedded(child));
     root.recompute_hashes();
 
-    let ChildEdge::Static(embedded) = root.child("widgets_subtree").unwrap_or_else(|| {
-        root.children.first().expect("one child")
-    }) else {
-        panic!("expected a static child")
-    };
+    let embedded = root
+        .child("widgets_subtree")
+        .unwrap_or_else(|| root.children.first().expect("one child"))
+        .child()
+        .expect("an embedded child");
     assert_eq!(
         embedded.backend_name, None,
         "§3.3 — an embedded node MUST NOT carry a root fact"

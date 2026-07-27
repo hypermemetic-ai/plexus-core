@@ -31,19 +31,20 @@ fn schema_ref(name: &str) -> SchemaRef {
     .expect("an informative schema")
 }
 
-/// The hash a Dynamic edge **advertises** — the child's identity.
+/// The hash an edge **advertises** — the child's identity.
+///
+/// PLX-160 moved the three-arm match this used to be onto the type itself, as
+/// `ChildEdge::advertised_hash`: it is a DELIVERY question (`Embedded` has the
+/// subtree, `Lazy` has the digest) and never a shape one, so it needed one arm
+/// per delivery and not one per variant.
 ///
 /// Deliberately not `ChildEdge::edge_hash()`, which is a different quantity:
-/// that is the digest of the edge's own §4.6 preimage tuple (tag ‖ namespace ‖
-/// advertised hash ‖ description), i.e. the edge's contribution to its parent's
-/// fold. Reading it as "the child's hash" is an easy and silent mistake — the
-/// two are both 64 hex and neither equals the other.
+/// that is the digest of the edge's own §4.6 preimage tuple, i.e. the edge's
+/// contribution to its parent's fold. Reading it as "the child's hash" is an
+/// easy and silent mistake — the two are both 64 hex and neither equals the
+/// other.
 fn advertised(edge: &ChildEdge) -> String {
-    match edge {
-        ChildEdge::Dynamic { hash, .. } => hash.clone(),
-        ChildEdge::Static(sub) => sub.hash.clone(),
-        ChildEdge::Indexed { template, .. } => template.hash.clone(),
-    }
+    edge.advertised_hash().to_string()
 }
 
 /// A leaf a hub can hold without embedding.
@@ -82,11 +83,10 @@ fn claudecode() -> IrActivation {
                 .with_auth(AuthRequirementIr::Public)
                 .with_terminal(schema_ref("Sessions")),
         )
-        .with_child(ChildEdge::Dynamic {
-            namespace: "session".into(),
-            hash: session_document().hash.clone(),
-            description: "one session".into(),
-        });
+        .with_child(
+            ChildEdge::lazy("session", session_document().hash.clone())
+                .with_description("one session"),
+        );
     IrActivation::new(
         ir,
         HandlerTable::new([(
@@ -121,7 +121,7 @@ fn a_lazily_declared_child_stays_dynamic_and_advertises_its_connectome_hash() {
     let legacy = hub().connectome();
     let legacy_edge = legacy.child("health").expect("health is a child");
     assert!(
-        matches!(legacy_edge, ChildEdge::Dynamic { .. }),
+        legacy_edge.is_lazy(),
         "an undeclared child is advertised, not embedded"
     );
     // The legacy `PluginSchema::hash`, whatever width this build computes it
@@ -137,9 +137,14 @@ fn a_lazily_declared_child_stays_dynamic_and_advertises_its_connectome_hash() {
     let doc = hub().declare_ir_lazy(health_document()).connectome();
     let edge = doc.child("health").expect("health is still a child");
     assert!(
-        matches!(edge, ChildEdge::Dynamic { .. }),
-        "a lazy declaration must NOT promote the edge to Static — not embedding \
-         it is the whole difference between the two kinds"
+        edge.is_lazy(),
+        "a lazy declaration must NOT promote the edge to embedded — not embedding \
+         it is the whole difference, and after PLX-160 it is the only difference: \
+         the shape axis is untouched by it"
+    );
+    assert!(
+        !edge.is_indexed(),
+        "and the OTHER axis did not move either — a single child stays single"
     );
     assert_eq!(
         advertised(edge),
@@ -196,10 +201,7 @@ fn a_nested_dynamic_edge_had_no_route_and_now_resolves_by_path() {
         plain
             .connectome()
             .child("claudecode")
-            .and_then(|c| match c {
-                ChildEdge::Static(sub) => sub.child("session"),
-                _ => None,
-            })
+            .and_then(|c| c.child().and_then(|sub| sub.child("session")))
             .is_some(),
         "the document advertises claudecode/session"
     );
@@ -218,10 +220,7 @@ fn a_nested_dynamic_edge_had_no_route_and_now_resolves_by_path() {
         fetched.hash,
         hub.connectome()
             .child("claudecode")
-            .and_then(|c| match c {
-                ChildEdge::Static(sub) => sub.child("session"),
-                _ => None,
-            })
+            .and_then(|c| c.child().and_then(|sub| sub.child("session")))
             .map(advertised)
             .expect("the nested edge"),
         "the nested edge advertises exactly what the path fetch returns"
@@ -234,7 +233,7 @@ fn a_nested_dynamic_edge_had_no_route_and_now_resolves_by_path() {
 fn an_embedded_node_is_addressable_by_the_path_it_appears_at() {
     let ir = ActivationIr::new("orcha", "1.0.0")
         .with_description("graphs")
-        .with_child(ChildEdge::Static(
+        .with_child(ChildEdge::embedded(
             ActivationIr::new("pm", "1.0.0").with_method(
                 MethodIr::new("plan", "orcha.pm.plan")
                     .with_auth(AuthRequirementIr::Public)
@@ -251,10 +250,15 @@ fn an_embedded_node_is_addressable_by_the_path_it_appears_at() {
     assert_eq!(nested.methods.len(), 1);
     // Still a node hash, not a new one: §4.7 keeps the root facts out of the
     // preimage, so the same subtree hashes the same embedded and standalone.
-    let embedded = match hub.connectome().child("orcha").expect("orcha") {
-        ChildEdge::Static(sub) => advertised(sub.child("pm").expect("pm")),
-        other => panic!("expected a Static edge, got {other:?}"),
-    };
+    let embedded = advertised(
+        hub.connectome()
+            .child("orcha")
+            .expect("orcha")
+            .child()
+            .expect("an embedded subtree")
+            .child("pm")
+            .expect("pm"),
+    );
     assert_eq!(nested.hash, embedded);
 }
 
@@ -288,7 +292,7 @@ fn declaring_lazily_moves_the_edge_and_the_root_and_no_method_hash() {
             .map(|m| (m.name.clone(), m.hash.clone()))
             .collect();
         for c in &ir.children {
-            if let ChildEdge::Static(sub) = c {
+            if let Some(sub) = c.child() {
                 out.extend(methods(sub));
             }
         }
@@ -301,9 +305,13 @@ fn declaring_lazily_moves_the_edge_and_the_root_and_no_method_hash() {
 
     assert_eq!(methods(&before), methods(&after), "no method hash moved");
 
-    let claudecode = |ir: &ActivationIr| match ir.child("claudecode").expect("claudecode") {
-        ChildEdge::Static(sub) => sub.hash.clone(),
-        other => panic!("expected Static, got {other:?}"),
+    let claudecode = |ir: &ActivationIr| {
+        ir.child("claudecode")
+            .expect("claudecode")
+            .child()
+            .expect("an embedded subtree")
+            .hash
+            .clone()
     };
     assert_eq!(
         claudecode(&before),
@@ -339,7 +347,7 @@ fn an_embedded_declaration_wins_the_edge_over_a_lazy_one() {
         .declare_ir_lazy(health_document())
         .declare_ir(health_document());
     let edge = hub.connectome().child("health").expect("health").clone();
-    assert!(matches!(edge, ChildEdge::Static(_)));
+    assert!(!edge.is_lazy(), "embedding wins over advertising");
     assert_eq!(
         hub.child_connectome("health").expect("still fetchable").hash,
         health_document().hash

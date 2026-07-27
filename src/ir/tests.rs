@@ -84,27 +84,31 @@ fn tree() -> ActivationIr {
                 .with_http_method(HttpMethodIr::Get)
                 .with_auth(AuthRequirementIr::Public),
         )
-        .with_child(ChildEdge::Indexed {
-            namespace: "session".into(),
-            list_method: "claudecode.list".into(),
-            search_method: Some("claudecode.search".into()),
-            id_field: "session_id".into(),
-            path_template: "session/{id}".into(),
-            template: Box::new(instance),
-            description: "live sessions".into(),
-        });
+        .with_child(
+            ChildEdge::embedded(instance)
+                .with_namespace("session")
+                .indexed(
+                    "claudecode.list",
+                    Some("claudecode.search".into()),
+                    "session_id",
+                    "session/{id}",
+                )
+                .with_description("live sessions"),
+        );
 
     let mut root = ActivationIr::new("substrate", "0.6.0")
         .with_backend_name("substrate")
         .with_respond_method("respond")
         .with_description("the substrate root")
         .with_method(MethodIr::new("health", "substrate.health").with_http_method(HttpMethodIr::Get))
-        .with_child(ChildEdge::Static(claudecode))
-        .with_child(ChildEdge::Dynamic {
-            namespace: "jsexec".into(),
-            hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
-            description: "runtime-registered js executor".into(),
-        })
+        .with_child(ChildEdge::embedded(claudecode))
+        .with_child(
+            ChildEdge::lazy(
+                "jsexec",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .with_description("runtime-registered js executor"),
+        )
         .with_deprecation(DeprecationIr::new("0.6", "use vNext").removed_in("0.8"));
 
     root.recompute_hashes();
@@ -113,29 +117,29 @@ fn tree() -> ActivationIr {
 
 /// Borrow the `claudecode` static subtree.
 fn claudecode(ir: &ActivationIr) -> &ActivationIr {
-    match ir.child("claudecode").expect("static child present") {
-        ChildEdge::Static(c) => c,
-        other => panic!("expected Static, got {other:?}"),
-    }
+    ir.child("claudecode")
+        .expect("static child present")
+        .child()
+        .expect("an embedded child")
 }
 
 fn claudecode_mut(ir: &mut ActivationIr) -> &mut ActivationIr {
-    match ir
+    match &mut ir
         .children
         .iter_mut()
         .find(|c| c.namespace() == "claudecode")
         .unwrap()
+        .delivery
     {
-        ChildEdge::Static(c) => c,
-        other => panic!("expected Static, got {other:?}"),
+        ChildDelivery::Embedded { child } => child,
+        other => panic!("expected an embedded child, got {other:?}"),
     }
 }
 
 fn session_template(ir: &ActivationIr) -> &ActivationIr {
-    match claudecode(ir).child("session").expect("indexed child") {
-        ChildEdge::Indexed { template, .. } => template,
-        other => panic!("expected Indexed, got {other:?}"),
-    }
+    let edge = claudecode(ir).child("session").expect("indexed child");
+    assert!(edge.is_indexed(), "expected an indexed edge, got {edge:?}");
+    edge.child().expect("an embedded template")
 }
 
 // ---------------------------------------------------------------------------
@@ -148,12 +152,9 @@ fn ac1_three_level_tree_round_trips_losslessly() {
 
     // Sanity: the fixture really is 3 levels and really has all three variants.
     assert_eq!(ir.children.len(), 2);
-    assert!(matches!(ir.children[0], ChildEdge::Static(_)));
-    assert!(matches!(ir.children[1], ChildEdge::Dynamic { .. }));
-    assert!(matches!(
-        claudecode(&ir).children[0],
-        ChildEdge::Indexed { .. }
-    ));
+    assert!(!ir.children[0].is_indexed() && !ir.children[0].is_lazy());
+    assert!(!ir.children[1].is_indexed() && ir.children[1].is_lazy());
+    assert!(claudecode(&ir).children[0].is_indexed() && !claudecode(&ir).children[0].is_lazy());
     assert_eq!(session_template(&ir).namespace, "session_instance");
 
     let json = serde_json::to_string_pretty(&ir).unwrap();
@@ -187,15 +188,14 @@ fn ac1_three_level_tree_round_trips_losslessly() {
     assert_eq!(chat.extensions.len(), 2);
     assert_eq!(chat.extensions["acp_role"], json!("prompt"));
 
-    match cc.child("session").unwrap() {
-        ChildEdge::Indexed {
+    match &cc.child("session").unwrap().shape {
+        ChildShape::Indexed {
             list_method,
             search_method,
             id_field,
             path_template,
-            template,
-            ..
         } => {
+            let template = cc.child("session").unwrap().child().expect("embedded");
             assert_eq!(list_method, "claudecode.list");
             assert_eq!(search_method.as_deref(), Some("claudecode.search"));
             assert_eq!(id_field, "session_id");
@@ -254,11 +254,13 @@ fn ac2_hashing_is_merkle_and_locality_preserving() {
     let mut after = before.clone();
     {
         let cc = claudecode_mut(&mut after);
-        match cc.children.iter_mut().next().unwrap() {
-            ChildEdge::Indexed { template, .. } => {
-                template.methods[0].description = "replay the transcript (v2)".into();
+        let edge = cc.children.iter_mut().next().unwrap();
+        assert!(edge.is_indexed(), "expected an indexed edge");
+        match &mut edge.delivery {
+            ChildDelivery::Embedded { child } => {
+                child.methods[0].description = "replay the transcript (v2)".into();
             }
-            other => panic!("expected Indexed, got {other:?}"),
+            other => panic!("expected an embedded template, got {other:?}"),
         }
     }
     after.recompute_hashes();
@@ -320,11 +322,11 @@ fn ac2_mutating_a_dynamic_edge_propagates_upward_only() {
     let cc_hash = claudecode(&before).hash.clone();
 
     let mut after = before.clone();
-    match &mut after.children[1] {
-        ChildEdge::Dynamic { hash, .. } => {
+    match &mut after.children[1].delivery {
+        ChildDelivery::Lazy { hash } => {
             *hash = "1".repeat(64);
         }
-        other => panic!("expected Dynamic, got {other:?}"),
+        other => panic!("expected a lazy edge, got {other:?}"),
     }
     after.recompute_hashes();
 
@@ -346,7 +348,7 @@ fn ac2_static_child_hash_is_folded_into_the_parent_verbatim() {
     let expected_edge = {
         let mut probe = ActivationIr::new("substrate", "0.6.0");
         probe.hash = cc.hash.clone();
-        ChildEdge::Static(probe).edge_hash()
+        ChildEdge::embedded(probe).edge_hash()
     };
     assert_eq!(ir.children[0].edge_hash(), expected_edge);
 }
@@ -461,8 +463,8 @@ fn rfc002_4_8_methods_and_child_edges_are_sets_not_sequences() {
     b.recompute_hashes();
     assert_eq!(a.hash, b.hash, "method declaration order is not content");
 
-    let k = || ChildEdge::Static(ActivationIr::new("k", "1"));
-    let z = || ChildEdge::Static(ActivationIr::new("z", "1"));
+    let k = || ChildEdge::embedded(ActivationIr::new("k", "1"));
+    let z = || ChildEdge::embedded(ActivationIr::new("z", "1"));
     let mut kz = ActivationIr::new("n", "1").with_child(k()).with_child(z());
     let mut zk = ActivationIr::new("n", "1").with_child(z()).with_child(k());
     kz.recompute_hashes();
@@ -636,19 +638,26 @@ fn ac5_deserialization_cannot_smuggle_in_a_degraded_callback() {
     let ir = tree();
     let pristine = serde_json::to_value(&ir).unwrap();
 
-    // The `chat` method lives on the Static `claudecode` child. `ChildEdge` is
-    // internally tagged, so the child's own fields sit alongside `"edge"`.
+    // The `chat` method lives on the embedded `claudecode` child. PLX-160 put
+    // the delivered subtree under `child` rather than flattening it into the
+    // edge object, so that the delivery payload has ONE spelling under both
+    // shapes instead of being inline for a single child and under `template`
+    // for an indexed family.
     fn first_callback(v: &mut serde_json::Value) -> &mut serde_json::Value {
-        &mut v["children"][0]["methods"][0]["callbacks"][0]
+        &mut v["children"][0]["child"]["methods"][0]["callbacks"][0]
     }
     fn updates(v: &mut serde_json::Value) -> &mut serde_json::Value {
-        &mut v["children"][0]["methods"][0]["updates"]
+        &mut v["children"][0]["child"]["methods"][0]["updates"]
     }
 
     // Baseline: the pristine document decodes, and `chat` really has callbacks.
     {
         let mut v = pristine.clone();
-        assert_eq!(pristine["children"][0]["edge"], json!("static"));
+        // PLX-160 — TWO fields, one per axis, where a single `edge` tag used
+        // to answer both questions at once.
+        assert_eq!(pristine["children"][0]["shape"], json!("single"));
+        assert_eq!(pristine["children"][0]["delivery"], json!("embedded"));
+        assert_eq!(pristine["children"][0]["edge"], serde_json::Value::Null);
         assert_eq!(
             first_callback(&mut v)["name"],
             json!("session/request_permission")
@@ -839,10 +848,11 @@ fn completeness_every_embedded_node_carries_a_hash() {
             assert_eq!(m.hash.len(), 64, "{} has no hash", m.dotted_id);
         }
         for c in &ir.children {
-            match c {
-                ChildEdge::Static(child) => walk(child),
-                ChildEdge::Indexed { template, .. } => walk(template),
-                ChildEdge::Dynamic { hash, .. } => assert!(!hash.is_empty()),
+            // Two axes: the walk is a DELIVERY question and never a shape one,
+            // which before PLX-160 could not be said in one arm.
+            match c.child() {
+                Some(child) => walk(child),
+                None => assert!(!c.advertised_hash().is_empty()),
             }
         }
     }
@@ -947,18 +957,18 @@ fn completeness_the_turn_terminal_is_distinct_from_the_update_stream() {
 fn completeness_indexed_edge_answers_all_three_client_questions() {
     // Inventory items 16 and 17: enumerate, form a path, know the shape.
     // Unchanged by PLX-77 — recorded here so the remap is explicit: items 16
-    // and 17 stay on `ChildEdge::Indexed`, items 7 and 8 moved onto the turn
+    // and 17 stay on `ChildShape::Indexed`, items 7 and 8 moved onto the turn
     // envelope (see the two tests above).
     let ir = tree();
-    match claudecode(&ir).child("session").unwrap() {
-        ChildEdge::Indexed {
+    let edge = claudecode(&ir).child("session").unwrap();
+    match &edge.shape {
+        ChildShape::Indexed {
             list_method,
             search_method,
             id_field,
             path_template,
-            template,
-            ..
         } => {
+            let template = edge.child().expect("embedded template");
             // (a) enumerate
             assert!(!list_method.is_empty());
             assert!(search_method.is_some());
@@ -1054,15 +1064,13 @@ fn rfc002_3_3_root_facts_are_on_the_root_and_nowhere_else() {
     // A Static child built by the same builder as a root must not carry any of
     // them, whatever it was constructed with.
     let mut root = ActivationIr::new("r", "1")
-        .with_child(ChildEdge::Static(
+        .with_child(ChildEdge::embedded(
             ActivationIr::new("c", "1")
                 .with_backend_name("smuggled")
                 .with_respond_method("smuggled"),
         ));
     root.recompute_hashes();
-    let ChildEdge::Static(child) = &root.children[0] else {
-        panic!("expected a static child")
-    };
+    let child = root.children[0].child().expect("an embedded child");
     assert_eq!(child.ir_version, None);
     assert_eq!(child.hash_algorithm, None);
     assert_eq!(child.ir_hash, None);
@@ -1191,15 +1199,11 @@ fn rfc002_6_9_request_context_is_declared_overridden_and_hashed() {
 #[test]
 fn navigation_helpers_find_children_across_all_edge_kinds() {
     let ir = tree();
-    assert!(matches!(ir.child("claudecode"), Some(ChildEdge::Static(_))));
-    assert!(matches!(
-        ir.child("jsexec"),
-        Some(ChildEdge::Dynamic { .. })
-    ));
-    assert!(matches!(
-        claudecode(&ir).child("session"),
-        Some(ChildEdge::Indexed { .. })
-    ));
+    assert!(ir.child("claudecode").is_some_and(|c| !c.is_lazy() && !c.is_indexed()));
+    assert!(ir.child("jsexec").is_some_and(|c| c.is_lazy() && !c.is_indexed()));
+    assert!(claudecode(&ir)
+        .child("session")
+        .is_some_and(|c| !c.is_lazy() && c.is_indexed()));
     assert!(ir.child("nope").is_none());
 }
 

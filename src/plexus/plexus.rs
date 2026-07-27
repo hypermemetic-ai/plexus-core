@@ -1972,7 +1972,7 @@ impl DynamicHub {
                     .map(|ir| (**ir).clone())
             });
             root = match subtree {
-                Some(ir) => root.with_child(ChildEdge::Static(ir)),
+                Some(ir) => root.with_child(ChildEdge::embedded(ir)),
                 // PLX-148: a lazily-declared document — the hub HAS this
                 // child and will serve it at `{"namespace": ns}`, so the edge
                 // advertises the child's real CONNECTOME-HASH/1 node hash and
@@ -1980,18 +1980,16 @@ impl DynamicHub {
                 // subtree stays out of this document by choice, which is the
                 // difference between a Dynamic edge and a Static one.
                 None => match self.inner.lazy_irs.get(ns) {
-                    Some(ir) => root.with_child(ChildEdge::Dynamic {
-                        namespace: ns.to_string(),
-                        hash: ir.hash.clone(),
-                        description: ir.description.clone(),
-                    }),
+                    Some(ir) => root.with_child(
+                        ChildEdge::lazy(ns, ir.hash.clone())
+                            .with_description(ir.description.clone()),
+                    ),
                     None => {
                         let schema = activation.plugin_schema();
-                        root.with_child(ChildEdge::Dynamic {
-                            namespace: schema.namespace,
-                            hash: schema.hash,
-                            description: schema.description,
-                        })
+                        root.with_child(
+                            ChildEdge::lazy(schema.namespace, schema.hash)
+                                .with_description(schema.description),
+                        )
                     }
                 },
             };
@@ -2088,14 +2086,12 @@ impl DynamicHub {
         //    path it carries it at.
         let mut node = self.connectome();
         for segment in path.split('/').filter(|s| !s.is_empty()) {
-            node = match node.child(segment)? {
-                crate::ir::ChildEdge::Static(sub) => sub.clone(),
-                crate::ir::ChildEdge::Indexed { template, .. } => (**template).clone(),
-                // A Dynamic edge is a hash and nothing else. If step 2 did not
-                // supply it, the honest answer is that this hub cannot serve
-                // it — not a document assembled from the legacy schema.
-                crate::ir::ChildEdge::Dynamic { .. } => return None,
-            };
+            // A lazy edge is a hash and nothing else (§5.2). If step 2 did not
+            // supply it, the honest answer is that this hub cannot serve it —
+            // not a document assembled from the legacy schema. `child()` is
+            // `None` under `Lazy` for both shapes, which is why this reads the
+            // delivery axis and never the shape one.
+            node = node.child(segment)?.child()?.clone();
         }
         Some(self.as_served_document(node))
     }

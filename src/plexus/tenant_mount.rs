@@ -4,7 +4,7 @@
 //! # The easy half and the hard half
 //!
 //! The easy half is that `tenants/<id>` is structurally the same
-//! [`ChildEdge::Indexed`](crate::ir::ChildEdge::Indexed) family as
+//! [`ChildShape::Indexed`](crate::ir::ChildShape::Indexed) family as
 //! `session/<id>`: one shape, many instances, a `path_template` and a
 //! `list_method`.
 //!
@@ -365,7 +365,7 @@ pub type TenantSubtreeFactory = Arc<
 ///
 /// Register it on a hub like any other activation; it occupies one namespace
 /// (conventionally `tenants`) and renders as a
-/// [`ChildEdge::Indexed`](crate::ir::ChildEdge::Indexed) family.
+/// [`ChildShape::Indexed`](crate::ir::ChildShape::Indexed) family.
 ///
 /// See the module docs for the two structural properties that make this a gate
 /// rather than a hole.
@@ -444,15 +444,19 @@ impl TenantMount {
     /// template, the path template and the name of the listing method, exactly
     /// RFC 002 §5.1's five facts, and instances stay live.
     pub fn indexed_edge(&self) -> ChildEdge {
-        ChildEdge::Indexed {
-            namespace: self.namespace.to_string(),
-            list_method: Self::LIST_METHOD.to_string(),
-            search_method: None,
-            id_field: Self::ID_FIELD.to_string(),
-            path_template: Self::PATH_TEMPLATE.to_string(),
-            template: Box::new((*self.template).clone()),
-            description: self.description.to_string(),
-        }
+        // Two axes, named separately: the family is INDEXED (it enumerates),
+        // and its template is EMBEDDED (it is right here). PLX-160 — before it,
+        // saying both at once required the one variant that happened to mean
+        // both, and the other three combinations were a variant apart.
+        ChildEdge::embedded((*self.template).clone())
+            .with_namespace(self.namespace.to_string())
+            .indexed(
+                Self::LIST_METHOD,
+                None,
+                Self::ID_FIELD,
+                Self::PATH_TEMPLATE,
+            )
+            .with_description(self.description.to_string())
     }
 
     /// `tenants.list` — the only enumeration, and it is auth-aware.

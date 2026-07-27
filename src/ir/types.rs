@@ -742,63 +742,29 @@ impl MethodIr {
 // ChildEdge
 // ===========================================================================
 
-/// The three ways an activation can have children — made explicit.
+/// **Axis 1 — SHAPE.** How many children does this edge name?
 ///
-/// PLX-73: "recursion today is three mechanisms in a trenchcoat" (static
-/// `#[child]`, runtime `DynamicHub::register`, and indexed `session/{id}`
-/// families). `ChildSummary` flattened all three into
-/// `{namespace, description, hash}`, which is what forces one `.schema`
-/// round-trip per tree level. Each mechanism gets its own variant here, with
-/// exactly the data a client needs to act without another fetch.
+/// PLX-160. This is one of the two independent questions the old three-variant
+/// `ChildEdge` answered with a single discriminant. It is a property of the
+/// *declaration*: in `plexus-macros` it is exactly the presence or absence of
+/// `#[child(list = "…")]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "edge", rename_all = "snake_case")]
-pub enum ChildEdge {
-    /// A compile-time `#[child]`: the whole subtree is embedded.
-    ///
-    /// Retires PLX-73 `q-ir-completeness` items 1–4 (per-level drill-down, the
-    /// two re-fetch scars, and the parent-deprecation re-fetch): the client
-    /// already holds the child's methods, grandchildren, hash and deprecation.
-    Static(ActivationIr),
+#[serde(tag = "shape", rename_all = "snake_case")]
+pub enum ChildShape {
+    /// One named child occupying the edge's namespace segment.
+    Single,
 
-    /// A runtime-registered child (`DynamicHub::register`).
+    /// A family of instances sharing one shape — `session/{id}`-shaped.
     ///
-    /// Deliberately *not* embedded: its content is live and may change after
-    /// the document was produced. The client fetches it lazily and caches by
-    /// `hash`; when the parent's advertised `hash` for the edge differs from
-    /// the cached one, only that subtree is refetched.
-    Dynamic {
-        /// The child's namespace segment.
-        namespace: String,
-        /// Content hash of the child subtree as of document production — the
-        /// cache key and the invalidation signal.
-        hash: String,
-        /// Human-readable description, so a listing needs no fetch.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        description: String,
-    },
-
-    /// An indexed family — `session/{id}`-style instances sharing one shape.
-    ///
-    /// PLX-73 `q-ir-completeness` items 16 and 17 are the *capability gaps*
-    /// this variant closes. Today a client cannot walk `hub session <id>
-    /// <method>` at all: nothing tells it how to enumerate instances, how to
-    /// form an instance path, or what an instance looks like. This edge carries
-    /// all three:
-    ///
-    /// - **(a) enumerate** — [`list_method`](Self::Indexed::list_method) and
-    ///   [`search_method`](Self::Indexed::search_method) name the dotted
-    ///   methods to call. Instances themselves stay *live*: they are correctly
-    ///   not in the IR (inventory item 12).
-    /// - **(b) form a path** — [`path_template`](Self::Indexed::path_template)
-    ///   plus [`id_field`](Self::Indexed::id_field), which names the field of
-    ///   the list response that holds the id. That replaces the client's
-    ///   three-tolerated-shapes guess with a `"name"` fallback (item 17).
-    /// - **(c) know the shape** — [`template`](Self::Indexed::template) is ONE
-    ///   `ActivationIr` describing every instance of the family, so descending
-    ///   into an instance costs zero round-trips.
+    /// RFC 002 §5.1 requires an indexed edge to carry enough for a consumer to
+    /// **(a) enumerate** ([`list_method`](Self::Indexed::list_method) /
+    /// [`search_method`](Self::Indexed::search_method)), **(b) construct an
+    /// instance path** ([`path_template`](Self::Indexed::path_template) plus
+    /// [`id_field`](Self::Indexed::id_field), which names the field of the
+    /// enumeration response that holds the id), and **(c) know an instance's
+    /// shape** — which is the *delivery* axis's job, not this one, and is the
+    /// separation PLX-160 exists to make.
     Indexed {
-        /// The family's namespace segment, e.g. `"session"`.
-        namespace: String,
         /// Dotted id of the method that lists instances.
         list_method: String,
         /// Dotted id of the method that searches instances, when one exists.
@@ -808,102 +774,303 @@ pub enum ChildEdge {
         id_field: String,
         /// How an instance path is formed, e.g. `"session/{id}"`.
         path_template: String,
-        /// The shape shared by every instance in the family.
-        template: Box<ActivationIr>,
-        /// Human-readable description of the family.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        description: String,
     },
 }
 
-impl ChildEdge {
+/// **Axis 2 — DELIVERY.** Does this document carry the child's subtree, or only
+/// its digest?
+///
+/// PLX-148 established this separation at the hub (`declare_ir` vs
+/// `declare_ir_lazy`): *have it* and *embed it* are two questions. PLX-160
+/// carries it into the type, where it belongs, so that it composes freely with
+/// [`ChildShape`].
+///
+/// Both arms carry a hash — that is what makes this an axis rather than a
+/// special case. [`Embedded`](Self::Embedded) has it as the embedded subtree's
+/// stored hash; [`Lazy`](Self::Lazy) has it as the advertised one. See
+/// [`ChildEdge::advertised_hash`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "delivery", rename_all = "snake_case")]
+pub enum ChildDelivery {
+    /// The subtree is embedded. Descending requires no additional round trip
+    /// (§5.1).
+    ///
+    /// For an [`Indexed`](ChildShape::Indexed) edge this is §5.1(c)'s "one
+    /// template subtree describing every instance of the family": the same
+    /// field, doing the same job, which is why delivery does not need to know
+    /// the shape.
+    Embedded {
+        /// The delivered subtree. For an indexed edge, the family template.
+        child: Box<ActivationIr>,
+    },
+
+    /// The subtree is NOT embedded; the edge carries its advertised hash,
+    /// sufficient to fetch and cache it lazily (§5.1).
+    ///
+    /// §5.2: a consumer MUST NOT synthesize a subtree here. There is
+    /// deliberately no field in this arm that could hold one.
+    Lazy {
+        /// Content hash of the child subtree as of document production — the
+        /// cache key and the invalidation signal.
+        hash: String,
+    },
+}
+
+/// A child edge: one namespace segment, one [shape](ChildShape), one
+/// [delivery](ChildDelivery).
+///
+/// # Why this is a struct of two axes and not an enum of variants (PLX-160)
+///
+/// PLX-73 replaced `ChildSummary`'s flattened `{namespace, description, hash}`
+/// with three named variants — `Static`, `Dynamic`, `Indexed`. That was right
+/// about *what a client needs* and wrong about *how many questions were being
+/// asked*. Three variants answer two independent questions:
+///
+/// |  | embedded | lazy |
+/// |---|---|---|
+/// | **single** | `Static` | `Dynamic` |
+/// | **indexed** | `Indexed` | — **unrepresentable** — |
+///
+/// Three cells cannot cover four, and the missing one is the cell
+/// `#[child(list = "…")] fn session(&self, id: &str) -> Option<S>` declares:
+/// an enumerable family whose template the hub holds but does not embed. Before
+/// PLX-160 `plexus-macros` resolved that declaration by **discarding**
+/// `list_method`, `id_field` and `path_template` without a diagnostic.
+///
+/// Carrying the axes separately makes all four representable, makes a fifth
+/// axis an added field rather than a doubled variant count, and makes
+/// "somebody has to notice a cell is missing" impossible: the encoder matches
+/// on the *pair*, and `rustc` checks that match for exhaustiveness.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildEdge {
     /// The namespace segment this edge occupies under its parent.
-    pub fn namespace(&self) -> &str {
-        match self {
-            Self::Static(ir) => &ir.namespace,
-            Self::Dynamic { namespace, .. } => namespace,
-            Self::Indexed { namespace, .. } => namespace,
+    ///
+    /// Hoisted out of the variants: it is an edge-level fact under every
+    /// combination of the two axes. For an [`Embedded`](ChildDelivery::Embedded)
+    /// edge the child's own `namespace` is stamped to match, which is what keeps
+    /// §4.6's `tag(1)` preimage — which covers the namespace only transitively,
+    /// through the child's own hash — byte-identical to PLX-73's.
+    pub namespace: String,
+
+    /// Axis 1 — one named child, or an indexed family.
+    #[serde(flatten)]
+    pub shape: ChildShape,
+
+    /// Axis 2 — embedded here, or fetched later.
+    #[serde(flatten)]
+    pub delivery: ChildDelivery,
+
+    /// Human-readable description, so a listing needs no fetch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+impl ChildEdge {
+    /// A single child whose subtree is embedded — PLX-73's `Static`.
+    ///
+    /// The edge takes its namespace from the child, matching the old
+    /// `ChildEdge::Static(ir)` exactly.
+    pub fn embedded(child: ActivationIr) -> Self {
+        Self {
+            namespace: child.namespace.clone(),
+            shape: ChildShape::Single,
+            delivery: ChildDelivery::Embedded {
+                child: Box::new(child),
+            },
+            description: String::new(),
         }
     }
 
-    /// The hash this edge contributes to its parent's hash.
+    /// A single child that is advertised and not embedded — PLX-73's `Dynamic`.
+    pub fn lazy(namespace: impl Into<String>, hash: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            shape: ChildShape::Single,
+            delivery: ChildDelivery::Lazy { hash: hash.into() },
+            description: String::new(),
+        }
+    }
+
+    /// Rename the edge's own namespace segment.
     ///
-    /// For [`ChildEdge::Static`] this is exactly the embedded subtree's hash —
-    /// which is what makes the fold a Merkle fold rather than a re-hash.
+    /// Deliberately does **not** touch an embedded child's own `namespace`
+    /// field: that participates in the child's node hash, and an indexed
+    /// family's template legitimately carries a different name from the segment
+    /// the family occupies.
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = namespace.into();
+        self
+    }
+
+    /// Attach a description without naming the other three fields.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Turn a single edge into an indexed family, leaving delivery untouched.
+    ///
+    /// This is the operation that makes the axes orthogonal in practice: it is
+    /// callable on an embedded edge and on a lazy one, and neither knows about
+    /// the other.
+    #[must_use]
+    pub fn indexed(
+        mut self,
+        list_method: impl Into<String>,
+        search_method: Option<String>,
+        id_field: impl Into<String>,
+        path_template: impl Into<String>,
+    ) -> Self {
+        self.shape = ChildShape::Indexed {
+            list_method: list_method.into(),
+            search_method,
+            id_field: id_field.into(),
+            path_template: path_template.into(),
+        };
+        self
+    }
+
+    /// The namespace segment this edge occupies under its parent.
+    ///
+    /// Kept as a method as well as a field so the ~30 `edge.namespace()` call
+    /// sites PLX-73 created still read the same.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// The embedded subtree, when there is one.
+    ///
+    /// `None` under [`ChildDelivery::Lazy`] — and §5.2 says a consumer MUST NOT
+    /// invent one, so this is the only way to ask.
+    pub fn child(&self) -> Option<&ActivationIr> {
+        match &self.delivery {
+            ChildDelivery::Embedded { child } => Some(child),
+            ChildDelivery::Lazy { .. } => None,
+        }
+    }
+
+    /// The hash of the child subtree this edge names — embedded or advertised.
+    ///
+    /// Deliberately **not** [`edge_hash`](Self::edge_hash), which is a different
+    /// quantity: the digest of this edge's own §4.6 preimage tuple. The two are
+    /// both 64 hex and neither equals the other; PLX-148's test helper existed
+    /// only because the old enum gave no single place to put this.
+    pub fn advertised_hash(&self) -> &str {
+        match &self.delivery {
+            ChildDelivery::Embedded { child } => &child.hash,
+            ChildDelivery::Lazy { hash } => hash,
+        }
+    }
+
+    /// Whether the subtree must be fetched (§5.1's lazy clause).
+    pub fn is_lazy(&self) -> bool {
+        matches!(self.delivery, ChildDelivery::Lazy { .. })
+    }
+
+    /// Whether this edge names a family rather than one child.
+    pub fn is_indexed(&self) -> bool {
+        matches!(self.shape, ChildShape::Indexed { .. })
+    }
+
+    /// The hash this edge contributes to its parent's hash.
     pub fn edge_hash(&self) -> String {
         let mut e = Encoder::new();
         self.encode_into(&mut e);
         e.digest()
     }
 
-    /// RFC 002 §4.6 — an edge's preimage component. Three kinds, three tags:
+    /// RFC 002 §4.6 — an edge's preimage component. **Four cells, four tags:**
     ///
     /// ```text
-    /// static  := tag(1) ‖ hash(child activation hash)
-    /// dynamic := tag(2) ‖ text(namespace) ‖ hash(advertised) ‖ opt(description)
-    /// indexed := tag(3) ‖ text(namespace) ‖ text(list_method)
-    ///                   ‖ opt(search_method) ‖ text(id_field)
-    ///                   ‖ text(path_template) ‖ hash(template hash)
-    ///                   ‖ opt(description)
+    /// (single,  embedded) := tag(1) ‖ hash(child activation hash)
+    /// (single,  lazy)     := tag(2) ‖ text(namespace) ‖ hash(advertised)
+    ///                              ‖ opt(description)
+    /// (indexed, embedded) := tag(3) ‖ text(namespace) ‖ text(list_method)
+    ///                              ‖ opt(search_method) ‖ text(id_field)
+    ///                              ‖ text(path_template) ‖ hash(template hash)
+    ///                              ‖ opt(description)
+    /// (indexed, lazy)     := tag(4) ‖ text(namespace) ‖ text(list_method)
+    ///                              ‖ opt(search_method) ‖ text(id_field)
+    ///                              ‖ text(path_template) ‖ hash(advertised)
+    ///                              ‖ opt(description)
     /// ```
     ///
-    /// A Static edge contributes exactly the embedded subtree's stored hash —
-    /// that is what makes the fold a Merkle fold rather than a re-hash. A
-    /// Dynamic edge contributes its **advertised** hash and never a
-    /// recomputation: recomputing would be the fabrication §5.2 forbids, and
-    /// there is nothing here to recompute from.
+    /// # Why the preimage keeps ONE dense tag while the wire carries two fields
+    ///
+    /// §4.6's job is injectivity and determinism, not mirroring the wire — and
+    /// it already does not mirror it: a `(single, embedded)` edge serializes its
+    /// whole subtree and contributes only that subtree's stored hash, because
+    /// "a Static edge contributes exactly the embedded subtree's hash — that is
+    /// what makes the fold a Merkle fold rather than a re-hash". The preimage is
+    /// a **Merkle projection**.
+    ///
+    /// So the tag here is a *dense enumeration of the product* `shape ×
+    /// delivery`, computed by an exhaustive match rather than authored. It is
+    /// not a fourth variant: no cell can be forgotten, because `rustc` rejects a
+    /// non-exhaustive match on the pair. What it buys is that `tag(1)`,
+    /// `tag(2)` and `tag(3)` are **byte-identical to PLX-73's**, so
+    /// `CONNECTOME-HASH/1` remains the construction that produced every hash
+    /// this project has ever published (§4.7), and the only node hashes that
+    /// move are the ones whose edges genuinely changed cell.
+    ///
+    /// The rejected alternative — `tag(shape) ‖ tag(delivery)` — is more
+    /// obviously two-axis and moves **every activation hash in the corpus**,
+    /// forcing `CONNECTOME-HASH/2` and invalidating PLX-89's cross-implementation
+    /// agreement evidence, to buy nothing §4.6 asks for.
+    ///
+    /// Note `tag(3)` and `tag(4)` carry identical field lists. They differ only
+    /// in the tag, and in what the hash *means*: a fold of a present subtree, or
+    /// an advertisement of an absent one. That is exactly §5.2's distinction,
+    /// and the tag is what keeps the two injective.
     pub(crate) fn encode_into(&self, e: &mut Encoder) {
-        match self {
-            Self::Static(ir) => {
+        match (&self.shape, &self.delivery) {
+            (ChildShape::Single, ChildDelivery::Embedded { child }) => {
                 e.tag(1);
-                e.hash_ref(&ir.hash);
+                e.hash_ref(&child.hash);
             }
-            Self::Dynamic {
-                namespace,
-                hash,
-                description,
-            } => {
+            (ChildShape::Single, ChildDelivery::Lazy { hash }) => {
                 e.tag(2);
-                e.text(namespace);
+                e.text(&self.namespace);
                 e.hash_ref(hash);
-                e.opt_text(text_or_absent(description));
+                e.opt_text(text_or_absent(&self.description));
             }
-            Self::Indexed {
-                namespace,
-                list_method,
-                search_method,
-                id_field,
-                path_template,
-                template,
-                description,
-            } => {
-                e.tag(3);
-                e.text(namespace);
+            (
+                ChildShape::Indexed {
+                    list_method,
+                    search_method,
+                    id_field,
+                    path_template,
+                },
+                delivery,
+            ) => {
+                e.tag(match delivery {
+                    ChildDelivery::Embedded { .. } => 3,
+                    ChildDelivery::Lazy { .. } => 4,
+                });
+                e.text(&self.namespace);
                 e.text(list_method);
                 e.opt_text(search_method.as_deref());
                 e.text(id_field);
                 e.text(path_template);
-                e.hash_ref(&template.hash);
-                e.opt_text(text_or_absent(description));
+                e.hash_ref(self.advertised_hash());
+                e.opt_text(text_or_absent(&self.description));
             }
         }
     }
 
     fn recompute_hashes(&mut self) {
-        match self {
-            Self::Static(ir) => ir.recompute_node_hashes(),
-            Self::Dynamic { .. } => {}
-            Self::Indexed { template, .. } => template.recompute_node_hashes(),
+        if let ChildDelivery::Embedded { child } = &mut self.delivery {
+            child.recompute_node_hashes();
         }
     }
 
     /// §3.3 — strip the root facts from an embedded node and everything under
     /// it.
     fn strip_root_facts(&mut self) {
-        match self {
-            Self::Static(ir) => ir.strip_root_facts(),
-            Self::Dynamic { .. } => {}
-            Self::Indexed { template, .. } => template.strip_root_facts(),
+        if let ChildDelivery::Embedded { child } = &mut self.delivery {
+            child.strip_root_facts();
         }
     }
 }

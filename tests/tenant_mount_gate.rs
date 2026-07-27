@@ -25,7 +25,7 @@ use plexus_auth_core::{
 };
 use plexus_core::activations::echo::Echo;
 use plexus_core::activations::health::Health;
-use plexus_core::ir::{ActivationIr, ChildEdge, StopKind};
+use plexus_core::ir::{ActivationIr, ChildShape, StopKind};
 use plexus_core::plexus::{
     mount_segment_is_safe, AdmittedTenant, ChildRouter, DynamicHub, MountRefusal, PlexusError,
     TenantMount, TenantMountGate,
@@ -433,26 +433,30 @@ async fn c2_the_mount_renders_as_an_indexed_family_with_no_instances() {
         .find(|e| e.namespace() == "tenants")
         .expect("the mount is rendered as a child edge");
 
-    match edge {
-        ChildEdge::Indexed {
+    // PLX-160: the mount asserts BOTH axes, separately, because they are now
+    // separately assertable — the family is indexed AND its template is
+    // embedded, and neither implies the other.
+    match &edge.shape {
+        ChildShape::Indexed {
             list_method,
             id_field,
             path_template,
-            template,
             search_method,
-            ..
         } => {
             assert_eq!(list_method, "tenants.list");
             assert_eq!(id_field, "tenant_id");
             assert_eq!(path_template, "tenants/{id}");
             assert_eq!(search_method, &None);
-            // The template is the shape of EVERY tenant and is bound to none.
-            let rendered = serde_json::to_string(template).unwrap();
-            assert!(rendered.contains("echo"), "the template has no content: {rendered}");
-            assert!(!rendered.contains("tenant-a") && !rendered.contains("tenant-b"));
         }
-        other => panic!("the mount must render as ChildEdge::Indexed, got {other:?}"),
+        other => panic!("the mount must render with ChildShape::Indexed, got {other:?}"),
     }
+    let template = edge
+        .child()
+        .expect("the mount embeds its template rather than advertising it");
+    // The template is the shape of EVERY tenant and is bound to none.
+    let rendered = serde_json::to_string(template).unwrap();
+    assert!(rendered.contains("echo"), "the template has no content: {rendered}");
+    assert!(!rendered.contains("tenant-a") && !rendered.contains("tenant-b"));
 }
 
 /// The new `connectome_edge` seam is opt-in: an activation that does not

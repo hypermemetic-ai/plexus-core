@@ -97,11 +97,9 @@
 //!     .with_backend_name("substrate")
 //!     .with_respond_method("respond")
 //!     .with_method(MethodIr::new("list", "claudecode.list"))
-//!     .with_child(ChildEdge::Dynamic {
-//!         namespace: "jsexec".into(),
-//!         hash: "deadbeef".into(),
-//!         description: "runtime-registered".into(),
-//!     });
+//!     .with_child(
+//!         ChildEdge::lazy("jsexec", "deadbeef").with_description("runtime-registered"),
+//!     );
 //!
 //! ir.recompute_hashes();
 //! assert!(ir.ir_hash.is_some());
@@ -117,6 +115,6 @@ mod tests;
 pub use hash::{canonical_json, Encoder, Hasher, HASH_ALGORITHM};
 pub use stop::{StopDetail, StopKind, StopReason};
 pub use types::{
-    ActivationIr, AuthRequirementIr, CallbackIr, ChildEdge, DeprecationIr, HttpMethodIr, MethodIr,
-    ParamIr, SchemaRef, SchemaRefError, IR_VERSION,
+    ActivationIr, AuthRequirementIr, CallbackIr, ChildDelivery, ChildEdge, ChildShape,
+    DeprecationIr, HttpMethodIr, MethodIr, ParamIr, SchemaRef, SchemaRefError, IR_VERSION,
 };

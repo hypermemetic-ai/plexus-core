@@ -71,6 +71,28 @@ pub mod codes {
     pub const HANDLER_PANICKED: &str = "plexus.handler_panicked";
     /// A server-to-client callback could not be completed.
     pub const CALLBACK_FAILED: &str = "plexus.callback_failed";
+
+    // -----------------------------------------------------------------------
+    // PLX-133 item 8 — codes the runtime already emitted but never declared.
+    //
+    // `plexus.` is reserved for the runtime (PLX-114), and these four were being
+    // emitted as bare string literals: three from `runtime::handler` and one
+    // from the code plexus-macros generates. Undeclared, they were reserved-
+    // namespace codes that no consumer could discover from this module, which is
+    // the module's entire job. Declaring them is additive — no code string
+    // changes, so no client branching on a code is affected.
+    // -----------------------------------------------------------------------
+
+    /// A handler returned an error the macro-generated arm could not attribute
+    /// to a domain type. Emitted from plexus-macros' generated handler.
+    pub const EXECUTION_ERROR: &str = "plexus.execution_error";
+    /// The turn's terminal value could not be serialized.
+    pub const TERMINAL_UNSERIALIZABLE: &str = "plexus.terminal_unserializable";
+    /// An update could not be serialized, so the turn fails rather than
+    /// silently dropping it.
+    pub const UPDATE_UNSERIALIZABLE: &str = "plexus.update_unserializable";
+    /// An update was emitted after the turn's channel had closed.
+    pub const TURN_CLOSED: &str = "plexus.turn_closed";
 }
 
 // ===========================================================================

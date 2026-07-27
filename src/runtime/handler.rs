@@ -102,7 +102,7 @@ impl TurnOutcome {
             .map(Self::value)
             .map_err(|e| {
                 TurnError::new(
-                    "plexus.terminal_unserializable",
+                    super::error::codes::TERMINAL_UNSERIALIZABLE,
                     format!("the turn's terminal value could not be serialized: {e}"),
                 )
             })
@@ -257,12 +257,12 @@ impl TurnContext {
     pub async fn emit_typed<T: Serialize + ?Sized>(&self, value: &T) -> Result<(), TurnError> {
         let content = serde_json::to_value(value).map_err(|e| {
             TurnError::new(
-                "plexus.update_unserializable",
+                super::error::codes::UPDATE_UNSERIALIZABLE,
                 format!("an update could not be serialized: {e}"),
             )
         })?;
         self.emit(content).await.map_err(|e| {
-            TurnError::new("plexus.turn_closed", e.to_string())
+            TurnError::new(super::error::codes::TURN_CLOSED, e.to_string())
         })
     }
 

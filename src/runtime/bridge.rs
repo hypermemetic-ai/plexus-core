@@ -108,6 +108,101 @@ impl MethodEnumSchema for IrMethods {
 /// assert_eq!(activation.methods(), vec!["hello"]);
 /// # });
 /// ```
+/// The registry of a dispatcher's live turns, keyed by [`TurnId`].
+///
+/// PLX-146. This used to be an inline `Arc<Mutex<HashMap<..>>>` field on
+/// [`IrActivation`], with the four lookup operations written as inherent
+/// methods beside it. It is a named type now because [`IrActivation`] is no
+/// longer the only dispatcher that needs one: a `#[plexus_macros::activation]`
+/// generates its own dispatch path (`call_arc`) and previously passed
+/// `live: None` to [`turn_stream_to_plexus_stream`], which left every
+/// macro-produced activation unable to answer a callback at all — the turn's
+/// [`TurnControl`] was dropped, so nothing could reach the parked responder and
+/// the awaiting handler hung forever.
+///
+/// The operations are exactly the ones [`IrActivation`] already exposed;
+/// [`IrActivation`] now delegates to them rather than duplicating them, so
+/// there is one implementation of "find the turn this callback id names".
+#[derive(Clone, Default)]
+pub struct LiveTurns {
+    inner: Arc<Mutex<HashMap<TurnId, TurnControl>>>,
+}
+
+impl std::fmt::Debug for LiveTurns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveTurns").field("len", &self.len()).finish()
+    }
+}
+
+impl LiveTurns {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a turn's control surface, so a later `respond` can find it.
+    ///
+    /// Called immediately after the turn is opened and before its stream is
+    /// handed to the caller — the callback event can be observed by the peer
+    /// as soon as the stream is polled, so the control must already be here.
+    pub fn register(&self, handle: &TurnHandle) {
+        self.inner
+            .lock()
+            .expect("live turn registry poisoned")
+            .insert(handle.turn_id(), handle.control());
+    }
+
+    /// Answer a callback on one of the live turns.
+    ///
+    /// The peer quotes the [`CallbackId`] it saw on the wire, and the turn it
+    /// names is the turn it reaches — or [`RespondError::WrongTurn`] if the id
+    /// has been tampered with.
+    pub fn respond(&self, id: CallbackId, response: Value) -> Result<(), RespondError> {
+        self.control_for(id.turn)?.respond(id, response)
+    }
+
+    /// Report that the peer could not serve a callback on a live turn.
+    pub fn fail_callback(
+        &self,
+        id: CallbackId,
+        message: impl Into<String>,
+    ) -> Result<(), RespondError> {
+        self.control_for(id.turn)?.fail_callback(id, message)
+    }
+
+    /// Cancel a live turn by id.
+    pub fn cancel_turn(&self, turn: TurnId) -> Result<(), RespondError> {
+        self.control_for(turn)?.cancel();
+        Ok(())
+    }
+
+    /// How many turns are currently live.
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("live turn registry poisoned").len()
+    }
+
+    /// Whether no turn is currently live.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn control_for(&self, turn: TurnId) -> Result<TurnControl, RespondError> {
+        self.inner
+            .lock()
+            .expect("live turn registry poisoned")
+            .get(&turn)
+            .cloned()
+            .ok_or(RespondError::TurnEnded(turn))
+    }
+
+    fn forget(&self, turn: &TurnId) {
+        self.inner
+            .lock()
+            .expect("live turn registry poisoned")
+            .remove(turn);
+    }
+}
+
 #[derive(Clone)]
 pub struct IrActivation {
     ir: Arc<ActivationIr>,
@@ -115,7 +210,7 @@ pub struct IrActivation {
     peer: PeerCapabilities,
     /// Live turns, so a legacy `respond`-style method can reach a turn's
     /// control surface by id. Entries are removed when the turn resolves.
-    live: Arc<Mutex<HashMap<TurnId, TurnControl>>>,
+    live: LiveTurns,
 }
 
 impl std::fmt::Debug for IrActivation {
@@ -135,7 +230,7 @@ impl IrActivation {
             ir: Arc::new(ir),
             handlers: Arc::new(handlers.into()),
             peer: PeerCapabilities::all(),
-            live: Arc::new(Mutex::new(HashMap::new())),
+            live: LiveTurns::new(),
         }
     }
 
@@ -165,10 +260,7 @@ impl IrActivation {
             request.peer = self.peer.clone();
         }
         let handle = entry(&self.ir, &self.handlers, request)?;
-        self.live
-            .lock()
-            .expect("live turn registry poisoned")
-            .insert(handle.turn_id(), handle.control());
+        self.live.register(&handle);
         Ok(handle)
     }
 
@@ -179,7 +271,7 @@ impl IrActivation {
     /// reaches — or [`RespondError::WrongTurn`] if the id has been tampered
     /// with.
     pub fn respond(&self, id: CallbackId, response: Value) -> Result<(), RespondError> {
-        self.control_for(id.turn)?.respond(id, response)
+        self.live.respond(id, response)
     }
 
     /// Report that the peer could not serve a callback on a live turn.
@@ -188,27 +280,17 @@ impl IrActivation {
         id: CallbackId,
         message: impl Into<String>,
     ) -> Result<(), RespondError> {
-        self.control_for(id.turn)?.fail_callback(id, message)
+        self.live.fail_callback(id, message)
     }
 
     /// Cancel a live turn by id.
     pub fn cancel_turn(&self, turn: TurnId) -> Result<(), RespondError> {
-        self.control_for(turn)?.cancel();
-        Ok(())
+        self.live.cancel_turn(turn)
     }
 
     /// How many turns are currently live.
     pub fn live_turns(&self) -> usize {
-        self.live.lock().expect("live turn registry poisoned").len()
-    }
-
-    fn control_for(&self, turn: TurnId) -> Result<TurnControl, RespondError> {
-        self.live
-            .lock()
-            .expect("live turn registry poisoned")
-            .get(&turn)
-            .cloned()
-            .ok_or(RespondError::TurnEnded(turn))
+        self.live.len()
     }
 }
 
@@ -272,6 +354,7 @@ impl Activation for IrActivation {
             handle,
             Some(self.live.clone()),
         ))
+        // (unchanged: `self.live` is now a `LiveTurns` rather than a bare Arc)
     }
 
     fn plugin_id(&self) -> uuid::Uuid {
@@ -340,7 +423,7 @@ pub fn turn_stream_to_plexus_stream(
     dotted_id: String,
     provenance: Vec<String>,
     handle: TurnHandle,
-    live: Option<Arc<Mutex<HashMap<TurnId, TurnControl>>>>,
+    live: Option<LiveTurns>,
 ) -> PlexusStream {
     let plexus_hash = crate::plexus::context::PlexusContext::hash();
     let update_type = format!("{dotted_id}.update");
@@ -362,9 +445,7 @@ pub fn turn_stream_to_plexus_stream(
             }],
             TurnEvent::Terminal { stop, value, .. } => {
                 if let Some(live) = &live {
-                    live.lock()
-                        .expect("live turn registry poisoned")
-                        .remove(&turn_id);
+                    live.forget(&turn_id);
                 }
                 let content = serde_json::json!({
                     "stop": stop,

@@ -82,6 +82,8 @@
 
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
+
 use serde_json::Value;
 
 use plexus_auth_core::{TenantGate, TenantId, TenantResolver};
@@ -343,8 +345,21 @@ impl TenantMountGate {
 /// run. An implementation is free to be fallible — return `None` to refuse a
 /// tenant whose record does not exist or is suspended (PLX-151 c4's
 /// obligation, discharged at the composer where the record actually lives).
-pub type TenantSubtreeFactory =
-    Arc<dyn Fn(&AdmittedTenant) -> Option<Arc<DynamicHub>> + Send + Sync>;
+///
+/// # Why it returns a future (PLX-128)
+///
+/// It did not, until M4·D. PLX-151 recorded the consequence in the one place
+/// that felt it: `TenantAdmission` had to run at *every launch* rather than
+/// once at mount time, "because the factory is sync and admission is async".
+/// PLX-128 makes the whole per-tenant *subtree* depend on async work — the
+/// sealed `TenantRecord` lookup, and then opening that tenant's own sqlite
+/// files — so a sync factory would have forced either a `block_on` inside a
+/// reactor thread or a second, unproven construction path. The mount's only
+/// caller ([`TenantMount::dispatch`]) is already `async`, so awaiting here
+/// costs nothing and keeps the single mint path single.
+pub type TenantSubtreeFactory = Arc<
+    dyn for<'a> Fn(&'a AdmittedTenant) -> BoxFuture<'a, Option<Arc<DynamicHub>>> + Send + Sync,
+>;
 
 /// The `tenants/<id>` mount.
 ///
@@ -488,7 +503,7 @@ impl TenantMount {
         let admitted = self.gate.admit(auth, segment).await?;
 
         // ── Only now. The factory cannot be reached without `admitted`. ──
-        let Some(subtree) = (self.factory)(&admitted) else {
+        let Some(subtree) = (self.factory)(&admitted).await else {
             // The composer refused this tenant (no record, or suspended).
             // Same shape as a miss, same reason.
             return Err(MountRefusal::NoSuchTenant.into());

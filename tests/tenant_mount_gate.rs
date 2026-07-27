@@ -101,8 +101,11 @@ fn fixture_with_resolver(resolver: Arc<dyn TenantResolver>) -> Fixture {
     let factory: plexus_core::plexus::TenantSubtreeFactory =
         Arc::new(move |admitted: &AdmittedTenant| {
             // The only place a per-tenant object comes into existence.
-            log_for_factory.record(admitted.id());
-            Some(tenant_subtree_shape())
+            let log = Arc::clone(&log_for_factory);
+            Box::pin(async move {
+                log.record(admitted.id());
+                Some(tenant_subtree_shape())
+            })
         });
 
     let mount = TenantMount::new(gate, factory, tenant_template_ir());
@@ -273,8 +276,11 @@ async fn c1_the_auth_less_descent_door_is_nailed_shut() {
     let log_for_factory = Arc::clone(&log);
     let factory: plexus_core::plexus::TenantSubtreeFactory =
         Arc::new(move |admitted: &AdmittedTenant| {
-            log_for_factory.record(admitted.id());
-            Some(tenant_subtree_shape())
+            let log = Arc::clone(&log_for_factory);
+            Box::pin(async move {
+                log.record(admitted.id());
+                Some(tenant_subtree_shape())
+            })
         });
     let mount = TenantMount::new(
         Arc::new(TenantMountGate::new(strict_resolver())),

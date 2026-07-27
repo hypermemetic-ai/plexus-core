@@ -288,6 +288,27 @@ pub trait Activation: Send + Sync + 'static {
             )
         }
     }
+
+    /// PLX-142 — this activation's Connectome subtree, if it has one.
+    ///
+    /// This is the seam by which a document that only ever existed
+    /// builder-side reaches the wire. It is deliberately `Option` and
+    /// deliberately defaults to `None`: an activation that cannot honestly
+    /// produce a CONNECTOME RFC 002 document must say so rather than have one
+    /// manufactured for it from the legacy [`PluginSchema`]. Lifting a legacy
+    /// schema into an `ActivationIr` would be *conformant-looking* and silently
+    /// wrong — §5.1's five Indexed facts and a Dynamic child's advertised hash
+    /// simply are not present in the legacy shape, and §5.2 forbids inventing
+    /// them.
+    ///
+    /// The value returned MUST be the activation's own node, root facts or not:
+    /// the hub establishes §3.3's root facts on whichever node it serves as a
+    /// document and strips them from every embedded node
+    /// ([`ActivationIr::recompute_hashes`]), so a caller does not have to know
+    /// whether it is about to be a root or a subtree.
+    fn connectome_subtree(&self) -> Option<crate::ir::ActivationIr> {
+        None
+    }
 }
 
 // ============================================================================
@@ -639,6 +660,8 @@ trait ActivationObject: Send + Sync + 'static {
     async fn resolve_handle(&self, handle: &Handle) -> Result<PlexusStream, PlexusError>;
     fn plugin_schema(&self) -> PluginSchema;
     fn schema(&self) -> Schema;
+    /// PLX-142 — forward [`Activation::activation_ir`] through the erasure.
+    fn connectome_subtree(&self) -> Option<crate::ir::ActivationIr>;
 }
 
 /// The hub's owned handle on a registered activation.
@@ -673,6 +696,8 @@ impl<A: Activation> ActivationObject for ActivationWrapper<A> {
     }
 
     fn plugin_schema(&self) -> PluginSchema { self.inner.plugin_schema() }
+
+    fn connectome_subtree(&self) -> Option<crate::ir::ActivationIr> { self.inner.connectome_subtree() }
 
     fn schema(&self) -> Schema {
         let schema = schemars::schema_for!(A::Methods);
@@ -952,6 +977,22 @@ struct DynamicHubInner {
     /// gated dispatch are not in the index (registration is builder-time,
     /// before serving, in every supported composition).
     gate_index: std::sync::OnceLock<HashMap<String, super::scope_gate::MethodGateInfo>>,
+    /// PLX-142 — Connectome subtrees declared for registered activations,
+    /// keyed by namespace.
+    ///
+    /// This exists because the `#[activation]` macro emits its
+    /// [`ActivationIr`](crate::ir::ActivationIr) as an **inherent** associated
+    /// function (`T::activation_ir()`, PLX-91) rather than as a trait method,
+    /// so it is unreachable through the `Arc<dyn ActivationObject>` erasure the
+    /// hub stores. Rather than grow a second way to declare an IR — or reach
+    /// into `plexus-macros`, which another build owns — the composition
+    /// root declares it once, next to the registration it already writes, via
+    /// [`DynamicHub::declare_ir`].
+    ///
+    /// An activation that overrides [`Activation::activation_ir`] directly
+    /// (today: [`IrActivation`](crate::runtime::IrActivation)) needs no entry
+    /// here; the erased trait method is consulted first.
+    declared_irs: HashMap<String, Arc<crate::ir::ActivationIr>>,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -1024,6 +1065,7 @@ impl DynamicHub {
                 default_deny: false,
                 audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
                 gate_index: std::sync::OnceLock::new(),
+                declared_irs: HashMap::new(),
             }),
         }
     }
@@ -1551,6 +1593,152 @@ impl DynamicHub {
             .collect()
     }
 
+    // ========================================================================
+    // PLX-142 — the Connectome on the wire
+    // ========================================================================
+
+    /// Declare a registered activation's Connectome subtree (CONNECTOME RFC
+    /// 002 / PLX-84).
+    ///
+    /// The `#[activation]` macro has emitted every activation's
+    /// [`ActivationIr`](crate::ir::ActivationIr) since PLX-91, but as an
+    /// **inherent** associated function `T::activation_ir()` — which the
+    /// `Arc<dyn ActivationObject>` erasure cannot reach. Declaring it here, in
+    /// the composition root that already names the type, is the only additive
+    /// way to close that gap without a second vocabulary in `plexus-macros`.
+    ///
+    /// Keyed on the IR's own `namespace`, which is the key
+    /// [`register`](Self::register) uses too. Declaring an IR for a namespace
+    /// that is not registered is harmless and contributes no edge.
+    ///
+    /// ```
+    /// use plexus_core::ir::ActivationIr;
+    /// use plexus_core::plexus::DynamicHub;
+    ///
+    /// let hub = DynamicHub::new("substrate")
+    ///     .declare_ir(ActivationIr::new("solar", "1.0.0"));
+    /// // No `solar` activation is registered, so the document has no edge.
+    /// assert!(hub.connectome().children.is_empty());
+    /// ```
+    pub fn declare_ir(mut self, ir: crate::ir::ActivationIr) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot declare_ir: DynamicHub has multiple references");
+        inner.declared_irs.insert(ir.namespace.clone(), Arc::new(ir));
+        self
+    }
+
+    /// This hub's Connectome document — the whole tree, in one value.
+    ///
+    /// Served on `{ns}.connectome`. This is the method PLX-142 exists to add:
+    /// before it, `ActivationIr` appeared on no wire method at all and the only
+    /// fetchable schema was the legacy [`PluginSchema`], whose `ChildSummary`
+    /// is three fields and shallow by design.
+    ///
+    /// # How each child gets its edge, and why
+    ///
+    /// - A registered activation whose subtree this hub **has** — because the
+    ///   activation overrides [`Activation::connectome_subtree`], or because
+    ///   the composition root called [`declare_ir`](Self::declare_ir) — becomes
+    ///   a [`ChildEdge::Static`](crate::ir::ChildEdge::Static): the subtree is
+    ///   embedded, and §5.1's "descending MUST require no additional round
+    ///   trip" holds. This is the round-trip class the ticket deletes.
+    /// - A registered activation whose subtree this hub does **not** have
+    ///   becomes a [`ChildEdge::Dynamic`](crate::ir::ChildEdge::Dynamic)
+    ///   carrying its namespace and the hash that activation itself advertises.
+    ///   It is not embedded because there is nothing to embed. Fabricating a
+    ///   typed subtree out of the legacy schema's enumerated method names is
+    ///   exactly the synthesis **§5.2 forbids**, and PLX-119 measured that a
+    ///   lifted legacy document is *conformant-looking* — the dangerous kind of
+    ///   wrong. So the edge advertises identity and nothing more, which is what
+    ///   §5.1 asks of a Dynamic edge and all the wire honestly knows.
+    ///
+    /// The advertised hash of such an edge is the child's legacy
+    /// `PluginSchema::hash`. It is a genuine content identity — it moves when
+    /// the child moves, which is what makes it usable as a cache key — but it
+    /// is **not** a `CONNECTOME-HASH/1` digest. §4.6 folds a Dynamic edge's
+    /// advertised hash verbatim and forbids recomputing it, so this does not
+    /// affect any hash this document declares under §4.7; it does mean a
+    /// consumer must not assume a Dynamic edge's hash is comparable with a
+    /// Connectome node hash. The condition disappears for a child the moment
+    /// that child's IR is declared.
+    ///
+    /// # Root facts
+    ///
+    /// [`ActivationIr::recompute_hashes`] establishes §3.3's mandatory root
+    /// facts (`ir_version`, `hash_algorithm`, `ir_hash`) on this node and
+    /// strips all five from every embedded node, so a subtree cannot smuggle a
+    /// root fact into an embedded position no matter how it was built. The two
+    /// optional root facts — `backend_name` (§3.3, SHOULD) and
+    /// `respond_method` (§7.6) — are deliberately **not** set here: PLX-113
+    /// owns declaring them, on `#[activation]`, and adding a second way to set
+    /// them on the hub is the collision that ticket asks this one to avoid. A
+    /// checker therefore reports them as advisories, which §11.1 makes
+    /// non-binding.
+    pub fn connectome(&self) -> crate::ir::ActivationIr {
+        use crate::ir::{ActivationIr, ChildEdge};
+
+        let mut root = ActivationIr::new(
+            self.inner.namespace.clone(),
+            Activation::version(self),
+        );
+        let description = Activation::description(self);
+        if !description.is_empty() {
+            root = root.with_description(description);
+        }
+
+        // A set (§4.8), so order is not content — but a stable order keeps the
+        // serialized bytes stable across runs, which makes the document
+        // diffable and the hash's independence from order testable.
+        let mut namespaces: Vec<&str> =
+            self.inner.activations.keys().map(String::as_str).collect();
+        namespaces.sort_unstable();
+
+        for ns in namespaces {
+            let Some(activation) = self.inner.activations.get(ns) else {
+                continue;
+            };
+            let subtree = activation.connectome_subtree().or_else(|| {
+                self.inner
+                    .declared_irs
+                    .get(ns)
+                    .map(|ir| (**ir).clone())
+            });
+            root = match subtree {
+                Some(ir) => root.with_child(ChildEdge::Static(ir)),
+                None => {
+                    let schema = activation.plugin_schema();
+                    root.with_child(ChildEdge::Dynamic {
+                        namespace: schema.namespace,
+                        hash: schema.hash,
+                        description: schema.description,
+                    })
+                }
+            };
+        }
+
+        root.recompute_hashes();
+        root
+    }
+
+    /// The Connectome document for one registered activation, as a document in
+    /// its own right (root facts established, embedded nodes stripped).
+    ///
+    /// This is the lazy half of PLX-121's "one fetch plus K edge fetches": a
+    /// consumer that meets a [`ChildEdge`](crate::ir::ChildEdge) it wants to
+    /// descend into fetches exactly this, keyed by the hash the edge
+    /// advertised.
+    pub fn child_connectome(&self, namespace: &str) -> Option<crate::ir::ActivationIr> {
+        let activation = self.inner.activations.get(namespace)?;
+        let mut ir = activation.connectome_subtree().or_else(|| {
+            self.inner
+                .declared_irs
+                .get(namespace)
+                .map(|ir| (**ir).clone())
+        })?;
+        ir.recompute_hashes();
+        Some(ir)
+    }
+
     /// Convert to RPC module
     pub fn into_rpc_module(self) -> Result<RpcModule<()>, jsonrpsee::core::RegisterMethodError> {
         let mut module = RpcModule::new(());
@@ -1660,6 +1848,9 @@ impl DynamicHub {
                 })
             }
         )?;
+
+        // PLX-142: {ns}.connectome — the CONNECTOME RFC 002 document.
+        register_connectome_method(&mut module, self.clone(), ns_static)?;
 
         // Register _info well-known endpoint (no namespace prefix).
         // Returns backend name + auth_capabilities (AUTHZ-CORE-3) as a
@@ -1827,6 +2018,11 @@ impl DynamicHub {
                 })
             }
         )?;
+
+        // PLX-142: {ns}.connectome — the CONNECTOME RFC 002 document. Both
+        // module builders register it, or the Arc-hosted path (which is the one
+        // plexus-substrate actually uses) would silently lack the method.
+        register_connectome_method(&mut module, (*hub).clone(), ns_static)?;
 
         // Register _info well-known endpoint (no namespace prefix).
         // Returns backend name + auth_capabilities (AUTHZ-CORE-3) as a
@@ -2059,6 +2255,101 @@ struct CallParams {
 #[derive(Debug, Default, serde::Deserialize)]
 struct SchemaParams {
     method: Option<String>,
+}
+
+/// Params for `{ns}.connectome` (PLX-142).
+///
+/// `{}` (or no params at all) asks for the hub's own document — the root, with
+/// every registered activation as an edge. `{"namespace": "solar"}` asks for
+/// one registered activation's document on its own, which is the lazy half of
+/// "one fetch plus K edge fetches": a consumer that meets an edge it wants to
+/// descend into fetches exactly that child, keyed by the hash the edge
+/// advertised.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ConnectomeParams {
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+/// PLX-142 — register `{ns}.connectome` on a module.
+///
+/// Extracted rather than written twice because `into_rpc_module` and
+/// `arc_into_rpc_module` are near-duplicates and a method added to only one of
+/// them is invisible on exactly the path `plexus-substrate` serves.
+///
+/// The content type is `{ns}.connectome`, which deliberately does **not** end
+/// in `.schema`: [`DynamicHub::is_schema_query`] and
+/// `fill_site_hints_in_schema_stream` both key on that suffix and would try to
+/// decode this document as a [`PluginSchema`].
+fn register_connectome_method(
+    module: &mut RpcModule<()>,
+    hub: DynamicHub,
+    ns_static: &'static str,
+) -> Result<(), jsonrpsee::core::RegisterMethodError> {
+    let connectome_method: &'static str =
+        Box::leak(format!("{}.connectome", ns_static).into_boxed_str());
+    let connectome_unsub: &'static str =
+        Box::leak(format!("{}.connectome_unsub", ns_static).into_boxed_str());
+    let connectome_content_type: &'static str = connectome_method;
+
+    module.register_subscription(
+        connectome_method,
+        PLEXUS_NOTIF_METHOD,
+        connectome_unsub,
+        move |params, pending, _ctx, _ext| {
+            let hub = hub.clone();
+            Box::pin(async move {
+                // Tolerated rather than required: a caller sending no params at
+                // all gets the hub's own document.
+                let p: ConnectomeParams = params.parse().unwrap_or_default();
+                match p.namespace.as_deref() {
+                    None => {
+                        let doc = hub.connectome();
+                        let stream = async_stream::stream! { yield doc; };
+                        let wrapped = super::streaming::wrap_stream(
+                            stream,
+                            connectome_content_type,
+                            vec![ns_static.into()],
+                        );
+                        pipe_stream_to_subscription(pending, wrapped).await
+                    }
+                    Some(child) => match hub.child_connectome(child) {
+                        Some(doc) => {
+                            let stream = async_stream::stream! { yield doc; };
+                            let wrapped = super::streaming::wrap_stream(
+                                stream,
+                                connectome_content_type,
+                                vec![ns_static.into()],
+                            );
+                            pipe_stream_to_subscription(pending, wrapped).await
+                        }
+                        // Absent rather than empty: an activation that declares
+                        // no Connectome is reported as such, never handed a
+                        // manufactured one (§5.2).
+                        None => {
+                            let sink = pending.accept().await?;
+                            let item = super::types::PlexusStreamItem::Error {
+                                metadata: super::types::StreamMetadata::new(
+                                    vec![ns_static.into()],
+                                    super::context::PlexusContext::hash(),
+                                ),
+                                message: format!(
+                                    "no Connectome document is declared for `{child}`"
+                                ),
+                                code: Some("connectome_not_declared".to_string()),
+                                recoverable: false,
+                            };
+                            if let Ok(raw) = serde_json::value::to_raw_value(&item) {
+                                let _ = sink.send(raw).await;
+                            }
+                            Ok(())
+                        }
+                    },
+                }
+            })
+        },
+    )?;
+    Ok(())
 }
 
 /// Params for {ns}.respond (WebSocket bidirectional response)

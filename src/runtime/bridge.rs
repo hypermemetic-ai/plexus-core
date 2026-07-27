@@ -284,6 +284,12 @@ impl Activation for IrActivation {
         )
     }
 
+    /// PLX-142 — an IR-backed activation *is* its document, so this is the one
+    /// override that needs no bridge at all.
+    fn connectome_subtree(&self) -> Option<ActivationIr> {
+        Some((*self.ir).clone())
+    }
+
     fn into_rpc_methods(self) -> jsonrpsee::server::Methods {
         // An IR-backed activation is routed through `DynamicHub`, which calls
         // `Activation::call` directly; it registers no jsonrpsee methods of its

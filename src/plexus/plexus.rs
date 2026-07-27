@@ -1019,6 +1019,24 @@ struct DynamicHubInner {
     /// (today: [`IrActivation`](crate::runtime::IrActivation)) needs no entry
     /// here; the erased trait method is consulted first.
     declared_irs: HashMap<String, Arc<crate::ir::ActivationIr>>,
+    /// RFC 002 §3.3 `backend_name` — the root fact this hub declares.
+    ///
+    /// PLX-157. PLX-113 made this declarable on `#[activation]`, and
+    /// [`connectome`](DynamicHub::connectome) once deferred to it. That defer
+    /// is unreachable for a real service: a hub root is a `DynamicHub`, never
+    /// an `#[activation]`, and
+    /// [`ActivationIr::recompute_hashes`](crate::ir::ActivationIr::recompute_hashes)
+    /// strips all five root facts from every embedded node — so a
+    /// `backend_name` declared on a registered activation is *erased* the
+    /// moment that activation becomes a child edge. The capability therefore
+    /// had no producer it could reach. This is the reachable one.
+    backend_name: Option<String>,
+    /// RFC 002 §7.6 / §3.3 `respond_method` — the reply-channel method id.
+    ///
+    /// PLX-157, same reasoning as [`backend_name`](DynamicHubInner::backend_name).
+    /// The runtime registers `{namespace}.respond` for every hub, so the
+    /// honest declaration is that dotted id.
+    respond_method: Option<String>,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -1092,8 +1110,63 @@ impl DynamicHub {
                 audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
                 gate_index: std::sync::OnceLock::new(),
                 declared_irs: HashMap::new(),
+                backend_name: None,
+                respond_method: None,
             }),
         }
+    }
+
+    /// Declare RFC 002 §3.3's `backend_name` root fact on this hub's document.
+    ///
+    /// PLX-157. Without it a client must probe `_info` to learn who answered;
+    /// synapse did that three times per invocation. The value should be the
+    /// name the backend registers and answers `_info` with — for the substrate
+    /// that is `"substrate"`, which is also the hub's routing namespace.
+    ///
+    /// # It moves the document hash and no other hash
+    ///
+    /// Root facts enter the *document* preimage (§4.6) and not the activation
+    /// preimage, so declaring this changes `ir_hash` and leaves every
+    /// activation and method hash byte-identical. Advertised child hashes are
+    /// activation hashes and are unaffected.
+    ///
+    /// Empty is a §3.5 MUST violation and is rejected here rather than
+    /// serialized: `None` (silence) is conformant, `Some("")` is not.
+    pub fn with_backend_name(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        assert!(
+            !name.is_empty(),
+            "backend_name must not be empty (RFC 002 §3.5): omit the call instead"
+        );
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot set backend_name: DynamicHub has multiple references");
+        inner.backend_name = Some(name);
+        self
+    }
+
+    /// Declare RFC 002 §7.6's `respond_method` root fact — the method id a
+    /// consumer calls to answer a callback.
+    ///
+    /// PLX-157. §7.6 is a SHOULD and fires unconditionally when this is
+    /// absent, so every real service's document carried the advisory "a
+    /// consumer cannot determine before invoking whether it can serve a
+    /// declared callback". §3.3 turns it into a MUST the moment any method
+    /// declares callbacks.
+    ///
+    /// The runtime registers `{namespace}.respond` (see the `{ns}.respond`
+    /// registration in [`DynamicHub::into_rpc_module`]-time setup), so the
+    /// declaration must match that dotted id, not the bare `"respond"`
+    /// convention clients assume today.
+    pub fn with_respond_method(mut self, method: impl Into<String>) -> Self {
+        let method = method.into();
+        assert!(
+            !method.is_empty(),
+            "respond_method must not be empty (RFC 002 §3.5): omit the call instead"
+        );
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot set respond_method: DynamicHub has multiple references");
+        inner.respond_method = Some(method);
+        self
     }
 
     /// Configure the deployment's [`ScopeRegistry`] — the scope gate's
@@ -1705,12 +1778,29 @@ impl DynamicHub {
     /// [`ActivationIr::recompute_hashes`] establishes §3.3's mandatory root
     /// facts (`ir_version`, `hash_algorithm`, `ir_hash`) on this node and
     /// strips all five from every embedded node, so a subtree cannot smuggle a
-    /// root fact into an embedded position no matter how it was built. The two
-    /// optional root facts — `backend_name` (§3.3, SHOULD) and
-    /// `respond_method` (§7.6) — are deliberately **not** set here: PLX-113
-    /// owns declaring them, on `#[activation]`, and adding a second way to set
-    /// them on the hub is the collision that ticket asks this one to avoid. A
-    /// checker therefore reports them as advisories, which §11.1 makes
+    /// root fact into an embedded position no matter how it was built.
+    ///
+    /// The two optional root facts — `backend_name` (§3.3, SHOULD) and
+    /// `respond_method` (§7.6) — are set here from
+    /// [`DynamicHub::with_backend_name`] / [`DynamicHub::with_respond_method`]
+    /// when the deployment declared them.
+    ///
+    /// **PLX-157 corrects the earlier note here**, which said these were
+    /// deliberately unset because "PLX-113 owns declaring them, on
+    /// `#[activation]`, and adding a second way to set them on the hub is the
+    /// collision that ticket asks this one to avoid." That deferral could
+    /// never pay out. A hub root is a `DynamicHub`; every `#[activation]` in
+    /// the process is a *child* of it; and `strip_root_facts` (three lines up
+    /// in the same call) nulls `backend_name` and `respond_method` on every
+    /// child, recursively. A `backend_name` declared on `#[activation]` is
+    /// therefore erased before it can be served, so PLX-113's capability had
+    /// no reachable producer for the case that motivated it. This is not a
+    /// second way to set them — it is the first one that survives the fold.
+    /// `#[activation]`'s declaration remains correct and load-bearing for an
+    /// activation served as its *own* document.
+    ///
+    /// A hub that declares neither behaves exactly as before: the facts stay
+    /// `None` and a checker reports both as advisories, which §11.1 makes
     /// non-binding.
     pub fn connectome(&self) -> crate::ir::ActivationIr {
         use crate::ir::{ActivationIr, ChildEdge};
@@ -1722,6 +1812,16 @@ impl DynamicHub {
         let description = Activation::description(self);
         if !description.is_empty() {
             root = root.with_description(description);
+        }
+
+        // PLX-157 — the §3.3/§7.6 optional root facts, set before the fold so
+        // they enter the document preimage (§4.6). They contribute to
+        // `ir_hash` only; no activation or method hash moves.
+        if let Some(name) = &self.inner.backend_name {
+            root = root.with_backend_name(name.clone());
+        }
+        if let Some(method) = &self.inner.respond_method {
+            root = root.with_respond_method(method.clone());
         }
 
         // A set (§4.8), so order is not content — but a stable order keeps the

@@ -348,3 +348,138 @@ fn a_child_that_declares_no_connectome_has_none_to_serve() {
     assert!(hub().child_connectome("health").is_none());
     assert!(hub().child_connectome("nonexistent").is_none());
 }
+
+// ===========================================================================
+// PLX-157 — the two OPTIONAL root facts, and why they live on the hub
+// ===========================================================================
+//
+// PLX-113 made `backend_name` and `respond_method` declarable on
+// `#[activation]`. Inventory item 5 (an `_info` probe firing three times per
+// synapse invocation) and item 8 (§7.6's advisory on every real service) both
+// waited on a producer, and no producer appeared. The reason is structural and
+// is pinned by `a_root_fact_declared_on_a_child_is_erased` below: a hub root is
+// a `DynamicHub`, every `#[activation]` under it is a CHILD, and §3.3 requires
+// root facts to be stripped from every embedded node. A `backend_name`
+// declared on an activation therefore cannot survive to be served — the
+// capability had no reachable producer for the case that motivated it.
+
+fn declaring_hub() -> DynamicHub {
+    DynamicHub::new("substrate")
+        .with_backend_name("substrate")
+        .with_respond_method("substrate.respond")
+        .register(widgets())
+        .register(Health::new())
+}
+
+#[test]
+fn a_hub_can_declare_the_two_optional_root_facts() {
+    let doc = declaring_hub().connectome();
+
+    // §3.3 SHOULD — a client no longer has to probe `_info` for backend
+    // identity once it holds the document.
+    assert_eq!(doc.backend_name.as_deref(), Some("substrate"));
+    // §7.6 SHOULD — a consumer can tell BEFORE invoking whether it can serve a
+    // declared callback, because the reply channel is named.
+    assert_eq!(doc.respond_method.as_deref(), Some("substrate.respond"));
+}
+
+#[test]
+fn a_hub_that_declares_nothing_is_byte_identical_to_before() {
+    // Adoption must be opt-in: a deployment that does not call the builders
+    // gets exactly the previous document, advisories included.
+    let plain = hub().connectome();
+    assert_eq!(plain.backend_name, None);
+    assert_eq!(plain.respond_method, None);
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::to_value(&hub().connectome()).unwrap()
+    );
+}
+
+#[test]
+fn declaring_root_facts_moves_the_document_hash_and_no_other_hash() {
+    // §4.6 — the root facts enter the DOCUMENT preimage and not the activation
+    // preimage. This is what lets a deployment adopt them without invalidating
+    // any advertised child hash a consumer is already caching by.
+    let plain = hub().connectome();
+    let declared = declaring_hub().connectome();
+
+    assert_ne!(
+        plain.ir_hash, declared.ir_hash,
+        "the document hash MUST move: the facts are part of the document"
+    );
+    assert_eq!(
+        plain.hash, declared.hash,
+        "the ROOT ACTIVATION hash must not move"
+    );
+
+    // Every child edge, recursively, is byte-identical.
+    fn edge_hashes(a: &ActivationIr, out: &mut Vec<(String, String)>) {
+        for m in &a.methods {
+            out.push((m.dotted_id.clone(), m.hash.clone()));
+        }
+        for c in &a.children {
+            match c {
+                ChildEdge::Static(child) => {
+                    out.push((child.namespace.clone(), child.hash.clone()));
+                    edge_hashes(child, out);
+                }
+                ChildEdge::Dynamic { namespace, hash, .. } => {
+                    out.push((namespace.clone(), hash.clone()));
+                }
+                ChildEdge::Indexed {
+                    namespace, template, ..
+                } => {
+                    out.push((namespace.clone(), template.hash.clone()));
+                    edge_hashes(template, out);
+                }
+            }
+        }
+    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    edge_hashes(&plain, &mut a);
+    edge_hashes(&declared, &mut b);
+    assert!(!a.is_empty(), "the fixture must actually have children");
+    assert_eq!(a, b, "no activation or method hash may move");
+}
+
+#[test]
+fn a_root_fact_declared_on_a_child_is_erased() {
+    // THE REASON THIS API EXISTS. §3.3's strip is unconditional, so declaring
+    // `backend_name` on a registered activation is silently discarded. If this
+    // ever starts failing, the strip has been weakened and PLX-157's premise
+    // must be re-read — it does not mean the hub builders became redundant.
+    let child = subtree()
+        .with_backend_name("i-will-not-survive")
+        .with_respond_method("neither.will.i");
+    assert_eq!(child.backend_name.as_deref(), Some("i-will-not-survive"));
+
+    let mut root = ActivationIr::new("substrate", "1.0.0");
+    root = root.with_child(ChildEdge::Static(child));
+    root.recompute_hashes();
+
+    let ChildEdge::Static(embedded) = root.child("widgets_subtree").unwrap_or_else(|| {
+        root.children.first().expect("one child")
+    }) else {
+        panic!("expected a static child")
+    };
+    assert_eq!(
+        embedded.backend_name, None,
+        "§3.3 — an embedded node MUST NOT carry a root fact"
+    );
+    assert_eq!(embedded.respond_method, None);
+}
+
+#[test]
+#[should_panic(expected = "backend_name must not be empty")]
+fn an_empty_backend_name_is_refused_rather_than_served() {
+    // §3.5 — present-but-empty is a MUST violation. Silence is conformant;
+    // an empty string is not, so it is refused at the point of declaration.
+    let _ = DynamicHub::new("substrate").with_backend_name("");
+}
+
+#[test]
+#[should_panic(expected = "respond_method must not be empty")]
+fn an_empty_respond_method_is_refused_rather_than_served() {
+    let _ = DynamicHub::new("substrate").with_respond_method("");
+}

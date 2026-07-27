@@ -1,0 +1,78 @@
+error[E0277]: the trait bound `(Permission,): Has<FsRead, _>` is not satisfied
+  --> tests/ui/protocol_typed_capability_still_gated.rs:28:10
+   |
+28 |         .issue_as_async::<FsRead, _, _, _>(AnyRequest {
+   |          ^^^^^^^^^^^^^^ the trait `Has<FsRead, _>` is not implemented for `(Permission,)`
+   |
+   = help: the following other types implement trait `Has<M, I>`:
+             `(A, B)` implements `Has<A, Here>`
+             `(A, B)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<A, Here>`
+             `(A, B, C)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<C, There<There<Here>>>`
+             `(A, B, C, D)` implements `Has<A, Here>`
+             `(A, B, C, D)` implements `Has<B, There<Here>>`
+             `(A, B, C, D)` implements `Has<C, There<There<Here>>>`
+           and $N others
+note: required by a bound in `Client::<C>::issue_as_async`
+  --> src/capability/client.rs
+   |
+   |     pub async fn issue_as_async<M, I, Req, Resp>(
+   |                  -------------- required by a bound in this associated function
+...
+   |         C: Has<M, I>,
+   |            ^^^^^^^^^ required by this bound in `Client::<C>::issue_as_async`
+
+error[E0277]: the trait bound `(Permission,): Has<FsRead, _>` is not satisfied
+  --> tests/ui/protocol_typed_capability_still_gated.rs:27:40
+   |
+27 |       let _bad: Result<AnyResponse, _> = client
+   |  ________________________________________^
+28 | |         .issue_as_async::<FsRead, _, _, _>(AnyRequest {
+29 | |             path: "/etc/hosts".into(),
+30 | |         })
+   | |__________^ the trait `Has<FsRead, _>` is not implemented for `(Permission,)`
+   |
+   = help: the following other types implement trait `Has<M, I>`:
+             `(A, B)` implements `Has<A, Here>`
+             `(A, B)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<A, Here>`
+             `(A, B, C)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<C, There<There<Here>>>`
+             `(A, B, C, D)` implements `Has<A, Here>`
+             `(A, B, C, D)` implements `Has<B, There<Here>>`
+             `(A, B, C, D)` implements `Has<C, There<There<Here>>>`
+           and $N others
+note: required by a bound in `Client::<C>::issue_as_async`
+  --> src/capability/client.rs
+   |
+   |     pub async fn issue_as_async<M, I, Req, Resp>(
+   |                  -------------- required by a bound in this associated function
+...
+   |         C: Has<M, I>,
+   |            ^^^^^^^^^ required by this bound in `Client::<C>::issue_as_async`
+
+error[E0277]: the trait bound `(Permission,): Has<FsRead, _>` is not satisfied
+  --> tests/ui/protocol_typed_capability_still_gated.rs:31:10
+   |
+31 |         .await;
+   |          ^^^^^ the trait `Has<FsRead, _>` is not implemented for `(Permission,)`
+   |
+   = help: the following other types implement trait `Has<M, I>`:
+             `(A, B)` implements `Has<A, Here>`
+             `(A, B)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<A, Here>`
+             `(A, B, C)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<C, There<There<Here>>>`
+             `(A, B, C, D)` implements `Has<A, Here>`
+             `(A, B, C, D)` implements `Has<B, There<Here>>`
+             `(A, B, C, D)` implements `Has<C, There<There<Here>>>`
+           and $N others
+note: required by a bound in `Client::<C>::issue_as_async`
+  --> src/capability/client.rs
+   |
+   |     pub async fn issue_as_async<M, I, Req, Resp>(
+   |                  -------------- required by a bound in this associated function
+...
+   |         C: Has<M, I>,
+   |            ^^^^^^^^^ required by this bound in `Client::<C>::issue_as_async`

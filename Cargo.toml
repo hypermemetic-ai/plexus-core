@@ -50,12 +50,12 @@ jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 rmcp = { version = "0.12", features = ["server", "transport-io", "transport-streamable-http-server"] }
 
 # Hub macro for activation generation
-plexus-macros = { path = "../plexus-macros-macro-6", version = "0.6.0" }
+plexus-macros = { path = "../plexus-macros", version = "0.6.0" }
 
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
 # Wasm-safe by construction; the dependency only runs this way, since
 # plexus-client must build for wasm32 and plexus-core cannot.
-plexus-client = { path = "../plexus-macros-macro-6/plexus-client", version = "0.6.0" }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.0" }
 
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code

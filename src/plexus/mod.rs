@@ -10,6 +10,8 @@ pub mod dispatch;
 pub mod errors;
 pub mod forward_registry;
 pub mod hub_context;
+// MACRO-2.B3: the in-process transport for the macro-generated typed client.
+pub mod in_process;
 pub mod method_enum;
 pub mod middleware;
 pub mod path;
@@ -26,6 +28,7 @@ pub use auth::{AuthContext, Principal, ServiceIdentity, SessionValidator, Verifi
 pub use test_validator::TestSessionValidator;
 pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirChannel, StandardRequest, StandardResponse};
 pub use context::PlexusContext;
+pub use in_process::InProcessTransport;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::ForwardPolicyRegistry;

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use plexus_client::{wire_result, Note, StreamItem};
 use plexus_core::plexus::schema::Cardinality;
-use plexus_core::plexus::{PlexusStreamItem, PluginSchema};
+use plexus_core::plexus::{PlexusStreamItem, PluginSchema, SchemaResult};
 use schemars::schema_for;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -277,14 +277,19 @@ fn the_schema_is_a_plugin_schema() {
     ];
     // The six methods, then the `schema` method the macro lists in every
     // activation's schema (RETURNS-8 regenerated the file from the served
-    // output): one item, any value, no error, no progress.
+    // output): one item, a `SchemaResult` (RETURNS-26) — this plugin's
+    // schema, or one method's — no error, no progress.
     let names: Vec<&str> = schema.methods.iter().map(|m| m.name.as_str()).collect();
     let mut expected_names: Vec<&str> = expected.iter().map(|e| e.0).collect();
     expected_names.push("schema");
     assert_eq!(names, expected_names);
     let auto = schema.methods.last().unwrap();
     assert_eq!(auto.cardinality, One, "schema: cardinality");
-    assert_eq!(s(auto.returns.clone()), json!({}), "schema: returns any value");
+    assert_eq!(
+        s(auto.returns.clone()),
+        s(schema_for!(SchemaResult)),
+        "schema: returns is schema_for!(SchemaResult)"
+    );
     assert_eq!((auto.error.is_none(), auto.progress.is_none()), (true, true));
 
     let mut forms = BTreeSet::new();

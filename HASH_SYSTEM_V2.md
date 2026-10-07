@@ -328,7 +328,8 @@ fn should_rebuild_ir(
       "description": "Echo a message",
       "hash": "m123hash",
       "params": { /* ... */ },
-      "streaming": false
+      "returns": { /* ... */ },
+      "cardinality": "many"
     }
   ],
   "children": null
@@ -349,8 +350,8 @@ fn should_rebuild_ir(
       "name": "status",
       "description": "Get hyperforge status",
       "hash": "status_hash",
-      "params": null,
-      "streaming": false
+      "returns": { /* ... */ },
+      "cardinality": "one"
     }
   ],
   "children": [

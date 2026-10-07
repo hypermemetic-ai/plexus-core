@@ -5,6 +5,8 @@ pub mod auth;
 pub mod test_validator;
 pub mod bidirectional;
 pub mod context;
+// RETURNS-10: canonical schema JSON and the SHA-256/16 hash every schema hash is.
+pub mod content_hash;
 pub mod credential_envelope;
 pub mod dispatch;
 pub mod errors;

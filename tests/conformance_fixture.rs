@@ -9,9 +9,10 @@
 //! 0.7 type it claims to be, and the files agree with each other and with
 //! the fixture's own item types (`src/types.rs`, included below).
 //!
-//! Comparison rules (the fixture's README): a `"*"` hash is a wildcard,
-//! `timestamp` is normalized to 0, and key order is not significant except in
-//! `aggregate.jsonl`, which is byte-exact serde output.
+//! Comparison rules (the fixture's README): `timestamp` is normalized to 0,
+//! and key order is not significant except in `aggregate.jsonl`, which is
+//! byte-exact serde output. Hashes are real (RETURNS-10): every one in the
+//! files is recomputed here from the files' own JSON.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -108,6 +109,20 @@ fn calls() -> Vec<Call> {
     serde_json::from_str(&read("calls.json")).expect("calls.json is a list of calls")
 }
 
+/// The fixture activation's hash, as `schema.json` pins it — what a hub
+/// serving the fixture as its own root puts in every frame's `plexus_hash`.
+fn plugin_hash() -> String {
+    value(&read("schema.json"))["hash"]
+        .as_str()
+        .expect("schema.json has a hash")
+        .to_string()
+}
+
+/// 16 lowercase hex characters: every Plexus hash's form.
+fn is_hash16(h: &str) -> bool {
+    h.len() == 16 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The aggregate rule (RETURNS-1 decisions 1, 5, 7), applied by hand: one
 /// variant per method, keyed by its wire name, carrying the method's item. A
 /// progress update is not an item, so `load` carries `Result<Loaded,
@@ -170,11 +185,13 @@ fn check_progress(method: &str, content: &Value, what: &str) {
 
 /// Acceptance 1: every line of `wire/*.jsonl` and `errors.jsonl` is a
 /// `PlexusStreamItem` 0.7 (and a client `StreamItem`), whole: it re-encodes to
-/// the same value. Its metadata is the deterministic one. `calls.json` names
-/// every file exactly once.
+/// the same value. Its metadata is the deterministic one, its `plexus_hash`
+/// the fixture's plugin hash (RETURNS-10). `calls.json` names every file
+/// exactly once.
 #[test]
 fn every_frame_is_a_plexus_stream_item() {
     let calls = calls();
+    let plugin_hash = plugin_hash();
 
     let mut on_disk: BTreeSet<String> = std::fs::read_dir(expected_dir().join("wire"))
         .expect("expected/wire/")
@@ -207,8 +224,8 @@ fn every_frame_is_a_plexus_stream_item() {
                 "{what}: provenance"
             );
             assert_eq!(
-                metadata.plexus_hash, "*",
-                "{what}: plexus_hash is the wildcard"
+                metadata.plexus_hash, plugin_hash,
+                "{what}: plexus_hash is the fixture's hash"
             );
             assert_eq!(
                 metadata.timestamp, 0,
@@ -223,21 +240,34 @@ fn every_frame_is_a_plexus_stream_item() {
     );
 }
 
-/// Acceptance 2 and 4: `schema.json` is a 0.7 `PluginSchema`, whole, with
-/// every hash the `"*"` wildcard. Each method's `returns` / `error` /
-/// `progress` is the schema of its T / E / P (RETURNS-5: `with_returns(
-/// schema_for!(T))` …), and the six methods are the six signature forms,
-/// followed by the auto-generated `schema` method.
+/// Acceptance 2 and 4: `schema.json` is a 0.7 `PluginSchema`, whole. Each
+/// method's `returns` / `error` / `progress` is the schema of its T / E / P
+/// (RETURNS-5: `with_returns(schema_for!(T))` …), and the six methods are the
+/// six signature forms, followed by the auto-generated `schema` method.
+/// RETURNS-10: each method's hash is its schema's content hash and the
+/// plugin's are their SHA-256 roll-up — recomputed here from the file.
 #[test]
 fn the_schema_is_a_plugin_schema() {
     let v = value(&read("schema.json"));
     let schema: PluginSchema = exact(&v, "schema.json");
 
     assert_eq!(schema.namespace, NS);
+    let rolled = PluginSchema::leaf(
+        schema.namespace.clone(),
+        schema.version.clone(),
+        schema.description.clone(),
+        schema.methods.clone(),
+    );
     assert_eq!(
         (schema.self_hash.as_str(), schema.hash.as_str()),
-        ("*", "*")
+        (rolled.self_hash.as_str(), rolled.hash.as_str()),
+        "the plugin hashes are the roll-up of the method hashes"
     );
+    assert!(is_hash16(&schema.self_hash) && is_hash16(&schema.hash));
+    for m in &schema.methods {
+        assert!(is_hash16(&m.hash), "{}: 16 lowercase hex: {}", m.name, m.hash);
+        assert_eq!(m.hash, m.content_hash(), "{}: hash is the content hash", m.name);
+    }
     assert_eq!(schema.children_hash, None, "a leaf");
     assert!(!schema.is_hub_by_role(), "a leaf");
 
@@ -294,7 +324,6 @@ fn the_schema_is_a_plugin_schema() {
 
     let mut forms = BTreeSet::new();
     for (m, (name, cardinality, returns, error, progress)) in schema.methods.iter().zip(expected) {
-        assert_eq!(m.hash, "*", "{name}: hash is the wildcard");
         assert_eq!(m.cardinality, cardinality, "{name}: cardinality");
         assert_eq!(
             s(m.returns.clone()),

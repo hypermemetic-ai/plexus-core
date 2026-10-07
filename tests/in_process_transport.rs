@@ -3,10 +3,15 @@
 //! MACRO-2 acceptance criterion 2, second half: "over the in-process
 //! transport it runs with no server". No port is opened here, no runtime is
 //! configured beyond `#[tokio::test]`, and no `DynamicHub` is built — the
-//! client's calls land in `Activation::call` and come back as typed events.
+//! client's calls land in `Activation::call` and come back as typed items.
+//!
+//! RETURNS-9: a dispatch that fails (`Activation::call` returning `Err`) is a
+//! typed error frame here, as it is from a hub's `call` route — so the
+//! client sees `ClientError::Remote(RemoteError)` in-process exactly as it
+//! would over a socket.
 
-use futures::StreamExt;
-use plexus_client::{ClientError, ClientEvent, MethodRef, Transport};
+use futures::{StreamExt, TryStreamExt};
+use plexus_client::{ClientError, MethodRef, ParamProblem, RemoteError, StreamItem, Transport};
 use plexus_core::plexus::{Activation, InProcessTransport, PlexusError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -85,7 +90,7 @@ impl Notes {
 async fn a_generated_client_runs_against_the_activation_with_no_server() {
     let client = NotesClient::new(InProcessTransport::new(Notes::default()));
 
-    let events = client.get_all("N-1".to_string()).await.expect("ok");
+    let events: Vec<NoteEvent> = client.get("N-1".to_string()).try_collect().await.expect("ok");
     assert_eq!(
         events,
         vec![NoteEvent::Note {
@@ -94,16 +99,10 @@ async fn a_generated_client_runs_against_the_activation_with_no_server() {
         }]
     );
 
-    assert_eq!(
-        client.list_all(None).await.expect("ok").len(),
-        2,
-        "no params, no filter"
-    );
-    assert_eq!(
-        client.list_all(Some("N".into())).await.expect("ok").len(),
-        1,
-        "the Option param reached the activation"
-    );
+    let all: Vec<NoteEvent> = client.list(None).try_collect().await.expect("ok");
+    assert_eq!(all.len(), 2, "no params, no filter");
+    let some: Vec<NoteEvent> = client.list(Some("N".into())).try_collect().await.expect("ok");
+    assert_eq!(some.len(), 1, "the Option param reached the activation");
 }
 
 #[tokio::test]
@@ -113,11 +112,18 @@ async fn the_streaming_form_works_the_same_in_process() {
     let mut ids = Vec::new();
     let mut stream = client.list(None);
     while let Some(ev) = stream.next().await {
-        if let ClientEvent::Data(NoteEvent::Note { id, .. }) = ev.expect("ok") {
+        if let NoteEvent::Note { id, .. } = ev.expect("ok") {
             ids.push(id);
         }
     }
     assert_eq!(ids, vec!["N-1".to_string(), "M-1".to_string()]);
+
+    // …and as the activation's derived aggregate.
+    let events: Vec<NotesEvent> = client.list(None).events().try_collect().await.expect("ok");
+    assert!(
+        matches!(&events[..], [NotesEvent::List(NoteEvent::Note { .. }), NotesEvent::List(NoteEvent::Note { .. })]),
+        "{events:?}"
+    );
 }
 
 /// The activation's *own* error variant is a data event. Distinguishing it
@@ -125,32 +131,83 @@ async fn the_streaming_form_works_the_same_in_process() {
 #[tokio::test]
 async fn an_activation_error_variant_arrives_as_data() {
     let client = NotesClient::new(InProcessTransport::new(Notes::default()));
+    let events: Vec<NoteEvent> = client.boom().try_collect().await.expect("not a client error");
     assert_eq!(
-        client.boom_all().await.expect("not a client error"),
+        events,
         vec![NoteEvent::Error {
             message: "the activation said no".into()
         }]
     );
 }
 
-/// `Activation::call` returning `Err` means nothing was answered — the same
-/// class as a dropped connection, so it reports as a transport error.
+/// `Activation::call` returning `Err` is the call failing, typed: one error
+/// frame carrying `RemoteError::from(&e)` — provenance the activation, not
+/// recoverable, no `done` — as a hub's `call` route sends it.
 #[tokio::test]
-async fn a_failed_dispatch_is_a_transport_error_not_a_remote_one() {
+async fn a_failed_dispatch_is_a_typed_error_frame() {
     let transport = InProcessTransport::new(Notes::default());
     // An unknown method is the cleanest way to make `call` return Err.
-    let stream = Transport::call(&transport, MethodRef::new("notes", "nope"), json!({}));
-    let items: Vec<_> = stream.collect().await;
-    assert_eq!(items.len(), 1);
-    assert!(items[0].is_err(), "{items:?}");
+    let items: Vec<_> = Transport::call(&transport, MethodRef::new("notes", "nope"), json!({}))
+        .collect()
+        .await;
+    match &items[..] {
+        [Ok(StreamItem::Error {
+            metadata,
+            recoverable: false,
+            error,
+        })] => {
+            assert_eq!(
+                *error,
+                RemoteError::MethodNotFound {
+                    activation: "notes".into(),
+                    method: "nope".into()
+                }
+            );
+            let meta = metadata.as_ref().expect("in-process carries metadata");
+            assert_eq!(meta.provenance, vec!["notes".to_string()]);
+        }
+        other => panic!("expected exactly one error frame, got {other:?}"),
+    }
+}
 
-    // And through a typed decode, it lands in the transport layer.
-    let decoded: Vec<Result<ClientEvent<NoteEvent>, ClientError>> = plexus_client::decode(
-        Transport::call(&transport, MethodRef::new("notes", "nope"), json!({})),
-    )
+/// Through the generated client, a failed dispatch is
+/// `ClientError::Remote(RemoteError)` — the same value a wire transport
+/// yields for the same failure.
+#[tokio::test]
+async fn through_the_client_a_failed_dispatch_is_client_error_remote() {
+    let transport = InProcessTransport::new(Notes::default());
+
+    let decoded: Vec<Result<NoteEvent, ClientError>> = plexus_client::decode(Transport::call(
+        &transport,
+        MethodRef::new("notes", "nope"),
+        json!({}),
+    ))
     .collect()
     .await;
-    assert!(decoded[0].as_ref().unwrap_err().is_transport());
+    assert_eq!(
+        decoded,
+        vec![Err(ClientError::Remote(RemoteError::MethodNotFound {
+            activation: "notes".into(),
+            method: "nope".into()
+        }))]
+    );
+
+    // A missing required param, through the same typed path a generated
+    // method uses.
+    let missing: Vec<Result<NoteEvent, ClientError>> = plexus_client::decode(Transport::call(
+        &transport,
+        NotesClient::<InProcessTransport<Notes>>::METHOD_GET,
+        json!({}),
+    ))
+    .collect()
+    .await;
+    assert_eq!(
+        missing,
+        vec![Err(ClientError::Remote(RemoteError::InvalidParams {
+            param: Some("id".into()),
+            problem: ParamProblem::Missing,
+        }))]
+    );
 }
 
 /// Wiring a client for one activation to a transport bound to another must

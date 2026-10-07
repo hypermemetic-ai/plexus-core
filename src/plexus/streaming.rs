@@ -5,8 +5,8 @@
 //! the caller uses these helpers to create PlexusStreamItems.
 
 use futures::stream::{self, Stream, StreamExt};
-use plexus_client::RemoteError;
-use serde::Serialize;
+use plexus_client::{Progress, RemoteError};
+use serde::{Serialize, Serializer};
 use serde::de::DeserializeOwned;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -57,6 +57,150 @@ pub fn wrap_stream<T: Serialize + Send + 'static>(
     content_type: &'static str,
     provenance: Vec<String>,
 ) -> PlexusStream {
+    wrap_frames(stream.map(Out::<T, ()>::Data), content_type, provenance)
+}
+
+// ============================================================================
+// RETURNS-8: one wrapper per signature form
+// ============================================================================
+//
+// `#[plexus_macros::method]` reads a method's return type and calls the one
+// wrapper that matches it (RETURNS-1 decisions 2, 3, 4, 10):
+//
+// | signature | wrapper | frames per item |
+// |---|---|---|
+// | `-> T` | [`wrap_one`] | data `T`, then done |
+// | `-> Result<T, E>` | [`wrap_one_result`] | data `{"ok": t}` / `{"err": e}`, then done |
+// | `-> impl Stream<Item = T>` | [`wrap_stream`] | data `T` … done |
+// | `-> impl Stream<Item = Result<T, E>>` | [`wrap_result_stream`] | data `{ok}` / `{err}` … done |
+// | `-> impl Stream<Item = Progress<T, P>>` | [`wrap_progress_stream`] | `Update(p)` → progress `P`; `Item(t)` → data `T` |
+// | `-> impl Stream<Item = Result<Progress<T, P>, E>>` | [`wrap_result_progress_stream`] | `Ok(Update(p))` → progress; `Ok(Item(t))` → data `{ok}`; `Err(e)` → data `{err}` |
+//
+// An `Err` item is data: it does not end the stream — the method ends it by
+// returning. Every wrapper appends exactly one `done`.
+
+/// One frame of a method's output before metadata: an item (a data frame) or
+/// a progress update (a progress frame).
+enum Out<D, P> {
+    Data(D),
+    Progress(P),
+}
+
+/// A Result item as the wire carries it: `Ok(t)` → `{"ok": t}`, `Err(e)` →
+/// `{"err": e}` (`plexus_client::wire_result`).
+struct WireResult<T, E>(Result<T, E>);
+
+impl<T: Serialize, E: Serialize> Serialize for WireResult<T, E> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        plexus_client::wire_result::serialize(&self.0, serializer)
+    }
+}
+
+/// `-> T`: one data frame carrying `item`, then `done`.
+pub fn wrap_one<T: Serialize + Send + 'static>(
+    item: T,
+    content_type: &'static str,
+    provenance: Vec<String>,
+) -> PlexusStream {
+    wrap_frames(
+        stream::once(futures::future::ready(Out::<T, ()>::Data(item))),
+        content_type,
+        provenance,
+    )
+}
+
+/// `-> Result<T, E>`: one data frame, `{"ok": t}` or `{"err": e}`, then `done`.
+pub fn wrap_one_result<T, E>(
+    item: Result<T, E>,
+    content_type: &'static str,
+    provenance: Vec<String>,
+) -> PlexusStream
+where
+    T: Serialize + Send + 'static,
+    E: Serialize + Send + 'static,
+{
+    wrap_frames(
+        stream::once(futures::future::ready(Out::<_, ()>::Data(WireResult(item)))),
+        content_type,
+        provenance,
+    )
+}
+
+/// `-> impl Stream<Item = Result<T, E>>`: one data frame per item, `{"ok": t}`
+/// or `{"err": e}`; an `Err` does not end the stream. Then `done`.
+pub fn wrap_result_stream<T, E>(
+    stream: impl Stream<Item = Result<T, E>> + Send + 'static,
+    content_type: &'static str,
+    provenance: Vec<String>,
+) -> PlexusStream
+where
+    T: Serialize + Send + 'static,
+    E: Serialize + Send + 'static,
+{
+    wrap_frames(
+        stream.map(|r| Out::<_, ()>::Data(WireResult(r))),
+        content_type,
+        provenance,
+    )
+}
+
+/// `-> impl Stream<Item = Progress<T, P>>`: `Update(p)` → a progress frame
+/// carrying `p`; `Item(t)` → a data frame carrying `t`. Then `done`.
+pub fn wrap_progress_stream<T, P>(
+    stream: impl Stream<Item = Progress<T, P>> + Send + 'static,
+    content_type: &'static str,
+    provenance: Vec<String>,
+) -> PlexusStream
+where
+    T: Serialize + Send + 'static,
+    P: Serialize + Send + 'static,
+{
+    wrap_frames(
+        stream.map(|step| match step {
+            Progress::Update(p) => Out::Progress(p),
+            Progress::Item(t) => Out::Data(t),
+        }),
+        content_type,
+        provenance,
+    )
+}
+
+/// `-> impl Stream<Item = Result<Progress<T, P>, E>>`: `Ok(Update(p))` → a
+/// progress frame; `Ok(Item(t))` → a data frame `{"ok": t}`; `Err(e)` → a data
+/// frame `{"err": e}`. Then `done`.
+pub fn wrap_result_progress_stream<T, P, E>(
+    stream: impl Stream<Item = Result<Progress<T, P>, E>> + Send + 'static,
+    content_type: &'static str,
+    provenance: Vec<String>,
+) -> PlexusStream
+where
+    T: Serialize + Send + 'static,
+    P: Serialize + Send + 'static,
+    E: Serialize + Send + 'static,
+{
+    wrap_frames(
+        stream.map(|r| match r {
+            Ok(Progress::Update(p)) => Out::Progress(p),
+            Ok(Progress::Item(t)) => Out::Data(WireResult(Ok(t))),
+            Err(e) => Out::Data(WireResult(Err(e))),
+        }),
+        content_type,
+        provenance,
+    )
+}
+
+/// The one place frames get their metadata: every data item goes through the
+/// credential capture `wrap_stream` has always applied, every progress value
+/// is serialized as-is, and exactly one `done` follows the last item.
+fn wrap_frames<D, P>(
+    stream: impl Stream<Item = Out<D, P>> + Send + 'static,
+    content_type: &'static str,
+    provenance: Vec<String>,
+) -> PlexusStream
+where
+    D: Serialize + Send + 'static,
+    P: Serialize + Send + 'static,
+{
     let plexus_hash = PlexusContext::hash();
     let metadata = StreamMetadata::new(provenance.clone(), plexus_hash.clone());
     let done_metadata = StreamMetadata::new(provenance, plexus_hash);
@@ -79,15 +223,24 @@ pub fn wrap_stream<T: Serialize + Send + 'static>(
     // emits the `Set-Cookie` header.
     let projector = CookieProjector::None;
 
-    let data_stream = stream.map(move |item| {
-        let (payload, captured) = serialize_with_credential_capture(&item);
-        let (content, _hints) =
-            assemble_envelope_content(payload, captured, &projector);
-        PlexusStreamItem::Data {
-            metadata: metadata.clone(),
-            content_type: content_type.to_string(),
-            content,
+    let data_stream = stream.map(move |out| match out {
+        Out::Data(item) => {
+            let (payload, captured) = serialize_with_credential_capture(&item);
+            let (content, _hints) =
+                assemble_envelope_content(payload, captured, &projector);
+            PlexusStreamItem::Data {
+                metadata: metadata.clone(),
+                content_type: content_type.to_string(),
+                content,
+            }
         }
+        // A progress value is the method's `P` (RETURNS-6's progress frame),
+        // serialized as-is: progress reports carry no credentials.
+        Out::Progress(p) => PlexusStreamItem::progress(
+            metadata.clone(),
+            content_type.to_string(),
+            serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+        ),
     });
 
     let done_stream = stream::once(async move { PlexusStreamItem::Done {
@@ -504,5 +657,104 @@ mod tests {
             }
             _ => panic!("Expected Progress item"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // RETURNS-8: the per-form wrappers
+    // ------------------------------------------------------------------
+
+    /// `(type, content)` of every frame but the last, and asserts the last
+    /// is the stream's one `done`.
+    async fn frames(stream: PlexusStream) -> Vec<(&'static str, serde_json::Value)> {
+        let items: Vec<_> = stream.collect().await;
+        let (last, body) = items.split_last().expect("at least a done");
+        assert!(matches!(last, PlexusStreamItem::Done { .. }), "ends in done");
+        body.iter()
+            .map(|item| match item {
+                PlexusStreamItem::Data { content_type, content, .. } => {
+                    assert_eq!(content_type, "t.m");
+                    ("data", content.clone())
+                }
+                PlexusStreamItem::Progress { content_type, content, .. } => {
+                    assert_eq!(content_type, "t.m");
+                    ("progress", content.clone())
+                }
+                PlexusStreamItem::Done { .. } => panic!("a second done"),
+                other => panic!("unexpected frame {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn wrap_one_is_one_data_frame_then_done() {
+        let got = frames(wrap_one(TestEvent { value: 1 }, "t.m", vec!["t".into()])).await;
+        assert_eq!(got, vec![("data", serde_json::json!({"value": 1}))]);
+    }
+
+    #[tokio::test]
+    async fn wrap_one_result_carries_ok_or_err() {
+        let ok: Result<u32, String> = Ok(7);
+        let err: Result<u32, String> = Err("no".into());
+        assert_eq!(
+            frames(wrap_one_result(ok, "t.m", vec!["t".into()])).await,
+            vec![("data", serde_json::json!({"ok": 7}))]
+        );
+        assert_eq!(
+            frames(wrap_one_result(err, "t.m", vec!["t".into()])).await,
+            vec![("data", serde_json::json!({"err": "no"}))]
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_result_stream_carries_on_past_an_err() {
+        let items: Vec<Result<u32, String>> = vec![Ok(1), Err("bad".into()), Ok(3)];
+        let got = frames(wrap_result_stream(stream::iter(items), "t.m", vec!["t".into()])).await;
+        assert_eq!(
+            got,
+            vec![
+                ("data", serde_json::json!({"ok": 1})),
+                ("data", serde_json::json!({"err": "bad"})),
+                ("data", serde_json::json!({"ok": 3})),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_progress_stream_splits_updates_from_items() {
+        let steps: Vec<Progress<u32>> = vec![
+            Progress::Update(plexus_client::Note::new("half").with_percentage(50.0)),
+            Progress::Item(9),
+        ];
+        let got = frames(wrap_progress_stream(stream::iter(steps), "t.m", vec!["t".into()])).await;
+        assert_eq!(
+            got,
+            vec![
+                ("progress", serde_json::json!({"message": "half", "percentage": 50.0})),
+                ("data", serde_json::json!(9)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_result_progress_stream_maps_all_three_cases() {
+        let steps: Vec<Result<Progress<u32, String>, String>> = vec![
+            Ok(Progress::Update("step".into())),
+            Ok(Progress::Item(1)),
+            Err("refused".into()),
+        ];
+        let got = frames(wrap_result_progress_stream(
+            stream::iter(steps),
+            "t.m",
+            vec!["t".into()],
+        ))
+        .await;
+        assert_eq!(
+            got,
+            vec![
+                ("progress", serde_json::json!("step")),
+                ("data", serde_json::json!({"ok": 1})),
+                ("data", serde_json::json!({"err": "refused"})),
+            ]
+        );
     }
 }

@@ -1,0 +1,16 @@
+# RETURNS-3 spike — the cost half: the proposed hash on a real activation,
+# menger's `tickets`, built from menger's checkout by sibling path (read
+# only; run.sh seeds this crate's Cargo.lock from menger's so the versions
+# are menger's). Its own workspace root, like the probe one directory up.
+[package]
+name = "returns3-menger-cost"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+returns3-hash-spike = { path = ".." }
+menger-tickets-api = { path = "../../../../menger/tickets-api" }
+serde_json = "1"

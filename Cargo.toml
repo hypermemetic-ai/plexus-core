@@ -55,7 +55,7 @@ plexus-macros = { path = "../plexus-macros", version = "0.6.0" }
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
 # Wasm-safe by construction; the dependency only runs this way, since
 # plexus-client must build for wasm32 and plexus-core cannot.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.0" }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.7.0" }
 
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code

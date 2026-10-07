@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (RETURNS-10, 0.7): every schema hash changes value once.** A
+  method's `hash` is its schema's content hash —
+  `MethodSchema::content_hash()`: the method object minus `hash`, as
+  canonical JSON (`plexus::content_hash::canonical_json`), SHA-256, 16 hex —
+  set by `MethodSchema::with_content_hash()`, which the code
+  `#[plexus_macros::activation]` emits applies once, where it caches the
+  method schemas. A change anywhere in a method's params, `returns`, `error`
+  or `progress` (down to a nested field) moves its hash, its plugin's and
+  every ancestor's. `PluginSchema`'s roll-up and the default
+  `Activation::plugin_schema` use SHA-256 too (`content_hash::hash16_lines`),
+  same structure and width. New dependency: `sha2` 0.10.
+
 - **BREAKING**: `DynamicHub::new()` now requires explicit namespace parameter
   - Forces intentional naming instead of defaulting to "plexus"
   - Example: `DynamicHub::new("substrate")` or `DynamicHub::new("myapp")`

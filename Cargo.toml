@@ -33,6 +33,10 @@ anyhow = "1.0"
 # Schema generation
 schemars = { version = "1.1", features = ["derive", "uuid1"] }
 
+# RETURNS-10: schema content hashes — SHA-256 of a method's canonical schema
+# JSON, truncated to 16 hex (`plexus::content_hash`). RustCrypto, pure Rust.
+sha2 = "0.10"
+
 # HTTP types for RawRequestContext
 http = "1"
 

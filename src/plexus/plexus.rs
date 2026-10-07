@@ -312,17 +312,12 @@ pub trait Activation: Send + Sync + 'static {
 
     /// Return this activation's schema (methods + optional children)
     fn plugin_schema(&self) -> PluginSchema {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
+        // A method of an activation not built with `#[activation]` is known
+        // by its name and help text alone; its hash is that schema's content
+        // hash (RETURNS-10), as a macro-built method's is of its whole schema.
         let methods: Vec<MethodSchema> = self.methods().iter().map(|name| {
             let desc = self.method_help(name).unwrap_or_default();
-            // Compute a simple hash for methods not using hub-macro
-            let mut hasher = DefaultHasher::new();
-            name.hash(&mut hasher);
-            desc.hash(&mut hasher);
-            let hash = format!("{:016x}", hasher.finish());
-            MethodSchema::new(name.to_string(), desc, hash)
+            MethodSchema::new(name.to_string(), desc, String::new()).with_content_hash()
         }).collect();
 
         if let Some(long_desc) = self.long_description() {

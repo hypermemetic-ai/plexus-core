@@ -1,5 +1,29 @@
 # Hash System V2: Granular Cache Invalidation
 
+> **Plexus 0.7 (RETURNS-10): what the hashes are made of changed; their
+> structure did not.** The `self_hash` / `children_hash` / `hash` structure
+> below stands, at the same 16-hex width, but nothing is hashed with
+> `DefaultHasher` any more (std does not promise its output across Rust
+> releases):
+>
+> - A **method's hash** is its schema's content hash,
+>   `MethodSchema::content_hash()` (`src/plexus/schema.rs`): the method
+>   object as it serializes, without `hash`, written as canonical JSON
+>   (`content_hash::canonical_json`: keys sorted by code point, no
+>   whitespace, arrays in order) → SHA-256 → first 8 bytes as 16 lowercase
+>   hex. It is computed at runtime, once, where the macro caches a plugin's
+>   method schemas — no longer at compile time from the item type's name
+>   tokens — so a field renamed inside `T`, `E` or `P` moves it.
+> - The **roll-up** is SHA-256/16 of its inputs, one per line
+>   (`content_hash::hash16_lines`): `self_hash` of the method hashes,
+>   `children_hash` of the child hashes, `hash` of `self_hash` and (for a
+>   hub) `children_hash`.
+>
+> Any consumer can recompute every hash from the schema JSON a server sends
+> (the conformance fixture's tests do, in Rust and by hand). The code
+> excerpts below are the V2 design as written; `compute_hashes` now reads as
+> above.
+
 ## Problem Statement
 
 Current hash system mixes method changes and child changes together:

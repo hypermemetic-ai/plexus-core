@@ -104,23 +104,21 @@ fn to_client_item(item: PlexusStreamItem) -> StreamItem {
         },
         PlexusStreamItem::Progress {
             metadata,
-            message,
-            percentage,
+            content_type,
+            content,
         } => StreamItem::Progress {
             metadata: meta(metadata),
-            message,
-            percentage,
+            content_type: Some(content_type),
+            content,
         },
         PlexusStreamItem::Error {
             metadata,
-            message,
-            code,
             recoverable,
+            error,
         } => StreamItem::Error {
             metadata: meta(metadata),
-            message,
-            code,
             recoverable,
+            error,
         },
         PlexusStreamItem::Request {
             request_id,

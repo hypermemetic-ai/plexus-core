@@ -113,7 +113,9 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
         PlexusError::MethodNotFound { activation, method } => {
             McpError::invalid_params(format!("Unknown method: {}.{}", activation, method), None)
         }
-        PlexusError::InvalidParams(reason) => McpError::invalid_params(reason, None),
+        invalid @ PlexusError::InvalidParams { .. } => {
+            McpError::invalid_params(invalid.to_string(), None)
+        }
         PlexusError::ExecutionError(error) => McpError::internal_error(error, None),
         PlexusError::HandleNotSupported(activation) => {
             McpError::invalid_params(format!("Handle resolution not supported: {}", activation), None)
@@ -129,6 +131,16 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
         forbidden @ PlexusError::Forbidden { .. } => {
             McpError::invalid_request(forbidden.to_string(), None)
         }
+    }
+}
+
+/// An MCP progress notification's `(message, percentage)` from a 0.7
+/// progress frame's `content`: the default `Note` maps field for field; any
+/// other declared progress type `P` travels as its JSON text, no percentage.
+fn progress_note(content: &serde_json::Value) -> (String, Option<f32>) {
+    match serde_json::from_value::<plexus_client::Note>(content.clone()) {
+        Ok(note) => (note.message, note.percentage),
+        Err(_) => (content.to_string(), None),
     }
 }
 
@@ -282,20 +294,17 @@ impl ServerHandler for PlexusMcpBridge {
             }
 
             match &item {
-                PlexusStreamItem::Progress {
-                    message,
-                    percentage,
-                    ..
-                } => {
+                PlexusStreamItem::Progress { content, .. } => {
                     // Only send progress if client provided token
                     if let Some(ref token) = progress_token {
+                        let (message, percentage) = progress_note(content);
                         let _ = ctx
                             .peer
                             .notify_progress(ProgressNotificationParam {
                                 progress_token: token.clone(),
                                 progress: percentage.unwrap_or(0.0) as f64,
                                 total: None,
-                                message: Some(message.clone()),
+                                message: Some(message),
                             })
                             .await;
                     }
@@ -323,10 +332,11 @@ impl ServerHandler for PlexusMcpBridge {
                 }
 
                 PlexusStreamItem::Error {
-                    message, recoverable, ..
+                    error, recoverable, ..
                 } => {
-                    // Buffer errors for final result
-                    error_messages.push(message.clone());
+                    // Buffer errors for final result: RemoteError's Display
+                    // is the human line.
+                    error_messages.push(error.to_string());
 
                     let _ = ctx
                         .peer
@@ -335,7 +345,7 @@ impl ServerHandler for PlexusMcpBridge {
                             logger: Some(logger.clone()),
                             data: json!({
                                 "type": "error",
-                                "error": message,
+                                "error": error,
                                 "recoverable": recoverable,
                             }),
                         })

@@ -5,6 +5,7 @@
 //! the caller uses these helpers to create PlexusStreamItems.
 
 use futures::stream::{self, Stream, StreamExt};
+use plexus_client::RemoteError;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::pin::Pin;
@@ -213,42 +214,17 @@ where
 
 /// Create an error stream
 ///
-/// Returns a single-item stream containing an error event.
+/// Returns a single-item stream containing an error frame carrying `error`.
+/// From a `PlexusError`: `error_stream(RemoteError::from(&e), provenance, false)`.
 pub fn error_stream(
-    message: String,
+    error: RemoteError,
     provenance: Vec<String>,
     recoverable: bool,
 ) -> PlexusStream {
     let metadata = StreamMetadata::new(provenance, PlexusContext::hash());
 
     Box::pin(stream::once(async move {
-        PlexusStreamItem::Error {
-            metadata,
-            message,
-            code: None,
-            recoverable,
-        }
-    }))
-}
-
-/// Create an error stream with error code
-///
-/// Returns a single-item stream containing an error event with a code.
-pub fn error_stream_with_code(
-    message: String,
-    code: String,
-    provenance: Vec<String>,
-    recoverable: bool,
-) -> PlexusStream {
-    let metadata = StreamMetadata::new(provenance, PlexusContext::hash());
-
-    Box::pin(stream::once(async move {
-        PlexusStreamItem::Error {
-            metadata,
-            message,
-            code: Some(code),
-            recoverable,
-        }
+        PlexusStreamItem::error(metadata, error, recoverable)
     }))
 }
 
@@ -265,20 +241,18 @@ pub fn done_stream(provenance: Vec<String>) -> PlexusStream {
 
 /// Create a progress stream
 ///
-/// Returns a single-item stream containing a progress event.
+/// Returns a single-item stream containing a progress frame for the call
+/// `content_type` (e.g. "tickets.import"), carrying the method's progress
+/// value `content` — `serde_json::to_value(&p)` of its declared `P`.
 pub fn progress_stream(
-    message: String,
-    percentage: Option<f32>,
+    content_type: String,
+    content: serde_json::Value,
     provenance: Vec<String>,
 ) -> PlexusStream {
     let metadata = StreamMetadata::new(provenance, PlexusContext::hash());
 
     Box::pin(stream::once(async move {
-        PlexusStreamItem::Progress {
-            metadata,
-            message,
-            percentage,
-        }
+        PlexusStreamItem::progress(metadata, content_type, content)
     }))
 }
 
@@ -462,48 +436,73 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_stream() {
-        let stream = error_stream("Something failed".into(), vec!["test".into()], false);
-        let items: Vec<_> = stream.collect().await;
-
-        assert_eq!(items.len(), 1);
-        match &items[0] {
-            PlexusStreamItem::Error {
-                message,
-                recoverable,
-                code,
-                ..
-            } => {
-                assert_eq!(message, "Something failed");
-                assert!(!recoverable);
-                assert!(code.is_none());
-            }
-            _ => panic!("Expected Error item"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_error_stream_with_code() {
-        let stream = error_stream_with_code(
-            "Not found".into(),
-            "NOT_FOUND".into(),
+        let stream = error_stream(
+            RemoteError::Execution {
+                message: "Something failed".into(),
+            },
             vec!["test".into()],
-            true,
+            false,
         );
         let items: Vec<_> = stream.collect().await;
 
         assert_eq!(items.len(), 1);
         match &items[0] {
             PlexusStreamItem::Error {
-                message,
-                code,
+                error,
                 recoverable,
-                ..
+                metadata,
             } => {
-                assert_eq!(message, "Not found");
-                assert_eq!(code.as_deref(), Some("NOT_FOUND"));
-                assert!(recoverable);
+                assert_eq!(
+                    error,
+                    &RemoteError::Execution {
+                        message: "Something failed".into()
+                    }
+                );
+                assert!(!recoverable);
+                assert_eq!(metadata.provenance, vec!["test"]);
             }
             _ => panic!("Expected Error item"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_stream_carries_recoverable() {
+        let stream = error_stream(RemoteError::Unauthenticated, vec!["test".into()], true);
+        let items: Vec<_> = stream.collect().await;
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            PlexusStreamItem::Error {
+                error: RemoteError::Unauthenticated,
+                recoverable: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_progress_stream() {
+        let stream = progress_stream(
+            "test.import".into(),
+            serde_json::json!({"message": "indexing", "percentage": 50.0}),
+            vec!["test".into()],
+        );
+        let items: Vec<_> = stream.collect().await;
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            PlexusStreamItem::Progress {
+                content_type,
+                content,
+                ..
+            } => {
+                assert_eq!(content_type, "test.import");
+                let note: plexus_client::Note =
+                    serde_json::from_value(content.clone()).expect("a Note");
+                assert_eq!(note, plexus_client::Note::new("indexing").with_percentage(50.0));
+            }
+            _ => panic!("Expected Progress item"),
         }
     }
 }

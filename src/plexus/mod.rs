@@ -36,7 +36,10 @@ pub use forward_registry::ForwardPolicyRegistry;
 pub use middleware::{ActivationRegistry, GuidedErrorMiddleware};
 pub use path::Provenance;
 #[allow(deprecated)]
-pub use plexus::{Activation, ActivationInfo, AuthzDenyReason, ChildCapabilities, ChildRouter, DynamicHub, PlexusError, TransportErrorKind, route_to_child, PLEXUS_NOTIF_METHOD};
+pub use plexus::{Activation, ActivationInfo, AuthzDenyReason, ChildCapabilities, ChildRouter, DynamicHub, PlexusError, TransportErrorKind, plexus_error_to_jsonrpc, route_to_child, PLEXUS_NOTIF_METHOD};
+// RETURNS-6: the wire's typed call failure, re-exported so server code (and
+// the code `#[activation]` emits) names it through plexus-core.
+pub use plexus_client::{DenyReason, ParamProblem, RemoteError};
 pub use crate::types::Handle;
 pub use schema::{
     AuthPosture, Cardinality, ChildHashes, ChildSummary, DeprecationInfo, MethodRole,

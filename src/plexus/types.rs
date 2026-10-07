@@ -4,6 +4,7 @@
 //! The key architectural principle is "caller wraps" - activations return
 //! typed domain events, and the caller (DynamicHub routing layer) wraps them with metadata.
 
+use plexus_client::RemoteError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +41,24 @@ impl StreamMetadata {
 ///
 /// The caller (DynamicHub routing layer) wraps activation responses with
 /// metadata. This is the only type that crosses the wire.
+///
+/// # 0.7 wire shape (RETURNS-6)
+///
+/// ```text
+/// {"type":"data",    "metadata":…, "content_type":"ns.method", "content":<T>}
+/// {"type":"progress","metadata":…, "content_type":"ns.method", "content":<P>}
+/// {"type":"error",   "metadata":…, "recoverable":<bool>, "error":<RemoteError>}
+/// {"type":"request", "requestId":…, "requestData":…, "timeoutMs":…}
+/// {"type":"done",    "metadata":…}
+/// ```
+///
+/// The progress frame carries the method's declared progress type `P`
+/// (`plexus_client::Note` by default) and the same `content_type` a data
+/// frame does, so a receiver attributes it to its call the same way. The
+/// error frame carries a typed [`RemoteError`] — the call failed — in place
+/// of 0.6's stringly `message` / `code`; `RemoteError`'s `Display` is the
+/// human line. `plexus_client::StreamItem` mirrors this type; the
+/// cross-serialization test is `tests/client_envelope_compat.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlexusStreamItem {
@@ -53,28 +72,27 @@ pub enum PlexusStreamItem {
         content: Value,
     },
 
-    /// Progress update during long-running operations
+    /// An intermediate report of a method that declares progress — one
+    /// `Progress::Update(p)` of its return type. Never terminates the stream.
     Progress {
         /// Metadata from calling layer
         metadata: StreamMetadata,
-        /// Human-readable progress message
-        message: String,
-        /// Optional completion percentage (0.0 - 100.0)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        percentage: Option<f32>,
+        /// The call's method, as on its data frames (e.g. "tickets.import")
+        content_type: String,
+        /// The method's progress value `P`, serialized
+        /// (`{"message", "percentage"}` for the default `Note`)
+        content: Value,
     },
 
-    /// Error occurred during processing
+    /// The call failed — bad params, unknown method, auth, or the method
+    /// itself blew up. (An activation saying no is a data item, not this.)
     Error {
         /// Metadata from calling layer
         metadata: StreamMetadata,
-        /// Human-readable error message
-        message: String,
-        /// Optional error code for programmatic handling
-        #[serde(skip_serializing_if = "Option::is_none")]
-        code: Option<String>,
         /// Whether the operation can be retried
         recoverable: bool,
+        /// Why the call failed, typed. Its `Display` is the human line.
+        error: RemoteError,
     },
 
     /// Bidirectional request from server to client
@@ -109,27 +127,24 @@ impl PlexusStreamItem {
         }
     }
 
-    /// Create a Progress item
-    pub fn progress(metadata: StreamMetadata, message: String, percentage: Option<f32>) -> Self {
+    /// Create a Progress item carrying the method's progress value `content`
+    pub fn progress(metadata: StreamMetadata, content_type: String, content: Value) -> Self {
         Self::Progress {
             metadata,
-            message,
-            percentage,
+            content_type,
+            content,
         }
     }
 
-    /// Create an Error item
-    pub fn error(
-        metadata: StreamMetadata,
-        message: String,
-        code: Option<String>,
-        recoverable: bool,
-    ) -> Self {
+    /// Create an Error item.
+    ///
+    /// Dispatch never builds one by hand from a `PlexusError`:
+    /// `PlexusStreamItem::error(metadata, RemoteError::from(&e), recoverable)`.
+    pub fn error(metadata: StreamMetadata, error: RemoteError, recoverable: bool) -> Self {
         Self::Error {
             metadata,
-            message,
-            code,
             recoverable,
+            error,
         }
     }
 
@@ -186,34 +201,69 @@ mod tests {
         assert!(json.contains("\"provenance\":[\"substrate\",\"health\"]"));
     }
 
+    fn fixed_metadata() -> StreamMetadata {
+        StreamMetadata {
+            provenance: vec!["tickets".into()],
+            plexus_hash: "h".into(),
+            timestamp: 1,
+        }
+    }
+
+    /// RETURNS-6: the 0.7 error frame — `recoverable` and a typed
+    /// `RemoteError`; no `message`, no `code`.
     #[test]
     fn test_stream_item_error_serialization() {
-        let metadata = StreamMetadata::new(vec!["substrate".into()], "hash".into());
-
         let item = PlexusStreamItem::error(
-            metadata,
-            "Something went wrong".into(),
-            Some("E001".into()),
+            fixed_metadata(),
+            RemoteError::MethodNotFound {
+                activation: "tickets".into(),
+                method: "frob".into(),
+            },
             false,
         );
 
         let json = serde_json::to_string(&item).unwrap();
-        assert!(json.contains("\"type\":\"error\""));
-        assert!(json.contains("\"message\":\"Something went wrong\""));
-        assert!(json.contains("\"code\":\"E001\""));
-        assert!(json.contains("\"recoverable\":false"));
+        assert_eq!(
+            json,
+            r#"{"type":"error","metadata":{"provenance":["tickets"],"plexus_hash":"h","timestamp":1},"recoverable":false,"error":{"kind":"method_not_found","activation":"tickets","method":"frob"}}"#
+        );
+        let back: PlexusStreamItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
+    /// RETURNS-6: the 0.7 progress frame — `content_type` plus the typed
+    /// progress value as `content`.
     #[test]
     fn test_stream_item_progress_serialization() {
-        let metadata = StreamMetadata::new(vec!["substrate".into()], "hash".into());
-
-        let item = PlexusStreamItem::progress(metadata, "Processing...".into(), Some(50.0));
+        let item = PlexusStreamItem::progress(
+            fixed_metadata(),
+            "tickets.import".into(),
+            // keys in sorted order, so the literal holds with or without
+            // serde_json's `preserve_order`
+            serde_json::json!({"done": 0, "of": 10, "type": "chunk"}),
+        );
 
         let json = serde_json::to_string(&item).unwrap();
-        assert!(json.contains("\"type\":\"progress\""));
-        assert!(json.contains("\"message\":\"Processing...\""));
-        assert!(json.contains("\"percentage\":50.0"));
+        assert_eq!(
+            json,
+            r#"{"type":"progress","metadata":{"provenance":["tickets"],"plexus_hash":"h","timestamp":1},"content_type":"tickets.import","content":{"done":0,"of":10,"type":"chunk"}}"#
+        );
+        let back: PlexusStreamItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    /// A 0.6-shaped frame does not parse as 0.7 (no back-compat, RETURNS-1
+    /// decision 12): `message`/`code` are gone and `error` is required.
+    #[test]
+    fn test_stream_item_06_error_frame_is_rejected() {
+        let old = serde_json::json!({
+            "type": "error",
+            "metadata": {"provenance": [], "plexus_hash": "h", "timestamp": 1},
+            "message": "boom",
+            "code": "-32601",
+            "recoverable": false
+        });
+        assert!(serde_json::from_value::<PlexusStreamItem>(old).is_err());
     }
 
     #[test]

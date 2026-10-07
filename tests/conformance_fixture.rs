@@ -226,7 +226,8 @@ fn every_frame_is_a_plexus_stream_item() {
 /// Acceptance 2 and 4: `schema.json` is a 0.7 `PluginSchema`, whole, with
 /// every hash the `"*"` wildcard. Each method's `returns` / `error` /
 /// `progress` is the schema of its T / E / P (RETURNS-5: `with_returns(
-/// schema_for!(T))` …), and the six methods are the six signature forms.
+/// schema_for!(T))` …), and the six methods are the six signature forms,
+/// followed by the auto-generated `schema` method.
 #[test]
 fn the_schema_is_a_plugin_schema() {
     let v = value(&read("schema.json"));
@@ -274,8 +275,17 @@ fn the_schema_is_a_plugin_schema() {
             Some(s(schema_for!(Note))),
         ),
     ];
+    // The six methods, then the `schema` method the macro lists in every
+    // activation's schema (RETURNS-8 regenerated the file from the served
+    // output): one item, any value, no error, no progress.
     let names: Vec<&str> = schema.methods.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names, expected.iter().map(|e| e.0).collect::<Vec<_>>());
+    let mut expected_names: Vec<&str> = expected.iter().map(|e| e.0).collect();
+    expected_names.push("schema");
+    assert_eq!(names, expected_names);
+    let auto = schema.methods.last().unwrap();
+    assert_eq!(auto.cardinality, One, "schema: cardinality");
+    assert_eq!(s(auto.returns.clone()), json!({}), "schema: returns any value");
+    assert_eq!((auto.error.is_none(), auto.progress.is_none()), (true, true));
 
     let mut forms = BTreeSet::new();
     for (m, (name, cardinality, returns, error, progress)) in schema.methods.iter().zip(expected) {

@@ -388,40 +388,25 @@ pub enum AuthPosture {
 }
 
 // =============================================================================
-// Return Shape
+// Cardinality
 // =============================================================================
 
-/// Describes the structural shape of a method's return type.
+/// How many items a method yields: exactly one, or a stream of them.
 ///
-/// Orthogonal to the fine-grained JSON Schema stored in `MethodSchema.returns`:
-/// that schema describes the inner type; this tag describes the wrapping.
+/// Read from the method's signature (RETURNS-1 decision 2): a plain return
+/// type (`-> T`, `-> Result<T, E>`) is [`Cardinality::One`]; `-> impl
+/// Stream<Item = …>` is [`Cardinality::Many`]. A reader decides how to present
+/// a method (a single awaited value vs. a stream) from this field alone —
+/// never from the presence of a stream type or a guess at the item's shape.
 ///
-/// - `Bare` — `T`
-/// - `Option` — `Option<T>`
-/// - `Result` — `Result<T, E>`
-/// - `Vec` — `Vec<T>`
-/// - `Stream` — a stream of `T` (e.g., `AsyncGenerator<T>`)
-/// - `ResultOption` — `Result<Option<T>, E>`
-///
-/// Added in IR-2 as an optional, additive field on `MethodSchema`. Consumers
-/// that don't care can ignore it; those generating language bindings use it to
-/// pick the right idiom (e.g., TypeScript `T | null` for `Option`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Serialized as `"one"` / `"many"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ReturnShape {
-    /// `T` — the return type is used as-is.
-    Bare,
-    /// `Option<T>` — the return may be null/absent.
-    Option,
-    /// `Result<T, E>` — the return may be an error.
-    Result,
-    /// `Vec<T>` — the return is a list.
-    Vec,
-    /// A stream of `T` events.
-    Stream,
-    /// `Result<Option<T>, E>` — common pattern for fallible lookups.
-    ResultOption,
+pub enum Cardinality {
+    /// The method yields exactly one item.
+    One,
+    /// The method yields a stream of zero or more items.
+    Many,
 }
 
 // =============================================================================
@@ -587,19 +572,32 @@ pub struct MethodSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<schemars::Schema>,
 
-    /// JSON Schema for the method's return type (None if not specified)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub returns: Option<schemars::Schema>,
+    /// JSON Schema for the method's item type `T` — what one success carries.
+    ///
+    /// Always present: every method has a return type. For a `Result<T, E>`
+    /// or `Progress<T, P>` item it is `T` alone — `E` and `P` have fields of
+    /// their own. [`MethodSchema::new`] starts it at the empty schema `{}`
+    /// (any value) until [`MethodSchema::with_returns`] sets it.
+    pub returns: schemars::Schema,
 
-    /// Whether this method streams multiple events (true) or returns a single result (false)
+    /// JSON Schema for the method's error type `E` — what the activation says
+    /// when it says no (`-> Result<T, E>`). Absent from the wire when the
+    /// method is infallible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<schemars::Schema>,
+
+    /// JSON Schema for the method's progress type `P` (an item of
+    /// `Progress<T, P>`), carried by progress frames. Absent from the wire
+    /// when the method reports no progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<schemars::Schema>,
+
+    /// Whether the method yields one item or many — `"one"` / `"many"`.
     ///
-    /// - `streaming: true` → returns `AsyncGenerator<T>` (multiple events)
-    /// - `streaming: false` → returns `Promise<T>` (single event, collected)
-    ///
-    /// All methods use the same streaming protocol under the hood, but this flag
-    /// tells clients how to present the result.
-    #[serde(default)]
-    pub streaming: bool,
+    /// Required on the wire: a schema that does not state its cardinality is
+    /// not a 0.7 schema, and guessing would reintroduce the disagreement this
+    /// field exists to end.
+    pub cardinality: Cardinality,
 
     /// Whether this method supports bidirectional communication
     ///
@@ -654,16 +652,6 @@ pub struct MethodSchema {
     /// method (IR-5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecation: Option<DeprecationInfo>,
-
-    /// Structural shape of the method's return type (e.g., `Option`, `Vec`,
-    /// `Stream`).
-    ///
-    /// Orthogonal to `returns`, which holds the fine-grained JSON Schema of
-    /// the inner type. Added in IR-2 as an optional, additive field. `None`
-    /// means "not populated" (the wire format supports pre-IR schemas that
-    /// omit this field entirely).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub return_shape: Option<ReturnShape>,
 
     /// Per-parameter metadata (currently just deprecation).
     ///
@@ -802,8 +790,7 @@ impl PluginSchema {
     ) -> usize {
         let mut count = 0;
         for m in methods {
-            let Some(returns_schema) = &m.returns else { continue };
-            let Ok(returns_json) = serde_json::to_value(returns_schema) else { continue };
+            let Ok(returns_json) = serde_json::to_value(&m.returns) else { continue };
             if super::credential_envelope::check_returns_schema_for_credentials_collision(
                 namespace,
                 &m.name,
@@ -1178,6 +1165,12 @@ impl MethodSchema {
     ///
     /// The hash should be computed from the method definition string
     /// within the hub-macro at compile time.
+    ///
+    /// Starts as an infallible, progress-free [`Cardinality::One`] method
+    /// whose `returns` is the empty schema `{}` (any value); the builders
+    /// [`with_returns`](Self::with_returns), [`with_error`](Self::with_error),
+    /// [`with_progress`](Self::with_progress) and
+    /// [`with_cardinality`](Self::with_cardinality) state the real contract.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -1188,15 +1181,16 @@ impl MethodSchema {
             description: description.into(),
             hash: hash.into(),
             params: None,
-            returns: None,
-            streaming: false,
+            returns: schemars::Schema::default(),
+            error: None,
+            progress: None,
+            cardinality: Cardinality::One,
             bidirectional: false,
             http_method: HttpMethod::default(),
             request_type: None,
             response_type: None,
             role: MethodRole::Rpc,
             deprecation: None,
-            return_shape: None,
             params_meta: Vec::new(),
             credentials: Vec::new(),
             requires_credential: None,
@@ -1211,18 +1205,31 @@ impl MethodSchema {
         self
     }
 
-    /// Add return type schema
+    /// Set the schema of the method's item type `T`.
     pub fn with_returns(mut self, returns: schemars::Schema) -> Self {
-        self.returns = Some(returns);
+        self.returns = returns;
         self
     }
 
-    /// Set the streaming flag
+    /// Set the schema of the method's error type `E` (a fallible method,
+    /// `Result<T, E>`).
+    pub fn with_error(mut self, error: schemars::Schema) -> Self {
+        self.error = Some(error);
+        self
+    }
+
+    /// Set the schema of the method's progress type `P` (an item of
+    /// `Progress<T, P>`).
+    pub fn with_progress(mut self, progress: schemars::Schema) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Set whether the method yields one item or many.
     ///
-    /// - `true` → method streams multiple events (use `AsyncGenerator<T>`)
-    /// - `false` → method returns single result (use `Promise<T>`)
-    pub fn with_streaming(mut self, streaming: bool) -> Self {
-        self.streaming = streaming;
+    /// [`MethodSchema::new`] starts at [`Cardinality::One`].
+    pub fn with_cardinality(mut self, cardinality: Cardinality) -> Self {
+        self.cardinality = cardinality;
         self
     }
 
@@ -1293,15 +1300,6 @@ impl MethodSchema {
     /// `DeprecationInfo`.
     pub fn with_deprecation(mut self, info: DeprecationInfo) -> Self {
         self.deprecation = Some(info);
-        self
-    }
-
-    /// Set the structural shape of this method's return type.
-    ///
-    /// Added in IR-2. Orthogonal to `with_returns`, which sets the fine-grained
-    /// JSON Schema.
-    pub fn with_return_shape(mut self, shape: ReturnShape) -> Self {
-        self.return_shape = Some(shape);
         self
     }
 
@@ -1798,19 +1796,25 @@ mod tests {
 
     /// AC #5: Deserializing a JSON `MethodSchema` with no `role` or
     /// `deprecation` fields yields `MethodRole::Rpc` and `None`.
+    ///
+    /// 0.7 (RETURNS-5): the minimal method carries the two required fields,
+    /// `returns` and `cardinality`; everything else still defaults.
     #[test]
     fn ir2_default_role_is_rpc_on_deserialize() {
-        // Pre-IR MethodSchema shape (no role, no deprecation, no return_shape)
+        // Minimal MethodSchema shape (no role, no deprecation, no error/progress)
         let pre_ir_json = serde_json::json!({
             "name": "ping",
             "description": "pong",
-            "hash": "abc"
+            "hash": "abc",
+            "returns": {},
+            "cardinality": "one"
         });
 
         let schema: MethodSchema = serde_json::from_value(pre_ir_json).unwrap();
         assert_eq!(schema.role, MethodRole::Rpc);
         assert!(schema.deprecation.is_none());
-        assert!(schema.return_shape.is_none());
+        assert!(schema.error.is_none());
+        assert!(schema.progress.is_none());
     }
 
     /// AC #5: And at the PluginSchema level — a full pre-IR schema with
@@ -1825,8 +1829,8 @@ mod tests {
             "self_hash": "s1",
             "hash": "h1",
             "methods": [
-                { "name": "a", "description": "alpha", "hash": "ah" },
-                { "name": "b", "description": "beta",  "hash": "bh" }
+                { "name": "a", "description": "alpha", "hash": "ah", "returns": {}, "cardinality": "one" },
+                { "name": "b", "description": "beta",  "hash": "bh", "returns": {}, "cardinality": "many" }
             ]
         });
 
@@ -1999,21 +2003,113 @@ mod tests {
         assert!(hub_with_rpc_only.is_hub());
     }
 
-    /// `ReturnShape` round-trips cleanly via serde.
+    // =========================================================================
+    // RETURNS-5 tests: schema 0.7 — returns · error · progress · cardinality
+    // =========================================================================
+
+    fn returns_5_full_method() -> MethodSchema {
+        MethodSchema::new("import", "imports tickets", "h_import")
+            .with_returns(schemars::json_schema!({ "type": "string", "title": "Summary" }))
+            .with_error(schemars::json_schema!({ "type": "object", "title": "ImportError" }))
+            .with_progress(schemars::json_schema!({ "type": "integer", "title": "Step" }))
+            .with_cardinality(Cardinality::Many)
+    }
+
+    /// AC #1: a method with all four fields round-trips through serde, with
+    /// the names and spellings of the 0.7 table.
     #[test]
-    fn ir2_return_shape_roundtrip() {
-        for shape in [
-            ReturnShape::Bare,
-            ReturnShape::Option,
-            ReturnShape::Result,
-            ReturnShape::Vec,
-            ReturnShape::Stream,
-            ReturnShape::ResultOption,
-        ] {
-            let m = MethodSchema::new("m", "d", "h").with_return_shape(shape.clone());
-            let j = serde_json::to_string(&m).unwrap();
-            let d: MethodSchema = serde_json::from_str(&j).unwrap();
-            assert_eq!(d.return_shape, Some(shape));
+    fn returns_5_all_four_fields_roundtrip() {
+        let method = returns_5_full_method();
+        let json = serde_json::to_value(&method).unwrap();
+        let obj = json.as_object().unwrap();
+
+        assert_eq!(obj["returns"], serde_json::json!({ "type": "string", "title": "Summary" }));
+        assert_eq!(obj["error"], serde_json::json!({ "type": "object", "title": "ImportError" }));
+        assert_eq!(obj["progress"], serde_json::json!({ "type": "integer", "title": "Step" }));
+        assert_eq!(obj["cardinality"], serde_json::json!("many"));
+
+        let decoded: MethodSchema = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.returns, method.returns);
+        assert_eq!(decoded.error, method.error);
+        assert_eq!(decoded.progress, method.progress);
+        assert_eq!(decoded.cardinality, Cardinality::Many);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
+    }
+
+    /// AC #1: `error` and `progress` are absent — not `null` — when `None`;
+    /// `returns` and `cardinality` are always present.
+    #[test]
+    fn returns_5_error_and_progress_absent_when_none() {
+        let method = MethodSchema::new("get", "gets a ticket", "h_get")
+            .with_returns(schemars::json_schema!({ "type": "string" }));
+        let json = serde_json::to_value(&method).unwrap();
+        let obj = json.as_object().unwrap();
+
+        assert!(!obj.contains_key("error"), "error must be omitted when None, got {json}");
+        assert!(!obj.contains_key("progress"), "progress must be omitted when None, got {json}");
+        assert_eq!(obj["returns"], serde_json::json!({ "type": "string" }));
+        assert_eq!(obj["cardinality"], serde_json::json!("one"));
+
+        let decoded: MethodSchema = serde_json::from_value(json).unwrap();
+        assert!(decoded.error.is_none());
+        assert!(decoded.progress.is_none());
+        assert_eq!(decoded.cardinality, Cardinality::One);
+    }
+
+    /// `MethodSchema::new` starts as one item of any value, infallible and
+    /// progress-free.
+    #[test]
+    fn returns_5_new_defaults() {
+        let method = MethodSchema::new("ping", "pong", "h_ping");
+        assert_eq!(method.returns, schemars::Schema::default());
+        assert!(method.error.is_none());
+        assert!(method.progress.is_none());
+        assert_eq!(method.cardinality, Cardinality::One);
+        assert_eq!(
+            serde_json::to_value(&method).unwrap()["returns"],
+            serde_json::json!({})
+        );
+    }
+
+    /// `Cardinality` spells `"one"` / `"many"` both ways and rejects anything else.
+    #[test]
+    fn returns_5_cardinality_spelling() {
+        for (c, s) in [(Cardinality::One, "\"one\""), (Cardinality::Many, "\"many\"")] {
+            assert_eq!(serde_json::to_string(&c).unwrap(), s);
+            assert_eq!(serde_json::from_str::<Cardinality>(s).unwrap(), c);
+        }
+        assert!(serde_json::from_str::<Cardinality>("\"One\"").is_err());
+        assert!(serde_json::from_str::<Cardinality>("true").is_err());
+    }
+
+    /// `returns` and `cardinality` are required: a 0.6-shaped method (no
+    /// `cardinality`, or no `returns`) does not parse.
+    #[test]
+    fn returns_5_required_fields_reject_0_6_shape() {
+        let no_cardinality = serde_json::json!({
+            "name": "ping", "description": "pong", "hash": "h",
+            "returns": {}, "bidirectional": false
+        });
+        assert!(serde_json::from_value::<MethodSchema>(no_cardinality).is_err());
+
+        let no_returns = serde_json::json!({
+            "name": "ping", "description": "pong", "hash": "h",
+            "cardinality": "one"
+        });
+        assert!(serde_json::from_value::<MethodSchema>(no_returns).is_err());
+    }
+
+    /// The fields sit where `returns` / the old flag sat: after `params`,
+    /// before `bidirectional` — every other field keeps its place on the wire.
+    #[test]
+    fn returns_5_field_order_on_the_wire() {
+        let method = returns_5_full_method()
+            .with_params(schemars::json_schema!({ "type": "object" }));
+        let text = serde_json::to_string(&method).unwrap();
+        let pos = |k: &str| text.find(&format!("\"{k}\":")).unwrap_or_else(|| panic!("{k} missing in {text}"));
+        let order = ["name", "description", "hash", "params", "returns", "error", "progress", "cardinality", "bidirectional", "http_method", "role"];
+        for pair in order.windows(2) {
+            assert!(pos(pair[0]) < pos(pair[1]), "{} must precede {} in {text}", pair[0], pair[1]);
         }
     }
 
@@ -2573,12 +2669,17 @@ mod tests {
     /// Tested by deserializing a pre-CRED-CORE-3 JSON shape (no
     /// `credentials`, no `requires_credential` fields) and asserting the
     /// defaults are applied.
+    ///
+    /// 0.7 (RETURNS-5): the JSON carries the two required fields, `returns`
+    /// and `cardinality`.
     #[test]
     fn cred_core_3_ac7_pre_ir_json_deserializes_with_empty_defaults() {
         let pre_ir_json = serde_json::json!({
             "name": "ping",
             "description": "pong",
-            "hash": "abc"
+            "hash": "abc",
+            "returns": {},
+            "cardinality": "one"
         });
         let schema: MethodSchema = serde_json::from_value(pre_ir_json).unwrap();
         assert!(schema.credentials.is_empty());
@@ -2597,8 +2698,8 @@ mod tests {
             "self_hash": "s1",
             "hash": "h1",
             "methods": [
-                { "name": "a", "description": "alpha", "hash": "ah" },
-                { "name": "b", "description": "beta",  "hash": "bh" }
+                { "name": "a", "description": "alpha", "hash": "ah", "returns": {}, "cardinality": "one" },
+                { "name": "b", "description": "beta",  "hash": "bh", "returns": {}, "cardinality": "one" }
             ]
         });
         let plugin: PluginSchema = serde_json::from_value(pre_ir_json).unwrap();
@@ -2725,7 +2826,8 @@ mod tests {
     fn r2_pre_r2_snapshot_decodes_with_defaults() {
         // Pinned old-wire shape: exactly what a pre-R-2 emitter produced for
         // a plain method (see `r2_unset_fields_are_omitted_from_wire`).
-        let old_wire = r#"{"name":"ping","description":"pong","hash":"h_ping","streaming":false,"bidirectional":false,"http_method":"POST","role":{"kind":"rpc"}}"#;
+        // 0.7 (RETURNS-5): `returns` + `cardinality` replace the old flag.
+        let old_wire = r#"{"name":"ping","description":"pong","hash":"h_ping","returns":{},"cardinality":"one","bidirectional":false,"http_method":"POST","role":{"kind":"rpc"}}"#;
         let decoded: MethodSchema = serde_json::from_str(old_wire).unwrap();
         assert!(decoded.auth_posture.is_none());
         assert!(!decoded.public);

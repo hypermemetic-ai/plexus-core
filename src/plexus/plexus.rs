@@ -2054,7 +2054,6 @@ async fn pipe_stream_to_subscription(
 impl DynamicHub {
     /// Route a call to a registered activation
     #[plexus_macros::method(
-        streaming,
         description = "Route a call to a registered activation",
         params(
             method = "The method to call (format: namespace.method)",

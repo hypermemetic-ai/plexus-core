@@ -626,6 +626,51 @@ async fn a_session_that_signed_out_cannot_grant() {
     assert!(!call(&w, "auth.providers", json!({}), Some(&admin)).await.expect("the door is public").is_empty());
 }
 
+/// AUTH-13 (AUTH-10 finding #3): `get(id)` and `delete(id)` take one param,
+/// their target. A bare value names no target — before, the gate decided it
+/// as "held anywhere" and the method took the value as `id`: an editor of
+/// MENGER read IDENTITY-1, an admin of MENGER deleted it. Now any call whose
+/// params are not an object is refused, typed, and so is a target the gate
+/// cannot read.
+#[tokio::test]
+async fn a_bare_value_reaches_no_target() {
+    let w = world();
+    let ada = key(ADA, "a");
+    let madmin = key(MENGER_ADMIN, "m");
+    // The shape that works, refused where it should be.
+    assert!(matches!(call(&w, "tickets.get", json!({"id": "IDENTITY-1"}), Some(&ada)).await, Err(PlexusError::Forbidden { .. })));
+    assert!(matches!(call(&w, "tickets.delete", json!({"id": "IDENTITY-1"}), Some(&madmin)).await, Err(PlexusError::Forbidden { .. })));
+
+    for (who, method, params) in [
+        (&ada, "tickets.get", json!("IDENTITY-1")),
+        (&madmin, "tickets.delete", json!("IDENTITY-1")),
+        (&ada, "tickets.get", json!(["IDENTITY-1"])),
+        (&ada, "tickets.get", json!(7)),
+        (&ada, "tickets.set_status", json!(["IDENTITY-1", "Done"])),
+        (&ada, "tickets.get", json!({"id": {"id": "IDENTITY-1"}})),
+        (&ada, "tickets.get", json!({"id": [{"id": "IDENTITY-1"}]})),
+        (&ada, "tickets.list", json!("IDENTITY")),
+    ] {
+        let err = call(&w, method, params.clone(), Some(who)).await.err().unwrap_or_else(|| panic!("{method} {params} answered"));
+        let wire = error_item("menger", &err);
+        assert_eq!(wire["error_kind"], "invalid_params", "{method} {params}: {wire}");
+    }
+    let err = call(&w, "tickets.get", json!("IDENTITY-1"), Some(&ada)).await.err().unwrap();
+    let mut wire = error_item("menger", &err);
+    wire.as_object_mut().unwrap().remove("metadata");
+    println!("WIRE tickets.get \"IDENTITY-1\": {wire}");
+    // Absent params are still no params.
+    assert!(call(&w, "tickets.list", Value::Null, Some(&ada)).await.is_ok());
+    // Anonymous: the shape is refused before anything is decided.
+    assert!(matches!(call(&w, "tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams(_))));
+
+    // The macro refuses it too, with no gate in front: a method with a
+    // target never takes its target as a bare value.
+    let bare = Arc::new(DynamicHub::new("menger").register(Tickets));
+    assert!(matches!(bare.route("tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams(_))));
+    assert!(bare.route("tickets.get", json!({"id": "MENGER-1"}), None).await.is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // Without a gate: nothing changes
 // ---------------------------------------------------------------------------

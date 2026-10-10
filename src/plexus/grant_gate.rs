@@ -20,7 +20,14 @@
 //! | a signed-in grant (AUTH-5: `auth.whoami`, `auth.logout`, `auth.requires`) | `Unauthenticated` | runs (its reach), whatever the roles or ceiling |
 //!
 //! A target whose value is a list is checked element by element; every
-//! element must be allowed. Introspection stays open here: what it answers
+//! element must be allowed.
+//!
+//! AUTH-13: before any of this, `params` must be an object (or absent):
+//! the gate reads a target by name, and a bare value (`"MENGER-1"`, `[…]`)
+//! names none — it would be decided as "held anywhere" while the method
+//! deserialized it into its only parameter. A target that is neither a
+//! scalar nor a list of scalars is refused too. Both are `InvalidParams`
+//! (`error_kind: invalid_params`), whoever calls. Introspection stays open here: what it answers
 //! is the caller's view (AUTH-4, [`super::view`]) — `_info` and every
 //! `schema` answered per caller; this gate decides calls, not what is listed.
 //!
@@ -105,19 +112,38 @@ pub(crate) fn say_ended(e: PlexusError, ended: Option<&str>) -> PlexusError {
 }
 
 /// The target values a call names: `None` when the param is absent or
-/// null; one string per element when it is a list.
-fn target_values(params: &Value, param: &str) -> Option<Vec<String>> {
-    let v = params.get(param)?;
+/// null; one string per element when it is a list. AUTH-13: a value the
+/// gate cannot read as a scope — an object, or a list holding anything but
+/// scalars — is refused, never skipped (skipped, it would be decided as
+/// "no target": held anywhere).
+fn target_values(params: &Value, param: &str) -> Result<Option<Vec<String>>, PlexusError> {
+    let Some(v) = params.get(param) else { return Ok(None) };
     let one = |v: &Value| match v {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     };
+    let unreadable = || {
+        PlexusError::InvalidParams(format!("`{param}` names what this call acts on: a string, or a list of strings"))
+    };
     match v {
-        Value::Null => None,
-        Value::Array(items) => Some(items.iter().filter_map(one).collect()),
-        other => one(other).map(|s| vec![s]),
+        Value::Null => Ok(None),
+        Value::Array(items) => items.iter().map(|i| one(i).ok_or_else(unreadable)).collect::<Result<_, _>>().map(Some),
+        other => one(other).map(|s| Some(vec![s])).ok_or_else(unreadable),
+    }
+}
+
+/// AUTH-13: under a gate, a call's params are an object (or absent). A
+/// bare value names no target, so the gate would decide it as "held
+/// anywhere" — while a method of one parameter would take it as that
+/// parameter.
+fn params_shape(params: &Value) -> Result<(), PlexusError> {
+    match params {
+        Value::Object(_) | Value::Null => Ok(()),
+        _ => Err(PlexusError::InvalidParams(
+            "params must be an object naming each parameter, e.g. {\"id\": \"…\"}: a gated method takes no bare value".into(),
+        )),
     }
 }
 
@@ -132,6 +158,7 @@ pub(crate) fn decide(
     auth: Option<&AuthContext>,
     signed_in_grants: &std::collections::BTreeSet<String>,
 ) -> Result<Admit, PlexusError> {
+    params_shape(params)?;
     let (ns, method) = full_path.split_once('.').unwrap_or((full_path, ""));
     let introspection = method == "schema"
         || method.ends_with(".schema")
@@ -152,9 +179,10 @@ pub(crate) fn decide(
         }
         return Ok(Admit::Reach(gate.reach_of_public(auth, &grant)));
     }
-    let targets = info
-        .and_then(|i| i.target.as_deref())
-        .and_then(|param| target_values(params, param));
+    let targets = match info.and_then(|i| i.target.as_deref()) {
+        Some(param) => target_values(params, param)?,
+        None => None,
+    };
     match targets {
         None => Ok(Admit::Reach(gate.check(auth, &grant, None)?)),
         Some(values) if values.is_empty() => Ok(Admit::Reach(gate.check(auth, &grant, None)?)),
@@ -199,6 +227,10 @@ pub(crate) fn error_fields(e: &PlexusError) -> Option<serde_json::Map<String, Va
                     m.insert("reason".into(), "not_accepted".into());
                 }
             }
+        }
+        // AUTH-13: params the gate (or the method) cannot read.
+        PlexusError::InvalidParams(_) => {
+            m.insert("error_kind".into(), "invalid_params".into());
         }
         _ => return None,
     }

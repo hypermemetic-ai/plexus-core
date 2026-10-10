@@ -132,6 +132,12 @@ pub(crate) struct MethodGateInfo {
     /// `MethodSchema.requires_credential.scopes` — the schema-declared
     /// requirement (empty when none declared).
     pub(crate) scopes: Vec<Scope>,
+    /// AUTH-2: the grant the method is (`MethodSchema.grant`, else the
+    /// dotted path it is indexed under).
+    pub(crate) grant: Option<String>,
+    /// AUTH-2: `MethodSchema.target` — the param that locates what the call
+    /// acts on.
+    pub(crate) target: Option<String>,
 }
 
 impl MethodGateInfo {
@@ -144,6 +150,8 @@ impl MethodGateInfo {
                 .as_ref()
                 .map(|rc| rc.scopes.clone())
                 .unwrap_or_default(),
+            grant: schema.grant.clone(),
+            target: schema.target.clone(),
         }
     }
 }

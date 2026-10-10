@@ -74,6 +74,23 @@ pub enum AuthzDenyReason {
     /// Layer 3 (action context): typed here but NOT emitted by the scope
     /// gate — AUTHLANG-3's action gate owns its emission.
     NotAccepted,
+    /// AUTH-2: the grant gate's refusal — the caller does not hold `grant`
+    /// on `scope` (within its session's ceiling). Unlike `MissingScope` it
+    /// names what was needed and where the caller does hold it (owner,
+    /// 2026-10-10: "return the grants required to hit an endpoint"); the
+    /// gate gives it only to a signed-in caller — an anonymous one gets
+    /// [`PlexusError::Unauthenticated`].
+    MissingGrant {
+        /// The method's grant, `<activation>.<method>`.
+        grant: plexus_auth_core::grants::Grant,
+        /// Where it was needed: the target's innermost scope, or `*` for a
+        /// method without a target.
+        scope: plexus_auth_core::grants::ScopeRef,
+        /// The roles that list the grant, `admin` last.
+        roles: Vec<plexus_auth_core::RoleName>,
+        /// Where the caller holds it.
+        held_on: Vec<plexus_auth_core::grants::ScopeRef>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +157,13 @@ impl std::fmt::Display for PlexusError {
                 }
                 AuthzDenyReason::TenantBoundary => write!(f, "Forbidden: tenant boundary"),
                 AuthzDenyReason::NotAccepted => write!(f, "Forbidden: call not accepted"),
+                // AUTH-2: the wire's `message` for a refusal.
+                AuthzDenyReason::MissingGrant { grant, scope, .. } if scope.is_everywhere() => {
+                    write!(f, "needs {}", grant)
+                }
+                AuthzDenyReason::MissingGrant { grant, scope, .. } => {
+                    write!(f, "needs {} on {}", grant, scope)
+                }
             },
         }
     }
@@ -169,6 +193,35 @@ fn plexus_error_code(e: &PlexusError) -> i32 {
 /// Convert PlexusError to a JSON-RPC ErrorObject with semantic error codes.
 fn plexus_error_to_jsonrpc(e: &PlexusError) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObject::owned(plexus_error_code(e), e.to_string(), None::<()>)
+}
+
+/// The error stream item a failed dispatch sends: `{"type":"error",
+/// "metadata", "message", "code", "recoverable"}`, plus — for an auth
+/// refusal — AUTH-2's typed fields (`error_kind`, and for a missing grant
+/// `grant`, `scope`, `roles`, `held_on`; see
+/// [`super::grant_gate::error_fields`]). Extra keys only: a client reading
+/// the item as [`super::types::PlexusStreamItem`] parses it as before.
+pub(crate) fn error_item_raw(ns: &str, e: &PlexusError) -> Option<Box<serde_json::value::RawValue>> {
+    serde_json::value::to_raw_value(&error_item(ns, e)).ok()
+}
+
+/// AUTH-2: the error stream item a failed dispatch of `ns.call` sends for
+/// `e`, as JSON — `{"type":"error","metadata","message","code",
+/// "recoverable"}` plus, for an auth refusal, `error_kind` and (a missing
+/// grant) `grant`, `scope`, `roles`, `held_on`. Public so a transport that
+/// renders dispatch errors itself renders them the same way.
+pub fn error_item(ns: &str, e: &PlexusError) -> serde_json::Value {
+    let item = super::types::PlexusStreamItem::Error {
+        metadata: super::types::StreamMetadata::new(vec![ns.into()], super::context::PlexusContext::hash()),
+        message: e.to_string(),
+        code: Some(plexus_error_code(e).to_string()),
+        recoverable: false,
+    };
+    let mut value = serde_json::to_value(&item).unwrap_or(serde_json::Value::Null);
+    if let (Some(obj), Some(extra)) = (value.as_object_mut(), super::grant_gate::error_fields(e)) {
+        obj.extend(extra);
+    }
+    value
 }
 
 // ============================================================================
@@ -907,6 +960,10 @@ struct DynamicHubInner {
     /// gated dispatch are not in the index (registration is builder-time,
     /// before serving, in every supported composition).
     gate_index: std::sync::OnceLock<HashMap<String, super::scope_gate::MethodGateInfo>>,
+    /// AUTH-2 — the grant gate: when set, every call is decided by it
+    /// before routing (default deny). `None` (the default): dispatch exactly
+    /// as before it existed. See [`super::grant_gate`].
+    gate: Option<Arc<plexus_auth_core::grants::Gate>>,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -979,6 +1036,7 @@ impl DynamicHub {
                 default_deny: false,
                 audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
                 gate_index: std::sync::OnceLock::new(),
+                gate: None,
             }),
         }
     }
@@ -1051,6 +1109,64 @@ impl DynamicHub {
         self
     }
 
+    /// AUTH-2: put every call through `gate` before routing — default deny.
+    ///
+    /// With a gate, a call runs only if the caller holds the method's grant
+    /// (`MethodSchema.grant`, else `<activation>.<method>`) through a role
+    /// on the scope its target param resolves to — or anywhere, for a method
+    /// without a target — within the session's ceiling. `public` methods run
+    /// for anyone; an anonymous caller reaches nothing else
+    /// ([`PlexusError::Unauthenticated`]); a refusal is
+    /// [`AuthzDenyReason::MissingGrant`], rendered on the wire as an error
+    /// item with `error_kind: "forbidden"`, `grant`, `scope`, `roles`,
+    /// `held_on`. The routed call runs with the gate's [`Reach`] as
+    /// [`super::grant_gate::current_reach`], which `#[plexus_macros::method]`
+    /// hands a method declaring `reach: Reach`.
+    ///
+    /// A gated hub also stops merging its activations' direct JSON-RPC
+    /// methods (`<activation>.<method>` registered beside `<hub>.call`):
+    /// they carry no auth and would pass around the gate. Every call goes
+    /// through `<hub>.call`.
+    ///
+    /// A hub that never calls this dispatches exactly as before. R-5's
+    /// [`DynamicHub::with_scope_registry`] / [`DynamicHub::with_default_deny`]
+    /// still apply after it when configured.
+    ///
+    /// [`Reach`]: plexus_auth_core::grants::Reach
+    pub fn with_gate(mut self, gate: Arc<plexus_auth_core::grants::Gate>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("Cannot set gate: DynamicHub has multiple references");
+        inner.gate = Some(gate);
+        self
+    }
+
+    /// AUTH-2: the configured gate, if any.
+    pub fn gate(&self) -> Option<&Arc<plexus_auth_core::grants::Gate>> {
+        self.inner.gate.as_ref()
+    }
+
+    /// AUTH-2/AUTH-3: the default roles every registered activation
+    /// declares (`#[plexus_macros::activation(roles(...))]`), merged by role
+    /// name — what a service seeds its [`Roles`] with
+    /// ([`RoleTable::from_lists`]) before an admin's edits.
+    ///
+    /// [`Roles`]: plexus_auth_core::grants::Roles
+    /// [`RoleTable::from_lists`]: plexus_auth_core::grants::RoleTable::from_lists
+    pub fn declared_roles(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut out: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        for activation in self.inner.activations.values() {
+            for (role, grants) in activation.plugin_schema().roles {
+                let entry = out.entry(role).or_default();
+                for g in grants {
+                    if !entry.contains(&g) {
+                        entry.push(g);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Read-only view of the configured [`ScopeRegistry`], if any.
     /// Test-side accessor.
     ///
@@ -1066,10 +1182,11 @@ impl DynamicHub {
             let mut index = HashMap::new();
             // The hub's own methods, addressable as "<hub-ns>.<method>".
             for m in &Activation::plugin_schema(self).methods {
-                index.insert(
-                    format!("{}.{}", self.inner.namespace, m.name),
-                    super::scope_gate::MethodGateInfo::from_schema(m),
-                );
+                let mut info = super::scope_gate::MethodGateInfo::from_schema(m);
+                // The hub's own methods are granted under its runtime
+                // namespace (the macro's static one is "plexus").
+                info.grant = Some(format!("{}.{}", self.inner.namespace, m.name));
+                index.insert(format!("{}.{}", self.inner.namespace, m.name), info);
             }
             // Each registered activation's methods, addressable as
             // "<activation-ns>.<method>". Deeper nested paths (an
@@ -1079,10 +1196,9 @@ impl DynamicHub {
             for activation in self.inner.activations.values() {
                 let schema = activation.plugin_schema();
                 for m in &schema.methods {
-                    index.insert(
-                        format!("{}.{}", schema.namespace, m.name),
-                        super::scope_gate::MethodGateInfo::from_schema(m),
-                    );
+                    let mut info = super::scope_gate::MethodGateInfo::from_schema(m);
+                    info.grant = Some(m.grant_or(&schema.namespace));
+                    index.insert(format!("{}.{}", schema.namespace, m.name), info);
                 }
             }
             index
@@ -1349,6 +1465,29 @@ impl DynamicHub {
 
     /// Route a call to the appropriate activation, with optional raw HTTP request context.
     pub async fn route_with_ctx(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        // AUTH-2 grant gate: only when configured — a hub without one pays
+        // this one branch and dispatches as before.
+        if let Some(gate) = self.inner.gate.as_ref() {
+            let admit = super::grant_gate::decide(
+                gate,
+                &self.inner.namespace,
+                method,
+                self.gate_index().get(method),
+                &params,
+                auth,
+            )?;
+            return match admit {
+                super::grant_gate::Admit::Open => self.route_ungated(method, params, auth, raw_ctx).await,
+                super::grant_gate::Admit::Reach(reach) => {
+                    super::grant_gate::with_reach(reach, self.route_ungated(method, params, auth, raw_ctx)).await
+                }
+            };
+        }
+        self.route_ungated(method, params, auth, raw_ctx).await
+    }
+
+    /// Everything [`DynamicHub::route_with_ctx`] does after the grant gate.
+    async fn route_ungated(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
         // R-5 scope gate (AUTHZ-CORE-1 + CORE-5). Inactive unless a
         // ScopeRegistry is configured or default_deny is set — a hub with
         // neither pays exactly this one branch and dispatches as before
@@ -1539,16 +1678,7 @@ impl DynamicHub {
                         Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
                         Err(e) => {
                             let sink = pending.accept().await?;
-                            let error_item = super::types::PlexusStreamItem::Error {
-                                metadata: super::types::StreamMetadata::new(
-                                    vec![ns_static.into()],
-                                    PlexusContext::hash(),
-                                ),
-                                message: e.to_string(),
-                                code: Some(plexus_error_code(&e).to_string()),
-                                recoverable: false,
-                            };
-                            if let Ok(raw) = serde_json::value::to_raw_value(&error_item) {
+                            if let Some(raw) = error_item_raw(ns_static, &e) {
                                 let _ = sink.send(raw).await;
                             }
                             Ok(())
@@ -1645,10 +1775,14 @@ impl DynamicHub {
             }
         )?;
 
-        // Add all registered activation RPC methods
+        // Add all registered activation RPC methods — unless a grant gate
+        // is set (AUTH-2): those direct methods carry no auth and would pass
+        // around it, so a gated hub is reached only through `<ns>.call`.
         let pending = std::mem::take(&mut *self.inner.pending_rpc.lock().unwrap());
-        for factory in pending {
-            module.merge(factory())?;
+        if self.inner.gate.is_none() {
+            for factory in pending {
+                module.merge(factory())?;
+            }
         }
 
         // CHILD-WIRE: for each registered child router with capability bits set,
@@ -1705,16 +1839,7 @@ impl DynamicHub {
                             // from a subscription handler causes jsonrpsee to wrap it as
                             // generic -32603, discarding our semantic error code.
                             let sink = pending.accept().await?;
-                            let error_item = super::types::PlexusStreamItem::Error {
-                                metadata: super::types::StreamMetadata::new(
-                                    vec![ns_static.into()],
-                                    PlexusContext::hash(),
-                                ),
-                                message: e.to_string(),
-                                code: Some(plexus_error_code(&e).to_string()),
-                                recoverable: false,
-                            };
-                            if let Ok(raw) = serde_json::value::to_raw_value(&error_item) {
+                            if let Some(raw) = error_item_raw(ns_static, &e) {
                                 let _ = sink.send(raw).await;
                             }
                             Ok(())
@@ -1856,7 +1981,11 @@ impl DynamicHub {
         })?;
 
         // Register pending RPC methods from activations
-        let pending = std::mem::take(&mut *hub.inner.pending_rpc.lock().unwrap());
+        // AUTH-2: not under a grant gate — see `into_rpc_module`.
+        let mut pending = std::mem::take(&mut *hub.inner.pending_rpc.lock().unwrap());
+        if hub.inner.gate.is_some() {
+            pending.clear();
+        }
         tracing::trace!(factories = pending.len(), "merging activation RPC factories");
         for (idx, factory) in pending.into_iter().enumerate() {
             tracing::trace!(factory_idx = idx, "calling factory to get Methods");

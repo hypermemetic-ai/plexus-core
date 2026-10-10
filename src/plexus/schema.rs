@@ -805,7 +805,53 @@ pub struct MethodSchema {
     /// holds nowhere).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_on: Option<Vec<String>>,
+
+    /// SYNAPSE-13: the method's group in a listing (`"read"`, `"write"`, …)
+    /// — one group, like an OpenAPI operation's first tag. Clients list the
+    /// methods of a group together and alphabetically within it.
+    ///
+    /// Optional on the wire (`serde(default)`, skipped when unset) so older
+    /// schemas and clients parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+
+    /// SYNAPSE-13: worked calls of this method, each its params object and a
+    /// note saying what it does — OpenAPI's `examples`. A client renders them
+    /// as command lines (`synapse … --id MENGER-40 --status Coding`).
+    ///
+    /// Optional on the wire (`serde(default)`, skipped when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<MethodExample>,
 }
+
+/// SYNAPSE-13: one worked call of a method — the params it sends and a note
+/// saying what it does (`#[plexus_macros::method(example(note = "…", params
+/// = r#"{…}"#))]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MethodExample {
+    /// The params object, as the method takes it.
+    pub params: serde_json::Value,
+    /// What the call does, in a line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl MethodExample {
+    /// An example of these params, with no note.
+    pub fn new(params: serde_json::Value) -> Self {
+        Self { params, note: None }
+    }
+
+    /// An example of these params, with a note.
+    pub fn with_note(params: serde_json::Value, note: impl Into<String>) -> Self {
+        Self { params, note: Some(note.into()) }
+    }
+}
+
+/// SYNAPSE-13: the JSON Schema extension key on a param's property that lists
+/// the values it is meant to take — a hint for help and completion, never
+/// enforced (the server may accept synonyms, e.g. `active` for `Coding`).
+pub const X_PLEXUS_VALUES: &str = "x-plexus-values";
 
 /// `skip_serializing_if` helper: omit `false` booleans from the wire so
 /// additive flags keep pre-existing JSON byte-identical (see
@@ -1281,6 +1327,8 @@ impl MethodSchema {
             target: None,
             long_description: None,
             held_on: None,
+            group: None,
+            examples: Vec::new(),
         }
     }
 
@@ -1467,6 +1515,50 @@ impl MethodSchema {
     pub fn with_long_description(mut self, long_description: impl Into<String>) -> Self {
         self.long_description = Some(long_description.into());
         self
+    }
+
+    /// SYNAPSE-13: put this method in a listing group (`"read"`, `"write"`).
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    /// SYNAPSE-13: add a worked call of this method.
+    pub fn with_example(mut self, example: MethodExample) -> Self {
+        self.examples.push(example);
+        self
+    }
+
+    /// SYNAPSE-13: say which values `param` is meant to take, as
+    /// [`X_PLEXUS_VALUES`] on its property in `params` — a hint, never
+    /// enforced. A param the schema does not have is left alone.
+    pub fn with_param_values<I, S>(mut self, param: &str, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let values: Vec<serde_json::Value> =
+            values.into_iter().map(|v| serde_json::Value::String(v.into())).collect();
+        if let Some(params) = self.params.take() {
+            let mut value = serde_json::to_value(&params).unwrap_or_default();
+            if let Some(prop) = value
+                .get_mut("properties")
+                .and_then(|p| p.get_mut(param))
+                .and_then(|p| p.as_object_mut())
+            {
+                prop.insert(X_PLEXUS_VALUES.to_string(), serde_json::Value::Array(values));
+            }
+            self.params = Some(serde_json::from_value(value).unwrap_or(params));
+        }
+        self
+    }
+
+    /// SYNAPSE-13: the values `param` is meant to take, when its property
+    /// says them ([`X_PLEXUS_VALUES`]).
+    pub fn param_values(&self, param: &str) -> Option<Vec<String>> {
+        let value = serde_json::to_value(self.params.as_ref()?).ok()?;
+        let list = value.get("properties")?.get(param)?.get(X_PLEXUS_VALUES)?.as_array()?;
+        Some(list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
     }
 
     /// AUTH-2: the grant a gate asks for this method under `activation`:
@@ -1804,6 +1896,38 @@ impl SchemaProperty {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+
+    /// SYNAPSE-13: group, examples and a param's values on the wire, and
+    /// absent when unset (an older client sees the shape it always did).
+    #[test]
+    fn synapse13_group_examples_values() {
+        let params: schemars::Schema = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" }, "status": { "type": "string", "description": "New status" } },
+            "required": ["id", "status"],
+        }))
+        .unwrap();
+        let bare = MethodSchema::new("set_status", "Set a ticket's status", "h").with_params(params);
+        let wire = serde_json::to_value(&bare).unwrap();
+        assert!(wire.get("group").is_none() && wire.get("examples").is_none());
+        assert_eq!(bare.param_values("status"), None);
+
+        let m = bare
+            .with_group("write")
+            .with_example(MethodExample::with_note(serde_json::json!({"id": "MENGER-40", "status": "Coding"}), "start work"))
+            .with_param_values("status", ["Pending", "Ready"])
+            .with_param_values("nope", ["x"]);
+        assert_eq!(m.param_values("status"), Some(vec!["Pending".to_string(), "Ready".to_string()]));
+        let wire = serde_json::to_value(&m).unwrap();
+        assert_eq!(wire["group"], "write");
+        assert_eq!(wire["examples"], serde_json::json!([{ "params": {"id": "MENGER-40", "status": "Coding"}, "note": "start work" }]));
+        assert_eq!(wire["params"]["properties"]["status"]["x-plexus-values"], serde_json::json!(["Pending", "Ready"]));
+        assert_eq!(wire["params"]["properties"]["status"]["description"], "New status");
+        assert!(wire["params"]["properties"].get("nope").is_none());
+        let back: MethodSchema = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.group.as_deref(), Some("write"));
+        assert_eq!(back.examples, m.examples);
+    }
 
     #[test]
     fn test_schema_creation() {

@@ -536,7 +536,7 @@ fn role_event(role: &RoleName, grants: Option<GrantSet>) -> AuthEvent {
 #[allow(deprecated)]
 impl Auth {
     /// The ways in this server offers.
-    #[plexus_macros::method(public, description = "The ways in this server offers")]
+    #[plexus_macros::method(public, group = "sign in", description = "The ways in this server offers")]
     async fn providers(&self) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let providers = self.inner.backend.providers();
         stream! {
@@ -551,6 +551,7 @@ impl Auth {
     /// a key-proved connection (`{session: {ttl_secs, ceiling}}`).
     #[plexus_macros::method(
         public,
+        group = "sign in",
         description = "Sign in — a person through the browser, an agent with its key",
         params(flow = "browser {redirect} | code {code, state} | password {username, password} | session {ttl_secs?, ceiling?}")
     )]
@@ -580,6 +581,7 @@ impl Auth {
     /// membership joins the waiting list for an admin.
     #[plexus_macros::method(
         public,
+        group = "sign in",
         description = "Create an account, or ask for access",
         params(via = "The provider to sign up through, where the server offers several")
     )]
@@ -606,7 +608,7 @@ impl Auth {
 
     /// Who this connection is: principal, name, the roles it holds where,
     /// and its session's ceiling.
-    #[plexus_macros::method(description = "Who you are: principal, roles held where, ceiling")]
+    #[plexus_macros::method(group = "you", description = "Who you are: principal, roles held where, ceiling")]
     async fn whoami(&self, auth: &AuthContext) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
         let ctx = auth.clone();
@@ -635,7 +637,7 @@ impl Auth {
     }
 
     /// End this session.
-    #[plexus_macros::method(description = "Sign out: end this session")]
+    #[plexus_macros::method(group = "you", description = "Sign out: end this session")]
     async fn logout(&self, auth: &AuthContext) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
         let ctx = auth.clone();
@@ -651,8 +653,10 @@ impl Auth {
     /// What a method needs: its grant, its target and the roles that list
     /// it.
     #[plexus_macros::method(
+        group = "you",
         description = "What a method needs: its grant, target, and the roles that list it",
-        params(method = "The method, as <activation>.<method>: tickets.set_status")
+        params(method = "The method, as <activation>.<method>: tickets.set_status"),
+        example(note = "what changing a ticket's status needs", params = r#"{"method": "tickets.set_status"}"#)
     )]
     async fn requires(&self, auth: &AuthContext, method: String) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
@@ -675,7 +679,7 @@ impl Auth {
     }
 
     /// Every role and the grants it lists (admin: every grant).
-    #[plexus_macros::method(description = "Every role and the grants it lists")]
+    #[plexus_macros::method(group = "admin", description = "Every role and the grants it lists")]
     async fn roles(&self, auth: &AuthContext) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
         let inner = self.inner.clone();
@@ -693,6 +697,7 @@ impl Auth {
     /// Set a role's grants (admin on `*`). Each entry a grant
     /// (`tickets.get`) or an existing role whose grants it includes.
     #[plexus_macros::method(
+        group = "admin",
         description = "Set a role's grants (admin on *)",
         params(role = "The role (not admin)", grants = "Grants (tickets.get) or roles to include")
     )]
@@ -749,8 +754,11 @@ impl Auth {
     /// the scope: admin there).
     #[plexus_macros::method(
         target = "scope",
+        group = "admin",
         description = "Give a principal a role on a scope",
-        params(principal = "key:…, oidc:…/…, idp:…", role = "The role", scope = "Where: a scope name, or *")
+        params(principal = "key:…, oidc:…/…, idp:…", role = "The role", scope = "Where: a scope name, or *"),
+        example(note = "make a person an editor on MENGER", params = r#"{"principal": "oidc:workos/user_01M4", "role": "editor", "scope": "MENGER"}"#),
+        example(note = "make an agent's key an admin everywhere", params = r#"{"principal": "key:ac79e0d1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", "role": "admin", "scope": "*"}"#)
     )]
     async fn grant(&self, auth: &AuthContext, principal: String, role: String, scope: String) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
@@ -784,6 +792,7 @@ impl Auth {
     /// Take `principal`'s role (or every role) on `scope` away.
     #[plexus_macros::method(
         target = "scope",
+        group = "admin",
         description = "Take a principal's role on a scope away",
         params(principal = "key:…, oidc:…/…, idp:…", role = "The role; absent: every role there", scope = "Where: a scope name, or *")
     )]
@@ -813,7 +822,7 @@ impl Auth {
 
     /// Who signed up or asked for access and holds nothing yet (admin on
     /// `*`).
-    #[plexus_macros::method(description = "Who asked for access and holds nothing yet (admin on *)")]
+    #[plexus_macros::method(group = "admin", description = "Who asked for access and holds nothing yet (admin on *)")]
     async fn waiting(&self, auth: &AuthContext, reach: Reach) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
         let inner = self.inner.clone();

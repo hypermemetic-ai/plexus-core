@@ -59,9 +59,9 @@ pub use path::Provenance;
 pub use plexus::{error_item, Activation, ActivationInfo, AuthzDenyReason, ChildCapabilities, ChildRouter, DynamicHub, PlexusError, TransportErrorKind, route_to_child, PLEXUS_NOTIF_METHOD};
 pub use crate::types::Handle;
 pub use schema::{
-    AuthPosture, ChildHashes, ChildSummary, DeprecationInfo, MethodRole, MethodSchema,
+    AuthPosture, ChildHashes, ChildSummary, DeprecationInfo, MethodExample, MethodRole, MethodSchema,
     ParamSchema, PluginHashes, PluginSchema, RequiredCredential, ReturnShape, Schema,
-    SchemaProperty, SchemaResult, SchemaType, ViewKind,
+    SchemaProperty, SchemaResult, SchemaType, ViewKind, X_PLEXUS_VALUES,
 };
 pub use types::{PlexusStreamItem, StreamMetadata};
 pub use method_enum::MethodEnumSchema;

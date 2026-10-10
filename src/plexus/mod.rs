@@ -2,6 +2,10 @@
 // pub mod guidance;
 
 pub mod auth;
+/// AUTH-5: the `auth` activation and what a service supplies it.
+pub mod auth_activation;
+/// AUTH-5: a reference in-memory backend and stores for the `auth` activation.
+pub mod auth_memory;
 pub mod test_validator;
 pub mod bidirectional;
 pub mod context;
@@ -38,6 +42,11 @@ pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::ForwardPolicyRegistry;
 pub use grant_gate::{current_reach, with_reach, ForbiddenItem};
 pub use view::View;
+pub use auth_activation::{
+    Auth, AuthBackend, AuthEvent, AuthFailure, AuthSetup, LoginAnswer, LoginFlow, MembershipEntry, MembershipStore,
+    Provider, ProviderKind, Requirement, RoleStore, Session, SignupAnswer, StoreError, Waiting, SIGNED_IN_GRANTS,
+};
+pub use auth_memory::{MemoryAuthBackend, MemoryMemberships, MemoryRoles};
 // AUTH-2: the grant model, re-exported so an activation needs only plexus-core.
 pub use plexus_auth_core::grants::{
     Ceiling, Gate, Grant, GrantSet, Membership, Memberships, Reach, Refusal, Resolve, RoleOrGrant,

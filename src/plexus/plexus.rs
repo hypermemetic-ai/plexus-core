@@ -966,11 +966,15 @@ struct DynamicHubInner {
     gate: Option<Arc<plexus_auth_core::grants::Gate>>,
     /// AUTH-4/AUTH-5: grants every signed-in caller reaches whatever its
     /// roles or ceiling (the auth activation's `whoami`, `logout`,
-    /// `requires`). Empty unless set by [`DynamicHub::with_signed_in_grants`].
+    /// `requires`). Empty unless [`DynamicHub::with_auth`] mounted it.
     signed_in_grants: std::collections::BTreeSet<String>,
     /// AUTH-4: the RFC 9728 metadata URL an anonymous `_info` names
     /// (`auth.resource_metadata`). See [`DynamicHub::with_resource_metadata`].
     resource_metadata: Option<String>,
+    /// AUTH-5: what each method requires — grant, target, public — kept
+    /// for `auth.requires`; present only when the auth activation is
+    /// mounted, and fed by every [`DynamicHub::register`].
+    auth_catalog: Option<super::auth_activation::Catalog>,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -1046,6 +1050,7 @@ impl DynamicHub {
                 gate: None,
                 signed_in_grants: std::collections::BTreeSet::new(),
                 resource_metadata: None,
+                auth_catalog: None,
             }),
         }
     }
@@ -1168,6 +1173,9 @@ impl DynamicHub {
     /// AUTH-4/AUTH-5: grants every signed-in caller reaches whatever its
     /// roles or ceiling — admitted by the gate like a `public` method, but
     /// only with a principal, and shown in every caller's view.
+    /// [`DynamicHub::with_auth`] sets the auth activation's `whoami`,
+    /// `logout` and `requires`; a hub calls this only for a method of its
+    /// own of the same kind.
     pub fn with_signed_in_grants<I, S>(mut self, grants: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1177,6 +1185,39 @@ impl DynamicHub {
             .expect("Cannot set signed_in grants: DynamicHub has multiple references");
         inner.signed_in_grants.extend(grants.into_iter().map(Into::into));
         self
+    }
+
+    /// AUTH-5: mount the `auth` activation ([`super::auth_activation::Auth`])
+    /// and put every call through a gate built from the same stores — the
+    /// one way a service turns login on. `setup` carries what only the
+    /// service knows: its [`AuthBackend`] (providers, login flows, sessions,
+    /// signup's waiting list), its editable [`RoleStore`] and
+    /// [`MembershipStore`], and its scope [`Resolve`]r.
+    ///
+    /// Call it **after** registering the service's own activations or
+    /// before — either way `auth.requires` knows every method (later
+    /// registrations are added as they come). It replaces a gate set by
+    /// [`DynamicHub::with_gate`].
+    ///
+    /// [`AuthBackend`]: super::auth_activation::AuthBackend
+    /// [`RoleStore`]: super::auth_activation::RoleStore
+    /// [`MembershipStore`]: super::auth_activation::MembershipStore
+    /// [`Resolve`]: plexus_auth_core::grants::Resolve
+    pub fn with_auth(mut self, setup: super::auth_activation::AuthSetup) -> Self {
+        let catalog = super::auth_activation::Catalog::default();
+        catalog.add(&Activation::plugin_schema(&self));
+        for a in self.inner.activations.values() {
+            catalog.add(&a.plugin_schema());
+        }
+        let (auth, gate) = super::auth_activation::Auth::mount(setup, catalog.clone());
+        {
+            let inner = Arc::get_mut(&mut self.inner)
+                .expect("Cannot mount auth: DynamicHub has multiple references");
+            inner.auth_catalog = Some(catalog);
+            inner.gate = Some(Arc::new(gate));
+        }
+        self.register(auth)
+            .with_signed_in_grants(super::auth_activation::SIGNED_IN_GRANTS.iter().copied())
     }
 
     /// AUTH-4: the hub as `caller` may see it — what `_info`, the hub's
@@ -1519,6 +1560,11 @@ impl DynamicHub {
             namespace.clone(), // Use namespace as plugin_type for now
         );
 
+        // AUTH-5: `auth.requires` knows every method, registered before
+        // the auth activation was mounted or after.
+        if let Some(catalog) = inner.auth_catalog.as_ref() {
+            catalog.add(&activation.plugin_schema());
+        }
         inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
         inner.child_routers.insert(namespace.clone(), Arc::new(activation_for_router));
         inner.pending_rpc.lock().unwrap()
@@ -1553,6 +1599,9 @@ impl DynamicHub {
             namespace.clone(), // Use namespace as plugin_type for now
         );
 
+        if let Some(catalog) = inner.auth_catalog.as_ref() {
+            catalog.add(&activation.plugin_schema());
+        }
         inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
         inner.child_routers.insert(namespace, Arc::new(activation_for_router));
         inner.pending_rpc.lock().unwrap()

@@ -566,6 +566,34 @@ pub struct PluginSchema {
     /// activation declares none.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub roles: std::collections::BTreeMap<String, Vec<String>>,
+
+    /// AUTH-4: which view of a gated hub this schema answers from —
+    /// `anonymous` (only the door: the public methods) or `caller` (the
+    /// methods the caller holds). Absent from every schema a hub without a
+    /// gate answers, so those stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewKind>,
+}
+
+/// AUTH-4: the two views of a gated hub. On the wire, `"anonymous"` or
+/// `"caller"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewKind {
+    /// Not signed in: only how to sign in (the public methods).
+    Anonymous,
+    /// Signed in: the methods whose grant some held role lists.
+    Caller,
+}
+
+impl ViewKind {
+    /// `"anonymous"` / `"caller"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Caller => "caller",
+        }
+    }
 }
 
 /// Result of a schema query - either full plugin or single method
@@ -770,6 +798,13 @@ pub struct MethodSchema {
     /// "..."` was given).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub long_description: Option<String>,
+
+    /// AUTH-4: in a caller's view of a gated hub, where the caller holds this
+    /// method's grant (`["MENGER"]`, `["*"]`), within its session's ceiling.
+    /// Absent outside a caller's view (and on a public method the caller
+    /// holds nowhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<Vec<String>>,
 }
 
 /// `skip_serializing_if` helper: omit `false` booleans from the wire so
@@ -1002,6 +1037,7 @@ impl PluginSchema {
             request: None,
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
+            view: None,
         }
     }
 
@@ -1032,6 +1068,7 @@ impl PluginSchema {
             request: None,
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
+            view: None,
         }
     }
 
@@ -1062,6 +1099,7 @@ impl PluginSchema {
             request: None,
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
+            view: None,
         }
     }
 
@@ -1093,6 +1131,7 @@ impl PluginSchema {
             request: None,
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
+            view: None,
         }
     }
 
@@ -1241,6 +1280,7 @@ impl MethodSchema {
             grant: None,
             target: None,
             long_description: None,
+            held_on: None,
         }
     }
 

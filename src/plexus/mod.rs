@@ -22,6 +22,8 @@ pub mod schema;
 pub(crate) mod scope_gate;
 pub mod streaming;
 pub mod types;
+/// AUTH-4: the caller's view of a gated hub.
+pub mod view;
 
 // AuthContext + SessionValidator + the sealed Principal / VerifiedUser /
 // ServiceIdentity types are re-exported from plexus-auth-core via
@@ -35,10 +37,11 @@ pub use in_process::InProcessTransport;
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::ForwardPolicyRegistry;
 pub use grant_gate::{current_reach, with_reach, ForbiddenItem};
+pub use view::View;
 // AUTH-2: the grant model, re-exported so an activation needs only plexus-core.
 pub use plexus_auth_core::grants::{
     Ceiling, Gate, Grant, GrantSet, Membership, Memberships, Reach, Refusal, Resolve, RoleOrGrant,
-    RoleTable, Roles, ScopeRef, ADMIN,
+    RoleTable, Roles, ScopeRef, ADMIN, CEILING_KEY,
 };
 #[deprecated(note = "Middleware removed - guidance provided via PlexusStreamEvent::Guidance")]
 pub use middleware::{ActivationRegistry, GuidedErrorMiddleware};
@@ -49,7 +52,7 @@ pub use crate::types::Handle;
 pub use schema::{
     AuthPosture, ChildHashes, ChildSummary, DeprecationInfo, MethodRole, MethodSchema,
     ParamSchema, PluginHashes, PluginSchema, RequiredCredential, ReturnShape, Schema,
-    SchemaProperty, SchemaResult, SchemaType,
+    SchemaProperty, SchemaResult, SchemaType, ViewKind,
 };
 pub use types::{PlexusStreamItem, StreamMetadata};
 pub use method_enum::MethodEnumSchema;

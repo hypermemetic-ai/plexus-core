@@ -17,11 +17,12 @@
 //! | method with a `target`, value present | `Unauthenticated` | allowed iff a role held on a scope in the value's chain lists the grant, and every ceiling layer allows it there |
 //! | method without a target (or the target param absent / null) | `Unauthenticated` | allowed iff the grant is held anywhere (within the ceiling) |
 //! | method no schema describes (a nested child path) | `Unauthenticated` | as "without a target", grant = the dotted path |
+//! | a signed-in grant (AUTH-5: `auth.whoami`, `auth.logout`, `auth.requires`) | `Unauthenticated` | runs (its reach), whatever the roles or ceiling |
 //!
 //! A target whose value is a list is checked element by element; every
-//! element must be allowed. Introspection stays open here because the
-//! per-caller view of a hub is AUTH-4's (`_info` and every `schema` answered
-//! per caller); this gate decides calls, not what is listed.
+//! element must be allowed. Introspection stays open here: what it answers
+//! is the caller's view (AUTH-4, [`super::view`]) — `_info` and every
+//! `schema` answered per caller; this gate decides calls, not what is listed.
 //!
 //! # How a method receives its [`Reach`]
 //!
@@ -107,6 +108,7 @@ pub(crate) fn decide(
     info: Option<&MethodGateInfo>,
     params: &Value,
     auth: Option<&AuthContext>,
+    signed_in_grants: &std::collections::BTreeSet<String>,
 ) -> Result<Admit, PlexusError> {
     let (ns, method) = full_path.split_once('.').unwrap_or((full_path, ""));
     let introspection = method == "schema"
@@ -117,6 +119,15 @@ pub(crate) fn decide(
     }
     let grant = Grant::new(info.and_then(|i| i.grant.clone()).unwrap_or_else(|| full_path.to_string()));
     if info.is_some_and(|i| i.public) {
+        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant)));
+    }
+    // AUTH-5: what every signed-in caller reaches (`auth.whoami`,
+    // `auth.logout`, `auth.requires`) — whatever its roles or ceiling, but
+    // never anonymously.
+    if signed_in_grants.contains(grant.as_str()) {
+        if auth.and_then(|a| a.principal()).is_none() {
+            return Err(Refusal::Unauthenticated.into());
+        }
         return Ok(Admit::Reach(gate.reach_of_public(auth, &grant)));
     }
     let targets = info

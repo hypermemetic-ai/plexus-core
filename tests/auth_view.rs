@@ -590,6 +590,42 @@ async fn password_and_session_flows() {
     assert_eq!(shape(&w.hub.view(Some(&ctx)))["tickets"], vec!["get @MENGER-12", "list @MENGER-12", "set_status @MENGER-12"]);
 }
 
+/// AUTH-11 (AUTH-10 finding #1): a session that signed out holds nothing on
+/// the socket that carried it — not `auth.grant`, not `auth.role_set`, not
+/// `auth.waiting`, not a service method — and sees the anonymous view. The
+/// review's attack: an admin's session logs out, then the same connection
+/// grants a fresh key admin on `*`.
+#[tokio::test]
+async fn a_session_that_signed_out_cannot_grant() {
+    let w = world();
+    let (_, admin) = session_for(&w, &key(ROOT, "boss"), None).await;
+    assert_eq!(one(&w, "auth.whoami", json!({}), Some(&admin)).await["principal"], ROOT);
+    assert_eq!(one(&w, "auth.logout", json!({}), Some(&admin)).await["type"], "logged_out");
+
+    let err = call(&w, "auth.grant", json!({"principal": NEW, "role": "admin", "scope": "*"}), Some(&admin)).await.err().unwrap();
+    let mut wire = error_item("menger", &err);
+    wire.as_object_mut().unwrap().remove("metadata");
+    println!("WIRE auth.grant after logout: {wire}");
+    assert_eq!(wire["error_kind"], "unauthenticated");
+    assert_eq!(wire["message"], "Authentication required: you have signed out: sign in again");
+    for (method, params) in [
+        ("auth.role_set", json!({"role": "viewer", "grants": ["tickets.get"]})),
+        ("auth.revoke", json!({"principal": ADA, "scope": "MENGER"})),
+        ("auth.waiting", json!({})),
+        ("auth.whoami", json!({})),
+        ("tickets.set_status", json!({"id": "MENGER-1", "status": "Done"})),
+        ("tickets.list", json!({})),
+    ] {
+        let err = call(&w, method, params, Some(&admin)).await.err().unwrap_or_else(|| panic!("{method} answered after logout"));
+        assert!(matches!(err, PlexusError::Unauthenticated(_)), "{method}: {err:?}");
+    }
+    // NEW holds nothing; the memberships are as they were.
+    assert_eq!(shape(&w.hub.view(Some(&key(NEW, "n")))).keys().collect::<Vec<_>>(), vec!["auth"]);
+    assert_eq!(w.hub.view(Some(&admin)).kind, ViewKind::Anonymous);
+    // The door stays open: it may sign in again.
+    assert!(!call(&w, "auth.providers", json!({}), Some(&admin)).await.expect("the door is public").is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Without a gate: nothing changes
 // ---------------------------------------------------------------------------

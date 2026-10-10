@@ -78,7 +78,29 @@ impl From<Refusal> for PlexusError {
             Refusal::MissingGrant { grant, scope, roles, held_on } => PlexusError::Forbidden {
                 reason: AuthzDenyReason::MissingGrant { grant, scope, roles, held_on },
             },
+            Refusal::Ended { reason } => PlexusError::Unauthenticated(reason),
         }
+    }
+}
+
+/// AUTH-11: the identity a call acts as — `auth` while its sign-in stands
+/// ([`Gate::alive`]); once it has ended (signed out, expired, revoked),
+/// nobody: the call is decided and dispatched as anonymous, and the second
+/// value says why. A socket that signed out sees the anonymous view and
+/// reaches only the `public` methods — not `auth.grant`.
+pub(crate) fn standing<'a>(gate: &Gate, auth: Option<&'a AuthContext>) -> (Option<&'a AuthContext>, Option<String>) {
+    match auth.map(|a| gate.alive(a)) {
+        Some(Err(reason)) => (None, Some(reason)),
+        _ => (auth, None),
+    }
+}
+
+/// AUTH-11: an anonymous refusal of a sign-in that ended says so, rather
+/// than "sign in first".
+pub(crate) fn say_ended(e: PlexusError, ended: Option<&str>) -> PlexusError {
+    match (e, ended) {
+        (PlexusError::Unauthenticated(_), Some(reason)) => PlexusError::Unauthenticated(reason.to_string()),
+        (e, _) => e,
     }
 }
 

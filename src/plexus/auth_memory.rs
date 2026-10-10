@@ -440,11 +440,35 @@ impl AuthBackend for MemoryAuthBackend {
         st.sessions.retain(|_, rec| rec.id != caller.session_id);
         Ok(())
     }
+
+    fn alive(&self, caller: &AuthContext) -> Result<(), String> {
+        self.session_alive(caller)
+    }
+}
+
+impl MemoryAuthBackend {
+    /// AUTH-11: a caller whose session this backend minted stands while
+    /// that session does; any other identity (a key proof) has none to end.
+    fn session_alive(&self, caller: &AuthContext) -> Result<(), String> {
+        if !caller.session_id.starts_with("sess_") {
+            return Ok(());
+        }
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match st.sessions.values().find(|rec| rec.id == caller.session_id) {
+            Some(rec) if rec.expires_at > now() => Ok(()),
+            Some(_) => Err("your sign-in has expired: sign in again".into()),
+            None => Err("you have signed out: sign in again".into()),
+        }
+    }
 }
 
 #[async_trait]
 impl SessionValidator for MemoryAuthBackend {
     async fn validate(&self, credential: &str) -> Option<AuthContext> {
         self.context_of(Self::token_in(credential)?)
+    }
+
+    fn alive(&self, ctx: &AuthContext) -> Result<(), String> {
+        self.session_alive(ctx)
     }
 }

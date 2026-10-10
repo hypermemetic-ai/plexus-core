@@ -558,6 +558,14 @@ pub struct PluginSchema {
     /// Activation for Foo` block (IR-5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecation: Option<DeprecationInfo>,
+
+    /// AUTH-3: this activation's default roles — role name → the grants it
+    /// lists (`<activation>.<method>`, role inclusion already flattened), as
+    /// declared by `#[plexus_macros::activation(roles(...))]`. `admin` is
+    /// built in and never listed. Empty (and absent on the wire) when the
+    /// activation declares none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub roles: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Result of a schema query - either full plugin or single method
@@ -738,6 +746,30 @@ pub struct MethodSchema {
     /// unchanged for non-public methods (i.e., every pre-R method).
     #[serde(default, skip_serializing_if = "is_false")]
     pub public: bool,
+
+    /// AUTH-3: the grant this method is — `<activation>.<method>`, inherent
+    /// (AUTH-1: "every method should be its own grant"). The macro emits it
+    /// for every method; `None` only on a hand-built or pre-AUTH schema, and
+    /// a gate then takes the method's dotted path.
+    ///
+    /// Optional on the wire (`serde(default)`, skipped when unset) so older
+    /// schemas and clients parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+
+    /// AUTH-3: the param that locates what this call acts on
+    /// (`#[plexus_macros::method(target = "id")]`). A gate resolves its
+    /// value to the scopes it lives in and asks for the grant there; a
+    /// method without one is allowed where the grant is held anywhere and
+    /// answers only from there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+
+    /// AUTH-3: the method's `///` doc comment, when it says more than
+    /// `description` (the macro used to drop it whenever `description =
+    /// "..."` was given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_description: Option<String>,
 }
 
 /// `skip_serializing_if` helper: omit `false` booleans from the wire so
@@ -969,6 +1001,7 @@ impl PluginSchema {
             children: None,
             request: None,
             deprecation: None,
+            roles: std::collections::BTreeMap::new(),
         }
     }
 
@@ -998,6 +1031,7 @@ impl PluginSchema {
             children: None,
             request: None,
             deprecation: None,
+            roles: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1027,6 +1061,7 @@ impl PluginSchema {
             children: Some(children),
             request: None,
             deprecation: None,
+            roles: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1057,6 +1092,7 @@ impl PluginSchema {
             children: Some(children),
             request: None,
             deprecation: None,
+            roles: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1202,6 +1238,9 @@ impl MethodSchema {
             requires_credential: None,
             auth_posture: None,
             public: false,
+            grant: None,
+            target: None,
+            long_description: None,
         }
     }
 
@@ -1370,6 +1409,30 @@ impl MethodSchema {
     pub fn with_public(mut self, public: bool) -> Self {
         self.public = public;
         self
+    }
+
+    /// AUTH-3: set the method's grant (`<activation>.<method>`).
+    pub fn with_grant(mut self, grant: impl Into<String>) -> Self {
+        self.grant = Some(grant.into());
+        self
+    }
+
+    /// AUTH-3: name the param that locates what this call acts on.
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
+        self
+    }
+
+    /// AUTH-3: the doc comment's fuller text.
+    pub fn with_long_description(mut self, long_description: impl Into<String>) -> Self {
+        self.long_description = Some(long_description.into());
+        self
+    }
+
+    /// AUTH-2: the grant a gate asks for this method under `activation`:
+    /// the schema's own `grant`, else `<activation>.<name>`.
+    pub fn grant_or(&self, activation: &str) -> String {
+        self.grant.clone().unwrap_or_else(|| format!("{activation}.{}", self.name))
     }
 
     /// CA-1: fill `requires_credential.site_hint` with the hub-derived

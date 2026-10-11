@@ -47,7 +47,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use plexus_auth_core::grants::{
-    Ceiling, Gate, Grant, GrantSet, Membership, Memberships, Reach, Resolve, Roles, ScopeRef, ADMIN,
+    Ceiling, Gate, Grant, GrantSet, Liveness, Membership, Memberships, Reach, Resolve, Roles, ScopeRef, ADMIN,
 };
 use plexus_auth_core::identity::Principal;
 use plexus_auth_core::RoleName;
@@ -355,6 +355,23 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// End the caller's session (`auth.logout`). A connection with no
     /// session to end (a bare key proof) is not an error.
     async fn logout(&self, caller: &AuthContext) -> Result<(), AuthFailure>;
+
+    /// AUTH-11: whether a signed-in caller's sign-in still stands — its
+    /// session not signed out, revoked or expired. The gate asks it before
+    /// every call it decides (`auth.*` included), so a sign-in that ended
+    /// holds nothing from its next call on. `Err`: why not, in words for
+    /// the caller. Memory only: it is asked on every call. (The gate
+    /// refuses a caller past its `expires_at` stamp before asking.)
+    fn alive(&self, caller: &AuthContext) -> Result<(), String>;
+}
+
+/// AUTH-11: the backend as the gate's [`Liveness`].
+struct BackendLiveness(Arc<dyn AuthBackend>);
+
+impl Liveness for BackendLiveness {
+    fn alive(&self, caller: &AuthContext) -> Result<(), String> {
+        self.0.alive(caller)
+    }
 }
 
 /// [`Roles`] an admin can edit (`auth.role_set`). The gate reads the same
@@ -480,7 +497,8 @@ impl Auth {
     pub(crate) fn mount(setup: AuthSetup, catalog: Catalog) -> (Self, Gate) {
         let memberships: Arc<dyn Memberships> = setup.memberships.clone();
         let roles: Arc<dyn Roles> = setup.roles.clone();
-        let gate = Gate::new(memberships, roles, Arc::new(WithEverywhere(setup.resolve)));
+        let gate = Gate::new(memberships, roles, Arc::new(WithEverywhere(setup.resolve)))
+            .with_liveness(Arc::new(BackendLiveness(setup.backend.clone())));
         let auth = Self {
             inner: Arc::new(AuthInner {
                 backend: setup.backend,

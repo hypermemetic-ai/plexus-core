@@ -590,6 +590,87 @@ async fn password_and_session_flows() {
     assert_eq!(shape(&w.hub.view(Some(&ctx)))["tickets"], vec!["get @MENGER-12", "list @MENGER-12", "set_status @MENGER-12"]);
 }
 
+/// AUTH-11 (AUTH-10 finding #1): a session that signed out holds nothing on
+/// the socket that carried it — not `auth.grant`, not `auth.role_set`, not
+/// `auth.waiting`, not a service method — and sees the anonymous view. The
+/// review's attack: an admin's session logs out, then the same connection
+/// grants a fresh key admin on `*`.
+#[tokio::test]
+async fn a_session_that_signed_out_cannot_grant() {
+    let w = world();
+    let (_, admin) = session_for(&w, &key(ROOT, "boss"), None).await;
+    assert_eq!(one(&w, "auth.whoami", json!({}), Some(&admin)).await["principal"], ROOT);
+    assert_eq!(one(&w, "auth.logout", json!({}), Some(&admin)).await["type"], "logged_out");
+
+    let err = call(&w, "auth.grant", json!({"principal": NEW, "role": "admin", "scope": "*"}), Some(&admin)).await.err().unwrap();
+    let mut wire = error_item("menger", &err);
+    wire.as_object_mut().unwrap().remove("metadata");
+    println!("WIRE auth.grant after logout: {wire}");
+    assert_eq!(wire["error_kind"], "unauthenticated");
+    assert_eq!(wire["message"], "Authentication required: you have signed out: sign in again");
+    for (method, params) in [
+        ("auth.role_set", json!({"role": "viewer", "grants": ["tickets.get"]})),
+        ("auth.revoke", json!({"principal": ADA, "scope": "MENGER"})),
+        ("auth.waiting", json!({})),
+        ("auth.whoami", json!({})),
+        ("tickets.set_status", json!({"id": "MENGER-1", "status": "Done"})),
+        ("tickets.list", json!({})),
+    ] {
+        let err = call(&w, method, params, Some(&admin)).await.err().unwrap_or_else(|| panic!("{method} answered after logout"));
+        assert!(matches!(err, PlexusError::Unauthenticated(_)), "{method}: {err:?}");
+    }
+    // NEW holds nothing; the memberships are as they were.
+    assert_eq!(shape(&w.hub.view(Some(&key(NEW, "n")))).keys().collect::<Vec<_>>(), vec!["auth"]);
+    assert_eq!(w.hub.view(Some(&admin)).kind, ViewKind::Anonymous);
+    // The door stays open: it may sign in again.
+    assert!(!call(&w, "auth.providers", json!({}), Some(&admin)).await.expect("the door is public").is_empty());
+}
+
+/// AUTH-13 (AUTH-10 finding #3): `get(id)` and `delete(id)` take one param,
+/// their target. A bare value names no target — before, the gate decided it
+/// as "held anywhere" and the method took the value as `id`: an editor of
+/// MENGER read IDENTITY-1, an admin of MENGER deleted it. Now any call whose
+/// params are not an object is refused, typed, and so is a target the gate
+/// cannot read.
+#[tokio::test]
+async fn a_bare_value_reaches_no_target() {
+    let w = world();
+    let ada = key(ADA, "a");
+    let madmin = key(MENGER_ADMIN, "m");
+    // The shape that works, refused where it should be.
+    assert!(matches!(call(&w, "tickets.get", json!({"id": "IDENTITY-1"}), Some(&ada)).await, Err(PlexusError::Forbidden { .. })));
+    assert!(matches!(call(&w, "tickets.delete", json!({"id": "IDENTITY-1"}), Some(&madmin)).await, Err(PlexusError::Forbidden { .. })));
+
+    for (who, method, params) in [
+        (&ada, "tickets.get", json!("IDENTITY-1")),
+        (&madmin, "tickets.delete", json!("IDENTITY-1")),
+        (&ada, "tickets.get", json!(["IDENTITY-1"])),
+        (&ada, "tickets.get", json!(7)),
+        (&ada, "tickets.set_status", json!(["IDENTITY-1", "Done"])),
+        (&ada, "tickets.get", json!({"id": {"id": "IDENTITY-1"}})),
+        (&ada, "tickets.get", json!({"id": [{"id": "IDENTITY-1"}]})),
+        (&ada, "tickets.list", json!("IDENTITY")),
+    ] {
+        let err = call(&w, method, params.clone(), Some(who)).await.err().unwrap_or_else(|| panic!("{method} {params} answered"));
+        let wire = error_item("menger", &err);
+        assert_eq!(wire["error_kind"], "invalid_params", "{method} {params}: {wire}");
+    }
+    let err = call(&w, "tickets.get", json!("IDENTITY-1"), Some(&ada)).await.err().unwrap();
+    let mut wire = error_item("menger", &err);
+    wire.as_object_mut().unwrap().remove("metadata");
+    println!("WIRE tickets.get \"IDENTITY-1\": {wire}");
+    // Absent params are still no params.
+    assert!(call(&w, "tickets.list", Value::Null, Some(&ada)).await.is_ok());
+    // Anonymous: the shape is refused before anything is decided.
+    assert!(matches!(call(&w, "tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams(_))));
+
+    // The macro refuses it too, with no gate in front: a method with a
+    // target never takes its target as a bare value.
+    let bare = Arc::new(DynamicHub::new("menger").register(Tickets));
+    assert!(matches!(bare.route("tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams(_))));
+    assert!(bare.route("tickets.get", json!({"id": "MENGER-1"}), None).await.is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // Without a gate: nothing changes
 // ---------------------------------------------------------------------------

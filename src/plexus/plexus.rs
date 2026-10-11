@@ -1237,7 +1237,11 @@ impl DynamicHub {
         let activations: Vec<PluginSchema> = self.inner.activations.values().map(|a| a.plugin_schema()).collect();
         match self.inner.gate.as_ref() {
             None => super::view::whole(hub, activations),
-            Some(gate) => super::view::build(gate, &self.inner.signed_in_grants, caller, hub, activations),
+            Some(gate) => {
+                // AUTH-11: a sign-in that ended sees the anonymous view.
+                let (caller, _) = super::grant_gate::standing(gate, caller);
+                super::view::build(gate, &self.inner.signed_in_grants, caller, hub, activations)
+            }
         }
     }
 
@@ -1671,6 +1675,8 @@ impl DynamicHub {
         // AUTH-2 grant gate: only when configured — a hub without one pays
         // this one branch and dispatches as before.
         if let Some(gate) = self.inner.gate.as_ref() {
+            // AUTH-11: a sign-in that ended proves no one, on every method.
+            let (auth, ended) = super::grant_gate::standing(gate, auth);
             let admit = super::grant_gate::decide(
                 gate,
                 &self.inner.namespace,
@@ -1679,7 +1685,8 @@ impl DynamicHub {
                 &params,
                 auth,
                 &self.inner.signed_in_grants,
-            )?;
+            )
+            .map_err(|e| super::grant_gate::say_ended(e, ended.as_deref()))?;
             return match admit {
                 // AUTH-4: introspection answers from the caller's view.
                 super::grant_gate::Admit::Open => match self.introspect_in_view(method, &params, auth, raw_ctx).await {

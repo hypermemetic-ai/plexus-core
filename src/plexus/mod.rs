@@ -4,6 +4,7 @@
 pub mod auth;
 /// AUTH-5: the `auth` activation and what a service supplies it.
 pub mod auth_activation;
+pub mod auth_params;
 /// AUTH-5: a reference in-memory backend and stores for the `auth` activation.
 pub mod auth_memory;
 pub mod test_validator;

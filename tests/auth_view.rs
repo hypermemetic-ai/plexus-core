@@ -456,6 +456,40 @@ async fn role_set_changes_the_next_view() {
     assert_eq!(out["held_on"], json!(["MENGER"]));
 }
 
+/// MACRO-12: `auth.*`'s parameters are types — a value that is not a role
+/// name, a grant entry, a method path or a provider name is InvalidParams
+/// naming the parameter, refused before the method runs; good values answer
+/// as they always did.
+#[tokio::test]
+async fn auth_params_are_typed_at_the_wire() {
+    let w = world();
+    let root = key(ROOT, "r");
+    let invalid = |r: Result<Vec<Value>, PlexusError>| match r {
+        Err(PlexusError::InvalidParams(m)) => m,
+        other => panic!("expected InvalidParams, got {other:?}"),
+    };
+    let m = invalid(call(&w, "auth.role_set", json!({"role": "a.b", "grants": []}), Some(&root)).await);
+    assert!(m.starts_with("role: `a.b` is not a role name"), "{m}");
+    let m = invalid(call(&w, "auth.role_set", json!({"role": "editor", "grants": ["tickets.get@MENGER"]}), Some(&root)).await);
+    assert!(m.starts_with("grants: `tickets.get@MENGER` is not a grant or a role"), "{m}");
+    let m = invalid(call(&w, "auth.requires", json!({"method": "tickets"}), Some(&root)).await);
+    assert!(m.starts_with("method: `tickets` is not a method path"), "{m}");
+    let m = invalid(call(&w, "auth.grant", json!({"principal": ADA, "role": "", "scope": "MENGER"}), Some(&root)).await);
+    assert!(m.starts_with("role: an empty role name"), "{m}");
+    // (`scope` is these methods' target: the gate reads it before params
+    // deserialize, so its refusals are the gate's; ScopeName's own rule is
+    // auth_params' unit test.)
+    let m = invalid(call(&w, "auth.signup", json!({"via": "two words"}), None).await);
+    assert!(m.starts_with("via: `two words` is not a provider name"), "{m}");
+    // A method path that is well formed but unknown is still the method's
+    // own answer, in band.
+    let out = one(&w, "auth.requires", json!({"method": "tickets.nope"}), Some(&root)).await;
+    assert_eq!(out["type"], "error");
+    // Good values: unchanged, and trimmed once at the wire as before.
+    let out = one(&w, "auth.requires", json!({"method": " tickets.set_status "}), Some(&root)).await;
+    assert_eq!(out["method"], "tickets.set_status");
+}
+
 #[tokio::test]
 async fn grant_and_revoke_by_admin_refused_otherwise() {
     let w = world();
@@ -490,8 +524,13 @@ async fn grant_and_revoke_by_admin_refused_otherwise() {
     // An unknown role, a bad principal.
     let out = one(&w, "auth.grant", json!({"principal": CAT, "role": "nope", "scope": "MENGER"}), Some(&root)).await;
     assert_eq!(out["type"], "error");
-    let out = one(&w, "auth.grant", json!({"principal": "nobody", "role": "viewer", "scope": "MENGER"}), Some(&root)).await;
-    assert_eq!(out["type"], "error");
+    // MACRO-12: a principal that does not parse is refused at the wire,
+    // InvalidParams naming the parameter, before the method runs.
+    let err = call(&w, "auth.grant", json!({"principal": "nobody", "role": "viewer", "scope": "MENGER"}), Some(&root)).await.err().unwrap();
+    assert!(
+        matches!(&err, PlexusError::InvalidParams(m) if m.starts_with("principal: `nobody` is not a principal")),
+        "{err:?}"
+    );
 
     // Revoke: one role, then every role on a scope.
     let out = one(&w, "auth.revoke", json!({"principal": ADA, "role": "viewer", "scope": "IDENTITY"}), Some(&root)).await;

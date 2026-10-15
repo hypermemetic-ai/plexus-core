@@ -53,6 +53,7 @@ use plexus_auth_core::identity::Principal;
 use plexus_auth_core::RoleName;
 
 use super::auth::AuthContext;
+use super::auth_params as param;
 use super::schema::{MethodRole, PluginSchema};
 
 /// The grants every signed-in caller reaches, whatever its roles or its
@@ -550,6 +551,9 @@ fn role_event(role: &RoleName, grants: Option<GrantSet>) -> AuthEvent {
     version = "1.0.0",
     description = "Sign in, who am I, what does this need",
     roles(member = ["whoami", "logout", "requires"]),
+    // MACRO-12: every parameter is a type (`super::auth_params`); a bare
+    // string parameter does not compile here.
+    typed_params,
 )]
 #[allow(deprecated)]
 impl Auth {
@@ -603,9 +607,10 @@ impl Auth {
         description = "Create an account, or ask for access",
         params(via = "The provider to sign up through, where the server offers several")
     )]
-    async fn signup(&self, auth: Option<&AuthContext>, via: Option<String>) -> impl Stream<Item = AuthEvent> + Send + 'static {
+    async fn signup(&self, auth: Option<&AuthContext>, via: Option<param::ProviderName>) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
         let caller = auth.cloned();
+        let via = via.map(param::ProviderName::into_string);
         stream! {
             let holds_none = caller
                 .as_ref()
@@ -676,16 +681,16 @@ impl Auth {
         params(method = "The method, as <activation>.<method>: tickets.set_status"),
         example(note = "what changing a ticket's status needs", params = r#"{"method": "tickets.set_status"}"#)
     )]
-    async fn requires(&self, auth: &AuthContext, method: String) -> impl Stream<Item = AuthEvent> + Send + 'static {
+    async fn requires(&self, auth: &AuthContext, method: param::MethodPath) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
-            match inner.catalog.get(method.trim()) {
+            match inner.catalog.get(method.as_str()) {
                 None => yield AuthEvent::error(format!("no method {method} here")),
                 Some(req) => {
                     let roles = inner.gate.roles_listing(&Grant::new(req.grant.clone()));
                     yield AuthEvent::Requires {
-                        method: method.trim().to_string(),
+                        method: method.into_string(),
                         grant: req.grant,
                         target: req.target,
                         roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
@@ -719,7 +724,7 @@ impl Auth {
         description = "Set a role's grants (admin on *)",
         params(role = "The role (not admin)", grants = "Grants (tickets.get) or roles to include")
     )]
-    async fn role_set(&self, auth: &AuthContext, reach: Reach, role: String, grants: Vec<String>) -> impl Stream<Item = AuthEvent> + Send + 'static {
+    async fn role_set(&self, auth: &AuthContext, reach: Reach, role: param::RoleName, grants: Vec<param::GrantName>) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
@@ -727,17 +732,15 @@ impl Auth {
                 yield needs_everywhere(&inner.gate, "auth.role_set", &reach);
                 return;
             }
-            let role = role.trim().to_string();
-            if role.is_empty() || role.contains('.') || role.contains('@') {
-                yield AuthEvent::error(format!("`{role}` is not a role name"));
-                return;
-            }
-            if role == ADMIN {
+            // The name's shape (one word, no `.` or `@`) is `param::RoleName`'s,
+            // refused as InvalidParams before this runs.
+            if role.as_str() == ADMIN {
                 yield AuthEvent::error("admin holds every grant; it is not edited");
                 return;
             }
             let mut set: BTreeSet<Grant> = BTreeSet::new();
-            for entry in grants.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
+            for entry in grants.iter() {
+                let entry = entry.as_str();
                 if entry.contains('.') {
                     if !inner.catalog.knows(entry) {
                         yield AuthEvent::error(format!("no method {entry} here"));
@@ -758,7 +761,7 @@ impl Auth {
                     }
                 }
             }
-            let name = RoleName::new(role.clone());
+            let name = role.role();
             if let Err(e) = inner.roles.set(&name, GrantSet::Listed(set)).await {
                 yield AuthEvent::error(e.0);
                 return;
@@ -778,23 +781,17 @@ impl Auth {
         example(note = "make a person an editor on MENGER", params = r#"{"principal": "oidc:workos/user_01M4", "role": "editor", "scope": "MENGER"}"#),
         example(note = "make an agent's key an admin everywhere", params = r#"{"principal": "key:ac79e0d1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", "role": "admin", "scope": "*"}"#)
     )]
-    async fn grant(&self, auth: &AuthContext, principal: String, role: String, scope: String) -> impl Stream<Item = AuthEvent> + Send + 'static {
+    async fn grant(&self, auth: &AuthContext, principal: param::Principal, role: param::RoleName, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
-            let who: Principal = match principal.trim().parse() {
-                Ok(p) => p,
-                Err(e) => {
-                    yield AuthEvent::error(format!("`{principal}` is not a principal: {e}"));
-                    return;
-                }
-            };
-            let role_name = RoleName::new(role.trim());
+            let who: Principal = principal.principal();
+            let role_name = role.role();
             if role_name.as_str() != ADMIN && inner.roles.grants(&role_name).is_none() {
                 yield AuthEvent::error(format!("no role {role} here"));
                 return;
             }
-            let scope_ref = ScopeRef::parse(&scope);
+            let scope_ref = scope.scope();
             let m = Membership { principal: who.clone(), role: role_name.clone(), scope: scope_ref.clone() };
             match inner.memberships.grant(m).await {
                 Ok(()) => yield AuthEvent::Granted {
@@ -814,19 +811,13 @@ impl Auth {
         description = "Take a principal's role on a scope away",
         params(principal = "key:…, oidc:…/…, idp:…", role = "The role; absent: every role there", scope = "Where: a scope name, or *")
     )]
-    async fn revoke(&self, auth: &AuthContext, principal: String, role: Option<String>, scope: String) -> impl Stream<Item = AuthEvent> + Send + 'static {
+    async fn revoke(&self, auth: &AuthContext, principal: param::Principal, role: Option<param::RoleName>, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
-            let who: Principal = match principal.trim().parse() {
-                Ok(p) => p,
-                Err(e) => {
-                    yield AuthEvent::error(format!("`{principal}` is not a principal: {e}"));
-                    return;
-                }
-            };
-            let scope_ref = ScopeRef::parse(&scope);
-            let role_name = role.as_deref().map(|r| RoleName::new(r.trim()));
+            let who: Principal = principal.principal();
+            let scope_ref = scope.scope();
+            let role_name = role.as_ref().map(param::RoleName::role);
             match inner.memberships.revoke(&who, role_name.as_ref(), &scope_ref).await {
                 Ok(removed) => yield AuthEvent::Revoked {
                     principal: who.to_string(),

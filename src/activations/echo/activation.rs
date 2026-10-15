@@ -10,7 +10,7 @@
 //! Event types are plain domain types (no special traits needed).
 //! The macro handles wrapping with `wrap_stream()` at the call site.
 
-use super::types::EchoEvent;
+use super::types::{EchoEvent, Message};
 use async_stream::stream;
 use futures::Stream;
 use std::time::Duration;
@@ -39,7 +39,9 @@ impl Default for Echo {
 #[plexus_macros::activation(
     namespace = "echo",
     version = "1.0.0",
-    description = "Echo messages back - demonstrates hub-macro usage"
+    description = "Echo messages back - demonstrates hub-macro usage",
+    // MACRO-12: the example — `message` is a `Message`, not a `String`.
+    typed_params
 )]
 #[allow(deprecated)]
 impl Echo {
@@ -53,10 +55,11 @@ impl Echo {
     )]
     async fn echo(
         &self,
-        message: String,
+        message: Message,
         count: u32,
     ) -> impl Stream<Item = EchoEvent> + Send + 'static {
         let count = if count == 0 { 1 } else { count };
+        let message = message.into_string();
         stream! {
             for i in 0..count {
                 if i > 0 {
@@ -75,10 +78,10 @@ impl Echo {
         description = "Echo a message once",
         params(message = "The message to echo")
     )]
-    async fn once(&self, message: String) -> impl Stream<Item = EchoEvent> + Send + 'static {
+    async fn once(&self, message: Message) -> impl Stream<Item = EchoEvent> + Send + 'static {
         stream! {
             yield EchoEvent::Echo {
-                message,
+                message: message.into_string(),
                 count: 1,
             };
         }

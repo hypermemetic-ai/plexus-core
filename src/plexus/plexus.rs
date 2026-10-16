@@ -273,6 +273,22 @@ pub trait Activation: Send + Sync + 'static {
 
     fn into_rpc_methods(self) -> Methods where Self: Sized;
 
+    /// MACRO-20: this activation's static children and theirs, as
+    /// `(path, schema)` — the same list as
+    /// [`ChildRouter::router_static_child_schemas`], reachable from the
+    /// hub's type-erased registry (which holds `Activation`s).
+    ///
+    /// Default empty; `#[plexus_macros::activation]` emits it for an
+    /// activation with static `#[plexus_macros::child]`ren. A
+    /// [`DynamicHub`] indexes each child's methods for its gate
+    /// (`<activation>.<path>.<method>`, the child's own `target`), merges the
+    /// children's `roles(...)` into [`DynamicHub::declared_roles`], and lists
+    /// them in `auth.requires` and the caller's view — every grant qualified
+    /// by the path (see [`super::children`]).
+    fn static_child_schemas(&self) -> Vec<(String, PluginSchema)> {
+        Vec::new()
+    }
+
     /// Return this activation's schema (methods + optional children)
     fn plugin_schema(&self) -> PluginSchema {
         use std::collections::hash_map::DefaultHasher;
@@ -431,6 +447,32 @@ pub trait ChildRouter: Send + Sync {
         _callee_ns: &str,
     ) -> Option<std::sync::Arc<dyn plexus_auth_core::ForwardPolicy>> {
         None
+    }
+
+    /// MACRO-20: this router's own schema, when it has one.
+    ///
+    /// Default `None` (a hand-written router describes nothing). The
+    /// `ChildRouter` impl `#[plexus_macros::activation]` emits answers its
+    /// activation's [`Activation::plugin_schema`], which is how a parent
+    /// describes its static children ([`Self::router_static_child_schemas`]).
+    fn router_schema(&self) -> Option<PluginSchema> {
+        None
+    }
+
+    /// MACRO-20: every static child below this router that describes itself,
+    /// as `(path, schema)` — `path` relative to this router, dotted for a
+    /// grandchild (`"commits"`, `"commits.audit"`), `schema` the child's own
+    /// (its methods' grants and its `roles` relative to it, as its macro
+    /// wrote them).
+    ///
+    /// Default empty. `#[plexus_macros::activation]` emits it for an
+    /// activation with static `#[plexus_macros::child]`ren: each child's
+    /// [`Self::router_schema`], then its own static children under its name.
+    /// A dynamic child (an open name set) is never listed. The hub reads it
+    /// through [`Activation::static_child_schemas`] to gate a child's method
+    /// by its whole path ([`super::children`]).
+    fn router_static_child_schemas(&self) -> Vec<(String, PluginSchema)> {
+        Vec::new()
     }
 
     /// Framework-stamped immediate-caller [`plexus_auth_core::Principal`] of
@@ -636,6 +678,14 @@ impl ChildRouter for ArcChildRouter {
     fn framework_stamped_principal(&self) -> plexus_auth_core::Principal {
         self.0.framework_stamped_principal()
     }
+
+    fn router_schema(&self) -> Option<PluginSchema> {
+        self.0.router_schema()
+    }
+
+    fn router_static_child_schemas(&self) -> Vec<(String, PluginSchema)> {
+        self.0.router_static_child_schemas()
+    }
 }
 
 // ============================================================================
@@ -655,6 +705,7 @@ trait ActivationObject: Send + Sync + 'static {
     async fn call(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError>;
     async fn resolve_handle(&self, handle: &Handle) -> Result<PlexusStream, PlexusError>;
     fn plugin_schema(&self) -> PluginSchema;
+    fn static_child_schemas(&self) -> Vec<(String, PluginSchema)>;
     fn schema(&self) -> Schema;
 }
 
@@ -681,6 +732,8 @@ impl<A: Activation> ActivationObject for ActivationWrapper<A> {
     }
 
     fn plugin_schema(&self) -> PluginSchema { self.inner.plugin_schema() }
+
+    fn static_child_schemas(&self) -> Vec<(String, PluginSchema)> { self.inner.static_child_schemas() }
 
     fn schema(&self) -> Schema {
         let schema = schemars::schema_for!(A::Methods);
@@ -1209,6 +1262,10 @@ impl DynamicHub {
         for a in self.inner.activations.values() {
             catalog.add(&a.plugin_schema());
         }
+        // MACRO-20: a static child's methods, by their whole path.
+        for child in self.static_children() {
+            catalog.add(&child);
+        }
         let (auth, gate) = super::auth_activation::Auth::mount(setup, catalog.clone());
         {
             let inner = Arc::get_mut(&mut self.inner)
@@ -1240,7 +1297,10 @@ impl DynamicHub {
             Some(gate) => {
                 // AUTH-11: a sign-in that ended sees the anonymous view.
                 let (caller, _) = super::grant_gate::standing(gate, caller);
-                super::view::build(gate, &self.inner.signed_in_grants, caller, hub, activations)
+                // MACRO-20: a static child's entry stays in its parent's
+                // view when the caller can use something below it.
+                let children = self.static_children();
+                super::view::build(gate, &self.inner.signed_in_grants, caller, hub, activations, &children)
             }
         }
     }
@@ -1353,8 +1413,11 @@ impl DynamicHub {
     /// [`RoleTable::from_lists`]: plexus_auth_core::grants::RoleTable::from_lists
     pub fn declared_roles(&self) -> std::collections::BTreeMap<String, Vec<String>> {
         let mut out: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
-        for activation in self.inner.activations.values() {
-            for (role, grants) in activation.plugin_schema().roles {
+        // MACRO-20: and every static child's, its grants qualified by the
+        // path it is reached through (`commits.link` → `tickets.commits.link`).
+        let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
+        for schema in schemas {
+            for (role, grants) in schema.roles {
                 let entry = out.entry(role).or_default();
                 for g in grants {
                     if !entry.contains(&g) {
@@ -1364,6 +1427,19 @@ impl DynamicHub {
             }
         }
         out
+    }
+
+    /// MACRO-20: every registered activation's static children (and
+    /// theirs), each a schema whose namespace is its whole path
+    /// (`tickets.commits`) and whose grants and roles are qualified by it —
+    /// see [`super::children`]. Empty for a hub whose activations have no
+    /// static `#[plexus_macros::child]`.
+    pub fn static_children(&self) -> Vec<PluginSchema> {
+        self.inner
+            .activations
+            .values()
+            .flat_map(|a| super::children::qualified(&a.plugin_schema().namespace, a.static_child_schemas()))
+            .collect()
     }
 
     /// Read-only view of the configured [`ScopeRegistry`], if any.
@@ -1388,12 +1464,15 @@ impl DynamicHub {
                 index.insert(format!("{}.{}", self.inner.namespace, m.name), info);
             }
             // Each registered activation's methods, addressable as
-            // "<activation-ns>.<method>". Deeper nested paths (an
-            // activation's own children) are not indexed here — they have
-            // no MethodSchema at this hub's level; the gate treats them as
-            // schema-less (registry overlay / default_deny still apply).
-            for activation in self.inner.activations.values() {
-                let schema = activation.plugin_schema();
+            // "<activation-ns>.<method>"; MACRO-20: and each static child's,
+            // as "<activation-ns>.<path>.<method>", with the child's own
+            // target and its grant qualified by the path
+            // (`tickets.commits.link`, see `super::children`). A dynamic
+            // child (an open name set) has no MethodSchema at this hub's
+            // level; the gate treats its paths as schema-less (grant = the
+            // dotted path; registry overlay / default_deny still apply).
+            let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
+            for schema in schemas {
                 for m in &schema.methods {
                     let mut info = super::scope_gate::MethodGateInfo::from_schema(m);
                     info.grant = Some(m.grant_or(&schema.namespace));
@@ -1567,7 +1646,12 @@ impl DynamicHub {
         // AUTH-5: `auth.requires` knows every method, registered before
         // the auth activation was mounted or after.
         if let Some(catalog) = inner.auth_catalog.as_ref() {
-            catalog.add(&activation.plugin_schema());
+            let schema = activation.plugin_schema();
+            // MACRO-20: and its static children's methods, by their whole path.
+            for child in super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation)) {
+                catalog.add(&child);
+            }
+            catalog.add(&schema);
         }
         inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
         inner.child_routers.insert(namespace.clone(), Arc::new(activation_for_router));
@@ -1604,7 +1688,12 @@ impl DynamicHub {
         );
 
         if let Some(catalog) = inner.auth_catalog.as_ref() {
-            catalog.add(&activation.plugin_schema());
+            let schema = activation.plugin_schema();
+            // MACRO-20: and its static children's methods, by their whole path.
+            for child in super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation)) {
+                catalog.add(&child);
+            }
+            catalog.add(&schema);
         }
         inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
         inner.child_routers.insert(namespace, Arc::new(activation_for_router));

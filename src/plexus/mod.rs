@@ -9,6 +9,8 @@ pub mod auth_params;
 pub mod auth_memory;
 pub mod test_validator;
 pub mod bidirectional;
+/// MACRO-20: a hub sees through its activations' static children.
+pub mod children;
 pub mod context;
 pub mod credential_envelope;
 pub mod dispatch;
@@ -40,7 +42,7 @@ pub use context::PlexusContext;
 pub use in_process::InProcessTransport;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
-pub use forward_registry::ForwardPolicyRegistry;
+pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME};
 pub use grant_gate::{current_reach, with_reach, ForbiddenItem};
 pub use view::View;
 pub use auth_activation::{

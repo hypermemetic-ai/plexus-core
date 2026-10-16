@@ -92,6 +92,42 @@ impl std::fmt::Debug for ForwardPolicyRegistry {
     }
 }
 
+/// MACRO-20: the name [`SameService`] reports (`"same_service"`), in the
+/// audit trail beside `identity_only` / `pass_through` / `anonymous`.
+pub const SAME_SERVICE_NAME: plexus_auth_core::ForwardPolicyName =
+    plexus_auth_core::ForwardPolicyName::new("same_service");
+
+/// MACRO-20: the policy for a callee that is the same service as its caller
+/// — a static `#[plexus_macros::child]`, a value the parent builds from its
+/// own fields, in the same process: the parent's own code, not a deputy
+/// acting for it. It keeps the caller whole ([`ForwardDerivation::PASS_THROUGH`]):
+/// the verified user and session id, the roles, and the metadata that holds
+/// the principal stamp, the session's key and expiry and the gate's ceiling.
+///
+/// It derives exactly what [`plexus_auth_core::PassThrough`] derives; the
+/// name is what differs, so the audit trail says *why* everything was kept.
+/// `#[plexus_macros::activation]` hands it to every static child unless the
+/// child says otherwise (`#[plexus_macros::child(forward = "identity_only")]`
+/// for a deputy that must not see the caller's session).
+///
+/// [`ForwardDerivation::PASS_THROUGH`]: plexus_auth_core::ForwardDerivation::PASS_THROUGH
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SameService;
+
+impl ForwardPolicy for SameService {
+    fn name(&self) -> plexus_auth_core::ForwardPolicyName {
+        SAME_SERVICE_NAME
+    }
+
+    fn forward(
+        &self,
+        _caller: &plexus_auth_core::AuthContext,
+        _site: &plexus_auth_core::CallSite,
+    ) -> plexus_auth_core::ForwardDerivation {
+        plexus_auth_core::ForwardDerivation::PASS_THROUGH
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

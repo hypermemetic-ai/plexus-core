@@ -137,7 +137,12 @@ impl Asker<'_> {
 
 /// One activation's schema as the view shows it, or `None` when it keeps
 /// no method of it.
-fn activation_view(asker: &Asker<'_>, kind: ViewKind, mut schema: PluginSchema) -> Option<PluginSchema> {
+fn activation_view(
+    asker: &Asker<'_>,
+    kind: ViewKind,
+    mut schema: PluginSchema,
+    children: &[PluginSchema],
+) -> Option<PluginSchema> {
     let ns = schema.namespace.clone();
     let mut kept = Vec::new();
     let mut schema_entry = None;
@@ -146,6 +151,21 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, mut schema: PluginSchema) 
         if is_schema_entry {
             schema_entry = Some(m);
             continue;
+        }
+        // MACRO-20: a static child's entry (`tickets.commits`) names no
+        // method of its own; it stays when the caller can use a method
+        // somewhere below it (`tickets.commits.link`), so the caller can
+        // navigate to what it holds.
+        // A child that describes nothing (a hand-written router) is
+        // decided as before, by the entry's own grant.
+        if matches!(m.role, MethodRole::StaticChild) {
+            if let Some(reached) = reaches_below(asker, &format!("{ns}.{}", m.name), children) {
+                if reached {
+                    m.held_on = None;
+                    kept.push(m);
+                }
+                continue;
+            }
         }
         let grant = m.grant_or(&ns);
         if let Some(held) = asker.keep(&grant, m.public) {
@@ -169,6 +189,22 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, mut schema: PluginSchema) 
     schema.view = Some(kind);
     rehash(&mut schema, None);
     Some(schema)
+}
+
+/// MACRO-20: whether the caller can use a method of a static child at
+/// `path` or of one below it (`children`: the hub's qualified static
+/// children, [`super::children`]).
+/// `None` when no child at `path` describes itself.
+fn reaches_below(asker: &Asker<'_>, path: &str, children: &[PluginSchema]) -> Option<bool> {
+    let below = format!("{path}.");
+    let mut known = children.iter().filter(|c| c.namespace == path || c.namespace.starts_with(&below)).peekable();
+    known.peek()?;
+    Some(
+        known
+            .flat_map(|c| c.methods.iter().map(move |m| (c, m)))
+            .filter(|(_, m)| matches!(m.role, MethodRole::Rpc) && !(m.name == "schema" && m.hash == "auto_schema"))
+            .any(|(c, m)| asker.keep(&m.grant_or(&c.namespace), m.public).is_some()),
+    )
 }
 
 /// Recompute `self_hash`, `children_hash` and `hash` over what the schema
@@ -198,6 +234,7 @@ pub(crate) fn build(
     caller: Option<&AuthContext>,
     mut hub: PluginSchema,
     activations: Vec<PluginSchema>,
+    children: &[PluginSchema],
 ) -> View {
     let signed_in = caller.and_then(|c| c.principal()).is_some();
     let kind = if signed_in { ViewKind::Caller } else { ViewKind::Anonymous };
@@ -205,7 +242,7 @@ pub(crate) fn build(
 
     let kept: BTreeMap<String, PluginSchema> = activations
         .into_iter()
-        .filter_map(|s| activation_view(&asker, kind, s))
+        .filter_map(|s| activation_view(&asker, kind, s, children))
         .map(|s| (s.namespace.clone(), s))
         .collect();
 

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::activations::echo::Echo;
+use crate::activations::echo::EchoActivation;
 use crate::activations::health::Health;
 use crate::plexus::DynamicHub;
 
@@ -23,6 +23,6 @@ pub fn build_example_hub() -> Arc<DynamicHub> {
     Arc::new(
         DynamicHub::new("example")
             .register(Health::new())
-            .register(Echo::new()),
+            .register(EchoActivation::new()),
     )
 }

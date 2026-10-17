@@ -36,15 +36,13 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Vault;
+struct VaultActivation;
 
 #[plexus_macros::activation(
-    namespace = "vault",
     version = "1.0.0",
     description = "CA-1 site-hint fixture",
-    crate_path = "plexus_core"
 )]
-impl Vault {
+impl VaultActivation {
     /// Scope-gated — carries a `requires_credential` with no macro-set
     /// site_hint (`from_method_scope` constructs `None`).
     #[plexus_macros::method(scope = "vault.write")]
@@ -93,7 +91,7 @@ fn cookie_caps() -> BackendAuthCapabilities {
 }
 
 fn hub_with(caps: Option<BackendAuthCapabilities>) -> DynamicHub {
-    let hub = DynamicHub::new("testhub").register(Vault);
+    let hub = DynamicHub::new("testhub").register(VaultActivation);
     match caps {
         Some(caps) => hub.with_auth_capabilities(caps),
         None => hub,

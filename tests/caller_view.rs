@@ -15,16 +15,14 @@ use plexus_core::{DynamicHub, PlexusError};
 use serde_json::{json, Value};
 
 #[derive(Clone)]
-struct Tickets;
+struct TicketsActivation;
 
 #[plexus_macros::activation(
-    namespace = "tickets",
     version = "1.0.0",
     description = "AUTH-4 view fixture",
-    crate_path = "plexus_core",
     roles(viewer = ["get", "list"], editor = [viewer, "set_status"]),
 )]
-impl Tickets {
+impl TicketsActivation {
     /// One ticket.
     #[plexus_macros::method(target = "id")]
     async fn get(&self, id: String) -> impl Stream<Item = String> + Send + 'static {
@@ -58,10 +56,10 @@ impl Tickets {
 
 /// A second activation nobody but admin holds anything of.
 #[derive(Clone)]
-struct Members;
+struct MembersActivation;
 
-#[plexus_macros::activation(namespace = "members", version = "1.0.0", description = "admin only", crate_path = "plexus_core")]
-impl Members {
+#[plexus_macros::activation(version = "1.0.0", description = "admin only")]
+impl MembersActivation {
     /// Add a member.
     #[plexus_macros::method]
     async fn add(&self, who: String) -> impl Stream<Item = String> + Send + 'static {
@@ -105,12 +103,12 @@ fn hub() -> (Arc<DynamicHub>, Arc<Rows>) {
     rows.add(BOB, "editor", "MENGER");
     rows.add(CAT, "viewer", "MENGER");
     rows.add(ROOT, "admin", "*");
-    let declared = DynamicHub::new("x").register(Tickets).declared_roles();
+    let declared = DynamicHub::new("x").register(TicketsActivation).declared_roles();
     let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let gate = Gate::new(rows.clone(), Arc::new(roles), Arc::new(Shortcodes));
     let hub = DynamicHub::new("menger")
-        .register(Tickets)
-        .register(Members)
+        .register(TicketsActivation)
+        .register(MembersActivation)
         .with_gate(Arc::new(gate))
         .with_resource_metadata("http://127.0.0.1:4455/.well-known/oauth-protected-resource");
     (Arc::new(hub), rows)
@@ -245,7 +243,7 @@ async fn the_rpc_module_reads_the_connection() {
 
 #[tokio::test]
 async fn without_a_gate_nothing_changes() {
-    let hub = Arc::new(DynamicHub::new("menger").register(Tickets).register(Members));
+    let hub = Arc::new(DynamicHub::new("menger").register(TicketsActivation).register(MembersActivation));
     // Captured from this hub shape before AUTH-4.
     let today = r#"{"auth_capabilities":{"mechanisms":[{"kind":"anonymous"}]},"backend":"menger"}"#;
     let mut module = DynamicHub::arc_into_rpc_module(hub.clone()).unwrap();

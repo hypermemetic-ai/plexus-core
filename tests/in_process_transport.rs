@@ -20,18 +20,21 @@ pub enum NoteEvent {
     Error { message: String },
 }
 
+impl plexus_client::FromClientError for NoteEvent {
+    fn from_client_error(error: ClientError) -> Self {
+        NoteEvent::Error { message: error.to_string() }
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct Notes {
+pub struct NotesActivation {
     fail_dispatch: bool,
 }
 
 #[plexus_macros::activation(
-    namespace = "notes",
     description = "Notes for the in-process transport test",
-    client,
-    crate_path = "plexus_core"
 )]
-impl Notes {
+impl NotesActivation {
     /// One note by id.
     #[plexus_macros::method]
     pub async fn get(&self, id: String) -> impl futures::Stream<Item = NoteEvent> + Send + 'static {
@@ -83,7 +86,7 @@ impl Notes {
 
 #[tokio::test]
 async fn a_generated_client_runs_against_the_activation_with_no_server() {
-    let client = NotesClient::new(InProcessTransport::new(Notes::default()));
+    let client = NotesClient::new(InProcessTransport::new(NotesActivation::default()));
 
     let events = client.get_all("N-1".to_string()).await.expect("ok");
     assert_eq!(
@@ -108,7 +111,7 @@ async fn a_generated_client_runs_against_the_activation_with_no_server() {
 
 #[tokio::test]
 async fn the_streaming_form_works_the_same_in_process() {
-    let client = NotesClient::new(InProcessTransport::new(Notes::default()));
+    let client = NotesClient::new(InProcessTransport::new(NotesActivation::default()));
 
     let mut ids = Vec::new();
     let mut stream = client.list(None);
@@ -124,7 +127,7 @@ async fn the_streaming_form_works_the_same_in_process() {
 /// from a failed call is the whole point of the two error layers.
 #[tokio::test]
 async fn an_activation_error_variant_arrives_as_data() {
-    let client = NotesClient::new(InProcessTransport::new(Notes::default()));
+    let client = NotesClient::new(InProcessTransport::new(NotesActivation::default()));
     assert_eq!(
         client.boom_all().await.expect("not a client error"),
         vec![NoteEvent::Error {
@@ -137,7 +140,7 @@ async fn an_activation_error_variant_arrives_as_data() {
 /// class as a dropped connection, so it reports as a transport error.
 #[tokio::test]
 async fn a_failed_dispatch_is_a_transport_error_not_a_remote_one() {
-    let transport = InProcessTransport::new(Notes::default());
+    let transport = InProcessTransport::new(NotesActivation::default());
     // An unknown method is the cleanest way to make `call` return Err.
     let stream = Transport::call(&transport, MethodRef::new("notes", "nope"), json!({}));
     let items: Vec<_> = stream.collect().await;
@@ -157,7 +160,7 @@ async fn a_failed_dispatch_is_a_transport_error_not_a_remote_one() {
 /// not silently dispatch on whichever method names happen to collide.
 #[tokio::test]
 async fn a_namespace_mismatch_is_refused_before_dispatch() {
-    let transport = InProcessTransport::new(Notes::default());
+    let transport = InProcessTransport::new(NotesActivation::default());
     let items: Vec<_> = Transport::call(&transport, MethodRef::new("tickets", "get"), json!({}))
         .collect()
         .await;
@@ -172,7 +175,7 @@ async fn a_namespace_mismatch_is_refused_before_dispatch() {
 /// drops nothing, so a consumer that reads provenance behaves the same.
 #[tokio::test]
 async fn in_process_carries_the_full_envelope() {
-    let transport = InProcessTransport::new(Notes::default());
+    let transport = InProcessTransport::new(NotesActivation::default());
     let items: Vec<_> = Transport::call(
         &transport,
         MethodRef::new("notes", "get"),
@@ -198,7 +201,7 @@ async fn in_process_carries_the_full_envelope() {
 /// does not replace it.
 #[tokio::test]
 async fn the_activation_is_reachable_through_the_transport() {
-    let transport = InProcessTransport::new(Notes::default());
+    let transport = InProcessTransport::new(NotesActivation::default());
     assert_eq!(transport.activation().namespace(), "notes");
 
     // and dispatching by hand still works, unchanged

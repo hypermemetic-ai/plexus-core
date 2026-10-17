@@ -300,6 +300,14 @@ impl AuthEvent {
     }
 }
 
+/// MACRO-13: `AuthClient` implements the `Auth` trait; a client failure is
+/// the in-band error, the last item of its stream.
+impl plexus_client::FromClientError for AuthEvent {
+    fn from_client_error(error: plexus_client::ClientError) -> Self {
+        Self::error(error.to_string())
+    }
+}
+
 impl From<Session> for AuthEvent {
     fn from(s: Session) -> Self {
         Self::Session {
@@ -468,7 +476,7 @@ impl Catalog {
 /// [`DynamicHub::with_auth`](super::DynamicHub::with_auth); see the module
 /// docs.
 #[derive(Clone)]
-pub struct Auth {
+pub struct AuthActivation {
     inner: Arc<AuthInner>,
 }
 
@@ -493,7 +501,7 @@ impl Resolve for WithEverywhere {
     }
 }
 
-impl Auth {
+impl AuthActivation {
     /// The activation and the gate over the same stores.
     pub(crate) fn mount(setup: AuthSetup, catalog: Catalog) -> (Self, Gate) {
         let memberships: Arc<dyn Memberships> = setup.memberships.clone();
@@ -547,7 +555,6 @@ fn role_event(role: &RoleName, grants: Option<GrantSet>) -> AuthEvent {
 }
 
 #[plexus_macros::activation(
-    namespace = "auth",
     version = "1.0.0",
     description = "Sign in, who am I, what does this need",
     roles(member = ["whoami", "logout", "requires"]),
@@ -555,8 +562,7 @@ fn role_event(role: &RoleName, grants: Option<GrantSet>) -> AuthEvent {
     // string parameter does not compile here.
     typed_params,
 )]
-#[allow(deprecated)]
-impl Auth {
+impl AuthActivation {
     /// The ways in this server offers.
     #[plexus_macros::method(public, group = "sign in", description = "The ways in this server offers")]
     async fn providers(&self) -> impl Stream<Item = AuthEvent> + Send + 'static {

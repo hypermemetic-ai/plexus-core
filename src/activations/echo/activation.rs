@@ -17,15 +17,15 @@ use std::time::Duration;
 
 /// Echo activation - echoes messages back
 #[derive(Clone)]
-pub struct Echo;
+pub struct EchoActivation;
 
-impl Echo {
+impl EchoActivation {
     pub fn new() -> Self {
-        Echo
+        EchoActivation
     }
 }
 
-impl Default for Echo {
+impl Default for EchoActivation {
     fn default() -> Self {
         Self::new()
     }
@@ -37,14 +37,12 @@ impl Default for Echo {
 /// - Activation trait implementation
 /// - EchoMethod enum with JSON schemas
 #[plexus_macros::activation(
-    namespace = "echo",
     version = "1.0.0",
     description = "Echo messages back - demonstrates hub-macro usage",
     // MACRO-12: the example — `message` is a `Message`, not a `String`.
     typed_params
 )]
-#[allow(deprecated)]
-impl Echo {
+impl EchoActivation {
     /// Echo a message back
     #[plexus_macros::method(
         description = "Echo a message back the specified number of times",

@@ -1049,7 +1049,7 @@ struct DynamicHubInner {
 /// ```ignore
 /// let hub = DynamicHub::with_namespace("myapp")
 ///     .register(Solar::new())
-///     .register(Echo::new());
+///     .register(EchoActivation::new());
 /// ```
 #[derive(Clone)]
 pub struct DynamicHub {
@@ -1240,7 +1240,7 @@ impl DynamicHub {
         self
     }
 
-    /// AUTH-5: mount the `auth` activation ([`super::auth_activation::Auth`])
+    /// AUTH-5: mount the `auth` activation ([`super::auth_activation::AuthActivation`])
     /// and put every call through a gate built from the same stores — the
     /// one way a service turns login on. `setup` carries what only the
     /// service knows: its [`AuthBackend`] (providers, login flows, sessions,
@@ -1266,7 +1266,7 @@ impl DynamicHub {
         for child in self.static_children() {
             catalog.add(&child);
         }
-        let (auth, gate) = super::auth_activation::Auth::mount(setup, catalog.clone());
+        let (auth, gate) = super::auth_activation::AuthActivation::mount(setup, catalog.clone());
         {
             let inner = Arc::get_mut(&mut self.inner)
                 .expect("Cannot mount auth: DynamicHub has multiple references");
@@ -2854,12 +2854,12 @@ mod tests {
     #[tokio::test]
     async fn invariant_resolve_handle_routes_by_plugin_id() {
         use crate::activations::health::Health;
-        use crate::activations::echo::Echo;
+        use crate::activations::echo::EchoActivation;
         use crate::types::Handle;
         use uuid::Uuid;
 
         let health = Health::new();
-        let echo = Echo::new();
+        let echo = EchoActivation::new();
         let health_plugin_id = health.plugin_id();
         let echo_plugin_id = echo.plugin_id();
 
@@ -2895,11 +2895,11 @@ mod tests {
     #[test]
     fn invariant_handle_plugin_id_determines_routing() {
         use crate::activations::health::Health;
-        use crate::activations::echo::Echo;
+        use crate::activations::echo::EchoActivation;
         use crate::types::Handle;
 
         let health = Health::new();
-        let echo = Echo::new();
+        let echo = EchoActivation::new();
 
         // Same meta, different activations → different routing targets (by plugin_id)
         let health_handle = Handle::new(health.plugin_id(), "1.0.0", "check")

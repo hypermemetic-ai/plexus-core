@@ -10,14 +10,14 @@
 //!
 //! ```rust,no_run
 //! use plexus_core::plexus::DynamicHub;
-//! use plexus_core::activations::echo::Echo;
+//! use plexus_core::activations::echo::EchoActivation;
 //! use plexus_core::activations::health::Health;
 //! use std::sync::Arc;
 //!
 //! let hub = Arc::new(
 //!     DynamicHub::new("myapp")
 //!         .register(Health::new())
-//!         .register(Echo::new())
+//!         .register(EchoActivation::new())
 //! );
 //! ```
 

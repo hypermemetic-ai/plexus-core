@@ -35,15 +35,13 @@ use std::sync::{Arc, Mutex};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Vault;
+struct VaultActivation;
 
 #[plexus_macros::activation(
-    namespace = "vault",
     version = "1.0.0",
     description = "R-5 scope-gate fixture",
-    crate_path = "plexus_core"
 )]
-impl Vault {
+impl VaultActivation {
     /// Schema-declared single scope.
     #[plexus_macros::method(scope = "vault.write")]
     async fn write(&self) -> impl Stream<Item = String> + Send + 'static {
@@ -121,7 +119,7 @@ fn authed(roles: &[&str]) -> AuthContext {
 fn hub(registry: Option<ScopeRegistry>, default_deny: bool) -> (DynamicHub, Arc<CaptureSink>) {
     let sink = Arc::new(CaptureSink::default());
     let mut hub = DynamicHub::new("testhub")
-        .register(Vault)
+        .register(VaultActivation)
         .with_audit_sink(sink.clone())
         .with_default_deny(default_deny);
     if let Some(registry) = registry {
@@ -485,7 +483,7 @@ async fn panicking_sink_does_not_block_dispatch() {
         .build()
         .unwrap();
     let hub = DynamicHub::new("testhub")
-        .register(Vault)
+        .register(VaultActivation)
         .with_scope_registry(registry)
         .with_audit_sink(Arc::new(PanicSink));
 

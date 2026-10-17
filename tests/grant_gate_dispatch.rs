@@ -14,16 +14,14 @@ use plexus_core::{AuthzDenyReason, DynamicHub, PlexusError};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
-struct Tickets;
+struct TicketsActivation;
 
 #[plexus_macros::activation(
-    namespace = "tickets",
     version = "1.0.0",
     description = "AUTH-2 gate fixture",
-    crate_path = "plexus_core",
     roles(viewer = ["get", "list"], editor = [viewer, "set_status"]),
 )]
-impl Tickets {
+impl TicketsActivation {
     /// One ticket.
     #[plexus_macros::method(target = "id")]
     async fn get(&self, id: String) -> impl Stream<Item = String> + Send + 'static {
@@ -107,10 +105,10 @@ impl Resolve for Shortcodes {
 
 fn hub(members: &Arc<Members>) -> DynamicHub {
     // Roles seeded from the activation's declared defaults.
-    let declared = DynamicHub::new("menger").register(Tickets).declared_roles();
+    let declared = DynamicHub::new("menger").register(TicketsActivation).declared_roles();
     let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let gate = Gate::new(members.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    DynamicHub::new("menger").register(Tickets).with_gate(Arc::new(gate))
+    DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate))
 }
 
 fn who(p: &str) -> AuthContext {
@@ -147,7 +145,7 @@ fn members() -> Arc<Members> {
 
 #[tokio::test]
 async fn a_hub_without_a_gate_dispatches_as_before() {
-    let hub = DynamicHub::new("menger").register(Tickets);
+    let hub = DynamicHub::new("menger").register(TicketsActivation);
     let out = data(hub.route("tickets.set_status", serde_json::json!({"id": "X-1", "status": "Ready"}), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(out, vec![serde_json::json!(format!("{}: X-1 -> Ready", who(ADA).user_id))]);
     // Anonymous, too — and `reach` is everywhere.
@@ -255,7 +253,7 @@ async fn a_list_target_needs_every_element() {
     m.add(ADA, "closer", "MENGER");
     let roles = RoleTable::new().define("closer", ["tickets.close"]).unwrap();
     let gate = Gate::new(m.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    let hub = DynamicHub::new("menger").register(Tickets).with_gate(Arc::new(gate));
+    let hub = DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate));
     assert!(hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1", "MENGER-2"]}), Some(&who(ADA))).await.is_ok());
     assert!(hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1", "IDENTITY-2"]}), Some(&who(ADA))).await.is_err());
 }
@@ -301,9 +299,9 @@ async fn a_method_receives_its_reach() {
             Some(v)
         }
     }
-    let declared = DynamicHub::new("x").register(Tickets).declared_roles();
+    let declared = DynamicHub::new("x").register(TicketsActivation).declared_roles();
     let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let hub2 = DynamicHub::new("menger").register(Tickets).with_gate(Arc::new(Gate::new(m.clone(), Arc::new(roles), Arc::new(Tickety))));
+    let hub2 = DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(Gate::new(m.clone(), Arc::new(roles), Arc::new(Tickety))));
     let out = data(hub2.route("tickets.list", serde_json::json!({}), Some(&narrowed)).await.unwrap()).await;
     assert_eq!(out, vec![serde_json::json!("MENGER-12")]);
     assert!(hub2.route("tickets.set_status", serde_json::json!({"id": "MENGER-12", "status": "x"}), Some(&narrowed)).await.is_ok());
@@ -339,7 +337,7 @@ async fn a_stream_follows_grants_as_they_stand() {
 #[test]
 fn the_hubs_own_methods_are_granted_under_its_runtime_namespace() {
     use plexus_core::plexus::Activation;
-    let hub = DynamicHub::new("menger").register(Tickets);
+    let hub = DynamicHub::new("menger").register(TicketsActivation);
     let schema = Activation::plugin_schema(&hub);
     let call = schema.methods.iter().find(|m| m.name == "call").unwrap();
     assert_eq!(call.grant.as_deref(), Some("menger.call"));

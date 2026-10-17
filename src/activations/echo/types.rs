@@ -19,6 +19,16 @@ pub enum EchoEvent {
     },
 }
 
+/// MACRO-13: `EchoClient` implements the `Echo` trait, and a client failure
+/// ends its stream as one event. `EchoEvent` has no error variant (adding one
+/// would change the wire), so the failure is an echo of its message with
+/// `count: 0` — a count no real echo has (they start at 1).
+impl plexus_client::FromClientError for EchoEvent {
+    fn from_client_error(error: plexus_client::ClientError) -> Self {
+        EchoEvent::Echo { message: error.to_string(), count: 0 }
+    }
+}
+
 /// A message to echo (MACRO-12: the example of a typed parameter). Any
 /// text is a message — prose stays prose, but it has a name, so it cannot
 /// be passed where another kind of string is meant. On the wire it is the

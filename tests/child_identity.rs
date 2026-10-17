@@ -15,27 +15,36 @@ use plexus_core::{AuthzDenyReason, DynamicHub, PlexusError};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-/// What a child's method saw of its caller.
-fn seen(auth: &AuthContext) -> Value {
-    json!({
+/// What a child's method saw of its caller — on the wire, the JSON object
+/// itself (MACRO-22: a newtype so the emitted client can carry a failure).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+struct Seen(Value);
+
+impl plexus_client::FromClientError for Seen {
+    fn from_client_error(error: plexus_client::ClientError) -> Self {
+        Seen(json!({ "error": error.to_string() }))
+    }
+}
+
+fn seen(auth: &AuthContext) -> Seen {
+    Seen(json!({
         "principal": auth.principal().map(|p| p.to_string()),
         "user": auth.user_id,
         "session": auth.session_id,
         "ceiling": auth.metadata.get(plexus_auth_core::CEILING_KEY).cloned(),
-    })
+    }))
 }
 
 #[derive(Clone)]
-struct Tickets;
+struct TicketsActivation;
 
 #[plexus_macros::activation(
-    namespace = "tickets",
     version = "1.0.0",
     description = "MACRO-20 parent",
-    crate_path = "plexus_core",
     roles(viewer = ["get"]),
 )]
-impl Tickets {
+impl TicketsActivation {
     /// One ticket.
     #[plexus_macros::method(target = "id")]
     async fn get(&self, id: String) -> impl Stream<Item = String> + Send + 'static {
@@ -44,77 +53,71 @@ impl Tickets {
 
     /// The commits that finished a ticket — the same service (the default).
     #[plexus_macros::child]
-    fn commits(&self) -> Commits {
-        Commits
+    fn commits(&self) -> CommitsActivation {
+        CommitsActivation
     }
 
     /// A deputy: told who called, never the caller's session.
     #[plexus_macros::child(forward = "identity_only")]
-    fn mirror(&self) -> Mirror {
-        Mirror
+    fn mirror(&self) -> MirrorActivation {
+        MirrorActivation
     }
 }
 
 #[derive(Clone)]
-struct Commits;
+struct CommitsActivation;
 
 #[plexus_macros::activation(
-    namespace = "commits",
     version = "1.0.0",
     description = "MACRO-20 child",
-    crate_path = "plexus_core",
     roles(editor = ["link"]),
 )]
-impl Commits {
+impl CommitsActivation {
     /// Link commits to a ticket: answers what the method saw of its caller.
     #[plexus_macros::method(target = "id")]
-    async fn link(&self, auth: &AuthContext, id: String) -> impl Stream<Item = Value> + Send + 'static {
+    async fn link(&self, auth: &AuthContext, id: String) -> impl Stream<Item = Seen> + Send + 'static {
         let mut v = seen(auth);
-        v["id"] = json!(id);
+        v.0["id"] = json!(id);
         stream! { yield v; }
     }
 
     /// A grandchild.
     #[plexus_macros::child]
-    fn audit(&self) -> Audit {
-        Audit
+    fn audit(&self) -> AuditActivation {
+        AuditActivation
     }
 }
 
 #[derive(Clone)]
-struct Audit;
+struct AuditActivation;
 
 #[plexus_macros::activation(
-    namespace = "audit",
     version = "1.0.0",
     description = "MACRO-20 grandchild",
-    crate_path = "plexus_core",
     roles(viewer = ["read"]),
 )]
-impl Audit {
+impl AuditActivation {
     /// Read a ticket's audit trail: what the method saw of its caller.
     #[plexus_macros::method(target = "id")]
-    async fn read(&self, auth: &AuthContext, id: String) -> impl Stream<Item = Value> + Send + 'static {
+    async fn read(&self, auth: &AuthContext, id: String) -> impl Stream<Item = Seen> + Send + 'static {
         let mut v = seen(auth);
-        v["id"] = json!(id);
+        v.0["id"] = json!(id);
         stream! { yield v; }
     }
 }
 
 #[derive(Clone)]
-struct Mirror;
+struct MirrorActivation;
 
 #[plexus_macros::activation(
-    namespace = "mirror",
     version = "1.0.0",
     description = "MACRO-20 identity-only child",
-    crate_path = "plexus_core",
     roles(viewer = ["whoami"]),
 )]
-impl Mirror {
+impl MirrorActivation {
     /// What the method saw of its caller.
     #[plexus_macros::method]
-    async fn whoami(&self, auth: &AuthContext) -> impl Stream<Item = Value> + Send + 'static {
+    async fn whoami(&self, auth: &AuthContext) -> impl Stream<Item = Seen> + Send + 'static {
         let v = seen(auth);
         stream! { yield v; }
     }
@@ -166,10 +169,10 @@ fn members() -> Arc<Members> {
 /// A gated hub whose roles are seeded from `declared_roles` alone — no
 /// child's roles added by hand.
 fn hub(members: &Arc<Members>) -> DynamicHub {
-    let declared = DynamicHub::new("menger").register(Tickets).declared_roles();
+    let declared = DynamicHub::new("menger").register(TicketsActivation).declared_roles();
     let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let gate = Gate::new(members.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    DynamicHub::new("menger").register(Tickets).with_gate(Arc::new(gate))
+    DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate))
 }
 
 fn who(p: &str) -> AuthContext {
@@ -208,7 +211,7 @@ fn missing_grant(err: PlexusError) -> (String, String, Vec<String>) {
 
 #[test]
 fn declared_roles_take_the_children_s_qualified_by_their_path() {
-    let roles = DynamicHub::new("menger").register(Tickets).declared_roles();
+    let roles = DynamicHub::new("menger").register(TicketsActivation).declared_roles();
     assert_eq!(roles["editor"], ["tickets.commits.link"]);
     let viewer: Vec<&str> = roles["viewer"].iter().map(String::as_str).collect();
     for g in ["tickets.get", "tickets.commits.audit.read", "tickets.mirror.whoami"] {
@@ -218,7 +221,7 @@ fn declared_roles_take_the_children_s_qualified_by_their_path() {
 
 #[test]
 fn static_children_are_listed_by_path_with_qualified_grants() {
-    let hub = DynamicHub::new("menger").register(Tickets);
+    let hub = DynamicHub::new("menger").register(TicketsActivation);
     let children = hub.static_children();
     let paths: Vec<&str> = children.iter().map(|c| c.namespace.as_str()).collect();
     assert_eq!(paths, ["tickets.commits", "tickets.commits.audit", "tickets.mirror"]);
@@ -306,7 +309,7 @@ async fn identity_only_when_chosen_drops_the_session_and_ceiling() {
 
 #[tokio::test]
 async fn without_a_gate_a_child_runs_as_before() {
-    let hub = DynamicHub::new("menger").register(Tickets);
+    let hub = DynamicHub::new("menger").register(TicketsActivation);
     let out = data(hub.route("tickets.commits.link", json!({"id": "X-1"}), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(out[0]["principal"], json!(ADA));
     assert_eq!(out[0]["id"], json!("X-1"));
@@ -315,12 +318,12 @@ async fn without_a_gate_a_child_runs_as_before() {
 #[test]
 fn the_parent_says_how_each_child_inherits() {
     use plexus_core::plexus::ChildRouter;
-    let t = Tickets;
+    let t = TicketsActivation;
     assert_eq!(t.forward_policy_for("commits").unwrap().name().as_str(), "same_service");
     assert_eq!(t.forward_policy_for("mirror").unwrap().name().as_str(), "identity_only");
     assert!(t.forward_policy_for("nope").is_none());
     // A leaf has no children to speak for.
-    assert!(Audit.forward_policy_for("anything").is_none());
+    assert!(AuditActivation.forward_policy_for("anything").is_none());
 }
 
 #[tokio::test]

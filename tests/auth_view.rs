@@ -23,16 +23,14 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Tickets;
+struct TicketsActivation;
 
 #[plexus_macros::activation(
-    namespace = "tickets",
     version = "0.5.0",
     description = "Plans as data",
-    crate_path = "plexus_core",
     roles(viewer = ["get", "list"], editor = [viewer, "set_status"]),
 )]
-impl Tickets {
+impl TicketsActivation {
     /// One ticket by id.
     #[plexus_macros::method(target = "id", description = "One ticket by id")]
     async fn get(&self, id: String) -> impl Stream<Item = String> + Send + 'static {
@@ -106,7 +104,7 @@ fn world() -> World {
             .with(MENGER_ADMIN, "admin", "MENGER"),
     );
     let hub = DynamicHub::new("menger")
-        .register(Tickets)
+        .register(TicketsActivation)
         .with_auth(AuthSetup::new(backend.clone(), roles.clone(), memberships, Arc::new(Shortcodes)))
         .with_resource_metadata("http://127.0.0.1:4456/.well-known/oauth-protected-resource");
     roles.seed(&hub.declared_roles());
@@ -705,7 +703,7 @@ async fn a_bare_value_reaches_no_target() {
 
     // The macro refuses it too, with no gate in front: a method with a
     // target never takes its target as a bare value.
-    let bare = Arc::new(DynamicHub::new("menger").register(Tickets));
+    let bare = Arc::new(DynamicHub::new("menger").register(TicketsActivation));
     assert!(matches!(bare.route("tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams(_))));
     assert!(bare.route("tickets.get", json!({"id": "MENGER-1"}), None).await.is_ok());
 }
@@ -716,7 +714,7 @@ async fn a_bare_value_reaches_no_target() {
 
 #[tokio::test]
 async fn a_gateless_hub_answers_info_byte_for_byte() {
-    let hub = Arc::new(DynamicHub::new("menger").register(Tickets));
+    let hub = Arc::new(DynamicHub::new("menger").register(TicketsActivation));
     // Today's payload, captured before AUTH-4 from this same hub shape.
     let today = r#"{"auth_capabilities":{"mechanisms":[{"kind":"anonymous"}]},"backend":"menger"}"#;
     for module in [DynamicHub::arc_into_rpc_module(hub.clone()).unwrap(), hub.as_ref().clone().into_rpc_module().unwrap()] {

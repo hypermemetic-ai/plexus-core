@@ -5,5 +5,5 @@
 mod activation;
 mod types;
 
-pub use activation::Echo;
+pub use activation::{Echo, EchoActivation, EchoClient};
 pub use types::{EchoEvent, Message};

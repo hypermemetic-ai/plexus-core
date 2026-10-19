@@ -21,6 +21,8 @@ pub mod grant_gate;
 pub mod hub_context;
 // MACRO-2.B3: the in-process transport for the macro-generated typed client.
 pub mod in_process;
+/// LOCAL-6: a whole hub, called in memory.
+pub mod hub_transport;
 pub mod method_enum;
 pub mod middleware;
 pub mod path;
@@ -40,6 +42,7 @@ pub use test_validator::TestSessionValidator;
 pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirChannel, StandardRequest, StandardResponse};
 pub use context::PlexusContext;
 pub use in_process::InProcessTransport;
+pub use hub_transport::HubTransport;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME};

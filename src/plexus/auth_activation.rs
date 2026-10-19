@@ -606,7 +606,8 @@ impl AuthActivation {
     }
 
     /// Create an account, or ask for access: a signed-in caller holding no
-    /// membership joins the waiting list for an admin.
+    /// membership of its own ([`Memberships::own_held`]) joins the waiting
+    /// list for an admin.
     #[plexus_macros::method(
         public,
         group = "sign in",
@@ -621,7 +622,7 @@ impl AuthActivation {
             let holds_none = caller
                 .as_ref()
                 .and_then(principal_of)
-                .map(|p| inner.memberships.held(&p).is_empty());
+                .map(|p| inner.memberships.own_held(&p).is_empty());
             let answer = match (holds_none, caller.as_ref()) {
                 (Some(true), Some(ctx)) => inner.backend.ask_access(ctx, via).await.map(SignupAnswer::Waiting),
                 _ => inner.backend.signup(caller.as_ref(), via).await,
@@ -835,8 +836,8 @@ impl AuthActivation {
         }
     }
 
-    /// Who signed up or asked for access and holds nothing yet (admin on
-    /// `*`).
+    /// Who signed up or asked for access and holds nothing of its own yet
+    /// ([`Memberships::own_held`]; admin on `*`).
     #[plexus_macros::method(group = "admin", description = "Who asked for access and holds nothing yet (admin on *)")]
     async fn waiting(&self, auth: &AuthContext, reach: Reach) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
@@ -850,7 +851,7 @@ impl AuthActivation {
                 let still = w
                     .principal
                     .parse::<Principal>()
-                    .map(|p| inner.memberships.held(&p).is_empty())
+                    .map(|p| inner.memberships.own_held(&p).is_empty())
                     .unwrap_or(true);
                 if still {
                     yield w.into();

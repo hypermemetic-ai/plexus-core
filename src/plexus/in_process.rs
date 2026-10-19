@@ -31,7 +31,9 @@
 //!
 //! `DynamicHub` applies the scope gate, provenance and credential-envelope
 //! assembly. This transport applies none of them: it is `Activation::call`
-//! and nothing else. Reaching for it outside a test is a smell.
+//! and nothing else. Reaching for it outside a test is a smell: a program
+//! that imports a whole hub calls it through
+//! [`HubTransport`](super::hub_transport::HubTransport) (LOCAL-6).
 
 use futures::StreamExt;
 use plexus_client::{ItemStream, MethodRef, StreamItem, StreamMetadata, Transport, TransportError};
@@ -83,7 +85,7 @@ impl<A: Activation> InProcessTransport<A> {
 /// The client type is looser by design (see `plexus-client`'s
 /// `envelope` module): every field the REST bridge drops is optional there.
 /// In-process nothing is dropped, so every field is carried.
-fn to_client_item(item: PlexusStreamItem) -> StreamItem {
+pub(crate) fn to_client_item(item: PlexusStreamItem) -> StreamItem {
     fn meta(m: super::types::StreamMetadata) -> Option<StreamMetadata> {
         Some(StreamMetadata {
             provenance: m.provenance,

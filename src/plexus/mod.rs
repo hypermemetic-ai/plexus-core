@@ -23,6 +23,8 @@ pub mod hub_context;
 pub mod in_process;
 /// LOCAL-6: a whole hub, called in memory.
 pub mod hub_transport;
+// POLYGLOT-4 (spike): the child seam over a process.
+pub mod remote_child;
 pub mod method_enum;
 pub mod middleware;
 pub mod path;

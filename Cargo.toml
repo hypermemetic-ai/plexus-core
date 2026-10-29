@@ -40,6 +40,9 @@ schemars = { version = "1.1", features = ["derive", "uuid1"] }
 # HTTP types for RawRequestContext
 http = "1"
 
+# IR Merkle hashing (BIDIR-4: from plx-146, PLX-77)
+sha2 = "0.10"
+
 # Core types
 uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -9,6 +9,7 @@ help: the trait `markers::sealed::Sealed` is not implemented for `SmuggledCapabi
    |
 11 | struct SmuggledCapability;
    | ^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: `SmuggledCapability` implements similarly named trait `dyn_clone::sealed::Sealed`, but not `markers::sealed::Sealed`
    = help: the following other types implement trait `markers::sealed::Sealed`:
              ()
              (A, B)

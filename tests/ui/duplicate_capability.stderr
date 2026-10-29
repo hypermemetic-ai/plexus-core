@@ -1,12 +1,17 @@
 error[E0080]: evaluation panicked: duplicate capability: this Client's capability set lists the same capability more than once. A capability set is a set — each capability may appear at most once in the tuple (e.g. write Client<(FsRead,)>, not Client<(FsRead, FsRead)>).
- --> src/capability/client.rs
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `plexus_core::capability::Client::<(plexus_core::capability::FsRead, plexus_core::capability::FsRead)>::NO_DUPLICATES` failed here
+  |
+ ::: src/capability/client.rs
   |
   |       pub const NO_DUPLICATES: () = assert!(
-  |  ___________________________________^
+  |  ___________________________________-
   | |         !has_duplicate_names(C::NAMES),
   | |         "duplicate capability: this Client's capability set lists the same capability more than once. A capability set is a set —...
   | |     );
-  | |_____^ evaluation of `plexus_core::capability::Client::<(plexus_core::capability::FsRead, plexus_core::capability::FsRead)>::NO_DUPLICATES` failed here
+  | |_____- in this macro invocation
 
 note: erroneous constant encountered
  --> src/capability/client.rs

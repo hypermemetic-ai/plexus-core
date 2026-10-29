@@ -69,7 +69,26 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1" }
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.1" }
 
+[features]
+# PLX-88 measurement scaffolding (BIDIR-4: from plx-146). Gates `runtime::profile`.
+profiling = []
+
+[[bench]]
+name = "dispatch"
+harness = false
+
+[[bench]]
+name = "turn_profile"
+harness = false
+required-features = ["profiling"]
+
+[[example]]
+name = "turn_alloc"
+required-features = ["profiling"]
+
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+dhat = "0.3"
 trybuild = "1.0"
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1", features = ["ws-native"] }

@@ -9,7 +9,7 @@
 
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use plexus_auth_core::{
     AttachmentSite, CredentialFieldMarker, CredentialIssuer, CredentialKind, CredentialMetadata,
@@ -596,7 +596,7 @@ impl ViewKind {
     }
 }
 
-/// Result of a schema query - either full plugin or single method
+/// Result of a schema query
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum SchemaResult {
@@ -822,6 +822,22 @@ pub struct MethodSchema {
     /// Optional on the wire (`serde(default)`, skipped when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<MethodExample>,
+
+    /// Open extension slot for per-method attributes that are not (yet)
+    /// first-class typed fields — the long tail of `#[method(ext(...))]`.
+    ///
+    /// PLX-71. Each entry is a namespaced key (e.g. `"nostr_kind"`) mapped to a
+    /// JSON value. Gateways opt in by reading
+    /// `schema.extensions.get("nostr_kind")` — a new per-method attribute costs
+    /// zero core edits. Load-bearing typed attributes (`http_method`, …) stay
+    /// first-class; this map is strictly additive.
+    ///
+    /// Defaults to an empty map via `#[serde(default)]` so pre-PLX-71 schemas
+    /// deserialize cleanly; `skip_serializing_if = "BTreeMap::is_empty"` keeps
+    /// the wire JSON byte-identical for methods that declare no extensions
+    /// (`BTreeMap` for stable, deterministic key ordering on the wire).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 /// SYNAPSE-13: one worked call of a method — the params it sends and a note
@@ -1329,6 +1345,7 @@ impl MethodSchema {
             held_on: None,
             group: None,
             examples: Vec::new(),
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -1565,6 +1582,17 @@ impl MethodSchema {
     /// the schema's own `grant`, else `<activation>.<name>`.
     pub fn grant_or(&self, activation: &str) -> String {
         self.grant.clone().unwrap_or_else(|| format!("{activation}.{}", self.name))
+    }
+
+    /// Set a single per-method extension entry (PLX-71).
+    ///
+    /// Chainable — call once per `key = value` pair emitted by
+    /// `#[method(ext(...))]`. Inserting an existing key overwrites it. Keys are
+    /// namespaced strings; values are arbitrary JSON. Gateways read them back
+    /// via `schema.extensions.get(key)` without any core edits.
+    pub fn with_extension(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.extensions.insert(key.into(), value);
+        self
     }
 
     /// CA-1: fill `requires_credential.site_hint` with the hub-derived
@@ -2957,6 +2985,48 @@ mod tests {
         assert!(decoded.auth_posture.is_none());
         assert!(!decoded.public);
         assert!(decoded.requires_credential.is_none());
+    }
+
+    /// PLX-71: `extensions` defaults to empty and is omitted from the wire when
+    /// unset (byte-compat), round-trips populated values, and legacy JSON
+    /// without the key decodes to an empty map.
+    #[test]
+    fn plx71_extensions_default_and_roundtrip() {
+        // (a) Unset extensions are omitted from the wire — byte-identical to
+        // pre-PLX-71 schemas.
+        let bare = MethodSchema::new("ping", "pong", "h_ping");
+        assert!(bare.extensions.is_empty());
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("extensions"),
+            "extensions must be omitted when empty, got {json}"
+        );
+
+        // (b) Populated extensions surface in the wire JSON and decode back
+        // losslessly, across string / int / bool value types.
+        let annotated = MethodSchema::new("publish", "publishes", "h_pub")
+            .with_extension("nostr_kind", serde_json::json!(30023))
+            .with_extension("label", serde_json::json!("x"))
+            .with_extension("nostr_addressable", serde_json::json!(true));
+        let json = serde_json::to_value(&annotated).unwrap();
+        assert_eq!(json["extensions"]["nostr_kind"], serde_json::json!(30023));
+        assert_eq!(json["extensions"]["label"], serde_json::json!("x"));
+        assert_eq!(json["extensions"]["nostr_addressable"], serde_json::json!(true));
+        let decoded: MethodSchema = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.extensions.len(), 3);
+        assert_eq!(
+            decoded.extensions.get("nostr_kind"),
+            Some(&serde_json::json!(30023))
+        );
+        assert_eq!(
+            decoded.extensions.get("nostr_addressable"),
+            Some(&serde_json::json!(true))
+        );
+
+        // (c) Legacy JSON that omits the key decodes to an empty map (default).
+        let legacy = r#"{"name":"ping","description":"pong","hash":"h_ping","streaming":false,"bidirectional":false,"http_method":"POST","role":{"kind":"rpc"}}"#;
+        let decoded: MethodSchema = serde_json::from_str(legacy).unwrap();
+        assert!(decoded.extensions.is_empty());
     }
 
     /// Populated round-trip: posture + public + requires_credential all

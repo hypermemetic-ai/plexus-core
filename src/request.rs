@@ -15,6 +15,13 @@ use crate::plexus::{AuthContext, PlexusError};
 ///
 /// This is populated from the HTTP upgrade/connection phase and made available
 /// to every `#[derive(PlexusRequest)]` extraction.
+///
+/// `Clone` and `Debug` are derived (PLX-80): the turn runtime hands a handler
+/// an owned copy through [`TurnContext`](crate::runtime::TurnContext), and it
+/// only ever receives a `&RawRequestContext` from the legacy
+/// [`Activation::call`](crate::Activation::call) surface. Every field was
+/// already `Clone + Debug`; the derives are additive and change no behaviour.
+#[derive(Clone, Debug)]
 pub struct RawRequestContext {
     /// HTTP headers from the request.
     pub headers: http::HeaderMap,

@@ -36,6 +36,7 @@ pub mod mcp_bridge;
 pub mod plexus;
 pub mod plugin_system;
 pub mod request;
+pub mod runtime;
 pub mod serde_helpers;
 pub mod types;
 

@@ -73,6 +73,7 @@ impl PlexusStreamBuilder {
                 message: err.to_string(),
                 code: None,
                 recoverable: false,
+                fields: Default::default(),
             },
         }))
     }

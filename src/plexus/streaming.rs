@@ -227,6 +227,7 @@ pub fn error_stream(
             message,
             code: None,
             recoverable,
+            fields: Default::default(),
         }
     }))
 }
@@ -248,6 +249,7 @@ pub fn error_stream_with_code(
             message,
             code: Some(code),
             recoverable,
+            fields: Default::default(),
         }
     }))
 }

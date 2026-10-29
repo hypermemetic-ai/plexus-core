@@ -75,6 +75,18 @@ pub enum PlexusStreamItem {
         code: Option<String>,
         /// Whether the operation can be retried
         recoverable: bool,
+        /// POLYGLOT-5: the typed error's own fields, flattened beside the
+        /// others on the wire (spec/05) — `error_kind` and what that kind
+        /// carries: `forbidden`'s `grant`, `scope`, `roles`, `held_on`;
+        /// `too_many_calls`' `max`; `child_unavailable`'s `child`, `reason`.
+        /// Empty for an untyped error, which serializes exactly as before;
+        /// any key an error item carries beyond the four above lands here,
+        /// so an item relayed from a child (or read back by a client)
+        /// keeps every field it came with. Additive: older readers ignore
+        /// the keys, older writers send none.
+        #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+        #[schemars(skip)]
+        fields: serde_json::Map<String, Value>,
     },
 
     /// Bidirectional request from server to client
@@ -130,6 +142,35 @@ impl PlexusStreamItem {
             message,
             code,
             recoverable,
+            fields: serde_json::Map::new(),
+        }
+    }
+
+    /// POLYGLOT-5: a typed error item (spec/05) — `code` and `error_kind`
+    /// both `kind` unless `code` is given, with the kind's own `fields`.
+    pub fn typed_error(
+        metadata: StreamMetadata,
+        message: String,
+        kind: &str,
+        recoverable: bool,
+        fields: serde_json::Map<String, Value>,
+    ) -> Self {
+        let mut all = fields;
+        all.insert("error_kind".into(), Value::String(kind.to_string()));
+        Self::Error {
+            metadata,
+            message,
+            code: Some(kind.to_string()),
+            recoverable,
+            fields: all,
+        }
+    }
+
+    /// POLYGLOT-5: an error item's `error_kind`, when it carries one.
+    pub fn error_kind(&self) -> Option<&str> {
+        match self {
+            Self::Error { fields, .. } => fields.get("error_kind").and_then(Value::as_str),
+            _ => None,
         }
     }
 

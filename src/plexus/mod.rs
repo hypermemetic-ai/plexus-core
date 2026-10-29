@@ -30,6 +30,8 @@ pub mod method_enum;
 pub mod middleware;
 pub mod path;
 pub mod plexus;
+// POLYGLOT-5: the child seam's second implementation — a process or a socket.
+pub mod remote_child;
 pub mod schema;
 pub(crate) mod scope_gate;
 pub mod streaming;
@@ -46,6 +48,9 @@ pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirCha
 pub use context::PlexusContext;
 pub use in_process::InProcessTransport;
 pub use hub_transport::HubTransport;
+pub use remote_child::{Backoff, ChildError, ChildMethods, ChildOptions, ChildSpec, ChildStats, MountTimings, RemoteChild};
+#[cfg(feature = "clap")]
+pub use remote_child::ChildArgs;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME};

@@ -1,9 +1,31 @@
 # Changelog
 
-All notable changes to hub-core will be documented in this file.
+All notable changes to plexus-core will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.6.2] — POLYGLOT-5: the child seam opened
+
+### Added
+
+- `plexus::RemoteChild` — an `Activation + ChildRouter + Clone` whose other end
+  is a process on stdio or a service on a WebSocket speaking plexus-wire
+  (spec/12, the hop between services): `RemoteChild::connect(ChildSpec,
+  ChildOptions)`, `stats() -> ChildStats { open, unasked, restarts, calls }`,
+  `pid()`, `principal()`, `mount_timings()`. Registered like any activation:
+  its schema and roles merged under the mount name.
+- `ChildSpec` (`NAME=stdio:CMD` | `NAME=ws://…`), `ChildOptions`, `Backoff`,
+  `ChildError`, `ChildMethods`, `parse_duration`; `ChildArgs` behind the new
+  `clap` feature (`--child`, `--child-timeout`, `--child-max-calls`,
+  `--child-env`, `--child-key`).
+- Features `child-ws` (default: a WebSocket child, dialed with the service's
+  key proof) and `child-wss` (TLS).
+- `PlexusStreamItem::Error { fields }` — the typed error's own fields
+  (`error_kind`, `grant`, `scope`, `roles`, `held_on`, …), flattened on the
+  wire; empty serializes as before. `PlexusStreamItem::typed_error`,
+  `PlexusStreamItem::error_kind`. **A struct literal of `Error` now names
+  `fields`** (`fields: Default::default()`), or uses `PlexusStreamItem::error`.
 
 ## [Unreleased]
 

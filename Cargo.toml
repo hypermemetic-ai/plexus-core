@@ -1,6 +1,6 @@
 [package]
 name = "plexus-core"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
 license = "AGPL-3.0-only"
@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
@@ -53,6 +53,18 @@ jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 # MCP server
 rmcp = { version = "0.12", features = ["server", "transport-io", "transport-streamable-http-server"] }
 
+# POLYGLOT-5: the child seam. `--child NAME=stdio:CMD` is split as a shell
+# would split it (shell-words), then run without one.
+shell-words = "1.1"
+# `ChildArgs` (feature `clap`): every service spells `--child` the same.
+clap = { version = "4", features = ["derive", "env"], optional = true }
+# A WebSocket child (feature `child-ws`): dialed with the service's key proof
+# (spec/00) — signed here, so the seam needs neither the adapters nor a
+# network client; `child-wss` adds TLS.
+tokio-tungstenite = { version = "0.30", optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"], optional = true }
+base64 = { version = "0.22", optional = true }
+
 # Hub macro for activation generation
 plexus-macros = { path = "../plexus-macros", version = "0.6.1" }
 
@@ -66,10 +78,32 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1" }
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.1" }
 
+[features]
+# POLYGLOT-5: a WebSocket child is on by default (three small crates);
+# `default-features = false` keeps stdio children only.
+default = ["child-ws"]
+# POLYGLOT-5: `ChildArgs`, the child seam's flags, as clap arguments.
+clap = ["dep:clap"]
+# POLYGLOT-5: a child on a WebSocket (ws://), dialed with a key proof.
+child-ws = ["dep:tokio-tungstenite", "dep:ed25519-dalek", "dep:base64"]
+# ... and on wss:// (TLS, webpki roots).
+child-wss = ["child-ws", "tokio-tungstenite/rustls-tls-webpki-roots"]
+
+[[test]]
+name = "remote_child"
+required-features = ["child-ws"]
+
+[[test]]
+name = "remote_child_perf"
+required-features = ["child-ws"]
+
 [dev-dependencies]
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1", features = ["ws-native"] }
 tempfile = "3"
+# POLYGLOT-5: tests/remote_child.rs signs a WebSocket child's trust in.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.22"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
 # BIDIR-13: tests/question_matrix.rs answers a question from two sockets.

@@ -118,6 +118,7 @@ pub(crate) fn to_client_item(item: PlexusStreamItem) -> StreamItem {
             message,
             code,
             recoverable,
+            ..
         } => StreamItem::Error {
             metadata: meta(metadata),
             message,

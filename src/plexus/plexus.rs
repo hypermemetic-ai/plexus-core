@@ -216,12 +216,10 @@ pub fn error_item(ns: &str, e: &PlexusError) -> serde_json::Value {
         message: e.to_string(),
         code: Some(plexus_error_code(e).to_string()),
         recoverable: false,
+        // POLYGLOT-5: the typed refusal's fields ride in the item itself.
+        fields: super::grant_gate::error_fields(e).unwrap_or_default(),
     };
-    let mut value = serde_json::to_value(&item).unwrap_or(serde_json::Value::Null);
-    if let (Some(obj), Some(extra)) = (value.as_object_mut(), super::grant_gate::error_fields(e)) {
-        obj.extend(extra);
-    }
-    value
+    serde_json::to_value(&item).unwrap_or(serde_json::Value::Null)
 }
 
 // ============================================================================
@@ -2597,6 +2595,7 @@ impl DynamicHub {
                         message: e.to_string(),
                         code: None,
                         recoverable: false,
+                        fields: Default::default(),
                     }
                 }))
             }

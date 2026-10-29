@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `(Permission,): Has<FsRead, _>` is not satisfied
+  --> tests/ui/undeclared_capability.rs:16:23
+   |
+16 |     let _bad = client.fs_read(FsReadRequest {
+   |                       ^^^^^^^ the trait `Has<FsRead, _>` is not implemented for `(Permission,)`
+   |
+   = help: the following other types implement trait `Has<M, I>`:
+             `(A, B)` implements `Has<A, Here>`
+             `(A, B)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<A, Here>`
+             `(A, B, C)` implements `Has<B, There<Here>>`
+             `(A, B, C)` implements `Has<C, There<There<Here>>>`
+             `(A, B, C, D)` implements `Has<A, Here>`
+             `(A, B, C, D)` implements `Has<B, There<Here>>`
+             `(A, B, C, D)` implements `Has<C, There<There<Here>>>`
+           and $N others
+note: required by a bound in `Client::<C>::fs_read`
+  --> src/capability/client.rs
+   |
+   |     pub fn fs_read<I>(&self, request: FsReadRequest) -> Result<FsReadResponse, CallbackError>
+   |            ------- required by a bound in this associated function
+   |     where
+   |         C: Has<FsRead, I>,
+   |            ^^^^^^^^^^^^^^ required by this bound in `Client::<C>::fs_read`

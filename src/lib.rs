@@ -29,6 +29,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod activations;
 pub mod builder;
+pub mod capability;
 pub mod identity;
 pub mod ir;
 pub mod mcp_bridge;

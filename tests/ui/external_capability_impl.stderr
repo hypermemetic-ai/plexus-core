@@ -1,0 +1,37 @@
+error[E0277]: the trait bound `SmuggledCapability: markers::sealed::Sealed` is not satisfied
+  --> tests/ui/external_capability_impl.rs:13:21
+   |
+13 | impl Capability for SmuggledCapability {
+   |                     ^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `markers::sealed::Sealed` is not implemented for `SmuggledCapability`
+  --> tests/ui/external_capability_impl.rs:11:1
+   |
+11 | struct SmuggledCapability;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `markers::sealed::Sealed`:
+             ()
+             (A, B)
+             (A, B, C)
+             (A, B, C, D)
+             (A, B, C, D, E)
+             (A, B, C, D, E, F)
+             (A, B, C, D, E, F, G)
+             (A, B, C, D, E, F, G, H)
+           and $N others
+note: required by a bound in `Capability`
+  --> src/capability/markers.rs
+   |
+   | pub trait Capability: sealed::Sealed + Copy + Send + Sync + 'static {
+   |                       ^^^^^^^^^^^^^^ required by this bound in `Capability`
+   = note: `Capability` is a "sealed trait", because to implement it you also need to implement `plexus_core::capability::markers::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+   = help: the following types implement the trait:
+             plexus_core::capability::Permission
+             plexus_core::capability::FsRead
+             plexus_core::capability::FsWrite
+             plexus_core::capability::Terminal
+             ()
+             (A,)
+             (A, B)
+             (A, B, C)
+           and $N others

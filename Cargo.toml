@@ -70,6 +70,7 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1" }
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.1" }
 
 [dev-dependencies]
+trybuild = "1.0"
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1", features = ["ws-native"] }
 tempfile = "3"

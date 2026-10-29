@@ -1,0 +1,27 @@
+error[E0080]: evaluation panicked: duplicate capability: this Client's capability set lists the same capability more than once. A capability set is a set — each capability may appear at most once in the tuple (e.g. write Client<(FsRead,)>, not Client<(FsRead, FsRead)>).
+ --> src/capability/client.rs
+  |
+  |       pub const NO_DUPLICATES: () = assert!(
+  |  ___________________________________^
+  | |         !has_duplicate_names(C::NAMES),
+  | |         "duplicate capability: this Client's capability set lists the same capability more than once. A capability set is a set —...
+  | |     );
+  | |_____^ evaluation of `plexus_core::capability::Client::<(plexus_core::capability::FsRead, plexus_core::capability::FsRead)>::NO_DUPLICATES` failed here
+
+note: erroneous constant encountered
+ --> src/capability/client.rs
+  |
+  |         let () = Self::NO_DUPLICATES;
+  |                  ^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn Client::<(FsRead, FsRead)>::unwired`
+  --> tests/ui/duplicate_capability.rs:19:45
+   |
+19 |     let _client: Client<(FsRead, FsRead)> = Client::unwired();
+   |                                             ^^^^^^^^^^^^^^^^^
+
+note: erroneous constant encountered
+ --> src/capability/client.rs
+  |
+  |         let () = Self::NO_DUPLICATES;
+  |                  ^^^^^^^^^^^^^^^^^^^

@@ -230,6 +230,32 @@ async fn cancel_crosses_hop() {
     }
 }
 
+/// spec/04: an item already in flight may land just after the unsubscribe's
+/// `true` (the reference echo's does, now and then) — still the cancel's
+/// tail: dropped quietly, never counted as unasked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_tail_after_true_is_quiet() {
+    for via in [Via::Stdio, Via::Ws] {
+        let r = rig_with(via, ChildOptions::default(), "--tail-after-unsub").await;
+        let t = hub_transport(&r, ADA);
+        for _ in 0..5 {
+            let mut s = t.call(MethodRef::new("echo", "count"), json!({ "to": 100000, "delay_ms": 1 }));
+            let mut got = 0;
+            while got < 10 {
+                if let Some(Ok(StreamItem::Data { .. })) = s.next().await {
+                    got += 1;
+                }
+            }
+            let dropped = unix_ns();
+            drop(s);
+            child_event(&r.log, "unsub", dropped, Duration::from_secs(2)).await.expect("the child was told");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(r.child.stats().unasked, 0, "an item just after the unsubscribe's `true` is the cancel's tail");
+        assert_eq!(r.child.routed(), 0, "and leaves no route");
+    }
+}
+
 // ------------------------------------------------------------- a child gone
 
 /// SIGKILL mid-stream: one `child_unavailable`, the end, within 1 s; the

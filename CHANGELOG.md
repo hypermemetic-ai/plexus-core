@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (spec/12, the hop between services): `RemoteChild::connect(ChildSpec,
   ChildOptions)`, `stats() -> ChildStats { open, unasked, restarts, calls }`,
   `pid()`, `principal()`, `mount_timings()`. Registered like any activation:
-  its schema and roles merged under the mount name.
+  its schema and roles merged under the mount name. An item for a call the
+  child was not given is dropped, logged and counted `unasked`; one landing
+  within 250 ms of an unsubscribe's `true` (spec/04's item in flight) is the
+  cancel's tail, dropped quietly.
 - `ChildSpec` (`NAME=stdio:CMD` | `NAME=ws://…`), `ChildOptions`, `Backoff`,
   `ChildError`, `ChildMethods`, `parse_duration`; `ChildArgs` behind the new
   `clap` feature (`--child`, `--child-timeout`, `--child-max-calls`,

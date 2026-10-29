@@ -78,16 +78,34 @@ struct Opening {
     items: mpsc::Sender<PlexusStreamItem>,
 }
 
+/// How long after its `true` an unsubscribed call's late item is still the
+/// cancel's tail: spec/04 lets an item already in flight land just after
+/// the response (the kit allows 50 ms).
+const TAIL: Duration = Duration::from_millis(250);
+
 #[derive(Default)]
 struct Routes {
     pending: HashMap<u64, Opening>,
     subs: HashMap<SubKey, mpsc::Sender<PlexusStreamItem>>,
-    /// Unsubscribes sent and not yet answered: their late items are the
-    /// cancel's tail, dropped quietly (not "unasked").
+    /// Unsubscribes sent and not yet answered, and those answered within
+    /// [`TAIL`]: their late items are the cancel's tail, dropped quietly
+    /// (not "unasked").
     closing: HashMap<u64, SubKey>,
     closing_subs: HashSet<SubKey>,
+    answered: VecDeque<(Instant, SubKey)>,
     /// Opens past their timeout: a late answer is unsubscribed at once.
     abandoned: HashSet<u64>,
+}
+
+impl Routes {
+    /// Forget the cancels answered more than [`TAIL`] ago.
+    fn expire_tails(&mut self, now: Instant) {
+        while self.answered.front().is_some_and(|(t, _)| now.duration_since(*t) >= TAIL) {
+            if let Some((_, key)) = self.answered.pop_front() {
+                self.closing_subs.remove(&key);
+            }
+        }
+    }
 }
 
 /// One connection to the child.
@@ -273,7 +291,10 @@ impl Conn {
                 }
             }
         } else if let Some(key) = r.closing.remove(&id) {
-            r.closing_subs.remove(&key);
+            // Answered: an item still in flight is the tail for TAIL more.
+            let now = Instant::now();
+            r.expire_tails(now);
+            r.answered.push_back((now, key));
         } else if r.abandoned.remove(&id) {
             // A call opened after its caller was told `child_timeout`: stop it.
             if let Some(sid) = msg.result.and_then(|s| serde_json::from_str::<Value>(s.get()).ok()) {
@@ -296,10 +317,11 @@ impl Conn {
 
     async fn route(&self, key: SubKey, raw: &RawValue) {
         let tx = {
-            let r = self.routes.lock().unwrap();
+            let mut r = self.routes.lock().unwrap();
             match r.subs.get(&key) {
                 Some(tx) => tx.clone(),
                 None => {
+                    r.expire_tails(Instant::now());
                     if !r.closing_subs.contains(&key) {
                         drop(r);
                         self.counters.unasked.fetch_add(1, Ordering::Relaxed);
@@ -340,6 +362,7 @@ impl Conn {
             self.alive.store(false, Ordering::Release);
             r.closing.clear();
             r.closing_subs.clear();
+            r.answered.clear();
             r.abandoned.clear();
             (std::mem::take(&mut r.subs), std::mem::take(&mut r.pending))
         };

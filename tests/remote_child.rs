@@ -70,6 +70,32 @@ async fn merged_schema_and_roles_golden() {
     assert_eq!((s.namespace.as_str(), s.version.as_str()), ("echo", "0.1.0"));
 }
 
+/// SYNAPSE-CC-9: the walk holds over a mounted child. Its schema is the
+/// child's declaration, kept whole under the mount name, and walked like any
+/// activation's: the stub declares no `returns`, so each of its five methods
+/// is named under `echo` (what synapse refuses at IR build); the service's
+/// own schemas, the in-process `rsecho` and the service itself, have none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_walk_names_a_mounted_childs_sites_under_its_mount() {
+    use plexus_core::plexus::schema::{foreign_keywords, untyped_sites};
+    let r = rig(Via::Stdio).await;
+    let child = plexus_core::plexus::Activation::plugin_schema(&r.child);
+    assert_eq!(untyped_sites(&child), [
+        "echo.count returns", "echo.echo returns", "echo.fail returns", "echo.shout returns", "echo.whoami returns"
+    ]);
+    assert_eq!(foreign_keywords(&child), Vec::<String>::new());
+    let all = r.service.list_plugin_schemas();
+    let names: Vec<&str> = all.iter().map(|s| s.namespace.as_str()).collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    for ns in ["service", "rsecho", "echo"] {
+        assert!(names.contains(&ns), "{names:?}");
+    }
+    for s in all.iter().filter(|s| s.namespace != "echo") {
+        assert_eq!(untyped_sites(s), Vec::<String>::new(), "{}", s.namespace);
+        assert_eq!(foreign_keywords(s), Vec::<String>::new(), "{}", s.namespace);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refuses_child_with_children() {
     let dir = tempfile::tempdir().unwrap();

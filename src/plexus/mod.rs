@@ -33,6 +33,7 @@ pub mod plexus;
 // POLYGLOT-5: the child seam's second implementation — a process or a socket.
 pub mod remote_child;
 pub mod schema;
+mod schema_sites;
 pub(crate) mod scope_gate;
 pub mod streaming;
 pub mod types;
@@ -75,7 +76,8 @@ pub use crate::types::Handle;
 pub use schema::{
     AuthPosture, ChildHashes, ChildSummary, DeprecationInfo, MethodExample, MethodRole, MethodSchema,
     ParamSchema, PluginHashes, PluginSchema, RequiredCredential, ReturnShape, Schema,
-    SchemaProperty, SchemaResult, SchemaType, ViewKind, X_PLEXUS_VALUES,
+    SchemaParams, SchemaProperty, SchemaResult, SchemaType, ViewKind, JSON_TYPES,
+    X_PLEXUS_VALUES,
 };
 pub use types::{PlexusStreamItem, StreamMetadata};
 pub use method_enum::MethodEnumSchema;

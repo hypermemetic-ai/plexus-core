@@ -2497,11 +2497,8 @@ struct CallParams {
     params: Option<Value>,
 }
 
-/// Params for {ns}.schema
-#[derive(Debug, Default, serde::Deserialize)]
-struct SchemaParams {
-    method: Option<String>,
-}
+/// Params for {ns}.schema (SYNAPSE-CC-9: the published type)
+use super::schema::SchemaParams;
 
 /// Params for {ns}.respond (WebSocket bidirectional response)
 #[derive(Debug, serde::Deserialize)]

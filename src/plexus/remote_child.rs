@@ -56,11 +56,11 @@ impl FromStr for ChildSpec {
     }
 }
 
-/// How the hub reaches its child.
+/// How the service reaches its child.
 #[derive(Debug, Clone)]
 pub struct ChildOptions {
-    /// The hop's principal: the hub acting (spec/12). `hub:<hub>` on stdio
-    /// when the hub holds no key of its own.
+    /// The hop's principal: the service acting (spec/12). `service:<service>` on stdio
+    /// when the service holds no key of its own.
     pub principal: String,
     /// A call's open, and the schema at connect.
     pub timeout: Duration,
@@ -68,7 +68,7 @@ pub struct ChildOptions {
 
 impl Default for ChildOptions {
     fn default() -> Self {
-        Self { principal: "hub:hub".into(), timeout: Duration::from_secs(5) }
+        Self { principal: "service:service".into(), timeout: Duration::from_secs(5) }
     }
 }
 
@@ -233,7 +233,7 @@ impl Link {
     }
 }
 
-/// The stream the hub hands its caller: the child's items, in order; dropped
+/// The stream the service hands its caller: the child's items, in order; dropped
 /// before its end, it unsubscribes the child's call.
 struct CallStream {
     rx: mpsc::UnboundedReceiver<PlexusStreamItem>,
@@ -343,7 +343,7 @@ impl RemoteChild {
             let status = child.wait().await.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
             reader.on_exit(&format!("the process exited ({status})"));
         });
-        // stderr: the child's log, into the hub's
+        // stderr: the child's log, into the service's
         let name = spec.name.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -412,7 +412,7 @@ impl RemoteChild {
         self.inner.timings
     }
 
-    /// The hop (spec/12): the hub acts, the caller is named `for`, the
+    /// The hop (spec/12): the service acts, the caller is named `for`, the
     /// gate's verdict is the limit. Nothing of the caller's credential.
     fn hop(&self, method: &str, auth: Option<&AuthContext>) -> Value {
         let reach = super::grant_gate::current_reach();

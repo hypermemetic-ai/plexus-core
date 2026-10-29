@@ -91,20 +91,20 @@ fn stub() -> PathBuf {
 }
 
 struct Rig {
-    hub: Arc<DynamicHub>,
+    service: Arc<DynamicHub>,
     child: RemoteChild,
     log: PathBuf,
     _dir: tempfile::TempDir,
 }
 
-/// A gated hub `hub` of `rsecho` (in process) and the stub mounted as `echo`;
+/// A gated service `service` of `rsecho` (in process) and the stub mounted as `echo`;
 /// ADA views everywhere, NOBODY holds nothing.
 async fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("child.log");
     let spec: ChildSpec = format!("echo=stdio:python3 -I {} --stdio --log {}", stub().display(), log.display()).parse().unwrap();
-    let child = RemoteChild::connect(spec, ChildOptions { principal: "hub:hub".into(), ..ChildOptions::default() }).await.expect("the stub mounts");
-    let plain = || DynamicHub::new("hub").register(RsechoActivation).register(child.clone());
+    let child = RemoteChild::connect(spec, ChildOptions { principal: "service:service".into(), ..ChildOptions::default() }).await.expect("the stub mounts");
+    let plain = || DynamicHub::new("service").register(RsechoActivation).register(child.clone());
     let members = Arc::new(Members::default());
     members.0.lock().unwrap().push(Membership {
         principal: ADA.parse().unwrap(),
@@ -114,7 +114,7 @@ async fn rig() -> Rig {
     let declared = plain().declared_roles();
     let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let gate = Gate::new(members, Arc::new(roles), Arc::new(Everywhere));
-    Rig { hub: Arc::new(plain().with_gate(Arc::new(gate))), child, log, _dir: dir }
+    Rig { service: Arc::new(plain().with_gate(Arc::new(gate))), child, log, _dir: dir }
 }
 
 async fn collect(t: &HubTransport, ns: &'static str, m: &'static str, p: Value) -> Vec<StreamItem> {
@@ -179,7 +179,7 @@ async fn time_calls(t: &HubTransport, ns: &'static str, n: usize) -> Vec<f64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row1_hop_cost_one_item_call() {
     let r = rig().await;
-    let t = HubTransport::as_(r.hub.clone(), who(ADA));
+    let t = HubTransport::as_(r.service.clone(), who(ADA));
     let inproc = time_calls(&t, "rsecho", 1000).await;
     let hop = time_calls(&t, "echo", 1000).await;
     let (p50, p99) = (pct(&hop, 0.5), pct(&hop, 0.99));
@@ -196,7 +196,7 @@ async fn row1_hop_cost_one_item_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row2_stream_10000() {
     let r = rig().await;
-    let t = HubTransport::as_(r.hub.clone(), who(ADA));
+    let t = HubTransport::as_(r.service.clone(), who(ADA));
     let rate = |items: usize, d: Duration| items as f64 / d.as_secs_f64();
     let mut best = (0f64, 0f64);
     for _ in 0..3 {
@@ -218,8 +218,8 @@ async fn row2_stream_10000() {
     }
     let raw = stub_raw_rate(10000).await;
     let ratio = best.1 / best.0;
-    row(json!({ "row": 2, "metric": "10,000-item stream (items/s)", "inproc": best.0, "child_through_hub": best.1,
-        "stub_alone_on_its_pipe": raw, "child_burst_through_hub": burst, "ratio_burst_vs_inproc": burst / best.0, "ratio_vs_inproc": ratio, "ratio_vs_stub_alone": best.1 / raw,
+    row(json!({ "row": 2, "metric": "10,000-item stream (items/s)", "inproc": best.0, "child_through_service": best.1,
+        "stub_alone_on_its_pipe": raw, "child_burst_through_service": burst, "ratio_burst_vs_inproc": burst / best.0, "ratio_vs_inproc": ratio, "ratio_vs_stub_alone": best.1 / raw,
         "target": ">= 50 % of in process" }));
     if release() {
         // The row as written; its verdict is recorded beside the hop's own share.
@@ -227,7 +227,7 @@ async fn row2_stream_10000() {
     }
 }
 
-/// The stub's own rate: the same `count` read straight off its stdout, no hub.
+/// The stub's own rate: the same `count` read straight off its stdout, no service.
 async fn stub_raw_rate(to: u64) -> f64 {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let mut c = tokio::process::Command::new("python3")
@@ -238,7 +238,7 @@ async fn stub_raw_rate(to: u64) -> f64 {
         .unwrap();
     let mut stdin = c.stdin.take().unwrap();
     let mut lines = BufReader::new(c.stdout.take().unwrap()).lines();
-    let hop = json!({ "principal": "hub:bench", "for": [], "limit": { "grant": "echo.count", "held_on": ["*"] }, "call": "raw" });
+    let hop = json!({ "principal": "service:bench", "for": [], "limit": { "grant": "echo.count", "held_on": ["*"] }, "call": "raw" });
     let mut best = 0f64;
     for i in 0..3 {
         let frame = json!({ "jsonrpc": "2.0", "id": i, "method": "echo.call", "params": { "method": "echo.count", "params": { "to": to }, "hop": hop } });
@@ -265,7 +265,7 @@ async fn stub_raw_rate(to: u64) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row3_cancel_crosses_the_hop() {
     let r = rig().await;
-    let t = HubTransport::as_(r.hub.clone(), who(ADA));
+    let t = HubTransport::as_(r.service.clone(), who(ADA));
     let mut lat = vec![];
     for _ in 0..20 {
         let mut s = t.call(MethodRef::new("echo", "count"), json!({ "to": 100000, "delay_ms": 1 }));
@@ -294,7 +294,7 @@ async fn row3_cancel_crosses_the_hop() {
     let open = r.child.stats().open;
     row(json!({ "row": 3, "metric": "cancel: drop → the child stopped (ms)", "p50": pct(&lat, 0.5), "max": lat[lat.len() - 1],
         "runs": lat.len(), "open_after": open, "target": "<= 100 ms" }));
-    assert_eq!(open, 0, "the hub keeps no entry for a cancelled call");
+    assert_eq!(open, 0, "the service keeps no entry for a cancelled call");
     assert!(lat[lat.len() - 1] <= 100.0, "{lat:?}");
 }
 
@@ -303,7 +303,7 @@ async fn row3_cancel_crosses_the_hop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row4_no_grant_never_reaches_the_child() {
     let r = rig().await;
-    let t = HubTransport::as_(r.hub.clone(), who(NOBODY));
+    let t = HubTransport::as_(r.service.clone(), who(NOBODY));
     let child = collect(&t, "echo", "echo", json!({ "text": "never-sent-7f3a", "times": 1 })).await;
     let inproc = collect(&t, "rsecho", "echo", json!({ "text": "never-sent-7f3a", "times": 1 })).await;
     let code = |items: &[StreamItem]| match items {
@@ -322,7 +322,7 @@ async fn row4_no_grant_never_reaches_the_child() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row5_child_killed_mid_stream() {
     let r = rig().await;
-    let t = HubTransport::as_(r.hub.clone(), who(ADA));
+    let t = HubTransport::as_(r.service.clone(), who(ADA));
     let mut s = t.call(MethodRef::new("echo", "count"), json!({ "to": 1000000, "delay_ms": 1 }));
     let mut got = 0;
     while got < 50 {
@@ -360,7 +360,7 @@ async fn row5_child_killed_mid_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row6_unasked_item_dropped() {
     let r = rig().await;
-    let t = HubTransport::as_(r.hub.clone(), who(ADA));
+    let t = HubTransport::as_(r.service.clone(), who(ADA));
     let items = collect(&t, "echo", "fail", json!({ "kind": "unasked" })).await;
     let strays = items.iter().filter(|i| matches!(i, StreamItem::Data { content, .. } if content["type"] == "stray")).count();
     let unasked = r.child.stats().unasked;
@@ -372,26 +372,26 @@ async fn row6_unasked_item_dropped() {
 }
 
 /// Row 7 — the schema: the child's methods under its mount name, its roles
-/// merged; `echo.schema` answered by the hub from what it merged.
+/// merged; `echo.schema` answered by the service from what it merged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row7_schema_merged_under_its_name() {
     let r = rig().await;
-    let roles = r.hub.declared_roles();
-    let t = HubTransport::as_(r.hub.clone(), who(ADA));
+    let roles = r.service.declared_roles();
+    let t = HubTransport::as_(r.service.clone(), who(ADA));
     let items = collect(&t, "echo", "schema", json!({})).await;
     let schema = match &items[0] {
         StreamItem::Data { content, .. } => content.clone(),
         other => panic!("{other:?}"),
     };
     let names: Vec<_> = schema["methods"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_string()).collect();
-    let hub_items = collect(&t, "hub", "schema", json!({})).await;
-    let in_hub = format!("{hub_items:?}").contains("\"echo\"") || format!("{hub_items:?}").contains("echo");
+    let service_items = collect(&t, "service", "schema", json!({})).await;
+    let in_hub = format!("{service_items:?}").contains("\"echo\"") || format!("{service_items:?}").contains("echo");
     let (spawn_ms, merge_ms) = r.child.mount_timings();
     row(json!({ "row": 7, "metric": "the schema", "namespace": schema["namespace"], "methods_in_viewers_view": names,
-        "viewer": roles.get("viewer"), "editor": roles.get("editor"), "in_hub_schema": in_hub,
+        "viewer": roles.get("viewer"), "editor": roles.get("editor"), "in_service_schema": in_hub,
         "spawn_to_schema_ms": spawn_ms, "merge_ms": merge_ms, "target": "the child's methods under its name, roles as declared" }));
     assert_eq!(schema["namespace"], "echo");
-    // The whole schema is the hub's; a caller is answered from its view
+    // The whole schema is the service's; a caller is answered from its view
     // (AUTH-4) — a viewer is not shown the editor's `shout`, as for any activation.
     let all: Vec<_> = plexus_core::plexus::Activation::plugin_schema(&r.child).methods.iter().map(|m| m.name.clone()).collect();
     for m in ["echo", "shout", "count", "whoami", "fail"] {
@@ -408,7 +408,7 @@ async fn row7_schema_merged_under_its_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row8_child_knows_principal_and_verdict_never_a_credential() {
     let r = rig().await;
-    let t = HubTransport::as_(r.hub.clone(), who(ADA));
+    let t = HubTransport::as_(r.service.clone(), who(ADA));
     let items = collect(&t, "echo", "whoami", json!({})).await;
     let hop = match &items[0] {
         StreamItem::Data { content, .. } => content["hop"].clone(),
@@ -420,7 +420,7 @@ async fn row8_child_knows_principal_and_verdict_never_a_credential() {
     row(json!({ "row": 8, "metric": "what the child knows of the caller", "hop": hop, "credential_leaks": leaks.len(),
         "target": "principal and verdict present; no credential, ever" }));
     assert_eq!(hop["for"], json!([ADA]));
-    assert_eq!(hop["principal"], "hub:hub");
+    assert_eq!(hop["principal"], "service:service");
     assert_eq!(hop["limit"]["grant"], "echo.whoami");
     assert_eq!(hop["limit"]["held_on"], json!(["*"]));
     assert!(hop["call"].as_str().is_some_and(|c| !c.is_empty()));
@@ -435,12 +435,12 @@ async fn row8_child_knows_principal_and_verdict_never_a_credential() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row2_stream_10000_over_the_websocket() {
     let r = rig().await;
-    let plain = Arc::new(DynamicHub::new("hub").register(RsechoActivation).register(r.child.clone()));
+    let plain = Arc::new(DynamicHub::new("service").register(RsechoActivation).register(r.child.clone()));
     let module = DynamicHub::arc_into_rpc_module(plain).unwrap();
     let server = jsonrpsee::server::Server::builder().build("127.0.0.1:0").await.unwrap();
     let addr = server.local_addr().unwrap();
     let handle = server.start(module);
-    let ws = plexus_client::WsTransport::connect(&format!("ws://{addr}"), "hub").await.unwrap();
+    let ws = plexus_client::WsTransport::connect(&format!("ws://{addr}"), "service").await.unwrap();
     let rate = |n: usize, d: Duration| n as f64 / d.as_secs_f64();
     let mut best = (0f64, 0f64, 0f64);
     for _ in 0..3 {
@@ -469,7 +469,7 @@ async fn row2_stream_10000_over_the_websocket() {
     handle.stop().unwrap();
 }
 
-/// Recorded, no target here (POLYGLOT-5 targets ≤ 512 KiB): the hub's RSS
+/// Recorded, no target here (POLYGLOT-5 targets ≤ 512 KiB): the service's RSS
 /// with 0, 1 and 8 stubs mounted, and 100 calls open on one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recorded_memory_per_mounted_child() {
@@ -488,8 +488,8 @@ async fn recorded_memory_per_mounted_child() {
         kids.push(RemoteChild::connect(spec(i), ChildOptions::default()).await.unwrap());
     }
     let r8 = rss_kib();
-    let hub = Arc::new(kids.iter().fold(DynamicHub::new("hub"), |h, k| h.register(k.clone())));
-    let t = HubTransport::anonymous(hub);
+    let service = Arc::new(kids.iter().fold(DynamicHub::new("service"), |h, k| h.register(k.clone())));
+    let t = HubTransport::anonymous(service);
     let mut open = vec![];
     for _ in 0..100 {
         let mut s = t.call(MethodRef::new("echo0", "count"), json!({ "to": 1000000, "delay_ms": 100 }));
@@ -497,7 +497,7 @@ async fn recorded_memory_per_mounted_child() {
         open.push(s);
     }
     let r100 = rss_kib();
-    row(json!({ "row": "mem", "metric": "hub RSS per mounted child (KiB)", "rss_0": r0, "first_child": r1 - r0,
+    row(json!({ "row": "mem", "metric": "service RSS per mounted child (KiB)", "rss_0": r0, "first_child": r1 - r0,
         "per_child_of_8": (r8 - r0) as f64 / 8.0, "with_100_open_calls": r100 as i64 - r8 as i64, "open": kids[0].stats().open }));
     drop(open);
 }

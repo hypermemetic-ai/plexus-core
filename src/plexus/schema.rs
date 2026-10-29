@@ -815,6 +815,13 @@ pub struct MethodSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
 
+    /// BIDIR-8: who may answer a question this method asks mid-call
+    /// (`#[method(answer_by = "person" | "grant:<g>")]`; BIDIR-1
+    /// `answerer`). Absent for the default, `caller` — the call's own
+    /// connection — so a method without the attribute is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_by: Option<String>,
+
     /// SYNAPSE-13: worked calls of this method, each its params object and a
     /// note saying what it does — OpenAPI's `examples`. A client renders them
     /// as command lines (`synapse … --id MENGER-40 --status Coding`).
@@ -1328,6 +1335,7 @@ impl MethodSchema {
             long_description: None,
             held_on: None,
             group: None,
+            answer_by: None,
             examples: Vec::new(),
         }
     }
@@ -1515,6 +1523,21 @@ impl MethodSchema {
     pub fn with_long_description(mut self, long_description: impl Into<String>) -> Self {
         self.long_description = Some(long_description.into());
         self
+    }
+
+    /// BIDIR-8: who may answer a question this method asks mid-call, as
+    /// `#[method(answer_by = "…")]` declares it (`person`, `grant:<g>`);
+    /// the default (`caller`) is left unset.
+    pub fn with_answer_by(mut self, answer_by: impl Into<String>) -> Self {
+        self.answer_by = Some(answer_by.into());
+        self
+    }
+
+    /// BIDIR-8: the method's [`Answerer`](plexus_auth_core::duplex::Answerer)
+    /// — [`answer_by`](Self::answer_by) read, absent the default (`caller`).
+    /// A spelling the macro would refuse is an error, never a wider answerer.
+    pub fn answerer(&self) -> Result<plexus_auth_core::duplex::Answerer, String> {
+        plexus_auth_core::duplex::Answerer::of_schema(self.answer_by.as_deref())
     }
 
     /// SYNAPSE-13: put this method in a listing group (`"read"`, `"write"`).

@@ -739,3 +739,35 @@ async fn a_gateless_hub_answers_info_byte_for_byte() {
     assert_eq!(h[0]["content"]["value"], hub.compute_hash());
     let _: &dyn AuthBackend = &MemoryAuthBackend::new("x");
 }
+
+/// BIDIR-8: the grants generation is the gate's, and the auth activation's
+/// writes move it — `auth.grant`, `auth.revoke`, `auth.role_set`,
+/// `auth.logout` — once each; a read moves nothing. A service that shares
+/// one generation hands it over in `AuthSetup::with_generation`.
+#[tokio::test]
+async fn the_auth_writes_move_the_gates_generation() {
+    let w = world();
+    let gen = || w.hub.gate().expect("a gated service").generation().current();
+    let root = key(ROOT, "r");
+    let g0 = gen();
+    let _ = one(&w, "auth.whoami", json!({}), Some(&root)).await;
+    assert_eq!(gen(), g0, "a read: 0");
+    one(&w, "auth.grant", json!({"principal": ADA, "role": "viewer", "scope": "IDENTITY"}), Some(&root)).await;
+    assert_eq!(gen(), g0 + 1, "a grant");
+    one(&w, "auth.revoke", json!({"principal": ADA, "role": "viewer", "scope": "IDENTITY"}), Some(&root)).await;
+    assert_eq!(gen(), g0 + 2, "a revoke");
+    one(&w, "auth.revoke", json!({"principal": ADA, "role": "viewer", "scope": "IDENTITY"}), Some(&root)).await;
+    assert_eq!(gen(), g0 + 2, "a revoke that removed nothing moves nothing");
+    one(&w, "auth.role_set", json!({"role": "triager", "grants": ["tickets.get"]}), Some(&root)).await;
+    assert_eq!(gen(), g0 + 3, "a role edit");
+
+    // Shared: the service's handle is its call gate's.
+    let shared = plexus_auth_core::grants::GrantsGeneration::new();
+    let backend = Arc::new(MemoryAuthBackend::new("http://127.0.0.1:4456/login"));
+    let roles = Arc::new(MemoryRoles::default());
+    let service = DynamicHub::new("menger").register(TicketsActivation).with_auth(
+        AuthSetup::new(backend, roles, Arc::new(MemoryMemberships::new()), Arc::new(Shortcodes)).with_generation(shared.clone()),
+    );
+    shared.bump();
+    assert_eq!(service.gate().unwrap().generation().current(), 1, "one generation, not two");
+}

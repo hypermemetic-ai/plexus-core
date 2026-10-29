@@ -14,6 +14,9 @@ pub mod children;
 pub mod context;
 pub mod credential_envelope;
 pub mod dispatch;
+/// BIDIR-8 (BIDIR-5's rule): the gate over a duplex call — open, admit,
+/// re-verify on the gate's grants generation, answer, audit.
+pub mod duplex_gate;
 pub mod errors;
 pub mod forward_registry;
 /// AUTH-2: the grant gate in dispatch, and the task-local reach.

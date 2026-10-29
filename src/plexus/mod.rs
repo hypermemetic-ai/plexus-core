@@ -14,6 +14,8 @@ pub mod children;
 pub mod context;
 pub mod credential_envelope;
 pub mod dispatch;
+/// BIDIR-5: the gate over a duplex call (spike).
+pub mod duplex_gate;
 pub mod errors;
 pub mod forward_registry;
 /// AUTH-2: the grant gate in dispatch, and the task-local reach.

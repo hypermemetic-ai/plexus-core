@@ -1,0 +1,59 @@
+{
+  "bare": {
+    "bidirectional": false,
+    "description": "d",
+    "hash": "h",
+    "http_method": "POST",
+    "name": "bare",
+    "role": {
+      "kind": "rpc"
+    },
+    "streaming": false
+  },
+  "full": {
+    "bidirectional": false,
+    "description": "Set a ticket's status",
+    "examples": [
+      {
+        "note": "note",
+        "params": {
+          "id": "A-1"
+        }
+      }
+    ],
+    "grant": "tickets.set_status",
+    "group": "write",
+    "hash": "h1",
+    "http_method": "GET",
+    "long_description": "long",
+    "name": "set_status",
+    "params": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "string",
+      "type": "string"
+    },
+    "request_type": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "boolean",
+      "type": "boolean"
+    },
+    "response_type": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "format": "int32",
+      "title": "int32",
+      "type": "integer"
+    },
+    "returns": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "format": "uint64",
+      "minimum": 0,
+      "title": "uint64",
+      "type": "integer"
+    },
+    "role": {
+      "kind": "rpc"
+    },
+    "streaming": true,
+    "target": "id"
+  }
+}

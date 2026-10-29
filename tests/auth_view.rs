@@ -729,9 +729,12 @@ async fn a_gateless_hub_answers_info_byte_for_byte() {
     assert_eq!(hub.info(Some(&key(ADA, "a"))).to_string(), today);
     // Schemas carry no view, no held_on; the hash is the hub's own.
     let s = one(&World { hub: hub.clone(), backend: Arc::new(MemoryAuthBackend::new("x")) }, "tickets.schema", json!({}), None).await;
+    // (The answer's own keys: since SYNAPSE-CC-9 the `schema` method's
+    // `returns` is SchemaResult's JSON Schema, which names both fields.)
     let text = s.to_string();
-    assert!(!text.contains("\"view\"") && !text.contains("held_on"), "{text}");
-    assert!(text.contains("\"roles\""), "declared roles stay on a gate-less schema");
+    assert!(s.get("view").is_none(), "{text}");
+    assert!(s["methods"].as_array().unwrap().iter().all(|m| m.get("held_on").is_none()), "{text}");
+    assert!(s.get("roles").is_some(), "declared roles stay on a gate-less schema");
     let v = hub.view(None);
     assert_eq!(v.hash, hub.compute_hash());
     assert_eq!(v.activations.len(), 1);
@@ -770,4 +773,21 @@ async fn the_auth_writes_move_the_gates_generation() {
     );
     shared.bump();
     assert_eq!(service.gate().unwrap().generation().current(), 1, "one generation, not two");
+}
+
+// ---------------------------------------------------------------------------
+// SYNAPSE-CC-9: the service's own activations, `auth` included, typed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_schema_of_a_gated_service_is_typed() {
+    use plexus_core::plexus::schema::{foreign_keywords, untyped_sites};
+    let w = world();
+    let schemas = w.hub.list_plugin_schemas();
+    let names: Vec<&str> = schemas.iter().map(|s| s.namespace.as_str()).collect();
+    assert!(names.contains(&"auth") && names.contains(&"menger"), "{names:?}");
+    for s in &schemas {
+        assert_eq!(untyped_sites(s), Vec::<String>::new(), "{}", s.namespace);
+        assert_eq!(foreign_keywords(s), Vec::<String>::new(), "{}", s.namespace);
+    }
 }

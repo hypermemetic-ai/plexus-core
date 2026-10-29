@@ -621,10 +621,12 @@ pub struct MethodSchema {
 
     /// JSON Schema for the method's parameters (None if no params)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")] // a JSON Schema document: the JSON type
     pub params: Option<schemars::Schema>,
 
     /// JSON Schema for the method's return type (None if not specified)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")] // a JSON Schema document: the JSON type
     pub returns: Option<schemars::Schema>,
 
     /// Whether this method streams multiple events (true) or returns a single result (false)
@@ -663,6 +665,7 @@ pub struct MethodSchema {
     /// Only relevant when `bidirectional: true`. Describes the structure of
     /// requests the server may send during method execution.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")] // a JSON Schema document: the JSON type
     pub request_type: Option<schemars::Schema>,
 
     /// JSON Schema for the response type sent from client to server
@@ -670,6 +673,7 @@ pub struct MethodSchema {
     /// Only relevant when `bidirectional: true`. Describes the structure of
     /// responses the client should send in reply to server requests.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")] // a JSON Schema document: the JSON type
     pub response_type: Option<schemars::Schema>,
 
     /// How this method participates in the activation graph.
@@ -829,6 +833,14 @@ pub struct MethodSchema {
     /// Optional on the wire (`serde(default)`, skipped when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<MethodExample>,
+
+    /// SYNAPSE-CC-9: reserved for BIDIR-6 — the JSON Schema of the items a
+    /// client streams *in* to this method (`Input<T>`). Always `None` until
+    /// BIDIR-6 fills it; absent from the wire while `None`, so a schema
+    /// without it is byte-identical to 0.6.1's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")] // a JSON Schema document: the JSON type
+    pub input: Option<schemars::Schema>,
 }
 
 /// SYNAPSE-13: one worked call of a method — the params it sends and a note
@@ -859,6 +871,134 @@ impl MethodExample {
 /// the values it is meant to take — a hint for help and completion, never
 /// enforced (the server may accept synonyms, e.g. `active` for `Coding`).
 pub const X_PLEXUS_VALUES: &str = "x-plexus-values";
+
+/// SYNAPSE-CC-9: the JSON type — what a `serde_json::Value` is, the JSON sum
+/// type — as plexus spells it in a schema: `{"type": [these six]}`, in this
+/// order, inline (never a `$ref`), annotations beside it. schemars writes a
+/// `Value` as `true` (or annotations alone); [`spell_json_values`] rewrites
+/// each such position to this, and every `MethodSchema` schema setter applies
+/// it, so the schema says "any JSON value" one way, which a client reads as a
+/// type (SYNAPSE-CC-8's `RefJson`). The owner, 2026-10-29: nothing is opaque.
+pub const JSON_TYPES: [&str; 6] = ["null", "boolean", "number", "string", "array", "object"];
+
+/// SYNAPSE-CC-9: the closed list of keywords synapse reads in a type position
+/// (IR 2.1). Any other is reported by [`foreign_keywords`].
+pub const CONTRACT_KEYWORDS: &[&str] = &[
+    "type", "$ref", "properties", "required", "additionalProperties", "items", "prefixItems",
+    "oneOf", "anyOf", "enum", "const", "format", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "minLength", "maxLength", "pattern", "minItems", "maxItems", "default",
+    "description", "title", "examples", "deprecated", "$schema", "$defs", "definitions",
+    "x-plexus-source", "x-plexus-values",
+];
+
+/// The keywords that only annotate (or hold definitions): a schema of these
+/// alone accepts any JSON value.
+const ANNOTATIONS: &[&str] = &[
+    "description", "title", "default", "examples", "deprecated", "$schema", "$comment", "readOnly",
+    "writeOnly", "x-plexus-values", "$defs", "definitions",
+];
+
+/// SYNAPSE-CC-9: is this schema node "any JSON value" — `true`, `{}`,
+/// annotations alone, or the spelled JSON type? An injected parameter
+/// (`x-plexus-source`) is not a value a client sends, so never.
+pub fn is_json_type(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Bool(true) => true,
+        serde_json::Value::Object(o) => is_json_type_object(o),
+        _ => false,
+    }
+}
+
+fn is_json_type_object(o: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if o.contains_key("x-plexus-source") {
+        return false;
+    }
+    let spelled = match o.get("type") {
+        None => true,
+        Some(serde_json::Value::Array(ts)) => {
+            let set: std::collections::BTreeSet<&str> = ts.iter().filter_map(|t| t.as_str()).collect();
+            ts.len() == JSON_TYPES.len() && JSON_TYPES.iter().all(|t| set.contains(t))
+        }
+        Some(_) => false,
+    };
+    spelled && o.keys().all(|k| k == "type" || ANNOTATIONS.contains(&k.as_str()))
+}
+
+/// SYNAPSE-CC-9: rewrite every "any JSON value" position in `schema` —
+/// `true`, `{}`, annotations alone — to the JSON type
+/// (`{"type": JSON_TYPES}`, annotations kept), through `properties`,
+/// `items`, `prefixItems`, `additionalProperties`, the unions and `$defs`.
+/// Idempotent; a typed node and an injected parameter are left as they are.
+/// In place: a schemars `Schema` is a JSON value, so nothing is copied.
+pub fn spell_json_values(schema: &mut schemars::Schema) {
+    if schema.as_bool() == Some(false) {
+        return; // accepts nothing: no value position
+    }
+    spell_object(schema.ensure_object()); // `true` becomes `{}`, then the JSON type
+}
+
+fn spell(v: &mut serde_json::Value) {
+    if matches!(v, serde_json::Value::Bool(true)) {
+        *v = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let serde_json::Value::Object(o) = v {
+        spell_object(o);
+    }
+}
+
+fn spell_object(o: &mut serde_json::Map<String, serde_json::Value>) {
+    use serde_json::Value;
+    let any = is_json_type_object(o);
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(m)) = o.get_mut(key) {
+            m.values_mut().for_each(spell);
+        }
+    }
+    if any {
+        o.insert("type".into(), Value::Array(JSON_TYPES.iter().map(|t| Value::String((*t).into())).collect()));
+        return;
+    }
+    if let Some(Value::Object(m)) = o.get_mut("properties") {
+        m.values_mut().for_each(spell);
+    }
+    for key in ["items", "additionalProperties"] {
+        if let Some(x) = o.get_mut(key) {
+            if !matches!(x, Value::Bool(false)) {
+                spell(x);
+            }
+        }
+    }
+    for key in ["prefixItems", "oneOf", "anyOf", "allOf"] {
+        if let Some(Value::Array(xs)) = o.get_mut(key) {
+            xs.iter_mut().for_each(spell);
+        }
+    }
+}
+
+/// SYNAPSE-CC-9: the params of every activation's `schema` method.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SchemaParams {
+    /// One method's schema instead of the whole activation's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+impl SchemaParams {
+    /// The params object as a method's `params` carries it: the struct's
+    /// schema without the document-level `$schema`, `title` and
+    /// `description` (a params object carries none; its properties do).
+    pub fn params_schema() -> schemars::Schema {
+        let mut s = schema_for!(SchemaParams);
+        if let Some(o) = s.as_object_mut() {
+            o.remove("$schema");
+            o.remove("title");
+            o.remove("description");
+        }
+        s
+    }
+}
+
+pub use super::schema_sites::{foreign_keywords, schema_untyped_sites, untyped_sites};
 
 /// `skip_serializing_if` helper: omit `false` booleans from the wire so
 /// additive flags keep pre-existing JSON byte-identical (see
@@ -1337,17 +1477,43 @@ impl MethodSchema {
             group: None,
             answer_by: None,
             examples: Vec::new(),
+            input: None,
         }
     }
 
+    /// SYNAPSE-CC-9: the entry of the `schema` method every activation
+    /// answers — `params` `{method?: string}` ([`SchemaParams`]) and
+    /// `returns` [`SchemaResult`] (this `PluginSchema`, or one `MethodSchema`
+    /// when called with `{"method": …}`; RETURNS-26). The macro adds the
+    /// activation's grant.
+    pub fn auto_schema() -> Self {
+        Self::new(
+            "schema",
+            "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
+            "auto_schema", // fixed: the entry is the same in every activation
+        )
+        .with_params(SchemaParams::params_schema())
+        .with_returns(schema_for!(SchemaResult))
+    }
+
+    /// SYNAPSE-CC-9: reserved for BIDIR-6 — the schema of the items a client
+    /// streams in.
+    pub fn with_input(mut self, mut input: schemars::Schema) -> Self {
+        spell_json_values(&mut input);
+        self.input = Some(input);
+        self
+    }
+
     /// Add parameter schema
-    pub fn with_params(mut self, params: schemars::Schema) -> Self {
+    pub fn with_params(mut self, mut params: schemars::Schema) -> Self {
+        spell_json_values(&mut params);
         self.params = Some(params);
         self
     }
 
     /// Add return type schema
-    pub fn with_returns(mut self, returns: schemars::Schema) -> Self {
+    pub fn with_returns(mut self, mut returns: schemars::Schema) -> Self {
+        spell_json_values(&mut returns);
         self.returns = Some(returns);
         self
     }
@@ -1389,7 +1555,8 @@ impl MethodSchema {
     ///
     /// Only relevant when `bidirectional: true`. Use `schema_for!(YourRequestType)`
     /// to generate the schema.
-    pub fn with_request_type(mut self, schema: schemars::Schema) -> Self {
+    pub fn with_request_type(mut self, mut schema: schemars::Schema) -> Self {
+        spell_json_values(&mut schema);
         self.request_type = Some(schema);
         self
     }
@@ -1398,7 +1565,8 @@ impl MethodSchema {
     ///
     /// Only relevant when `bidirectional: true`. Use `schema_for!(YourResponseType)`
     /// to generate the schema.
-    pub fn with_response_type(mut self, schema: schemars::Schema) -> Self {
+    pub fn with_response_type(mut self, mut schema: schemars::Schema) -> Self {
+        spell_json_values(&mut schema);
         self.response_type = Some(schema);
         self
     }

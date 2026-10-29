@@ -256,8 +256,11 @@ async fn without_a_gate_nothing_changes() {
     assert_eq!(out[0]["content"].to_string(), today);
     // Every method, no view, no held_on; the hub's own hash.
     let t = data(hub.route("tickets.schema", json!({}), None).await.unwrap()).await;
+    // (The answer's own keys: since SYNAPSE-CC-9 the `schema` method's
+    // `returns` is SchemaResult's JSON Schema, which names both fields.)
     let text = t[0].to_string();
-    assert!(!text.contains("\"view\"") && !text.contains("held_on"));
+    assert!(t[0].get("view").is_none(), "{text}");
+    assert!(t[0]["methods"].as_array().unwrap().iter().all(|m| m.get("held_on").is_none()), "{text}");
     assert_eq!(t[0]["methods"].as_array().unwrap().len(), 6);
     assert_eq!(hub.view(None).hash, hub.compute_hash());
     let h = data(hub.route("menger.hashes", json!({}), None).await.unwrap()).await;

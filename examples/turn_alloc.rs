@@ -28,7 +28,7 @@
 use serde_json::json;
 use tokio::runtime::Runtime;
 
-use plexus_core::activations::echo::Echo;
+use plexus_core::activations::echo::EchoActivation;
 use plexus_core::ir::{ActivationIr, AuthRequirementIr, MethodIr};
 use plexus_core::plexus::DynamicHub;
 use plexus_core::runtime::profile;
@@ -132,7 +132,7 @@ fn main() {
             }),
         )]),
     );
-    let legacy_hub = DynamicHub::new("hub").register(Echo::new());
+    let legacy_hub = DynamicHub::new("hub").register(EchoActivation::new());
     let turn_hub = DynamicHub::new("hub").register(child.clone());
 
     const N: [u64; 2] = [200, 2000];

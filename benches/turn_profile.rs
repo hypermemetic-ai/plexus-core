@@ -67,7 +67,7 @@ use futures::StreamExt;
 use serde_json::json;
 use tokio::runtime::Runtime;
 
-use plexus_core::activations::echo::Echo;
+use plexus_core::activations::echo::EchoActivation;
 use plexus_core::ir::{ActivationIr, AuthRequirementIr, MethodIr};
 use plexus_core::plexus::DynamicHub;
 use plexus_core::runtime::profile;
@@ -224,7 +224,7 @@ fn bench_ladder_on(c: &mut Criterion, flavor: &str, rt: &Runtime) {
 
     // The bar, re-measured in this bench so the two numbers come from the same
     // machine, the same build and the same session.
-    let hub = DynamicHub::new("bench_hub").register(Echo::new());
+    let hub = DynamicHub::new("bench_hub").register(EchoActivation::new());
     group.bench_function("legacy_echo_once", |b| {
         b.to_async(rt).iter(|| async {
             let stream = hub
@@ -305,7 +305,7 @@ fn bench_in_process_on(c: &mut Criterion, flavor: &str, rt: &Runtime) {
     )]);
     let child = IrActivation::new(child_ir, child_handlers);
 
-    let legacy_hub = DynamicHub::new("hub").register(Echo::new());
+    let legacy_hub = DynamicHub::new("hub").register(EchoActivation::new());
     let turn_hub = DynamicHub::new("hub").register(child.clone());
 
     let mut group = c.benchmark_group(format!("in_process_{flavor}"));
@@ -388,7 +388,7 @@ fn bench_concurrent(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let ir = bench_ir();
     let table = bench_table();
-    let hub = DynamicHub::new("hub").register(Echo::new());
+    let hub = DynamicHub::new("hub").register(EchoActivation::new());
 
     let mut group = c.benchmark_group("concurrent_multi");
     group.throughput(criterion::Throughput::Elements(BATCH as u64));

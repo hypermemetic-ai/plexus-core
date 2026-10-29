@@ -49,7 +49,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 
-use plexus_core::activations::echo::Echo;
+use plexus_core::activations::echo::EchoActivation;
 use plexus_core::ir::{ActivationIr, AuthRequirementIr, MethodIr};
 use plexus_core::plexus::DynamicHub;
 use plexus_core::runtime::{
@@ -243,7 +243,7 @@ fn bench_dispatch(c: &mut Criterion) {
 /// The bar: the cheapest *real* method, end to end through today's hub.
 fn bench_reference_bar(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let hub = DynamicHub::new("bench_hub").register(Echo::new());
+    let hub = DynamicHub::new("bench_hub").register(EchoActivation::new());
 
     let mut group = c.benchmark_group("reference_bar");
     group.bench_function("echo.once", |b| {
@@ -274,7 +274,7 @@ fn bench_turn_overhead(c: &mut Criterion) {
         ir
     };
     let table = closure_table();
-    let hub = DynamicHub::new("bench_hub").register(Echo::new());
+    let hub = DynamicHub::new("bench_hub").register(EchoActivation::new());
 
     let mut group = c.benchmark_group("turn_overhead");
     group.bench_function("entry/full_turn", |b| {

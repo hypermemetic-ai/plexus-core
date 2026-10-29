@@ -26,6 +26,8 @@ pub mod hub_context;
 pub mod in_process;
 /// LOCAL-6: a whole hub, called in memory.
 pub mod hub_transport;
+/// LOCAL-3: a spike, never merged.
+pub mod offer_spike;
 pub mod method_enum;
 pub mod middleware;
 pub mod path;
@@ -46,6 +48,7 @@ pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirCha
 pub use context::PlexusContext;
 pub use in_process::InProcessTransport;
 pub use hub_transport::HubTransport;
+pub use offer_spike::ServiceOffer;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME};

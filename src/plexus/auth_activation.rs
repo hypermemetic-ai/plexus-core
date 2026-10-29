@@ -47,7 +47,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use plexus_auth_core::grants::{
-    Ceiling, Gate, Grant, GrantSet, Liveness, Membership, Memberships, Reach, Resolve, Roles, ScopeRef, ADMIN,
+    Ceiling, Gate, Grant, GrantSet, GrantsGeneration, GrantsMove, Liveness, Membership, Memberships, Reach, Resolve, Roles, ScopeRef, ADMIN,
 };
 use plexus_auth_core::identity::Principal;
 use plexus_auth_core::RoleName;
@@ -414,6 +414,11 @@ pub struct AuthSetup {
     pub roles: Arc<dyn RoleStore>,
     pub memberships: Arc<dyn MembershipStore>,
     pub resolve: Arc<dyn Resolve>,
+    /// BIDIR-8: the service's grants generation, when it shares one between
+    /// this service's call gate and gates of its own (menger's access
+    /// layer); else the call gate counts alone. `auth.grant`, `auth.revoke`,
+    /// `auth.role_set` and `auth.logout` move it.
+    pub generation: Option<GrantsGeneration>,
 }
 
 impl AuthSetup {
@@ -423,7 +428,14 @@ impl AuthSetup {
         memberships: Arc<dyn MembershipStore>,
         resolve: Arc<dyn Resolve>,
     ) -> Self {
-        Self { backend, roles, memberships, resolve }
+        Self { backend, roles, memberships, resolve, generation: None }
+    }
+
+    /// BIDIR-8: the service's call gate counts its moves in `generation`, shared with
+    /// whatever else the service decides by it.
+    pub fn with_generation(mut self, generation: GrantsGeneration) -> Self {
+        self.generation = Some(generation);
+        self
     }
 }
 
@@ -506,8 +518,11 @@ impl AuthActivation {
     pub(crate) fn mount(setup: AuthSetup, catalog: Catalog) -> (Self, Gate) {
         let memberships: Arc<dyn Memberships> = setup.memberships.clone();
         let roles: Arc<dyn Roles> = setup.roles.clone();
-        let gate = Gate::new(memberships, roles, Arc::new(WithEverywhere(setup.resolve)))
+        let mut gate = Gate::new(memberships, roles, Arc::new(WithEverywhere(setup.resolve)))
             .with_liveness(Arc::new(BackendLiveness(setup.backend.clone())));
+        if let Some(generation) = setup.generation {
+            gate = gate.with_generation(generation);
+        }
         let auth = Self {
             inner: Arc::new(AuthInner {
                 backend: setup.backend,
@@ -674,7 +689,11 @@ impl AuthActivation {
         stream! {
             let principal = principal_of(&ctx).map(|p| p.to_string()).unwrap_or_default();
             match inner.backend.logout(&ctx).await {
-                Ok(()) => yield AuthEvent::LoggedOut { principal },
+                Ok(()) => {
+                    // BIDIR-8: a sign-in ended; whatever holds it verifies again.
+                    inner.gate.moved(GrantsMove::SignOut);
+                    yield AuthEvent::LoggedOut { principal }
+                }
                 Err(e) => yield AuthEvent::error(e.0),
             }
         }
@@ -773,6 +792,7 @@ impl AuthActivation {
                 yield AuthEvent::error(e.0);
                 return;
             }
+            inner.gate.moved(GrantsMove::RoleEdit);
             let now = inner.roles.grants(&name);
             yield role_event(&name, now);
         }
@@ -801,11 +821,14 @@ impl AuthActivation {
             let scope_ref = scope.scope();
             let m = Membership { principal: who.clone(), role: role_name.clone(), scope: scope_ref.clone() };
             match inner.memberships.grant(m).await {
-                Ok(()) => yield AuthEvent::Granted {
-                    principal: who.to_string(),
-                    role: role_name.as_str().into(),
-                    scope: scope_ref.as_str().into(),
-                },
+                Ok(()) => {
+                    inner.gate.moved(GrantsMove::Grant);
+                    yield AuthEvent::Granted {
+                        principal: who.to_string(),
+                        role: role_name.as_str().into(),
+                        scope: scope_ref.as_str().into(),
+                    }
+                }
                 Err(e) => yield AuthEvent::error(e.0),
             }
         }
@@ -826,11 +849,16 @@ impl AuthActivation {
             let scope_ref = scope.scope();
             let role_name = role.as_ref().map(param::RoleName::role);
             match inner.memberships.revoke(&who, role_name.as_ref(), &scope_ref).await {
-                Ok(removed) => yield AuthEvent::Revoked {
-                    principal: who.to_string(),
-                    scope: scope_ref.as_str().into(),
-                    roles: removed.iter().map(|r| r.as_str().to_string()).collect(),
-                },
+                Ok(removed) => {
+                    if !removed.is_empty() {
+                        inner.gate.moved(GrantsMove::Revoke);
+                    }
+                    yield AuthEvent::Revoked {
+                        principal: who.to_string(),
+                        scope: scope_ref.as_str().into(),
+                        roles: removed.iter().map(|r| r.as_str().to_string()).collect(),
+                    }
+                }
                 Err(e) => yield AuthEvent::error(e.0),
             }
         }

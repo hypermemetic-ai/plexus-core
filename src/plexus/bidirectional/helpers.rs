@@ -298,6 +298,7 @@ pub fn bidir_error_message(err: &BidirError) -> String {
         BidirError::Transport(e) => format!("Transport error: {}", e),
         BidirError::UnknownRequest => "Unknown request ID (may have already been handled)".to_string(),
         BidirError::ChannelClosed => "Response channel closed before response received".to_string(),
+        BidirError::NotThisCall => "This request was asked on another connection".to_string(),
     }
 }
 

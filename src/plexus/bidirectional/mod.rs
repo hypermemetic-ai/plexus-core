@@ -228,7 +228,7 @@ pub use helpers::{
     create_test_bidir_channel, create_test_standard_channel,
 };
 pub use registry::{
-    handle_pending_response, is_request_pending, pending_count, register_pending_request,
-    unregister_pending_request,
+    answer_pending, bind_asker, handle_pending_response, is_request_pending, pending_count,
+    register_pending_request, unregister_pending_request,
 };
 pub use types::{BidirError, SelectOption, StandardRequest, StandardResponse};

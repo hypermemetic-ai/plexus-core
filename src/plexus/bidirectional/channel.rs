@@ -234,6 +234,18 @@ where
 /// If not, all methods return `Err(BidirError::NotSupported)`.
 pub type StandardBidirChannel = BidirChannel<StandardRequest, StandardResponse>;
 
+/// BIDIR-13: a registry entry held for as long as its request waits; on drop
+/// (answered, timed out, or the waiting future dropped with its call) the
+/// entry is gone. An answered entry was already taken out; removing it again
+/// is a miss.
+struct PendingEntry<'a>(&'a str);
+
+impl Drop for PendingEntry<'_> {
+    fn drop(&mut self) {
+        unregister_pending_request(self.0);
+    }
+}
+
 impl<Req, Resp> BidirChannel<Req, Resp>
 where
     Req: Serialize + DeserializeOwned + Send + 'static,
@@ -379,8 +391,12 @@ where
         // Create oneshot channel for Value response (type-erased)
         let (tx, rx) = oneshot::channel::<Value>();
 
-        // Register in global registry
+        // Register in global registry. BIDIR-13: the guard takes the entry
+        // out however this future ends — answered, timed out, failed, or
+        // dropped mid-wait with its call (a cancel, a lost socket) — so a
+        // dropped call leaves no entry behind until its timeout.
         register_pending_request(request_id.clone(), tx);
+        let _entry = PendingEntry(&request_id);
 
         // Send Request stream item
         if let Err(e) = self
@@ -392,8 +408,6 @@ where
             ))
             .await
         {
-            // Clean up on failure
-            unregister_pending_request(&request_id);
             return Err(BidirError::Transport(format!("Failed to send request: {}", e)));
         }
 
@@ -406,16 +420,10 @@ where
                     got: e.to_string(),
                 })
             }
-            Ok(Err(_)) => {
-                // Channel closed before response
-                unregister_pending_request(&request_id);
-                Err(BidirError::ChannelClosed)
-            }
-            Err(_) => {
-                // Timeout - clean up from registry
-                unregister_pending_request(&request_id);
-                Err(BidirError::Timeout(timeout_ms))
-            }
+            // Channel closed before response
+            Ok(Err(_)) => Err(BidirError::ChannelClosed),
+            // Timeout
+            Err(_) => Err(BidirError::Timeout(timeout_ms)),
         }
     }
 
@@ -776,5 +784,39 @@ mod tests {
             .await;
 
         assert_eq!(resp, StandardResponse::Confirmed { value: false });
+    }
+
+    // BIDIR-13: a registry request leaves no entry however it ends.
+
+    #[tokio::test]
+    async fn test_dropped_request_unregisters() {
+        use crate::plexus::bidirectional::registry::is_request_pending;
+        let (tx, mut rx) = mpsc::channel(32);
+        let channel: Arc<StandardBidirChannel> =
+            Arc::new(BidirChannel::new(tx, true, vec!["test".into()], "hash".into()));
+        let c = channel.clone();
+        let asking = tokio::spawn(async move { c.confirm("Drop me?").await });
+        let Some(PlexusStreamItem::Request { request_id, .. }) = rx.recv().await else { panic!("no request") };
+        assert!(is_request_pending(&request_id));
+        asking.abort();
+        let _ = asking.await;
+        assert!(!is_request_pending(&request_id), "a dropped request left its entry");
+    }
+
+    #[tokio::test]
+    async fn test_timeout_still_unregisters() {
+        use crate::plexus::bidirectional::registry::is_request_pending;
+        let (tx, mut rx) = mpsc::channel(32);
+        let channel: Arc<StandardBidirChannel> =
+            Arc::new(BidirChannel::new(tx, true, vec!["test".into()], "hash".into()));
+        let c = channel.clone();
+        let asking = tokio::spawn(async move {
+            c.request_with_timeout(StandardRequest::Confirm { message: "Late?".into(), default: None }, Duration::from_millis(50))
+                .await
+        });
+        let Some(PlexusStreamItem::Request { request_id, .. }) = rx.recv().await else { panic!("no request") };
+        let r = asking.await.unwrap();
+        assert!(matches!(r, Err(BidirError::Timeout(50))), "{r:?}");
+        assert!(!is_request_pending(&request_id));
     }
 }

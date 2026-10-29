@@ -1,0 +1,67 @@
+[package]
+name = "perf5"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "PERF-5: a Plexus call from syscall to socket — the harness. A spike; nothing here ships. PERF-6 (plexus-bench) adopts its scenarios."
+
+# Its own workspace: the spike never joins plexus-core's build.
+[workspace]
+
+[dependencies]
+plexus-core = { path = "../.." }
+plexus-macros = { path = "../../../plexus-macros" }
+plexus-client = { path = "../../../plexus-macros/plexus-client" }
+plexus-transport = { path = "../../../plexus-transport", default-features = false }
+plexus-auth-core = { path = "../../../plexus-auth-core" }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+jsonrpsee = { version = "0.26", features = ["server", "ws-client"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+schemars = { version = "1.1", features = ["derive"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+pprof = { version = "0.15", features = ["flamegraph", "frame-pointer"] }
+libc = "0.2"
+memchr = "2"
+bytes = "1"
+core_affinity = "0.8"
+# codecs on our own frames
+sonic-rs = "0.5"
+simd-json = "0.15"
+postcard = { version = "1", features = ["alloc"] }
+ciborium = "0.2"
+rmp-serde = "1"
+# the raw WebSocket ceilings (no Plexus)
+fastwebsockets = { version = "0.10", features = ["upgrade"] }
+tokio-tungstenite = "0.26"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# the key proof against a throwaway menger (the kit's spec/00 §Key proof)
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.22"
+rand = "0.8"
+
+
+[[bench]]
+name = "inproc"
+harness = false
+
+[[bench]]
+name = "codec"
+harness = false
+
+[profile.release]
+debug = "line-tables-only"
+
+# PERF-1's `profiles` fork, on trial: the same build with LTO fat and one codegen unit.
+[profile.perf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

@@ -72,6 +72,8 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1", fe
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
+# BIDIR-13: tests/question_matrix.rs answers a question from two sockets.
+jsonrpsee = { version = "0.26", features = ["server", "macros", "ws-client"] }
 
 # Enable the `test-support` feature for plexus-auth-core in test builds
 # only, so the end-to-end credential-envelope tests in

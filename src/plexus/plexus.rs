@@ -2288,19 +2288,33 @@ impl DynamicHub {
         // Register {ns}.respond method for WebSocket bidirectional responses
         // This allows clients to respond to server-initiated requests (like confirmations/prompts)
         let respond_method: &'static str = Box::leak(format!("{}.respond", ns).into_boxed_str());
-        module.register_async_method(respond_method, |params, _ctx, _ext| async move {
-            use super::bidirectional::{handle_pending_response, BidirError};
+        // BIDIR-13: only the connection that was asked answers — the pipe
+        // bound each pending question to it as its `Request` item went out;
+        // another connection's answer is `not_this_call` and the question
+        // stays. BIDIR-9 retires this method for answers on the call itself.
+        module.register_async_method(respond_method, |params, _ctx, ext| async move {
+            use super::bidirectional::{answer_pending, BidirError};
 
             let p: RespondParams = params.parse()?;
+            let from = ext.get::<jsonrpsee::ConnectionId>().map(|c| c.0);
 
             tracing::debug!(
                 request_id = %p.request_id,
+                connection = ?from,
                 "Handling {}.respond via WebSocket",
                 "plexus"
             );
 
-            match handle_pending_response(&p.request_id, p.response_data) {
+            match answer_pending(&p.request_id, from, p.response_data) {
                 Ok(()) => Ok(serde_json::json!({"success": true})),
+                Err(BidirError::NotThisCall) => {
+                    tracing::warn!(request_id = %p.request_id, connection = ?from, "respond from a connection that was not asked");
+                    Err(jsonrpsee::types::ErrorObject::owned(
+                        -32003,
+                        format!("not_this_call: request {} was asked on another connection", p.request_id),
+                        Some(serde_json::json!({"error_kind": "not_this_call", "request_id": p.request_id})),
+                    ))
+                }
                 Err(BidirError::UnknownRequest) => {
                     tracing::warn!(request_id = %p.request_id, "Unknown request ID in respond");
                     Err(jsonrpsee::types::ErrorObject::owned(
@@ -2502,6 +2516,14 @@ struct RespondParams {
 ///
 /// Notifications are sent with `method: PLEXUS_NOTIF_METHOD` on the wire,
 /// as set by the `notif_method_name` arg in each `register_subscription` call.
+/// Pipe a call's stream to its subscription.
+///
+/// BIDIR-13: a `Request` item (an in-call question) is bound to this
+/// subscription's connection before it is sent, so `{ns}.respond` takes its
+/// answer from that connection alone; and the pipe watches the sink's close
+/// (an unsubscribe, a lost socket), dropping the stream at once — a call
+/// waiting on a question is dropped with its pending entry, not left until
+/// the question's timeout.
 async fn pipe_stream_to_subscription(
     pending: jsonrpsee::PendingSubscriptionSink,
     mut stream: PlexusStream,
@@ -2509,7 +2531,17 @@ async fn pipe_stream_to_subscription(
     use futures::StreamExt;
 
     let sink = pending.accept().await?;
-    while let Some(item) = stream.next().await {
+    let connection = sink.connection_id().0;
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = sink.closed() => return Ok(()),
+            item = stream.next() => item,
+        };
+        let Some(item) = item else { break };
+        if let super::types::PlexusStreamItem::Request { request_id, .. } = &item {
+            super::bidirectional::bind_asker(request_id, connection);
+        }
         let json = serde_json::value::to_raw_value(&item)?;
         sink.send(json).await?;
     }

@@ -152,6 +152,13 @@ pub enum BidirError {
     /// This typically means the waiting task was cancelled or dropped.
     #[error("Response channel closed")]
     ChannelClosed,
+
+    /// BIDIR-13: an answer from a connection other than the one that was
+    /// asked. The question stays pending; the asker may still answer. On
+    /// the wire, `{ns}.respond` says `error_kind: "not_this_call"` (BIDIR-7's
+    /// name).
+    #[error("not_this_call: this request was asked on another connection")]
+    NotThisCall,
 }
 
 /// Standard request types for common interactive UI patterns.

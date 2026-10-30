@@ -1,0 +1,16 @@
+== ab floor start 07:14:31
+ab exit 0
+== vraw start 07:17:01
+vraw exit 0
+== e5 start 07:17:57
+e5 exit 0
+== vsyscalls start 07:17:59
+floor-all2_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ENCODED=1_PERF17_GATE_CACHE=1_PERF17_BATCH=16 call: 7.08 a unit — futex 4.00, epoll_wait 1.07, recvfrom 1.00, sendto 1.00
+floor-all2_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ENCODED=1_PERF17_GATE_CACHE=1_PERF17_BATCH=16 stream64: 0.02 a unit — sendto 0.02
+floor-all2_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ENCODED=1_PERF17_GATE_CACHE=1_PERF17_BATCH=16 stream4096: 0.13 a unit — sendto 0.13
+vsyscalls exit 0
+== vflame start 07:18:06
+vflame exit 0
+Error: Connection refused (os error 111)
+vflame2 exit 1
+== done 07:18:20

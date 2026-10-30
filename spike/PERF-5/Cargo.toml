@@ -47,6 +47,12 @@ http-body-util = "0.1"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 base64 = "0.22"
 rand = "0.8"
+# PERF-17 E6 (PERF-12): mimalloc under the counting allocator, a cargo feature
+mimalloc = { version = "0.1", optional = true, default-features = false }
+
+[features]
+# PERF-17: each experiment a switch, so the combination is one build
+mimalloc = ["dep:mimalloc"]
 
 
 [[bench]]
@@ -61,7 +67,9 @@ harness = false
 debug = "line-tables-only"
 
 # PERF-1's `profiles` fork, on trial: the same build with LTO fat and one codegen unit.
+# PERF-17 E6: run.sh adds `-C target-cpu=native` to this profile's RUSTFLAGS (NATIVE=0 leaves it out).
 [profile.perf]
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+

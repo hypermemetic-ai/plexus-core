@@ -19,8 +19,124 @@ SRV_CPUS=${SRV_CPUS:-2-5}
 CLI_CPUS=${CLI_CPUS:-8-9}
 R=results
 mkdir -p $R flame syscalls
-cargo build -q --profile "$PROFILE" --bins 2>/dev/null
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
+# PERF-17 E6: [profile.perf] also gets -C target-cpu=native (NATIVE=0 leaves it out);
+# RUSTFLAGS replaces .cargo/config.toml's flags, so they are repeated here.
+if [ "$PROFILE" = perf ] && [ "${NATIVE:-1}" = 1 ]; then export RUSTFLAGS="-C force-frame-pointers=yes --cfg tokio_unstable -C target-cpu=native"; fi
+case "${1:-all}" in snap|ab|e7|vsyscalls) ;; *) cargo build -q --profile "$PROFILE" --bins 2>/dev/null ;; esac
 tag() { jq -c --arg p "$PROFILE" --arg l "$1" '. + {profile: $p, label: $l}'; }
+
+# PERF-17 (the floor): each experiment's server is a variant kept under $FB/<dir>/
+# (`snap DIR` builds the bins under $PROFILE with $FEATURES and keeps them); every
+# client is the one frozen at the start ($FB/client/p5-client), so only the server
+# changes between rows. `ab EXP V...` runs the quick set over the variants in
+# rotation, three rounds, each block started only once others' CPU has stayed
+# under QUIET (% of a core; cpusampler.py running beside it) for 15 s. A variant
+# is DIR[+KEY=VAL...][+--server-arg=VAL...]: env for the server, and its args.
+FB=$CARGO_TARGET_DIR/floor
+CPU=${CPU:-$R/floor/others-cpu.jsonl}
+quiet() {
+  local w0; w0=$(date +%s)
+  until tail -3 "$CPU" | jq -s --argjson q "${QUIET:-800}" 'length == 3 and all(.others_pct < $q)' | grep -q true; do
+    sleep 5
+    if [ $(( $(date +%s) - w0 )) -gt "${WAITMAX:-1500}" ]; then echo "not quiet after ${WAITMAX:-1500}s; running anyway" >&2; break; fi
+  done
+}
+snap() {
+  local dir=$1
+  cargo build -q --profile "$PROFILE" --bins ${FEATURES:+--features "$FEATURES"}
+  mkdir -p "$FB/$dir"; cp "$B/p5-server" "$B/p5-client" "$B/p5-rawecho" "$FB/$dir/"
+  echo "profile=$PROFILE features=${FEATURES:-} rustflags=${RUSTFLAGS:-config} $(date -u +%FT%TZ)" > "$FB/$dir/BUILD"
+}
+vserver() { # vserver VARIANT [extra server args] → SPID
+  local v=$1; shift
+  local dir=${v%%+*} envs=() args=() t
+  if [[ $v == *+* ]]; then IFS='+' read -ra toks <<< "${v#*+}"; for t in "${toks[@]}"; do if [[ $t == --* ]]; then args+=("$t"); else envs+=("$t"); fi; done; fi
+  env "${envs[@]}" taskset -c "$SRV_CPUS" "$FB/$dir/p5-server" --port 4478 "${args[@]}" "$@" > /tmp/perf5-server.log 2>&1 &
+  SPID=$!
+  until grep -q listening /tmp/perf5-server.log 2>/dev/null; do sleep 0.1; done
+}
+vsyscalls() { # vsyscalls VARIANT: syscalls() for a kept variant (its env passed into the container), rows to results/floor/syscalls-<label>
+  local v=$1 dir=${1%%+*} envs=() t
+  if [[ $v == *+* ]]; then IFS='+' read -ra toks <<< "${v#*+}"; for t in "${toks[@]}"; do [[ $t == --* ]] || envs+=(-e "$t"); done; fi
+  local O; O="$PWD/syscalls/floor-${v//[^A-Za-z0-9=_-]/_}"; mkdir -p "$O"
+  local C=${CLIENT_BIN:-$FB/client/p5-client}
+  vst() { local name=$1; shift; CN=perf5-strace-$name-$$
+    docker run -d --name "$CN" --rm --network host --security-opt label=disable "${envs[@]}" \
+      -v "$(readlink -f "$FB/$dir")":/b:ro -v "$O":/out mq-spike-prof:44 strace -f -c -o "/out/$name.txt" "$@" >/dev/null
+    until ss -ltn | grep -q ':4478 '; do sleep 0.2; done; sleep 0.5; }
+  vst_stop() { docker exec "$CN" pkill -TERM -f p5-server >/dev/null 2>&1 || true; while docker ps -aq -f name="^$CN\$" | grep -q .; do sleep 0.2; done; }
+  vst idle /b/p5-server --port 4478; sleep 2; vst_stop; echo 0 > "$O/idle.units"
+  vst call /b/p5-server --port 4478; taskset -c "$CLI_CPUS" "$C" seq --n 2000 --warm 0 > /dev/null; vst_stop; echo 2000 > "$O/call.units"
+  for size in 64 4096; do vst stream$size /b/p5-server --port 4478; taskset -c "$CLI_CPUS" "$C" stream --to 10000 --size $size --warm 0 > /dev/null; vst_stop; echo 30000 > "$O/stream$size.units"; done
+  python3 -I - "$O" <<'PY'
+import os, sys
+O = sys.argv[1]
+def counts(p):
+    d = {}
+    for line in open(p):
+        x = line.split()
+        if len(x) >= 5 and x[0][0].isdigit() and x[-1] != "total":
+            try: d[x[-1]] = d.get(x[-1], 0) + int(x[3])
+            except ValueError: pass
+    return d
+idle = counts(os.path.join(O, "idle.txt"))
+for name in ("call", "stream64", "stream4096"):
+    u = int(open(os.path.join(O, name + ".units")).read()); c = counts(os.path.join(O, name + ".txt"))
+    per = {k: (v - idle.get(k, 0)) / u for k, v in c.items()}
+    top = sorted(((k, v) for k, v in per.items() if v >= 0.005), key=lambda kv: -kv[1])
+    print(f"{os.path.basename(O)} {name}: {sum(per.values()):.2f} a unit — " + ", ".join(f"{k} {v:.2f}" for k, v in top))
+PY
+}
+e7() { # e7 VARIANT...: menger's self-description over the wire, a throwaway per variant (env KEY=VAL joined by +;
+  # `base` = no switch), in rotation; _info / menger.hash / tickets.schema then tickets.health, signed in as builder.
+  local M=${MENGER_BIN:-$HOME/.cache/cargo-target/menger-PERF-5/release/menger}
+  local C=${CLIENT_BIN:-$FB/client/p5-client} out=$R/floor/e7.jsonl U=ws://127.0.0.1:4476
+  mkdir -p $R/floor
+  for round in ${ROUNDS:-1 2 3}; do
+    for v in "$@"; do
+      quiet
+      local envs=(); [[ $v == base ]] || IFS='+' read -ra envs <<< "$v"
+      local DATA=/tmp/claude-$(id -u)/menger-PERF-17-data; mkdir -p "$DATA"
+      env "${envs[@]}" PLEXUS_NO_REGISTRY=1 taskset -c "$SRV_CPUS" "$M" --port 4476 --shell-port 4477 --data-dir "$DATA" \
+        --db-path /tmp/menger-PERF-17.db --auth-provider key --admin "$(synapse _key show builder)" > /tmp/menger-PERF-17.log 2>&1 &
+      local MPID=$!
+      until grep -q 'ws://127.0.0.1:4476' /tmp/menger-PERF-17.log 2>/dev/null; do sleep 0.2; done; sleep 1
+      for c in "_info x" "menger.hash x" "menger.call tickets.schema" "menger.call tickets.health"; do
+        set -- $c
+        local n=20; [ "$2" = tickets.health ] && n=5000
+        taskset -c "$CLI_CPUS" "$C" --url $U --bearer key:builder --call $1 --method $2 --label "describe $1 $2" seq --n $n --warm 1 \
+          | jq -c --arg v "$v" --arg r "$round" '. + {exp: "e7", variant: $v, round: ($r | tonumber)}' >> $out
+      done
+      kill $MPID; wait $MPID 2>/dev/null || true
+    done
+  done
+}
+ab() {
+  local exp=$1; shift
+  local out=$R/floor/$exp.jsonl; mkdir -p $R/floor
+  local C=${CLIENT_BIN:-$FB/client/p5-client}
+  vcli() { taskset -c "$CLI_CPUS" "$C" "$@"; }
+  vtag() { jq -c --arg e "$exp" --arg v "$1" --arg r "$2" '. + {exp: $e, variant: $v, round: ($r | tonumber)}'; }
+  for round in ${ROUNDS:-1 2 3}; do
+    for v in "$@"; do
+      quiet
+      vserver "$v"
+      vcli seq --n 5000 | vtag "$v" "$round" >> $out
+      vcli max --conns 1 --inflight 1 --secs 2 --server-pid "$SPID" | vtag "$v" "$round" >> $out
+      vcli max --conns 64 --inflight 4 --secs 2 --server-pid "$SPID" | vtag "$v" "$round" >> $out
+      for size in 64 1024 4096; do vcli stream --to 10000 --size $size --server-pid "$SPID" | vtag "$v" "$round" >> $out; done
+      stop
+    done
+  done
+  [ "${AB_ALLOCS:-1}" = 0 ] && return 0
+  for v in "$@"; do # allocations are counts, not times: one pass a variant
+    vserver "$v" --count-allocs
+    vcli allocs --server-pid "$SPID" --n 2000 | vtag "$v" 0 >> $out
+    for size in 64 4096; do vcli stream --to 10000 --size $size --server-pid "$SPID" | jq -c '. + {allocs_run: true}' | vtag "$v" 0 >> $out; done
+    stop
+  done
+}
 
 server() { # args → starts p5-server pinned, sets SPID
   taskset -c "$SRV_CPUS" "$B/p5-server" --port 4478 "$@" > /tmp/perf5-server.log 2>&1 &
@@ -151,5 +267,5 @@ describe() { # in process: where _info / hash / schema spend their time (menger'
 
 case "${1:-all}" in
   all) call; stream; raw; codec; inproc; flame; syscalls ;;
-  *) "$1" ;;
+  *) "$@" ;;
 esac

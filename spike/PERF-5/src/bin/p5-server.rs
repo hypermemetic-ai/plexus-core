@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         let gated = a.gate == "on";
         let svc = if gated { echo::gated_service() } else { echo::plain_service() };
         let (handle, addr) = echo::serve(svc, a.port, gated).await?;
-        println!("listening ws://{addr} pid {} rt {} gate {}", std::process::id(), a.rt, a.gate);
+        println!("listening ws://{addr} pid {} rt {} gate {} alloc {}", std::process::id(), a.rt, a.gate, alloc::INNER);
         use tokio::signal::unix::{signal, SignalKind};
         let mut u1 = signal(SignalKind::user_defined1())?;
         let mut u2 = signal(SignalKind::user_defined2())?;

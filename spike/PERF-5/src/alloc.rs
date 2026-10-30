@@ -1,8 +1,17 @@
 //! A counting global allocator: every allocation, reallocation and free, and
 //! the bytes asked for, counted process-wide and per thread. Off until
 //! `enable(true)`, so a latency run pays one relaxed load per allocation.
+//! PERF-17 E6: the allocator underneath is glibc's (`System`), or mimalloc
+//! with `--features mimalloc`.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+#[cfg(not(feature = "mimalloc"))]
+use std::alloc::System as Inner;
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc as Inner;
+
+/// Which allocator is underneath, for the rows.
+pub const INNER: &str = if cfg!(feature = "mimalloc") { "mimalloc" } else { "glibc" };
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
@@ -39,18 +48,18 @@ fn count_alloc(bytes: usize) {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count_alloc(layout.size());
-        System.alloc(layout)
+        Inner.alloc(layout)
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count_alloc(layout.size());
-        System.alloc_zeroed(layout)
+        Inner.alloc_zeroed(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ON.load(Relaxed) {
             FREES.fetch_add(1, Relaxed);
             bump(&T_FREES, 1);
         }
-        System.dealloc(ptr, layout)
+        Inner.dealloc(ptr, layout)
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if ON.load(Relaxed) {
@@ -58,7 +67,7 @@ unsafe impl GlobalAlloc for Counting {
             bump(&T_REALLOCS, 1);
             count_alloc(new_size.saturating_sub(layout.size()));
         }
-        System.realloc(ptr, layout, new_size)
+        Inner.realloc(ptr, layout, new_size)
     }
 }
 

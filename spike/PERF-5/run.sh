@@ -23,7 +23,7 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
 # PERF-17 E6: [profile.perf] also gets -C target-cpu=native (NATIVE=0 leaves it out);
 # RUSTFLAGS replaces .cargo/config.toml's flags, so they are repeated here.
 if [ "$PROFILE" = perf ] && [ "${NATIVE:-1}" = 1 ]; then export RUSTFLAGS="-C force-frame-pointers=yes --cfg tokio_unstable -C target-cpu=native"; fi
-case "${1:-all}" in snap|ab|e7|e5|vraw|vsyscalls) ;; *) cargo build -q --profile "$PROFILE" --bins 2>/dev/null ;; esac
+case "${1:-all}" in snap|ab|e7|e5|vraw|vsyscalls|vflame) ;; *) cargo build -q --profile "$PROFILE" --bins 2>/dev/null ;; esac
 tag() { jq -c --arg p "$PROFILE" --arg l "$1" '. + {profile: $p, label: $l}'; }
 
 # PERF-17 (the floor): each experiment's server is a variant kept under $FB/<dir>/
@@ -149,6 +149,24 @@ vraw() { # vraw EXP: the raw ceilings (PERF-5's p5-rawecho: the same frames, no 
       for size in 64 1024 4096; do taskset -c "$CLI_CPUS" "$C" stream --to 10000 --size $size --server-pid "$SPID" | "${tg[@]}" >> $out; done
       stop
     done
+  done
+}
+vflame() { # vflame VARIANT NAME: flame() for a kept variant → flame/NAME/<scenario>.{svg,folded,shares.json}
+  local v=$1 name=$2 sc
+  local C=${CLIENT_BIN:-$FB/client/p5-client}
+  mkdir -p "flame/$name"
+  for sc in call stream64 stream4096 call64conns; do
+    quiet
+    vserver "$v" --flame-prefix "flame/$name/$sc" --hz 1999
+    kill -USR1 "$SPID"; sleep 0.2
+    case $sc in
+      call) taskset -c "$CLI_CPUS" "$C" max --conns 1 --inflight 1 --secs 4 >/dev/null ;;
+      call64conns) taskset -c "$CLI_CPUS" "$C" max --conns 64 --inflight 4 --secs 4 >/dev/null ;;
+      stream64) for i in $(seq 1 30); do taskset -c "$CLI_CPUS" "$C" stream --to 10000 --size 64 --warm 0 >/dev/null; done ;;
+      stream4096) for i in $(seq 1 10); do taskset -c "$CLI_CPUS" "$C" stream --to 10000 --size 4096 --warm 0 >/dev/null; done ;;
+    esac
+    kill -USR2 "$SPID"; until [ -f "flame/$name/$sc.shares.json" ]; do sleep 0.2; done; sleep 0.5
+    stop
   done
 }
 ab() {

@@ -1,0 +1,20 @@
+== ab combo start 07:00:06
+ab exit 0
+== vraw start 07:02:37
+vraw exit 0
+== e7 start 07:03:33
+e7 exit 0
+== e5 start 07:04:21
+e5 exit 0
+== vsyscalls start 07:04:36
+floor-all_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ONE_ENCODE=1_PERF17_GATE_CACHE=1_PERF17_BATCH=16 call: 7.09 a unit — futex 4.01, epoll_wait 1.07, recvfrom 1.00, sendto 1.00
+floor-all_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ONE_ENCODE=1_PERF17_GATE_CACHE=1_PERF17_BATCH=16 stream64: 0.02 a unit — sendto 0.02
+floor-all_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ONE_ENCODE=1_PERF17_GATE_CACHE=1_PERF17_BATCH=16 stream4096: 0.13 a unit — sendto 0.13
+vsyscalls exit 0
+floor-all_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ONE_ENCODE=1_PERF17_GATE_CACHE=1 call: 7.08 a unit — futex 4.00, epoll_wait 1.07, recvfrom 1.00, sendto 1.00
+floor-all_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ONE_ENCODE=1_PERF17_GATE_CACHE=1 stream64: 0.06 a unit — sendto 0.04, epoll_wait 0.01, write 0.01
+floor-all_PERF17_WS_COALESCE=64_PERF17_WS_BUF=65536_PERF17_ONE_ENCODE=1_PERF17_GATE_CACHE=1 stream4096: 0.10 a unit — sendto 0.08, epoll_wait 0.01, write 0.01
+vsyscalls2 exit 0
+== vflame start 07:04:54
+vflame exit 0
+== done 07:05:08

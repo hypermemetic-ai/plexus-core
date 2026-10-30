@@ -1,0 +1,25 @@
+{
+  "by_layer": {
+    "gate": 13,
+    "jsonrpsee": 22,
+    "plexus": 162,
+    "serde_json": 337,
+    "socket": 80,
+    "tokio": 13
+  },
+  "layer_pct": {
+    "gate": 2.073365231259968,
+    "jsonrpsee": 3.508771929824561,
+    "plexus": 25.83732057416268,
+    "serde_json": 53.74800637958533,
+    "socket": 12.759170653907496,
+    "tokio": 2.073365231259968
+  },
+  "leaf_pct": {
+    "alloc": 7.974481658692185,
+    "code": 78.62838915470495,
+    "syscall:park": 0.6379585326953748,
+    "syscall:socket": 12.759170653907496
+  },
+  "samples": 627
+}

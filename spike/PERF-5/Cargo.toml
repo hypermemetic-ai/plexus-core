@@ -11,7 +11,7 @@ description = "PERF-5: a Plexus call from syscall to socket — the harness. A s
 [dependencies]
 plexus-core = { path = "../.." }
 plexus-macros = { path = "../../../plexus-macros" }
-plexus-client = { path = "../../../plexus-macros/plexus-client" }
+plexus-client = { path = "../../../plexus-macros/plexus-client", features = ["ws-native"] }  # PERF-17 E5: pcseq / pcstream
 plexus-transport = { path = "../../../plexus-transport", default-features = false }
 plexus-auth-core = { path = "../../../plexus-auth-core" }
 tokio = { version = "1", features = ["full"] }

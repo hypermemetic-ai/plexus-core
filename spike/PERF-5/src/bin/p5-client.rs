@@ -41,6 +41,55 @@ enum Cmd {
     Max { #[arg(long, default_value_t = 1)] conns: u64, #[arg(long, default_value_t = 1)] inflight: u64, #[arg(long, default_value_t = 3.0)] secs: f64, #[arg(long)] server_pid: Option<u32> },
     Stream { #[arg(long, default_value_t = 10000)] to: u64, #[arg(long, default_value_t = 64)] size: u64, #[arg(long, default_value_t = 2)] warm: u64, #[arg(long)] server_pid: Option<u32> },
     Allocs { #[arg(long)] server_pid: Option<u32>, #[arg(long, default_value_t = 2000)] n: u64 },
+    /// PERF-17 E5: one-item calls through plexus-client's WsTransport and its typed decode (a real Rust client)
+    Pcseq { #[arg(long, default_value_t = 5000)] n: u64, #[arg(long, default_value_t = 200)] warm: u64 },
+    /// PERF-17 E5: a stream through plexus-client, every item decoded to BenchEvent
+    Pcstream { #[arg(long, default_value_t = 10000)] to: u64, #[arg(long, default_value_t = 64)] size: u64, #[arg(long, default_value_t = 2)] warm: u64, #[arg(long)] server_pid: Option<u32> },
+}
+
+/// PERF-17 E5: the same scenarios through plexus-client (WsTransport, decode::<BenchEvent>).
+mod pc {
+    use futures::StreamExt;
+    use perf5::echo::BenchEvent;
+    use perf5::hist::Lat;
+    use plexus_client::{decode, ClientEvent, MethodRef, Transport, WsTransport};
+    use std::time::Instant;
+
+    async fn connect(url: &str, h: &[(String, String)]) -> anyhow::Result<WsTransport> {
+        WsTransport::connect_with_headers(url, "perf5", h).await.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn drain(t: &WsTransport, method: &'static str, params: serde_json::Value) -> anyhow::Result<u64> {
+        let mut ev = decode::<BenchEvent>(t.call(MethodRef::new("bench", method), params));
+        let mut items = 0;
+        while let Some(e) = ev.next().await {
+            if let ClientEvent::Data(_) = e.map_err(|e| anyhow::anyhow!("{e}"))? {
+                items += 1;
+            }
+        }
+        Ok(items)
+    }
+
+    pub async fn seq(url: &str, h: &[(String, String)], n: u64, warm: u64) -> anyhow::Result<(perf5::hist::Summary, f64)> {
+        let t = connect(url, h).await?;
+        let mut lat = Lat::new();
+        let t0 = Instant::now();
+        for i in 0..(warm + n) {
+            let s = Instant::now();
+            drain(&t, "once", serde_json::json!({})).await?;
+            if i >= warm {
+                lat.record(s.elapsed());
+            }
+        }
+        Ok((lat.summary(), (warm + n) as f64 / t0.elapsed().as_secs_f64()))
+    }
+
+    pub async fn stream(url: &str, h: &[(String, String)], to: u64, size: u64) -> anyhow::Result<(u64, f64)> {
+        let t = connect(url, h).await?;
+        let s = Instant::now();
+        let items = drain(&t, "count", serde_json::json!({"to": to, "size": size})).await?;
+        Ok((items, s.elapsed().as_secs_f64()))
+    }
 }
 
 fn headers(a: &Args) -> anyhow::Result<Vec<(String, String)>> {
@@ -205,6 +254,31 @@ fn main() -> anyhow::Result<()> {
                     v["server"] = proc_json(&d, items);
                 }
                 emit(v, &a, &format!("stream.10k.{size}B"));
+            }
+        }
+        Cmd::Pcseq { n, warm } => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            let (summary, cps) = rt.block_on(pc::seq(&a.url, &h, *n, *warm))?;
+            emit(json!({"summary": summary, "calls_per_s": cps, "n": n, "client": "plexus-client",
+                "typed_decode": std::env::var("PERF17_TYPED_DECODE").unwrap_or_default()}), &a, "call.one_item.seq.pc");
+        }
+        Cmd::Pcstream { to, size, warm, server_pid } => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            for _ in 0..*warm {
+                rt.block_on(pc::stream(&a.url, &h, *to, *size))?;
+            }
+            for run in 0..3 {
+                let p0 = server_pid.map(procstat::read).transpose()?;
+                let c0 = procstat::read(std::process::id())?;
+                let (items, secs) = rt.block_on(pc::stream(&a.url, &h, *to, *size))?;
+                let c1 = procstat::read(std::process::id())?;
+                let mut v = json!({"run": run, "to": to, "size": size, "items": items, "secs": secs, "items_per_s": items as f64 / secs,
+                    "client": "plexus-client", "typed_decode": std::env::var("PERF17_TYPED_DECODE").unwrap_or_default(),
+                    "client_cpu_us_per": (c1 - c0).cpu_ns as f64 / 1000.0 / items.max(1) as f64});
+                if let (Some(pid), Some(p0)) = (server_pid, p0) {
+                    v["server"] = proc_json(&(procstat::read(*pid)? - p0), items as f64);
+                }
+                emit(v, &a, &format!("stream.10k.{size}B.pc"));
             }
         }
         Cmd::Allocs { server_pid, n } => {

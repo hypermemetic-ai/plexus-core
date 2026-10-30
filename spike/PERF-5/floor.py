@@ -48,6 +48,20 @@ def m(v):
     o["rounds"] = len(seq)
     o["busy"] = len([r for r in rows if r["variant"] == v and r["round"] > 0 and not quiet(r)])
     return o
+if exp == "e5":  # a real Rust client: per server variant and client decode
+    print(f"### e5 — through plexus-client; medians over rows at ≤ {QMAX:.0f} % others' CPU\n")
+    print("| server variant · client decode | call p50 · p99 µs | calls/s | items/s 64 B | client CPU-µs an item 64 B | items/s 4 KB | client CPU-µs an item 4 KB | runs |")
+    print("| -- | -- | -- | -- | -- | -- | -- | -- |")
+    for v in vs:
+        q = [r for r in rows if r["variant"] == v and quiet(r)]
+        sq = [r for r in q if r["scenario"] == "call.one_item.seq.pc"]
+        s64 = [r for r in q if r["scenario"] == "stream.10k.64B.pc"]
+        s4k = [r for r in q if r["scenario"] == "stream.10k.4096B.pc"]
+        f = lambda xs, k: med([x[k] for x in xs])
+        print(f"| `{v}` | {med([r['summary']['p50_us'] for r in sq]):.1f} · {med([r['summary']['p99_us'] for r in sq]):.0f} | {f(sq, 'calls_per_s'):,.0f} | {f(s64, 'items_per_s'):,.0f} | {f(s64, 'client_cpu_us_per'):.2f} | {f(s4k, 'items_per_s'):,.0f} | {f(s4k, 'client_cpu_us_per'):.2f} | {len(sq)} · {len(s64)} |")
+    xs = [r["others_cpu_pct"] for r in rows if r.get("others_cpu_pct") is not None and quiet(r)]
+    print(f"\nothers' CPU over the quiet rows: {min(xs)}–{max(xs)} %" if xs else "")
+    sys.exit(0)
 if exp == "e7":  # menger's self-description over the wire: per variant and method
     print(f"### e7 — menger over the wire, signed in; medians over rows at ≤ {QMAX:.0f} % others' CPU; gain against `{vs[0]}`\n")
     meths = list(dict.fromkeys(r["label"].replace("describe ", "") for r in rows))

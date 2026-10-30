@@ -1,0 +1,2 @@
+Error: transport protocol: notification payload is not a Plexus stream item: invalid type: map, expected variant identifier
+exit 1

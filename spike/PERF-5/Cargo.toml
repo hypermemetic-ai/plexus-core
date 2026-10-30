@@ -73,3 +73,8 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
+# PERF-17 E2a (PERF-8): jsonrpsee-server 0.26.1 vendored into plexus-transport
+# (`vendor/jsonrpsee-server`, as archive/LOCAL-3 did) with one flush per wakeup
+# behind PERF17_WS_COALESCE=N (unset: 0.26.1's flush per message).
+[patch.crates-io]
+jsonrpsee-server = { path = "../../../plexus-transport/vendor/jsonrpsee-server" }

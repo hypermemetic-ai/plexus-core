@@ -12,10 +12,10 @@
 //!   answer.
 //!
 //! Two services (`describe_support`): `world()`, one activation behind a gate
-//! of its own, whose answers are the same from one service to the next — so
-//! a test compares them with a fresh service's; and `auth_world()`, AUTH-5's,
-//! with the auth activation mounted, whose answers are compared only with
-//! its own. `describe_golden.rs` holds the answers to today's bytes.
+//! of its own, and `auth_world()`, AUTH-5's, with the auth activation
+//! mounted. Each answers the same from one service to the next (PERF-21,
+//! `describe_starts.rs`), so a test compares `world()`'s answers with a fresh
+//! service's. `describe_golden.rs` holds both services' answers to their bytes.
 
 mod describe_support;
 

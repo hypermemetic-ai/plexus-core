@@ -1,0 +1,872 @@
+[
+  {
+    "ask": "module _info {}",
+    "bytes": 511,
+    "caller": "anonymous",
+    "sha256": "f15b0bf60749c24b1b8ca2453abc3b19278753bd1f9363d8f934675d1468326c"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 302,
+    "caller": "anonymous",
+    "sha256": "cebe1f1f36f980ccc9fe2fd01a3421660816fa6a6203540a3b13ebfa4cb37b38"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42277,
+    "caller": "anonymous",
+    "sha256": "40f78971f586d909485b245be6e36b5df0574bde87785ce9ae0ae0240a520a7a"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "anonymous",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 191,
+    "caller": "anonymous",
+    "sha256": "416ada48fd36b9cf1674212859c2e4407cecc1d18e84e3687769249f1f15a495"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 302,
+    "caller": "anonymous",
+    "sha256": "7af76e282bd6e9d1037b81df312557de0137e3b70d9e552d5b7da97bab8905c8"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42276,
+    "caller": "anonymous",
+    "sha256": "c99fe60d65f3beade694095d29c7c91ae2af02ab150f034737e91ba2f190840a"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 301,
+    "caller": "anonymous",
+    "sha256": "27395e2160fd22fe67e2c726df1a51758b3516f18661ab4397c557a5149187a6"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 434,
+    "caller": "anonymous",
+    "sha256": "fe9f1d75582077ee4de90f5cdcb2bd20866f02dbe41ad959b56ad4fb16e4da07"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "anonymous",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 43,
+    "caller": "anonymous",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 43,
+    "caller": "anonymous",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 43,
+    "caller": "anonymous",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 43,
+    "caller": "anonymous",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 43,
+    "caller": "anonymous",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 56200,
+    "caller": "anonymous",
+    "sha256": "3e33b53eb6b3ce373e7bfb27a90c4fb989ca8fcfd25f933c000f1a262420459f"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 43,
+    "caller": "anonymous",
+    "sha256": "fa27d41329f18efbd655985de6b28ae23bd48ea8dd83ed17ffa80090b5f166c3"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "anonymous",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "module _info {}",
+    "bytes": 357,
+    "caller": "ada: editor on MENGER",
+    "sha256": "94f24b2d6a1e0a9aab5ff18d0dbb7d7baee237d9cf8a561e1344f8fb7d06d1d3"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 297,
+    "caller": "ada: editor on MENGER",
+    "sha256": "60b2494c0eef3d643561f4aa6e5348ff4fb5fd1d7e1597426ec259419f0efa59"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42349,
+    "caller": "ada: editor on MENGER",
+    "sha256": "36f2460ef9de95a0e1017b9e8b8848a0b59a102d71781f7f4ecc3927ac1da54e"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "ada: editor on MENGER",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 37638,
+    "caller": "ada: editor on MENGER",
+    "sha256": "c5b19f2383f75f0bbac403abf46ad0700b8f57c3035f12d55c1b15d0fc6c406d"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 297,
+    "caller": "ada: editor on MENGER",
+    "sha256": "13e37daa7188d10ebcc53306ad235c833d7e91b836512a684a97d9179032785a"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42348,
+    "caller": "ada: editor on MENGER",
+    "sha256": "89d284c7904bca030e6e897abe22a03695ec7558779ec1bea3ca73a4d30e67f6"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 296,
+    "caller": "ada: editor on MENGER",
+    "sha256": "cc001b0c79191f07ac7b366e7c281d35ab60081e2b9850b4e9801adf8fbc1bf8"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 479,
+    "caller": "ada: editor on MENGER",
+    "sha256": "9c41eb74b0b9ff35936e56400f8db169895527ab797f8065ffac1ba9745107fb"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "ada: editor on MENGER",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 37637,
+    "caller": "ada: editor on MENGER",
+    "sha256": "3d8e0f9dd20ae26e8eea24677d483e8a02c726951d3ae1299ca275ec3a3d22fe"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 687,
+    "caller": "ada: editor on MENGER",
+    "sha256": "643cc3df9238e4cae77356492fb3954ff45020fe60eb18cbd9386fe4ce4250b7"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 46,
+    "caller": "ada: editor on MENGER",
+    "sha256": "ff747f8c2ef75a9871742bff0413fc817599ca0612ece6a184c5d27881960912"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 789,
+    "caller": "ada: editor on MENGER",
+    "sha256": "c4292d1872920d3746f1a1acbd6cf6bee41d694b500476cb5db2f8eea5061afc"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 44,
+    "caller": "ada: editor on MENGER",
+    "sha256": "28c330217641dbfb032c18768812f49d4d5c7a5c3dca14182a3182669581d5e7"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 72970,
+    "caller": "ada: editor on MENGER",
+    "sha256": "48ecfa372d8ea78b40e60e221126ee5773e97794157fb38d0d9680ca2099c44c"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 4838,
+    "caller": "ada: editor on MENGER",
+    "sha256": "eeb23474c3f2c6da3cfc9d52c73b8785f8ca41c10963353bbf8b0a826887946e"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "ada: editor on MENGER",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "module _info {}",
+    "bytes": 357,
+    "caller": "bob: editor on MENGER",
+    "sha256": "94f24b2d6a1e0a9aab5ff18d0dbb7d7baee237d9cf8a561e1344f8fb7d06d1d3"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 297,
+    "caller": "bob: editor on MENGER",
+    "sha256": "60b2494c0eef3d643561f4aa6e5348ff4fb5fd1d7e1597426ec259419f0efa59"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42349,
+    "caller": "bob: editor on MENGER",
+    "sha256": "36f2460ef9de95a0e1017b9e8b8848a0b59a102d71781f7f4ecc3927ac1da54e"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "bob: editor on MENGER",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 37638,
+    "caller": "bob: editor on MENGER",
+    "sha256": "c5b19f2383f75f0bbac403abf46ad0700b8f57c3035f12d55c1b15d0fc6c406d"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 297,
+    "caller": "bob: editor on MENGER",
+    "sha256": "13e37daa7188d10ebcc53306ad235c833d7e91b836512a684a97d9179032785a"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42348,
+    "caller": "bob: editor on MENGER",
+    "sha256": "89d284c7904bca030e6e897abe22a03695ec7558779ec1bea3ca73a4d30e67f6"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 296,
+    "caller": "bob: editor on MENGER",
+    "sha256": "cc001b0c79191f07ac7b366e7c281d35ab60081e2b9850b4e9801adf8fbc1bf8"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 479,
+    "caller": "bob: editor on MENGER",
+    "sha256": "9c41eb74b0b9ff35936e56400f8db169895527ab797f8065ffac1ba9745107fb"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "bob: editor on MENGER",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 37637,
+    "caller": "bob: editor on MENGER",
+    "sha256": "3d8e0f9dd20ae26e8eea24677d483e8a02c726951d3ae1299ca275ec3a3d22fe"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 687,
+    "caller": "bob: editor on MENGER",
+    "sha256": "643cc3df9238e4cae77356492fb3954ff45020fe60eb18cbd9386fe4ce4250b7"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 46,
+    "caller": "bob: editor on MENGER",
+    "sha256": "ff747f8c2ef75a9871742bff0413fc817599ca0612ece6a184c5d27881960912"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 789,
+    "caller": "bob: editor on MENGER",
+    "sha256": "c4292d1872920d3746f1a1acbd6cf6bee41d694b500476cb5db2f8eea5061afc"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 44,
+    "caller": "bob: editor on MENGER",
+    "sha256": "28c330217641dbfb032c18768812f49d4d5c7a5c3dca14182a3182669581d5e7"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 72970,
+    "caller": "bob: editor on MENGER",
+    "sha256": "48ecfa372d8ea78b40e60e221126ee5773e97794157fb38d0d9680ca2099c44c"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 4838,
+    "caller": "bob: editor on MENGER",
+    "sha256": "eeb23474c3f2c6da3cfc9d52c73b8785f8ca41c10963353bbf8b0a826887946e"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "bob: editor on MENGER",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "module _info {}",
+    "bytes": 357,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "3a5fdfb478fe058625fdd1bafbd3fd1db7c36dd6e93eca166ed81c6d23f64186"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 297,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "61a5c847979705e40a0efd3d9044bccbc529e4112225fbbff475d9ac53c2410d"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42349,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "35938fb8477a20b97f1fe2c4cf8ae112da2c19322be9a42d00da6f0011808de2"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 37644,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "9f843f19525fc07dcccb8baffdff76ea066663898b8f6bf07bcdfd59243a5005"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 297,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "44fee99679cb52fe5a1091ffe137335ab7399f65197ed22408dd1f6bd3bdb05f"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42348,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "f191263171eb288ad62b38cd1941a6d675687e7c7e18a479689194912749d786"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 296,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "fa73c07a4f7d9f14c5964677ba73883838e8721824e02bf5cc29e0bcd5969427"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 479,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "0ecbee626da2e04179ca5635dd48b92e0901288a9ef7413e694034d9670e06f8"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 37643,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "5c61fbbab23a49aa587f9793d5c32062967a425706b4c4b8824b03636988e18d"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 689,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "6fddfb4269e26f50bd37e433783068b5818b5ea0da5e108d1b5d6ac75b2445ca"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 46,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "ff747f8c2ef75a9871742bff0413fc817599ca0612ece6a184c5d27881960912"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 791,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "1135895ba4ee35466919c123a679e595b4399843d2696072036606ccf64de465"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 44,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "28c330217641dbfb032c18768812f49d4d5c7a5c3dca14182a3182669581d5e7"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 72970,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "48ecfa372d8ea78b40e60e221126ee5773e97794157fb38d0d9680ca2099c44c"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 4838,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "eeb23474c3f2c6da3cfc9d52c73b8785f8ca41c10963353bbf8b0a826887946e"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "cat: editor on IDENTITY",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "module _info {}",
+    "bytes": 357,
+    "caller": "root: admin on *",
+    "sha256": "868f1a7ef158e69de94dc97d296cf1fee6005703d84ec746576f1b629afd982a"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 297,
+    "caller": "root: admin on *",
+    "sha256": "53443a9a212f7fcf7a203158026e3e0dbc296513e3b76c7028798bf7b8125637"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42349,
+    "caller": "root: admin on *",
+    "sha256": "70f0ff38284e6ab76d42a611f9aec032d000412eeb161901e973838bb75b3c41"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "root: admin on *",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 38107,
+    "caller": "root: admin on *",
+    "sha256": "3ba7561009cc99f3dcdac9f3a33b990ae45610e4927e10a76dbadcf2e3ab6795"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 297,
+    "caller": "root: admin on *",
+    "sha256": "f06f8890abef59527aa93673f6fdb9f8c71e128e7b4f517d4f4b5e138e06c670"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42348,
+    "caller": "root: admin on *",
+    "sha256": "c349f1ac51f521cb1add2efa56bde6bdfc9ee841dbccf00e47dc65bccc0a42f0"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 296,
+    "caller": "root: admin on *",
+    "sha256": "481673ed22f78dbc4a115b9470cfb8ab3cd0bf7a78b9a62b7a6b49696257970e"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 479,
+    "caller": "root: admin on *",
+    "sha256": "17a9374bc2a1ad3f2cea790306d2be61807ebe3181c8b4b85799912aefe9955c"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "root: admin on *",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 38106,
+    "caller": "root: admin on *",
+    "sha256": "86730ca8c9355533a6a4183dbdedc920c0a403251c7fe502578e502628a40ba0"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 682,
+    "caller": "root: admin on *",
+    "sha256": "57d06a443c0c18ce3b57f1b1c1274deb1167f7bbf05e1b39bbed8fdb4b1864df"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 739,
+    "caller": "root: admin on *",
+    "sha256": "9fd4a5b5837138b6baa16d0c77b23f1bafc10c2430982b4241f0d7f982670a0d"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 784,
+    "caller": "root: admin on *",
+    "sha256": "306c9c5eb61e58e211de73ee790d16c91aa57b1acd1528b5f2c0f8d47abf4d90"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 44,
+    "caller": "root: admin on *",
+    "sha256": "28c330217641dbfb032c18768812f49d4d5c7a5c3dca14182a3182669581d5e7"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 105739,
+    "caller": "root: admin on *",
+    "sha256": "3a366f28d54c7193696f620b80341c332603ef512e454ac67c309dec233bc933"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 4854,
+    "caller": "root: admin on *",
+    "sha256": "55ef0dc36c4aaad65ee8b460828669948d7552f1b97ab5888a29513fbb8ef28b"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "root: admin on *",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "module _info {}",
+    "bytes": 357,
+    "caller": "dan: holds nothing",
+    "sha256": "324e22d0a461c7f0e68b20158bdcac9b1950b62b966efc04005d3fc552a95a8d"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 297,
+    "caller": "dan: holds nothing",
+    "sha256": "f9087c9d4b2a76f4594585899d2a5993e62b0a3cb82cf07e62e9c79446c0ba1d"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42269,
+    "caller": "dan: holds nothing",
+    "sha256": "52cd5d8b88e84ad100c00ef941439167b9d1c1e4572916898f5f8a3d6c9d240b"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "dan: holds nothing",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 191,
+    "caller": "dan: holds nothing",
+    "sha256": "416ada48fd36b9cf1674212859c2e4407cecc1d18e84e3687769249f1f15a495"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 297,
+    "caller": "dan: holds nothing",
+    "sha256": "a733cc5e9a27b568dddc9825267535223aec107bab5211a414ed42bc13dfb824"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42268,
+    "caller": "dan: holds nothing",
+    "sha256": "2c22ac9c04233e62d5fcdf7a2f4c3c935a691c31441a2dd1318382161892acab"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 296,
+    "caller": "dan: holds nothing",
+    "sha256": "5515054801cd810932a73d5c7f5fad9e64e4575e6113da790b2757d63e9060d2"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 429,
+    "caller": "dan: holds nothing",
+    "sha256": "b5db25856059218362cc9ef7fc9acbe21035236c7b249e293608de4019fbfeb3"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "dan: holds nothing",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 43,
+    "caller": "dan: holds nothing",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 43,
+    "caller": "dan: holds nothing",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 43,
+    "caller": "dan: holds nothing",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 43,
+    "caller": "dan: holds nothing",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 43,
+    "caller": "dan: holds nothing",
+    "sha256": "bc0fb9bada8a395369e11bd47a18fa0b5ca99ed3493b9c857b5c74f64f11bbf0"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 72970,
+    "caller": "dan: holds nothing",
+    "sha256": "48ecfa372d8ea78b40e60e221126ee5773e97794157fb38d0d9680ca2099c44c"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 4838,
+    "caller": "dan: holds nothing",
+    "sha256": "eeb23474c3f2c6da3cfc9d52c73b8785f8ca41c10963353bbf8b0a826887946e"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "dan: holds nothing",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "module _info {}",
+    "bytes": 357,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "d90aabb3dbae6c56fd52fa3b22f3713618bb3a0332e28593b48bd216aea2d85b"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 297,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "ff8a2c9af131f9748fe41938a5e5cd481f0a67a7f66bc5501f8c59da0af7b99b"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42349,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "27a78306d4c946191cd26cf4bb894bdeaacc6f14383d787a1c3236f525b5c3e6"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 37647,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "1100dbded409f6c9817c6e05c4abb39f079f6f9c770f90ddd814d0575a525b0d"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 297,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "59232358089da02d61fcb7307bd29f1def90343939e65edfbc0cb391336be512"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42348,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "c41e54b11b98ddfea27810bbff0266ebbfeb05bb2de471e72a9d8cb8b733ad71"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 296,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "a1648ad0d8a0b13b8f2693d28d696bc0b303bcc525f72de3d6a4ebcdd74ea46e"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 479,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "d4815d431d9af8e0a1a16873d388774537fa214b711af2bf3c4863d8ad1db69c"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 37646,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "43ea4e48be5c04df59dd256e1c861517d476e9538d7884147e79b3abf2238c59"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 690,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "64ffd17f8a33c4984b417cc7f02cc667dc5006a9d908904f637b475af2bf1dff"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 46,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "ff747f8c2ef75a9871742bff0413fc817599ca0612ece6a184c5d27881960912"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 792,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "437b17815a390e76c0b185691badceae27924fe6834966ce92efd468c5e55c8d"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 44,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "28c330217641dbfb032c18768812f49d4d5c7a5c3dca14182a3182669581d5e7"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 72970,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "48ecfa372d8ea78b40e60e221126ee5773e97794157fb38d0d9680ca2099c44c"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 4838,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "eeb23474c3f2c6da3cfc9d52c73b8785f8ca41c10963353bbf8b0a826887946e"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "ada's session within editor@MENGER-12",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "module _info {}",
+    "bytes": 357,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "cf0b68ac1eb6b257897717e80a5dbba26f04ad6c2038492c739becccd8e79b69"
+  },
+  {
+    "ask": "module menger.hash {}",
+    "bytes": 297,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "d5214fb5d32a1cc97051e5bde9f53ae22c3cfa48abb7970f415f536b3cbda79e"
+  },
+  {
+    "ask": "module menger.schema {}",
+    "bytes": 42349,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "5a860858f0f45f445c036975395c7d1cae4525c7ffb93dc4dd7a57dca93b2464"
+  },
+  {
+    "ask": "module menger.schema {\"method\":\"call\"}",
+    "bytes": 4270,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "4798aeeeebd57397c7cdf205ddb4dda383ba858d3982f0bf32ac37951b64b175"
+  },
+  {
+    "ask": "menger.call tickets.schema {}",
+    "bytes": 36727,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "df6121f99dafcd17e6e10bf181d8f9e1a7a4757adf5aa431b053f90f4bfe450f"
+  },
+  {
+    "ask": "menger.call menger.hash {}",
+    "bytes": 297,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "75a17d261012862853de04d267fc3690619b3d7866fd807b4f873b3b72780338"
+  },
+  {
+    "ask": "route menger.schema {}",
+    "bytes": 42348,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "bee65652e18516a6b1530ac25a93bfc3a4371e2aa58e142a64f5a333123bf3a8"
+  },
+  {
+    "ask": "route menger.hash {}",
+    "bytes": 296,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "5a12777ce156dbf1d712cf6f3f00a357cf4f354193b12b3809b7f2e01441f537"
+  },
+  {
+    "ask": "route menger.hashes {}",
+    "bytes": 479,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "3d117a204fa3eb11eac277ce16c0caa3153e60434f3224eb8c49256c30a3cfa8"
+  },
+  {
+    "ask": "route menger.call.schema {}",
+    "bytes": 4276,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "9f247cc1cfa9c9036be715a2b6e537d951c5250c5a7eaf826756cb5143ec173b"
+  },
+  {
+    "ask": "route tickets.schema {}",
+    "bytes": 36726,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "11fb1dd91dd58567e67f47ead1889016f7d69d8839e081e584c216836312857e"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"get\"}",
+    "bytes": 682,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "57d06a443c0c18ce3b57f1b1c1274deb1167f7bbf05e1b39bbed8fdb4b1864df"
+  },
+  {
+    "ask": "route tickets.schema {\"method\":\"delete\"}",
+    "bytes": 46,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "ff747f8c2ef75a9871742bff0413fc817599ca0612ece6a184c5d27881960912"
+  },
+  {
+    "ask": "route tickets.set_status.schema {}",
+    "bytes": 50,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "fd5bfe85714e9df88c7dc285672294725f542e607c02198c1de7d0856905a5f5"
+  },
+  {
+    "ask": "route tickets.nope.schema {}",
+    "bytes": 44,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "28c330217641dbfb032c18768812f49d4d5c7a5c3dca14182a3182669581d5e7"
+  },
+  {
+    "ask": "route auth.schema {}",
+    "bytes": 72970,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "48ecfa372d8ea78b40e60e221126ee5773e97794157fb38d0d9680ca2099c44c"
+  },
+  {
+    "ask": "route auth.schema {\"method\":\"whoami\"}",
+    "bytes": 4838,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "eeb23474c3f2c6da3cfc9d52c73b8785f8ca41c10963353bbf8b0a826887946e"
+  },
+  {
+    "ask": "route nope.schema {}",
+    "bytes": 40,
+    "caller": "root's session within tickets.get@*",
+    "sha256": "48a7d8d02b4edb9b0c5e3eb01be8f3b4dc3751059629dfad4a7df7ba585429d0"
+  },
+  {
+    "ask": "plexus_hash: its compute_hash",
+    "bytes": 16,
+    "caller": "the service",
+    "sha256": "9e7f7978cf541d2d73e01ed67f972496f8870f741d08870406a4cc0c54cb1cc3"
+  }
+]

@@ -26,7 +26,9 @@
 //! hashes — so two callers with identical holdings share a view hash, and
 //! a client's schema cache (synapse keeps IR by hash) never mixes two
 //! callers' views. The service's view hash is `v-anon-<hex>` for the anonymous
-//! view and `v-<hex>` for a caller's.
+//! view and `v-<hex>` for a caller's. PERF-21: the service lists its children
+//! by namespace, so a view hash is the same at every start of the same build,
+//! and a cache keeps its schema across a restart.
 //!
 //! A service **without a gate** never builds a view on the wire: `_info` and
 //! every schema answer exactly as before. [`DynamicHub::view`](super::DynamicHub::view)
@@ -162,7 +164,7 @@ impl Asker<'_> {
 pub(crate) struct Described {
     /// The service's own schema ([`Activation::plugin_schema`](super::Activation::plugin_schema)).
     pub(crate) service: PluginSchema,
-    /// Each registered activation's schema.
+    /// Each registered activation's schema, in namespace order (PERF-21).
     pub(crate) activations: Vec<PluginSchema>,
     /// The static children, by their whole path — what a view reads of them.
     below: Vec<Below>,

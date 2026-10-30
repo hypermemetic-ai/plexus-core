@@ -97,6 +97,24 @@ fn main() {
             b.extend_from_slice(t.as_bytes());
             black_box(b);
         }), "frame");
+        // PERF-17 E1: as today, but the item serialized once into its notification (SubscriptionMessage::new)
+        #[derive(Serialize)]
+        struct Notif3<'a> { jsonrpc: &'a str, method: &'a str, params: Params3<'a> }
+        #[derive(Serialize)]
+        struct Params3<'a> { subscription: u64, result: &'a PlexusStreamItem }
+        e(bench("PERF-17 E1: as today, the item serialized once into its notification", || {
+            let m = meta.clone();
+            let ct = "bench.count".to_string();
+            let c = serde_json::to_value(black_box(&ev)).unwrap();
+            let it = PlexusStreamItem::Data { metadata: m, content_type: ct, content: c };
+            let r = serde_json::value::to_raw_value(&Notif3 { jsonrpc: "2.0", method: "perf5.call", params: Params3 { subscription: 2_174_681_772_066_080, result: &it } }).unwrap();
+            let t = r.get();
+            let mut b = Vec::with_capacity(t.len() + 4);
+            b.extend_from_slice(&[0x81, 126]);
+            b.extend_from_slice(&(t.len() as u16).to_be_bytes());
+            b.extend_from_slice(t.as_bytes());
+            black_box(b);
+        }), "frame");
         // the floor: the typed item written once, straight into the frame buffer (PERF-7's shape)
         #[derive(Serialize)]
         struct Typed<'a, T> { #[serde(rename = "type")] t: &'a str, metadata: &'a StreamMetadata, content_type: &'a str, content: &'a T }

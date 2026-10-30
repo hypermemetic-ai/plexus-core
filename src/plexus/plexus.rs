@@ -2644,8 +2644,10 @@ async fn pipe_stream_to_subscription(
 
     let sink = pending.accept().await?;
     let connection = sink.connection_id().0;
-    // PERF-17 E2b: a batch is built once around its items (jsonrpsee sends
-    // a complete message as it is).
+    // PERF-17 E1: the notification built once around the item (jsonrpsee
+    // sends a complete message as it is), not the item to a RawValue and then
+    // jsonrpsee's envelope copying it.
+    let one = super::perf17::one_encode();
     let method = sink.method_name().to_string();
     let sub_id = sink.subscription_id();
     loop {
@@ -2694,8 +2696,17 @@ async fn pipe_stream_to_subscription(
             }
             continue;
         }
-        let json = serde_json::value::to_raw_value(&item)?;
-        sink.send(json).await?;
+        if one {
+            let id = match &sub_id {
+                jsonrpsee::types::SubscriptionId::Num(n) => jsonrpsee::types::SubscriptionId::Num(*n),
+                jsonrpsee::types::SubscriptionId::Str(s) => jsonrpsee::types::SubscriptionId::Str(std::borrow::Cow::Borrowed(s.as_ref())),
+            };
+            let msg = jsonrpsee::SubscriptionMessage::new(&method, id, &item)?;
+            sink.send(msg).await?;
+        } else {
+            let json = serde_json::value::to_raw_value(&item)?;
+            sink.send(json).await?;
+        }
     }
     Ok(())
 }

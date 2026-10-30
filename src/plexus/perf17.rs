@@ -11,6 +11,10 @@
 //!   cached per (service, method, params, caller) and the gate's grants
 //!   generation; a move of the generation misses. Assumes the activations'
 //!   schemas are fixed once registered (true of every macro activation).
+//! - `PERF17_ONE_ENCODE=1` (E1, PERF-7's first half): each item serialized
+//!   once, straight into its notification (`SubscriptionMessage::new`, which
+//!   jsonrpsee passes through whole), instead of `to_raw_value` and then
+//!   jsonrpsee's envelope copying it.
 //! - `PERF17_BATCH=N` (E2b, PERF-8's second half): the items a stream has
 //!   ready when one is taken (polled until `Pending`, never a timer), up to N,
 //!   go as one notification whose `result` is the array of them (PERF-8 names
@@ -86,6 +90,11 @@ pub fn introspect_cache() -> &'static GenCache<std::sync::Arc<Vec<super::types::
     C.get_or_init(Default::default)
 }
 
+/// E1: the item serialized once, into its notification.
+pub fn one_encode() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| flag("PERF17_ONE_ENCODE"))
+}
 
 pub fn view_cache() -> &'static GenCache<std::sync::Arc<super::view::View>> {
     static C: OnceLock<GenCache<std::sync::Arc<super::view::View>>> = OnceLock::new();

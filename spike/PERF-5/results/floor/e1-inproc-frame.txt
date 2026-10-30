@@ -1,0 +1,8 @@
+      38 ns   4.0 allocs  1 · metadata.clone() + content_type.to_string()
+     137 ns   6.0 allocs  2 · event → Value (serialize_with_credential_capture's to_value)
+     258 ns   3.0 allocs  3 · item → RawValue (to_raw_value, the second encode)
+     178 ns   3.0 allocs  4 · envelope: notification → String (jsonrpsee, copies the RawValue)
+      27 ns   2.0 allocs  5 · ws frame: header + copy into the write buffer
+     673 ns  17.0 allocs  all five, as today
+     636 ns  15.0 allocs  PERF-17 E1: as today, the item serialized once into its notification
+     265 ns   0.0 allocs  one encode into a reused frame buffer (the floor PERF-7 aims at)

@@ -280,9 +280,9 @@ fn stores() -> (Arc<MemoryMemberships>, Arc<MemoryRoles>) {
 
 /// The service before it is shared, one activation behind a gate of its own:
 /// ADA and BOB editors on MENGER, CAT on IDENTITY, ROOT admin on `*`, DAN
-/// nothing. One activation, so its answers are the same from one service to
-/// the next — a service lists its activations in its map's order, which two
-/// services (and two runs) need not share. `world()` is it, shared.
+/// nothing. `world()` is it, shared. Its answers are the same from one
+/// service to the next, as any service's are (PERF-21: a service lists its
+/// activations by namespace).
 pub fn service() -> (DynamicHub, impl FnOnce(DynamicHub) -> World) {
     let (memberships, roles) = stores();
     let (built, asked, ended) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(Ended::default()));
@@ -303,8 +303,8 @@ pub fn world() -> World {
 }
 
 /// AUTH-5's service: the auth activation mounted beside tickets, the
-/// reference stores under it. Its two activations are listed in its own
-/// map's order — compare its answers with its own, never another's.
+/// reference stores under it. Its two activations are listed by namespace,
+/// `auth` before `tickets`, at every start (PERF-21, `describe_starts.rs`).
 pub fn auth_world() -> World {
     let (memberships, roles) = stores();
     let backend = Arc::new(MemoryAuthBackend::new("http://127.0.0.1:4456/login"));
@@ -316,6 +316,21 @@ pub fn auth_world() -> World {
         .with_resource_metadata("http://127.0.0.1:4456/.well-known/oauth-protected-resource");
     roles.seed(&service.declared_roles());
     World { service: Arc::new(service), backend: Some(backend), memberships, roles, ended: Arc::new(Ended::default()), built, asked }
+}
+
+/// The callers every golden and every start is asked for, by name: anonymous,
+/// each holding, nothing held, and two sessions within a ceiling.
+pub fn callers() -> Vec<(&'static str, Option<AuthContext>)> {
+    vec![
+        ("anonymous", None),
+        ("ada: editor on MENGER", Some(key(ADA, "worker-1"))),
+        ("bob: editor on MENGER", Some(key(BOB, "worker-2"))),
+        ("cat: editor on IDENTITY", Some(key(CAT, "worker-3"))),
+        ("root: admin on *", Some(key(ROOT, "root"))),
+        ("dan: holds nothing", Some(key(DAN, "dan"))),
+        ("ada's session within editor@MENGER-12", Some(within(ADA, "worker-1", &["editor@MENGER-12"]))),
+        ("root's session within tickets.get@*", Some(within(ROOT, "root", &["tickets.get@*"]))),
+    ]
 }
 
 /// A key-proved connection (IDENTITY-40's adapter stamps `agent` and `name`).

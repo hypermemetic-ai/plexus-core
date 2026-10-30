@@ -29,7 +29,7 @@ pub const PLEXUS_NOTIF_METHOD: &str = "result";
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 // ============================================================================
@@ -958,9 +958,18 @@ fn fill_site_hints_in_schema_stream(
 struct DynamicHubInner {
     /// Custom namespace for this hub instance (defaults to "plexus")
     namespace: String,
-    activations: HashMap<String, Arc<dyn ActivationObject>>,
-    /// Child routers for direct nested routing (e.g., hub.solar.mercury.info)
-    child_routers: HashMap<String, Arc<dyn ChildRouter>>,
+    /// The registered activations, by namespace. PERF-21: ordered, so every
+    /// list of them — the service schema's `children`
+    /// ([`DynamicHub::plugin_children`]), what the self-description cache
+    /// keeps, the static children, the declared roles — is in namespace
+    /// order: a function of what the service serves, the same at every
+    /// start. A `HashMap` listed them in the process's own order, and every
+    /// hash over the service (its own, the `plexus_hash` its items carry,
+    /// each caller's view hash) moved with it.
+    activations: BTreeMap<String, Arc<dyn ActivationObject>>,
+    /// Child routers for direct nested routing (e.g.
+    /// `service.solar.mercury.info`), by namespace as `activations` are.
+    child_routers: BTreeMap<String, Arc<dyn ChildRouter>>,
     /// Activation registry mapping UUIDs to paths
     registry: std::sync::RwLock<PluginRegistry>,
     pending_rpc: std::sync::Mutex<Vec<Box<dyn FnOnce() -> Methods + Send>>>,
@@ -1092,8 +1101,8 @@ impl DynamicHub {
         Self {
             inner: Arc::new(DynamicHubInner {
                 namespace: namespace.into(),
-                activations: HashMap::new(),
-                child_routers: HashMap::new(),
+                activations: BTreeMap::new(),
+                child_routers: BTreeMap::new(),
                 registry: std::sync::RwLock::new(PluginRegistry::new()),
                 pending_rpc: std::sync::Mutex::new(Vec::new()),
                 auth_capabilities: None,
@@ -1837,7 +1846,10 @@ impl DynamicHub {
     /// Compute hash for cache invalidation
     ///
     /// Returns the hash from the recursive plugin schema. This hash changes
-    /// whenever any method definition or child plugin changes.
+    /// whenever any method definition or child plugin changes — and,
+    /// PERF-21, only then: the children are listed by namespace, so every
+    /// start of the same build computes the same hash (the `plexus_hash`
+    /// every item carries, [`PlexusContext::init`]).
     pub fn compute_hash(&self) -> String {
         // PERF-15: from what the service describes, kept per schema generation.
         self.described().service.hash.clone()
@@ -2042,8 +2054,10 @@ impl DynamicHub {
         Ok((parts[0], parts[1]))
     }
 
-    /// Get child activation summaries (for hub functionality)
-    /// Called by hub-macro when `hub` flag is set
+    /// Get child activation summaries: one per registered activation, in
+    /// namespace order (PERF-21) — the service schema's `children`, which
+    /// its `hash` and every caller's view hash digest in this order.
+    /// Called by `#[plexus_macros::activation]` when its `hub` flag is set.
     pub fn plugin_children(&self) -> Vec<ChildSummary> {
         self.inner.activations.values()
             .map(|a| {

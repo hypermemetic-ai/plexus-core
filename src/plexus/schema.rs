@@ -1056,6 +1056,25 @@ impl PluginSchema {
     /// domain field of the same name have it shadowed at dispatch time;
     /// the warning surfaces that fact at build time so backends can
     /// rename.
+    /// PERF-15: [`Self::warn_on_credentials_field_collisions`] once for
+    /// each schema a process builds — by namespace and hash — not in every
+    /// constructor call. A service's `_info`, `hash` and `schema` built
+    /// every activation's schema each time, and serializing each method's
+    /// `returns` to lint it was 39 % of that (PERF-5). A schema whose
+    /// methods change has another hash, and is linted again.
+    fn lint_once(namespace: &str, hash: &str, methods: &[MethodSchema]) {
+        static LINTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+            std::sync::OnceLock::new();
+        let first = LINTED
+            .get_or_init(Default::default)
+            .lock()
+            .map(|mut seen| seen.insert((namespace.to_string(), hash.to_string())))
+            .unwrap_or(true);
+        if first {
+            let _ = Self::warn_on_credentials_field_collisions(namespace, methods);
+        }
+    }
+
     fn warn_on_credentials_field_collisions(
         namespace: &str,
         methods: &[MethodSchema],
@@ -1214,9 +1233,10 @@ impl PluginSchema {
         // AUTHZ-CRED-CORE-2 acceptance criterion #8: warn at schema-build
         // time when a method's return-type schema declares a top-level
         // field named `_credentials` (reserved by the framework's
-        // credential sidecar).
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        // credential sidecar) — once for each schema the process builds
+        // (PERF-15, `lint_once`).
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, None);
+        Self::lint_once(&namespace, &hash, &methods);
         Self {
             namespace,
             version: version.into(),
@@ -1246,8 +1266,8 @@ impl PluginSchema {
         let namespace = namespace.into();
         Self::validate_no_collisions(&namespace, &methods, None);
         // AUTHZ-CRED-CORE-2 AC #8: see PluginSchema::leaf.
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, None);
+        Self::lint_once(&namespace, &hash, &methods);
         Self {
             namespace,
             version: version.into(),
@@ -1277,8 +1297,8 @@ impl PluginSchema {
         let namespace = namespace.into();
         Self::validate_no_collisions(&namespace, &methods, Some(&children));
         // AUTHZ-CRED-CORE-2 AC #8: see PluginSchema::leaf.
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, Some(&children));
+        Self::lint_once(&namespace, &hash, &methods);
         Self {
             namespace,
             version: version.into(),
@@ -1309,8 +1329,8 @@ impl PluginSchema {
         let namespace = namespace.into();
         Self::validate_no_collisions(&namespace, &methods, Some(&children));
         // AUTHZ-CRED-CORE-2 AC #8: see PluginSchema::leaf.
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, Some(&children));
+        Self::lint_once(&namespace, &hash, &methods);
         Self {
             namespace,
             version: version.into(),

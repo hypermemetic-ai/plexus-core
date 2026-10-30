@@ -108,6 +108,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
 # BIDIR-13: tests/question_matrix.rs answers a question from two sockets.
 jsonrpsee = { version = "0.26", features = ["server", "macros", "ws-client"] }
+# PERF-15: tests/describe_golden.rs pins each self-description answer by the
+# sha256 of its bytes (already in the lock, through jsonrpsee and ring's users).
+sha2 = "0.10"
 
 # POLYGLOT-6: tests/conformance.rs serves the reference echo (plexus-wire's
 # reference/echo-rs, taken by path) on a WebSocket under `key` — through

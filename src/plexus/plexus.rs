@@ -1026,6 +1026,10 @@ struct DynamicHubInner {
     /// for `auth.requires`; present only when the auth activation is
     /// mounted, and fed by every [`DynamicHub::register`].
     auth_catalog: Option<super::auth_activation::Catalog>,
+    /// PERF-15: the self-description cache — what the service's schemas
+    /// show, and each caller's view of them — that `_info`, `hash`, `hashes`
+    /// and every `<ns>.schema` answer from. See [`super::view`].
+    describe: super::view::Cache,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -1102,8 +1106,19 @@ impl DynamicHub {
                 signed_in_grants: std::collections::BTreeSet::new(),
                 resource_metadata: None,
                 auth_catalog: None,
+                describe: Default::default(),
             }),
         }
+    }
+
+    /// The service's state while it is built — every builder's way in;
+    /// panics with `refused` once the service is shared. PERF-15: a change
+    /// made here may change what the service describes, so the
+    /// self-description cache starts over.
+    fn inner_mut(&mut self, refused: &str) -> &mut DynamicHubInner {
+        let inner = Arc::get_mut(&mut self.inner).expect(refused);
+        inner.describe.reset();
+        inner
     }
 
     /// Configure the deployment's [`ScopeRegistry`] — the scope gate's
@@ -1126,8 +1141,7 @@ impl DynamicHub {
     /// [`ScopeRegistry`]: plexus_auth_core::ScopeRegistry
     /// [`MethodSchema`]: super::schema::MethodSchema
     pub fn with_scope_registry(mut self, registry: plexus_auth_core::ScopeRegistry) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot set scope_registry: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot set scope_registry: DynamicHub has multiple references");
         inner.scope_registry = Some(Arc::new(registry));
         self
     }
@@ -1151,8 +1165,7 @@ impl DynamicHub {
     ///
     /// [`ScopeRegistry::required_scopes_for`]: plexus_auth_core::ScopeRegistry::required_scopes_for
     pub fn with_default_deny(mut self, default_deny: bool) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot set default_deny: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot set default_deny: DynamicHub has multiple references");
         inner.default_deny = default_deny;
         self
     }
@@ -1168,8 +1181,7 @@ impl DynamicHub {
     ///
     /// [`AuditRecord`]: plexus_auth_core::AuditRecord
     pub fn with_audit_sink(mut self, sink: Arc<dyn plexus_auth_core::AuditSink>) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot set audit_sink: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot set audit_sink: DynamicHub has multiple references");
         inner.audit_sink = sink;
         self
     }
@@ -1199,8 +1211,7 @@ impl DynamicHub {
     ///
     /// [`Reach`]: plexus_auth_core::grants::Reach
     pub fn with_gate(mut self, gate: Arc<plexus_auth_core::grants::Gate>) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot set gate: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot set gate: DynamicHub has multiple references");
         inner.gate = Some(gate);
         self
     }
@@ -1215,8 +1226,7 @@ impl DynamicHub {
     /// caller's `_info` names as `auth.resource_metadata`. Only a gated hub
     /// says it; without a gate `_info` is unchanged.
     pub fn with_resource_metadata(mut self, url: impl Into<String>) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot set resource_metadata: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot set resource_metadata: DynamicHub has multiple references");
         inner.resource_metadata = Some(url.into());
         self
     }
@@ -1232,8 +1242,7 @@ impl DynamicHub {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot set signed_in grants: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot set signed_in grants: DynamicHub has multiple references");
         inner.signed_in_grants.extend(grants.into_iter().map(Into::into));
         self
     }
@@ -1266,8 +1275,7 @@ impl DynamicHub {
         }
         let (auth, gate) = super::auth_activation::AuthActivation::mount(setup, catalog.clone());
         {
-            let inner = Arc::get_mut(&mut self.inner)
-                .expect("Cannot mount auth: DynamicHub has multiple references");
+            let inner = self.inner_mut("Cannot mount auth: DynamicHub has multiple references");
             inner.auth_catalog = Some(catalog);
             inner.gate = Some(Arc::new(gate));
         }
@@ -1287,18 +1295,75 @@ impl DynamicHub {
     /// Without a gate: the whole hub, as every caller sees it today
     /// ([`ViewKind::Caller`](super::ViewKind::Caller), the hub's own hash).
     /// See [`super::view`].
+    ///
+    /// PERF-15: answered from the service's self-description cache — built
+    /// once per schema generation and, for a gated service, once per view
+    /// key (the caller's grants' fingerprint, or anonymous) and grants
+    /// generation.
     pub fn view(&self, caller: Option<&super::auth::AuthContext>) -> super::view::View {
-        let hub = Activation::plugin_schema(self);
-        let activations: Vec<PluginSchema> = self.inner.activations.values().map(|a| a.plugin_schema()).collect();
         match self.inner.gate.as_ref() {
-            None => super::view::whole(hub, activations),
-            Some(gate) => {
-                // AUTH-11: a sign-in that ended sees the anonymous view.
-                let (caller, _) = super::grant_gate::standing(gate, caller);
-                // MACRO-20: a static child's entry stays in its parent's
-                // view when the caller can use something below it.
-                let children = self.static_children();
-                super::view::build(gate, &self.inner.signed_in_grants, caller, hub, activations, &children)
+            None => self.described().whole(),
+            Some(_) => {
+                let (base, view) = self.shaped(caller);
+                view.view(&base)
+            }
+        }
+    }
+
+    /// PERF-15: something this service describes changed after it was built
+    /// — a child mounted or gone while it serves, an activation whose schema
+    /// changed: what the self-description cache kept is dropped, and the
+    /// next `_info`, `hash` or `schema` builds it again. Registering, and
+    /// every other change while the service is built, does this by itself.
+    pub fn schema_moved(&self) {
+        self.inner.describe.schema_moved();
+    }
+
+    /// PERF-15: what the service's schemas show whoever asks — its own,
+    /// every activation's, every static child's — kept per schema
+    /// generation.
+    fn described(&self) -> Arc<super::view::Described> {
+        let at = self.inner.describe.schema_generation();
+        match self.inner.describe.base(at) {
+            Some(cell) => cell.get_or_init(|| Arc::new(self.describe_now())).clone(),
+            None => Arc::new(self.describe_now()),
+        }
+    }
+
+    fn describe_now(&self) -> super::view::Described {
+        let service = Activation::plugin_schema(self);
+        let activations: Vec<PluginSchema> = self.inner.activations.values().map(|a| a.plugin_schema()).collect();
+        // MACRO-20: a static child's entry stays in its parent's view when
+        // the caller can use something below it.
+        super::view::Described::new(service, activations, self.static_children())
+    }
+
+    /// PERF-15: a gated service's view for `caller`, kept per view key and
+    /// grants generation, with what it was decided over. The generations
+    /// are read before anything they cover, so a write that lands while a
+    /// view is built leaves it under the generation before — dropped at the
+    /// next ask.
+    fn shaped(&self, caller: Option<&super::auth::AuthContext>) -> (Arc<super::view::Described>, Arc<super::view::Shaped>) {
+        let gate = self.inner.gate.as_ref().expect("a view is a gated service's");
+        let schema_at = self.inner.describe.schema_generation();
+        let grants_at = gate.generation().current();
+        // AUTH-11: a sign-in that ended sees the anonymous view — asked on
+        // every ask, never kept.
+        let (caller, _) = super::grant_gate::standing(gate, caller);
+        let who = caller.and_then(|c| gate.fingerprint(c));
+        let shape = |base: &super::view::Described| {
+            Arc::new(super::view::shape(gate, &self.inner.signed_in_grants, who.as_ref(), base))
+        };
+        match self.inner.describe.view(schema_at, grants_at, &who) {
+            Some((base, view)) => {
+                let base = base.get_or_init(|| Arc::new(self.describe_now())).clone();
+                let view = view.get_or_init(|| shape(&base)).clone();
+                (base, view)
+            }
+            None => {
+                let base = Arc::new(self.describe_now());
+                let view = shape(&base);
+                (base, view)
             }
         }
     }
@@ -1309,24 +1374,29 @@ impl DynamicHub {
     /// anonymous caller, `auth: {methods: [the public methods' grants],
     /// resource_metadata?}` — how to sign in.
     pub fn info(&self, caller: Option<&super::auth::AuthContext>) -> serde_json::Value {
-        let mut payload = build_info_payload(self.runtime_namespace(), self.inner.auth_capabilities.as_ref());
         if self.inner.gate.is_none() {
-            return payload;
+            return build_info_payload(self.runtime_namespace(), self.inner.auth_capabilities.as_ref());
         }
-        let view = self.view(caller);
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("view".into(), view.kind.as_str().into());
-            obj.insert("view_hash".into(), view.hash.clone().into());
-            if view.kind == super::ViewKind::Anonymous {
-                let mut auth = serde_json::Map::new();
-                auth.insert("methods".into(), view.public_methods().into());
-                if let Some(url) = self.inner.resource_metadata.as_ref() {
-                    auth.insert("resource_metadata".into(), url.clone().into());
+        // PERF-15: built once per view, kept with it.
+        let (base, view) = self.shaped(caller);
+        view.info
+            .get_or_init(|| {
+                let mut payload = build_info_payload(self.runtime_namespace(), self.inner.auth_capabilities.as_ref());
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("view".into(), view.kind.as_str().into());
+                    obj.insert("view_hash".into(), view.hash.clone().into());
+                    if view.kind == super::ViewKind::Anonymous {
+                        let mut auth = serde_json::Map::new();
+                        auth.insert("methods".into(), view.public_methods(&base).into());
+                        if let Some(url) = self.inner.resource_metadata.as_ref() {
+                            auth.insert("resource_metadata".into(), url.clone().into());
+                        }
+                        obj.insert("auth".into(), serde_json::Value::Object(auth));
+                    }
                 }
-                obj.insert("auth".into(), serde_json::Value::Object(auth));
-            }
-        }
-        payload
+                payload
+            })
+            .clone()
     }
 
     /// AUTH-4: a gated hub's introspection (`<ns>.schema`, the hub's
@@ -1343,14 +1413,17 @@ impl DynamicHub {
     ) -> Option<Result<PlexusStream, PlexusError>> {
         let (ns, rest) = method.split_once('.')?;
         let hub_ns = self.inner.namespace.as_str();
-        let view = self.view(auth);
+        // PERF-15: the view, and what it was decided over, from the cache.
+        let (base, view) = self.shaped(auth);
         let not_found = || PlexusError::ActivationNotFound(ns.to_string());
         let content: serde_json::Value = match rest {
             "schema" => {
-                let Some(schema) = view.schema_of(ns) else { return Some(Err(not_found())) };
+                if !view.shows(ns) {
+                    return Some(Err(not_found()));
+                }
                 let mut result = match params.get("method").and_then(|v| v.as_str()) {
-                    Some(name) => match schema.methods.iter().find(|m| m.name == name) {
-                        Some(m) => super::SchemaResult::Method(m.clone()),
+                    Some(name) => match view.method_of(&base, ns, name) {
+                        Some(m) => super::SchemaResult::Method(m),
                         None => {
                             return Some(Err(PlexusError::MethodNotFound {
                                 activation: ns.to_string(),
@@ -1358,7 +1431,7 @@ impl DynamicHub {
                             }))
                         }
                     },
-                    None => super::SchemaResult::Plugin(schema.clone()),
+                    None => super::SchemaResult::Plugin(view.schema_of(&base, ns)?),
                 };
                 if let Some(site) = self.derived_site_hint() {
                     result.fill_site_hints(&site);
@@ -1368,11 +1441,13 @@ impl DynamicHub {
             "hash" if ns == hub_ns => serde_json::to_value(HashEvent::Hash { value: view.hash.clone() }).ok()?,
             "hashes" if ns == hub_ns => serde_json::to_value(view.hashes()).ok()?,
             r if r.ends_with(".schema") => {
-                let Some(schema) = view.schema_of(ns) else { return Some(Err(not_found())) };
+                if !view.shows(ns) {
+                    return Some(Err(not_found()));
+                }
                 let name = r.trim_end_matches(".schema");
-                match schema.methods.iter().find(|m| m.name == name) {
+                match view.method_of(&base, ns, name) {
                     Some(m) if matches!(m.role, super::MethodRole::Rpc) => {
-                        serde_json::to_value(super::SchemaResult::Method(m.clone())).ok()?
+                        serde_json::to_value(super::SchemaResult::Method(m)).ok()?
                     }
                     // A visible nested child: its own routing answers.
                     Some(_) => return None,
@@ -1387,19 +1462,38 @@ impl DynamicHub {
             }
             _ => return None,
         };
-        // The stream the hub sends today, so content types and metadata
+        // The stream the service sends today, so content types and metadata
         // stay what clients know; only the content is the view's.
-        let stream = match self.route_ungated(method, params.clone(), auth, raw_ctx).await {
-            Ok(s) => s,
+        use futures::StreamExt;
+        let with = |content: serde_json::Value| {
+            move |item: super::types::PlexusStreamItem| match item {
+                super::types::PlexusStreamItem::Data { metadata, content_type, .. } => {
+                    super::types::PlexusStreamItem::Data { metadata, content_type, content: content.clone() }
+                }
+                other => other,
+            }
+        };
+        // R-5's scope gate decides introspection on every call, and audits
+        // it: routed every time, as before.
+        if self.inner.scope_registry.is_some() || self.inner.default_deny {
+            let routed = self.route_ungated(method, params.clone(), auth, raw_ctx).await;
+            return Some(routed.map(|s| -> PlexusStream { Box::pin(s.map(with(content))) }));
+        }
+        // PERF-15: that stream's envelope is learned from the first answer
+        // routed for this method and params, and kept with what the service
+        // describes; after it no activation builds its schema to say it.
+        let key = format!("{method}\n{params}");
+        if let Some(shell) = base.shell(&key) {
+            return Some(Ok(Box::pin(futures::stream::iter(shell.answer(content)))));
+        }
+        let items: Vec<super::types::PlexusStreamItem> = match self.route_ungated(method, params.clone(), auth, raw_ctx).await {
+            Ok(s) => s.collect().await,
             Err(e) => return Some(Err(e)),
         };
-        use futures::StreamExt;
-        Some(Ok(Box::pin(stream.map(move |item| match item {
-            super::types::PlexusStreamItem::Data { metadata, content_type, .. } => {
-                super::types::PlexusStreamItem::Data { metadata, content_type, content: content.clone() }
-            }
-            other => other,
-        }))))
+        if let Some(shell) = super::view::Shell::of(&items) {
+            base.keep_shell(key, shell);
+        }
+        Some(Ok(Box::pin(futures::stream::iter(items.into_iter().map(with(content))))))
     }
 
     /// AUTH-2/AUTH-3: the default roles every registered activation
@@ -1506,8 +1600,7 @@ impl DynamicHub {
         callee_ns: impl Into<String>,
         policy: std::sync::Arc<dyn plexus_auth_core::ForwardPolicy>,
     ) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot register forward policy: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot register forward policy: DynamicHub has multiple references");
         inner.forward_policies.register(callee_ns, policy);
         self
     }
@@ -1559,8 +1652,7 @@ impl DynamicHub {
         mut self,
         caps: plexus_auth_core::BackendAuthCapabilities,
     ) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot set auth_capabilities: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot set auth_capabilities: DynamicHub has multiple references");
         inner.auth_capabilities = Some(caps);
         self
     }
@@ -1631,8 +1723,7 @@ impl DynamicHub {
         let activation_for_rpc = activation.clone();
         let activation_for_router = activation.clone();
 
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot register: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot register: DynamicHub has multiple references");
 
         // Register in the activation registry
         inner.registry.write().unwrap().register(
@@ -1675,8 +1766,7 @@ impl DynamicHub {
         let activation_for_rpc = activation.clone();
         let activation_for_router = activation.clone();
 
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("Cannot register: DynamicHub has multiple references");
+        let inner = self.inner_mut("Cannot register: DynamicHub has multiple references");
 
         // Register in the activation registry
         inner.registry.write().unwrap().register(
@@ -1749,7 +1839,27 @@ impl DynamicHub {
     /// Returns the hash from the recursive plugin schema. This hash changes
     /// whenever any method definition or child plugin changes.
     pub fn compute_hash(&self) -> String {
-        Activation::plugin_schema(self).hash
+        // PERF-15: from what the service describes, kept per schema generation.
+        self.described().service.hash.clone()
+    }
+
+    /// PERF-15: the service's own `hash` answer for `caller` — the caller's
+    /// view's on a gated service (AUTH-4), the service's own otherwise —
+    /// from the cache.
+    fn own_hash(&self, caller: Option<&super::auth::AuthContext>) -> String {
+        match self.inner.gate {
+            Some(_) => self.shaped(caller).1.hash.clone(),
+            None => self.described().service.hash.clone(),
+        }
+    }
+
+    /// PERF-15: the service's own schema as `caller` sees it — the
+    /// `{ns}.schema` answer before its site hints — from the cache.
+    fn own_schema(&self, caller: Option<&super::auth::AuthContext>) -> PluginSchema {
+        match self.inner.gate {
+            Some(_) => self.shaped(caller).1.service.clone(),
+            None => self.described().service.clone(),
+        }
     }
 
     /// Route a call to the appropriate activation
@@ -2008,12 +2118,8 @@ impl DynamicHub {
                 let plexus = plexus_for_hash.clone();
                 Box::pin(async move {
                     // AUTH-4: a gated hub's hash is the caller's view's.
-                    let value = if plexus.inner.gate.is_some() {
-                        let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        plexus.view(auth).hash
-                    } else {
-                        Activation::plugin_schema(&plexus).hash
-                    };
+                    let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
+                    let value = plexus.own_hash(auth);
                     let stream = async_stream::stream! {
                         yield HashEvent::Hash { value };
                     };
@@ -2034,12 +2140,8 @@ impl DynamicHub {
                 Box::pin(async move {
                     let p: SchemaParams = params.parse().unwrap_or_default();
                     // AUTH-4: a gated hub answers from the caller's view.
-                    let mut plugin_schema = if plexus.inner.gate.is_some() {
-                        let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        plexus.view(auth).schema
-                    } else {
-                        Activation::plugin_schema(&plexus)
-                    };
+                    let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
+                    let mut plugin_schema = plexus.own_schema(auth);
                     // CA-1: hub-derived site hints on the hub's own schema.
                     if let Some(site) = plexus.derived_site_hint() {
                         plugin_schema.fill_site_hints(&site);
@@ -2187,12 +2289,8 @@ impl DynamicHub {
                 let hub = hub_for_hash.clone();
                 Box::pin(async move {
                     // AUTH-4: a gated hub's hash is the caller's view's.
-                    let value = if hub.inner.gate.is_some() {
-                        let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        hub.view(auth).hash
-                    } else {
-                        Activation::plugin_schema(&*hub).hash
-                    };
+                    let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
+                    let value = hub.own_hash(auth);
                     let stream = async_stream::stream! {
                         yield HashEvent::Hash { value };
                     };
@@ -2213,12 +2311,8 @@ impl DynamicHub {
                 Box::pin(async move {
                     let p: SchemaParams = params.parse().unwrap_or_default();
                     // AUTH-4: a gated hub answers from the caller's view.
-                    let mut plugin_schema = if hub.inner.gate.is_some() {
-                        let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        hub.view(auth).schema
-                    } else {
-                        Activation::plugin_schema(&*hub)
-                    };
+                    let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
+                    let mut plugin_schema = hub.own_schema(auth);
                     // CA-1: hub-derived site hints on the hub's own schema.
                     if let Some(site) = hub.derived_site_hint() {
                         plugin_schema.fill_site_hints(&site);

@@ -21,67 +21,97 @@ fn any(f: &str, keys: &[&str]) -> bool {
     keys.iter().any(|k| f.contains(k))
 }
 
-const SOCKET: &[&str] = &[
-    "__send", "sendmsg", "sendto", "__libc_send", "writev", "__libc_write", "__GI___libc_write", "__write", "__libc_recv", "recvfrom",
-    "recvmsg", "__GI___libc_read", "__libc_read", "__read", "std::sys::net", "mio::net", "mio::io_source", "tokio::net::tcp::stream",
-    "<tokio::net::tcp::stream::TcpStream as tokio::io::async_write::AsyncWrite>", "<tokio::net::tcp::stream::TcpStream as tokio::io::async_read::AsyncRead>",
-];
-const PARK: &[&str] = &["epoll_wait", "epoll_ctl", "futex", "syscall", "mio::poll", "Selector::select", "parking_lot", "std::sys::pal::unix::futex", "sched_yield"];
-const ALLOC: &[&str] = &["malloc", "_int_free", "cfree", "__libc_free", "realloc", "_int_realloc", "calloc", "perf5::alloc::", "__rust_alloc", "__rust_dealloc", "__rust_realloc"];
-const MEMCPY: &[&str] = &["memmove", "memcpy", "__memset", "memset"];
-
-/// The layer of one frame, if it names one.
-fn layer_of(f: &str) -> Option<&'static str> {
-    if any(f, &["plexus_auth_core", "grant_gate", "scope_gate", "duplex_gate"]) {
-        return Some("gate");
-    }
-    if any(f, &["serde_json", "serde::", "<serde", "ryu::", "itoa::", "sonic_rs", "simd_json"]) {
-        return Some("serde_json");
-    }
-    if any(f, &["plexus_core", "plexus_macros", "perf5::echo", "async_stream", "plexus_client"]) {
-        return Some("plexus");
-    }
-    if any(f, &["jsonrpsee", "soketto", "hyper::", "hyper_util", "plexus_transport", "tower::", "<tower"]) {
-        return Some("jsonrpsee");
-    }
-    if any(f, &["tokio::", "<tokio", "mio::"]) {
-        return Some("tokio");
+/// A syscall a sample stands in: the frame just above glibc's
+/// `__syscall_cancel` (or the leaf itself), by its bare name.
+fn syscall_of(frames: &[&str]) -> Option<&'static str> {
+    let n = frames.len();
+    for i in (n.saturating_sub(4)..n).rev() {
+        let head = frames[i].split('<').next().unwrap_or("");
+        let socket_ctx = frames[..i].iter().rev().take(4).any(|f| any(f, &["net::", "Socket", "TcpStream", "socket"]));
+        match head {
+            "send" | "__send" | "sendto" | "sendmsg" | "__libc_sendmsg" | "__libc_send" | "recv" | "__libc_recv" | "recvfrom" | "recvmsg" | "writev" => return Some("socket"),
+            "write" | "__libc_write" | "read" | "__libc_read" if socket_ctx => return Some("socket"),
+            "write" | "__libc_write" | "read" | "__libc_read" => return Some("park"),
+            "epoll_wait" | "epoll_ctl" | "syscall" | "futex_wait" | "futex_wake" | "sched_yield" | "__futex_abstimed_wait_common" => return Some("park"),
+            _ => {}
+        }
     }
     None
 }
 
+const ALLOC: &[&str] = &["malloc", "_int_free", "cfree", "__libc_free", "realloc", "calloc", "perf5::alloc::", "__rust_alloc", "__rust_dealloc", "__rust_realloc", "tcache", "unlink_chunk", "drop_in_place"];
+const MEMCPY: &[&str] = &["memmove", "memcpy", "memset"];
+
+/// The crate a frame belongs to: its own name if it says one, else the
+/// first crate path in its generics that is not std's.
+fn crate_of(f: &str) -> Option<&'static str> {
+    let head = f.split('<').next().unwrap_or(f);
+    let named = |h: &str| -> Option<&'static str> {
+        if any(h, &["plexus_auth_core", "grant_gate", "scope_gate", "duplex_gate"]) || matches!(h, "decide" | "check" | "standing" | "alive" | "caller_of" | "chain" | "held") {
+            return Some("gate");
+        }
+        if any(h, &["serde_json", "serde::", "ryu::", "itoa::", "to_raw_value", "to_value", "format_escaped_str", "visit_map", "from_slice", "from_trait", "deserialize", "serialize", "to_vec", "to_string", "to_writer", "end_map", "serialize_field", "serialize_str", "serialize_map"]) {
+            return Some("serde_json");
+        }
+        if any(h, &["plexus_core", "plexus_macros", "plexus_client", "perf5::echo", "async_stream", "pipe_stream_to_subscription", "route_with_ctx", "route_ungated", "wrap_stream", "assemble_envelope", "serialize_with_credential_capture", "StreamMetadata", "PlexusStreamItem", "BenchActivation", "dispatch"]) {
+            return Some("plexus");
+        }
+        if any(h, &["jsonrpsee", "soketto", "hyper", "tower", "plexus_transport", "sub_message_to_json", "send_task", "background_task", "http::"]) {
+            return Some("jsonrpsee");
+        }
+        if any(h, &["tokio::", "mio::"]) {
+            return Some("tokio");
+        }
+        None
+    };
+    if let Some(c) = named(head) {
+        return Some(c);
+    }
+    // the first non-std crate path in the generics
+    let gen = &f[head.len()..];
+    let mut best: Option<(usize, &'static str)> = None;
+    for (key, layer) in [
+        ("plexus_auth_core::", "gate"),
+        ("serde_json::", "serde_json"),
+        ("plexus_core::", "plexus"),
+        ("perf5::", "plexus"),
+        ("async_stream::", "plexus"),
+        ("jsonrpsee", "jsonrpsee"),
+        ("soketto::", "jsonrpsee"),
+        ("hyper", "jsonrpsee"),
+        ("tower", "jsonrpsee"),
+        ("plexus_transport::", "jsonrpsee"),
+        ("tokio::", "tokio"),
+        ("mio::", "tokio"),
+    ] {
+        if let Some(i) = gen.find(key) {
+            if best.map_or(true, |(j, _)| i < j) {
+                best = Some((i, layer));
+            }
+        }
+    }
+    best.map(|(_, l)| l)
+}
+
 /// (layer, leaf) of a stack, root first.
 pub fn classify(stack_root_first: &[&str]) -> (&'static str, &'static str) {
-    let leaf_frame = stack_root_first.last().copied().unwrap_or("");
+    if let Some(sc) = syscall_of(stack_root_first) {
+        return if sc == "socket" { ("socket", "syscall:socket") } else { ("tokio", "syscall:park") };
+    }
     let mut leaf = "code";
-    // the leaf view: the innermost frames decide
-    for f in stack_root_first.iter().rev().take(6) {
-        if any(f, ALLOC) {
+    for f in stack_root_first.iter().rev().take(4) {
+        let head = f.split('<').next().unwrap_or(f);
+        if any(head, ALLOC) || head.starts_with("_int_") {
             leaf = "alloc";
             break;
         }
-        if any(f, MEMCPY) {
+        if any(head, MEMCPY) {
             leaf = "memcpy";
             break;
         }
-        if any(f, SOCKET) {
-            leaf = "syscall:socket";
-            break;
-        }
-        if any(f, PARK) {
-            leaf = "syscall:park";
-            break;
-        }
-    }
-    let _ = leaf_frame;
-    if leaf == "syscall:socket" {
-        return ("socket", leaf);
-    }
-    if leaf == "syscall:park" {
-        return ("tokio", leaf);
     }
     for f in stack_root_first.iter().rev() {
-        if let Some(l) = layer_of(f) {
+        if let Some(l) = crate_of(f) {
             return (l, leaf);
         }
     }
@@ -132,25 +162,26 @@ mod tests {
 
     #[test]
     fn an_allocation_is_charged_to_the_layer_that_made_it() {
-        let st = ["tokio::runtime::task::harness", "jsonrpsee_server::x", "plexus_core::plexus::plexus::pipe_stream_to_subscription", "serde_json::value::to_raw_value", "alloc::raw_vec::finish_grow", "malloc"];
+        let st = ["tokio::runtime::task::harness", "poll<jsonrpsee_server::x>", "pipe_stream_to_subscription", "to_raw_value<plexus_core::plexus::types::PlexusStreamItem>", "insert<alloc::string::String, serde_json::value::Value, alloc::alloc::Global>", "finish_grow", "_int_malloc"];
         assert_eq!(classify(&st), ("serde_json", "alloc"));
     }
 
     #[test]
     fn a_send_is_the_socket_whoever_called_it() {
-        let st = ["tokio::runtime", "soketto::connection::Sender::flush", "<tokio::net::tcp::stream::TcpStream as tokio::io::async_write::AsyncWrite>::poll_write", "mio::net::tcp::stream", "__send"];
+        let st = ["tokio::runtime", "poll<jsonrpsee_server::transport::ws::send_task>", "<std::sys::net::connection::socket::TcpStream>::write", "send", "__syscall_cancel"];
         assert_eq!(classify(&st), ("socket", "syscall:socket"));
     }
 
     #[test]
     fn epoll_and_futex_are_tokios() {
-        assert_eq!(classify(&["tokio::runtime::scheduler", "mio::poll::Poll::poll", "epoll_wait"]).0, "tokio");
-        assert_eq!(classify(&["tokio::runtime::park", "std::sys::pal::unix::futex::futex_wait", "syscall"]).0, "tokio");
+        assert_eq!(classify(&["tokio::runtime::scheduler", "poll", "select", "epoll_wait", "__syscall_cancel"]).0, "tokio");
+        assert_eq!(classify(&["park_internal", "<std::sys::fs::unix::File>::write", "<std::sys::fd::unix::FileDesc>::write", "write", "__syscall_cancel"]).0, "tokio", "an eventfd wake");
+        assert_eq!(classify(&["tokio::runtime::park", "futex_wait", "syscall"]).0, "tokio");
     }
 
     #[test]
     fn the_gate_wins_over_plexus_core_that_called_it() {
-        let st = ["tokio::x", "plexus_core::plexus::plexus::DynamicHub::route_with_ctx", "plexus_core::plexus::grant_gate::decide", "plexus_auth_core::grants::Gate::check", "hashbrown::map::x"];
+        let st = ["tokio::x", "{async_block#0}<(), plexus_core::plexus::plexus::x>", "decide", "check", "from_iter<plexus_auth_core::grants::ScopeRef, core::iter::Map>", "hashbrown::map::x"];
         assert_eq!(classify(&st).0, "gate");
     }
 }

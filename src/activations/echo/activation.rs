@@ -1,7 +1,7 @@
 //! Echo activation - demonstrates plexus-macros usage with caller-wraps streaming
 //!
 //! This is a minimal example showing how to create an activation using the
-//! `#[hub_methods]` macro. The macro generates:
+//! `#[plexus_macros::activation]` macro. The macro generates:
 //!
 //! - RPC trait and server implementation
 //! - Activation trait implementation
@@ -31,14 +31,14 @@ impl Default for EchoActivation {
     }
 }
 
-/// Hub-macro generates all the boilerplate for this impl block:
+/// `#[plexus_macros::activation]` generates all the boilerplate for this impl block:
 /// - EchoRpc trait with JSON-RPC subscription methods
 /// - EchoRpcServer implementation
 /// - Activation trait implementation
 /// - EchoMethod enum with JSON schemas
 #[plexus_macros::activation(
     version = "1.0.0",
-    description = "Echo messages back - demonstrates hub-macro usage",
+    description = "Echo messages back - demonstrates plexus-macros usage",
     // MACRO-12: the example — `message` is a `Message`, not a `String`.
     typed_params
 )]

@@ -47,3 +47,17 @@ async fn the_echo_still_echoes_its_own_parameters() {
     let stream = service().route("echo.once", json!("hi"), None).await.expect("the bare value runs");
     assert!(!stream.collect::<Vec<_>>().await.is_empty());
 }
+
+/// The root (`DynamicHub`, no `typed_params`) is unchanged: every socket
+/// call reaches an activation through its `call {method, params}`, and a key
+/// beside those two is not its to refuse. The echo inside still checks its
+/// own params.
+#[tokio::test]
+async fn the_root_without_typed_params_is_unchanged() {
+    let stream = service()
+        .route("service.call", json!({ "method": "echo.once", "params": { "message": "hi" }, "extra": 1 }), None)
+        .await
+        .expect("service.call runs with a key beside method and params");
+    let items: Vec<_> = stream.collect().await;
+    assert!(items.iter().any(|i| serde_json::to_string(i).unwrap_or_default().contains("\"hi\"")), "it echoes: {items:?}");
+}

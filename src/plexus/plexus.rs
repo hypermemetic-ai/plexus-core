@@ -1305,6 +1305,58 @@ impl DynamicHub {
         }
     }
 
+    /// PERF-17 E7: the caller's view, shared: with `PERF17_DESCRIBE_CACHE=1`
+    /// kept per (service, caller after standing) and the gate's grants
+    /// generation, so `_info`, `{ns}.hash`, `{ns}.schema` and introspection
+    /// build it once; off, built on every call as [`DynamicHub::view`] does.
+    pub fn view_shared(&self, caller: Option<&super::auth::AuthContext>) -> Arc<super::view::View> {
+        let Some(gate) = self.inner.gate.as_ref().filter(|_| super::perf17::describe_cache()) else {
+            return Arc::new(self.view(caller));
+        };
+        let (standing, _) = super::grant_gate::standing(gate, caller);
+        let key = format!("{:p}|view|{}", Arc::as_ptr(&self.inner), super::perf17::caller_key(standing));
+        let generation = gate.generation().current();
+        if let Some(v) = super::perf17::view_cache().get(&key, generation) {
+            return v;
+        }
+        let v = Arc::new(self.view(caller));
+        super::perf17::view_cache().put(key, generation, v.clone());
+        v
+    }
+
+    /// PERF-17 E7: an introspection call through `{ns}.call` answered from
+    /// its encoded frames, cached per (service, method, params, caller after
+    /// standing) and the grants generation — no `Value` cloned or encoded
+    /// again. `None`: not cached here (the switch off, no gate, or not
+    /// introspection); route as before.
+    async fn perf17_call_encoded(
+        &self,
+        method: &str,
+        params: &Value,
+        auth: Option<&super::auth::AuthContext>,
+    ) -> Option<Result<Arc<Vec<Box<serde_json::value::RawValue>>>, PlexusError>> {
+        let gate = self.inner.gate.as_ref().filter(|_| super::perf17::describe_cache())?;
+        if !(method == "schema" || method.ends_with(".schema")) {
+            return None;
+        }
+        let (standing, _) = super::grant_gate::standing(gate, auth);
+        let key = format!("{:p}|enc|{method}|{params}|{}", Arc::as_ptr(&self.inner), super::perf17::caller_key(standing));
+        let generation = gate.generation().current();
+        if let Some(raws) = super::perf17::encoded_cache().get(&key, generation) {
+            return Some(Ok(raws));
+        }
+        let stream = match self.route(method, params.clone(), auth).await {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        use futures::StreamExt;
+        let items: Vec<super::types::PlexusStreamItem> = stream.collect().await;
+        let raws: Vec<Box<serde_json::value::RawValue>> = items.iter().filter_map(|i| serde_json::value::to_raw_value(i).ok()).collect();
+        let raws = Arc::new(raws);
+        super::perf17::encoded_cache().put(key, generation, raws.clone());
+        Some(Ok(raws))
+    }
+
     /// AUTH-4: `_info`'s content for `caller`. Without a gate, exactly
     /// today's `{backend, auth_capabilities}` whoever asks. With one, also
     /// `view` (`anonymous` | `caller`) and `view_hash`; and, to an
@@ -1315,7 +1367,18 @@ impl DynamicHub {
         if self.inner.gate.is_none() {
             return payload;
         }
-        let view = self.view(caller);
+        // PERF-17 E7: `_info` answered from a cache per caller and grants generation.
+        let cache_key = super::perf17::describe_cache().then(|| {
+            let gate = self.inner.gate.as_ref().unwrap();
+            let (standing, _) = super::grant_gate::standing(gate, caller);
+            (format!("{:p}|_info|{}", Arc::as_ptr(&self.inner), super::perf17::caller_key(standing)), gate.generation().current())
+        });
+        if let Some((k, g)) = cache_key.as_ref() {
+            if let Some(v) = super::perf17::info_cache().get(k, *g) {
+                return v;
+            }
+        }
+        let view = self.view_shared(caller);
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("view".into(), view.kind.as_str().into());
             obj.insert("view_hash".into(), view.hash.clone().into());
@@ -1327,6 +1390,9 @@ impl DynamicHub {
                 }
                 obj.insert("auth".into(), serde_json::Value::Object(auth));
             }
+        }
+        if let Some((k, g)) = cache_key {
+            super::perf17::info_cache().put(k, g, payload.clone());
         }
         payload
     }
@@ -1343,9 +1409,37 @@ impl DynamicHub {
         auth: Option<&super::auth::AuthContext>,
         raw_ctx: Option<&crate::request::RawRequestContext>,
     ) -> Option<Result<PlexusStream, PlexusError>> {
+        // PERF-17 E7: the answer replayed from a cache per (service, method,
+        // params, caller) and the gate's grants generation.
+        if !super::perf17::describe_cache() {
+            return self.introspect_in_view_uncached(method, params, auth, raw_ctx).await;
+        }
+        let generation = self.inner.gate.as_ref().map(|g| g.generation().current()).unwrap_or(0);
+        let key = format!("{:p}|{method}|{params}|{}", Arc::as_ptr(&self.inner), super::perf17::caller_key(auth));
+        if let Some(items) = super::perf17::introspect_cache().get(&key, generation) {
+            return Some(Ok(Box::pin(futures::stream::iter(items.as_ref().clone()))));
+        }
+        match self.introspect_in_view_uncached(method, params, auth, raw_ctx).await? {
+            Ok(stream) => {
+                use futures::StreamExt;
+                let items: Vec<super::types::PlexusStreamItem> = stream.collect().await;
+                super::perf17::introspect_cache().put(key, generation, Arc::new(items.clone()));
+                Some(Ok(Box::pin(futures::stream::iter(items))))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    async fn introspect_in_view_uncached(
+        &self,
+        method: &str,
+        params: &Value,
+        auth: Option<&super::auth::AuthContext>,
+        raw_ctx: Option<&crate::request::RawRequestContext>,
+    ) -> Option<Result<PlexusStream, PlexusError>> {
         let (ns, rest) = method.split_once('.')?;
         let hub_ns = self.inner.namespace.as_str();
-        let view = self.view(auth);
+        let view = self.view_shared(auth);
         let not_found = || PlexusError::ActivationNotFound(ns.to_string());
         let content: serde_json::Value = match rest {
             "schema" => {
@@ -1986,7 +2080,16 @@ impl DynamicHub {
                     } else {
                         None
                     };
-                    match plexus.route(&p.method, p.params.unwrap_or_default(), auth).await {
+                    let call_params = p.params.unwrap_or_default();
+                    // PERF-17 E7: introspection answered from its encoded frames.
+                    if let Some(Ok(raws)) = plexus.perf17_call_encoded(&p.method, &call_params, auth).await {
+                        let sink = pending.accept().await?;
+                        for raw in raws.iter() {
+                            sink.send(raw.clone()).await?;
+                        }
+                        return Ok(());
+                    }
+                    match plexus.route(&p.method, call_params, auth).await {
                         Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
                         Err(e) => {
                             let sink = pending.accept().await?;
@@ -2012,7 +2115,7 @@ impl DynamicHub {
                     // AUTH-4: a gated hub's hash is the caller's view's.
                     let value = if plexus.inner.gate.is_some() {
                         let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        plexus.view(auth).hash
+                        plexus.view_shared(auth).hash.clone()
                     } else {
                         Activation::plugin_schema(&plexus).hash
                     };
@@ -2038,7 +2141,7 @@ impl DynamicHub {
                     // AUTH-4: a gated hub answers from the caller's view.
                     let mut plugin_schema = if plexus.inner.gate.is_some() {
                         let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        plexus.view(auth).schema
+                        match Arc::try_unwrap(plexus.view_shared(auth)) { Ok(v) => v.schema, Err(v) => v.schema.clone() }
                     } else {
                         Activation::plugin_schema(&plexus)
                     };
@@ -2161,7 +2264,16 @@ impl DynamicHub {
                     // Extract auth context from Extensions (if present)
                     let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>()
                         .map(|arc| arc.as_ref());
-                    match hub.route(&p.method, p.params.unwrap_or_default(), auth).await {
+                    let call_params = p.params.unwrap_or_default();
+                    // PERF-17 E7: introspection answered from its encoded frames.
+                    if let Some(Ok(raws)) = hub.perf17_call_encoded(&p.method, &call_params, auth).await {
+                        let sink = pending.accept().await?;
+                        for raw in raws.iter() {
+                            sink.send(raw.clone()).await?;
+                        }
+                        return Ok(());
+                    }
+                    match hub.route(&p.method, call_params, auth).await {
                         Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
                         Err(e) => {
                             // Accept the subscription, then send the error as a stream item.
@@ -2191,7 +2303,7 @@ impl DynamicHub {
                     // AUTH-4: a gated hub's hash is the caller's view's.
                     let value = if hub.inner.gate.is_some() {
                         let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        hub.view(auth).hash
+                        hub.view_shared(auth).hash.clone()
                     } else {
                         Activation::plugin_schema(&*hub).hash
                     };
@@ -2217,7 +2329,7 @@ impl DynamicHub {
                     // AUTH-4: a gated hub answers from the caller's view.
                     let mut plugin_schema = if hub.inner.gate.is_some() {
                         let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-                        hub.view(auth).schema
+                        match Arc::try_unwrap(hub.view_shared(auth)) { Ok(v) => v.schema, Err(v) => v.schema.clone() }
                     } else {
                         Activation::plugin_schema(&*hub)
                     };

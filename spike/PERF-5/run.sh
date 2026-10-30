@@ -93,19 +93,21 @@ e7() { # e7 VARIANT...: menger's self-description over the wire, a throwaway per
   local M=${MENGER_BIN:-$HOME/.cache/cargo-target/menger-PERF-5/release/menger}
   local C=${CLIENT_BIN:-$FB/client/p5-client} out=$R/floor/e7.jsonl U=ws://127.0.0.1:4476
   mkdir -p $R/floor
+  local vs=("$@") v c m1 m2
   for round in ${ROUNDS:-1 2 3}; do
-    for v in "$@"; do
+    for v in "${vs[@]}"; do
       quiet
       local envs=(); [[ $v == base ]] || IFS='+' read -ra envs <<< "$v"
       local DATA=/tmp/claude-$(id -u)/menger-PERF-17-data; mkdir -p "$DATA"
+      : > /tmp/menger-PERF-17.log
       env "${envs[@]}" PLEXUS_NO_REGISTRY=1 taskset -c "$SRV_CPUS" "$M" --port 4476 --shell-port 4477 --data-dir "$DATA" \
         --db-path /tmp/menger-PERF-17.db --auth-provider key --admin "$(synapse _key show builder)" > /tmp/menger-PERF-17.log 2>&1 &
       local MPID=$!
       until grep -q 'ws://127.0.0.1:4476' /tmp/menger-PERF-17.log 2>/dev/null; do sleep 0.2; done; sleep 1
       for c in "_info x" "menger.hash x" "menger.call tickets.schema" "menger.call tickets.health"; do
-        set -- $c
-        local n=20; [ "$2" = tickets.health ] && n=5000
-        taskset -c "$CLI_CPUS" "$C" --url $U --bearer key:builder --call $1 --method $2 --label "describe $1 $2" seq --n $n --warm 1 \
+        read -r m1 m2 <<< "$c"
+        local n=20; [ "$m2" = tickets.health ] && n=5000
+        taskset -c "$CLI_CPUS" "$C" --url $U --bearer key:builder --call $m1 --method $m2 --label "describe $m1 $m2" seq --n $n --warm 1 \
           | jq -c --arg v "$v" --arg r "$round" '. + {exp: "e7", variant: $v, round: ($r | tonumber)}' >> $out
       done
       kill $MPID; wait $MPID 2>/dev/null || true

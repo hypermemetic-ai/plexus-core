@@ -1075,7 +1075,9 @@ impl PluginSchema {
         // time when a method's return-type schema declares a top-level
         // field named `_credentials` (reserved by the framework's
         // credential sidecar).
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        if !super::perf17::lint_once() || super::perf17::first_lint(&namespace) {
+            let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        }
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, None);
         Self {
             namespace,
@@ -1106,7 +1108,9 @@ impl PluginSchema {
         let namespace = namespace.into();
         Self::validate_no_collisions(&namespace, &methods, None);
         // AUTHZ-CRED-CORE-2 AC #8: see PluginSchema::leaf.
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        if !super::perf17::lint_once() || super::perf17::first_lint(&namespace) {
+            let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        }
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, None);
         Self {
             namespace,
@@ -1137,7 +1141,9 @@ impl PluginSchema {
         let namespace = namespace.into();
         Self::validate_no_collisions(&namespace, &methods, Some(&children));
         // AUTHZ-CRED-CORE-2 AC #8: see PluginSchema::leaf.
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        if !super::perf17::lint_once() || super::perf17::first_lint(&namespace) {
+            let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        }
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, Some(&children));
         Self {
             namespace,
@@ -1169,7 +1175,9 @@ impl PluginSchema {
         let namespace = namespace.into();
         Self::validate_no_collisions(&namespace, &methods, Some(&children));
         // AUTHZ-CRED-CORE-2 AC #8: see PluginSchema::leaf.
-        let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        if !super::perf17::lint_once() || super::perf17::first_lint(&namespace) {
+            let _ = Self::warn_on_credentials_field_collisions(&namespace, &methods);
+        }
         let (self_hash, children_hash, hash) = Self::compute_hashes(&methods, Some(&children));
         Self {
             namespace,

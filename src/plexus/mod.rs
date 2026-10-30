@@ -29,6 +29,7 @@ pub mod hub_transport;
 pub mod method_enum;
 pub mod middleware;
 pub mod path;
+pub mod perf17;
 pub mod plexus;
 pub mod schema;
 pub(crate) mod scope_gate;

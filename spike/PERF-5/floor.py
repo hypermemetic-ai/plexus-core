@@ -48,6 +48,24 @@ def m(v):
     o["rounds"] = len(seq)
     o["busy"] = len([r for r in rows if r["variant"] == v and r["round"] > 0 and not quiet(r)])
     return o
+if exp == "e7":  # menger's self-description over the wire: per variant and method
+    print(f"### e7 — menger over the wire, signed in; medians over rows at ≤ {QMAX:.0f} % others' CPU; gain against `{vs[0]}`\n")
+    meths = list(dict.fromkeys(r["label"].replace("describe ", "") for r in rows))
+    print("| call | " + " | ".join(f"`{v}` p50 · p99 ms" for v in vs) + " |")
+    print("| -- | " + " | ".join("--" for _ in vs) + " |")
+    for mt in meths:
+        cells = []
+        b = None
+        for v in vs:
+            rs = [r for r in rows if r["variant"] == v and r["label"] == "describe " + mt and quiet(r)]
+            p50 = med([r["summary"]["p50_us"] / 1000 for r in rs]); p99 = med([r["summary"]["p99_us"] / 1000 for r in rs])
+            b = p50 if b is None else b
+            x = "" if v == vs[0] or p50 != p50 else f" ({b / p50:,.0f}× faster)" if p50 < b else f" ({(1 - p50 / b) * 100:+.1f} %)"
+            cells.append(f"{p50:,.3f} · {p99:,.3f}{x} [{len(rs)}]")
+        print(f"| `{mt}` | " + " | ".join(cells) + " |")
+    xs = [r["others_cpu_pct"] for r in rows if r.get("others_cpu_pct") is not None]
+    print(f"\nothers' CPU over the rows: {min(xs)}–{max(xs)} %; [n] = quiet runs in the median")
+    sys.exit(0)
 ms = {v: m(v) for v in vs}
 base = ms[vs[0]]
 cols = [("seq_p50", "call p50 µs", "lo"), ("seq_p99", "p99", "lo"), ("seq_p999", "p999", "lo"), ("seq_cps", "calls/s seq", "hi"),

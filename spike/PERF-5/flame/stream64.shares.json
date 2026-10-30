@@ -1,25 +1,25 @@
 {
   "by_layer": {
-    "gate": 5,
-    "jsonrpsee": 91,
-    "plexus": 57,
-    "serde_json": 306,
-    "socket": 1827,
-    "tokio": 72
+    "gate": 1,
+    "jsonrpsee": 57,
+    "plexus": 42,
+    "serde_json": 153,
+    "socket": 1498,
+    "tokio": 25
   },
   "layer_pct": {
-    "gate": 0.21204410517387617,
-    "jsonrpsee": 3.8592027141645464,
-    "plexus": 2.4173027989821882,
-    "serde_json": 12.977099236641221,
-    "socket": 77.48091603053435,
-    "tokio": 3.053435114503817
+    "gate": 0.05630630630630631,
+    "jsonrpsee": 3.2094594594594597,
+    "plexus": 2.364864864864865,
+    "serde_json": 8.614864864864865,
+    "socket": 84.34684684684684,
+    "tokio": 1.4076576576576576
   },
   "leaf_pct": {
-    "alloc": 3.138252756573367,
-    "code": 18.829516539440203,
-    "syscall:park": 0.5513146734520781,
-    "syscall:socket": 77.48091603053435
+    "alloc": 1.8018018018018018,
+    "code": 13.682432432432432,
+    "syscall:park": 0.16891891891891891,
+    "syscall:socket": 84.34684684684684
   },
-  "samples": 2358
+  "samples": 1776
 }

@@ -2,12 +2,14 @@
 # PERF-5: a Plexus call from syscall to socket — re-measure every row.
 #
 #   ./run.sh all              call, stream, raw, codec, inproc, flame, syscalls
-#   ./run.sh call|stream|raw|codec|inproc|flame|syscalls|menger|describe|perf
+#   ./run.sh call|stream|raw|codec|inproc|flame|syscalls|menger|describe
+#   (menger and describe need the menger worktree built: CARGO_TARGET_DIR=~/.cache/cargo-target/menger-PERF-5
+#    cargo build --release --bin menger --example perf5_describe, in ../../../menger)
 #   PROFILE=perf ./run.sh call   the same under [profile.perf] (LTO fat, cgu 1)
 #
 # Server pinned to CPUs 2-5 (4 workers, physical cores 2-5), client to 8-9
-# (physical cores 8-9): never SMT siblings of each other. Ports 4478 (the
-# service) and 4479 (the raw echo); menger throwaway on 4476/4477.
+# (physical cores 8-9): never SMT siblings of each other. Port 4478 (the
+# service, or the raw echo in its place); menger throwaway on 4476/4477.
 set -euo pipefail
 cd "$(dirname "$0")"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target/PERF-5}
@@ -28,8 +30,9 @@ server() { # args → starts p5-server pinned, sets SPID
 stop() { kill "$SPID" 2>/dev/null || true; wait "$SPID" 2>/dev/null || true; }
 cli() { taskset -c "$CLI_CPUS" "$B/p5-client" "$@"; }
 
-call() {
-  for cfg in "multi on" "multi off" "current on"; do
+call() { # CALL_CFGS="multi off;current on" picks configurations; CALL_ALLOCS=0 skips the allocation rows
+  local cfgs; IFS=';' read -ra cfgs <<< "${CALL_CFGS:-multi on;multi off;current on}"
+  for cfg in "${cfgs[@]}"; do
     set -- $cfg
     server --rt "$1" --gate "$2"
     l="rt=$1 gate=$2"
@@ -43,6 +46,7 @@ call() {
     done
     stop
   done
+  [ "${CALL_ALLOCS:-1}" = 0 ] && return 0
   server --count-allocs
   cli allocs --server-pid "$SPID" --n 2000 | tag "allocs" >> $R/call.jsonl
   stop
@@ -90,18 +94,59 @@ flame() { # SIGPROF sampling of the server under each load
   done
 }
 
-syscalls() { # strace -c -f in an unprivileged fedora:44 container (MQ-11's image)
-  for sc in call stream64; do
-    docker run -d --name perf5-strace --rm --network host --security-opt label=disable \
-      -v "$B":/b:ro -v "$PWD/syscalls":/out mq-spike-prof:44 \
-      strace -f -c -o /out/$sc.txt /b/p5-server --port 4478 >/dev/null
-    sleep 2
-    case $sc in
-      call) cli seq --n 2000 --warm 0 | tag "under strace" >> $R/syscalls.jsonl ;;
-      stream64) cli stream --to 10000 --size 64 --warm 0 | tag "under strace" >> $R/syscalls.jsonl ;;
-    esac
-    docker exec perf5-strace pkill -TERM p5-server; sleep 2
+syscalls() { # strace -c -f in an unprivileged fedora:44 container (MQ-11's image), the
+  # server process alone. An idle server's counts are subtracted; syscalls/<sc>.units
+  # says what was driven (calls or items), so report.py prints syscalls per unit.
+  mkdir -p syscalls
+  local BR CN; BR="$(readlink -f "$B")"
+  st() { # name, server command line inside the container
+    local name=$1; shift
+    CN=perf5-strace-$name  # a name per scenario: --rm removes a stopped container asynchronously
+    docker run -d --name "$CN" --rm --network host --security-opt label=disable \
+      -v "$BR":/b:ro -v "$PWD/syscalls":/out mq-spike-prof:44 strace -f -c -o "/out/$name.txt" "$@" >/dev/null
+    until ss -ltn | grep -q ':4478 '; do sleep 0.2; done; sleep 0.5
+  }
+  st_stop() { docker exec "$CN" pkill -TERM -f "$1" >/dev/null 2>&1 || true; while docker ps -aq -f name="^$CN\$" | grep -q .; do sleep 0.2; done; }
+  st idle /b/p5-server --port 4478; sleep 2; st_stop p5-server; echo 0 > syscalls/idle.units
+  st call /b/p5-server --port 4478
+  cli seq --n 2000 --warm 0 | tag "under strace: call" >> $R/syscalls.jsonl; st_stop p5-server; echo 2000 > syscalls/call.units
+  for size in 64 4096; do
+    st stream$size /b/p5-server --port 4478
+    cli stream --to 10000 --size $size --warm 0 | tag "under strace: stream$size" >> $R/syscalls.jsonl; st_stop p5-server; echo 30000 > syscalls/stream$size.units
   done
+  for stack in tungstenite fastwebsockets; do # the floor: the same frames from a stack with no Plexus
+    st raw-$stack-stream64 /b/p5-rawecho --port 4478 --stack $stack
+    cli stream --to 10000 --size 64 --warm 0 | tag "under strace: raw $stack stream64" >> $R/syscalls.jsonl; st_stop p5-rawecho; echo 30000 > syscalls/raw-$stack-stream64.units
+  done
+}
+
+menger() { # menger itself, a throwaway from the menger worktree's build (../../../menger at
+  # spike/PERF-5) on 4476/4477, signed in as the builder key (the key's file, never argv):
+  # the kit's client and the raw client on tickets.health, then the self-description calls.
+  local M=${MENGER_BIN:-$HOME/.cache/cargo-target/menger-PERF-5/release/menger}
+  local KIT=${KIT:-$HOME/dev/controlflow/hypermemetic/plexus-wire}
+  local DATA=${MENGER_DATA:-/tmp/claude-$(id -u)/menger-PERF-5-data}
+  mkdir -p "$DATA"
+  PLEXUS_NO_REGISTRY=1 taskset -c "$SRV_CPUS" "$M" --port 4476 --shell-port 4477 --data-dir "$DATA" \
+    --db-path /tmp/menger-PERF-5.db --auth-provider key --admin "$(synapse _key show builder)" > /tmp/menger-PERF-5.log 2>&1 &
+  local MPID=$!
+  until grep -q 'ws://127.0.0.1:4476' /tmp/menger-PERF-5.log 2>/dev/null; do sleep 0.2; done; sleep 1
+  local U=ws://127.0.0.1:4476
+  for i in 1 2 3; do
+    (cd "$KIT" && taskset -c "$CLI_CPUS" python3 -I conformance/run.py $U --as builder --bench 1000 2>&1 | tail -1 | sed "s/\$/ load=$(cut -d' ' -f1 /proc/loadavg)/") >> $R/menger_kit.txt
+  done
+  for i in 1 2 3; do cli --url $U --bearer key:builder --call menger.call --method tickets.health --label "menger, rust raw client" seq --n 5000 >> $R/menger_call.jsonl; done
+  for c in "_info x" "menger.hash x" "menger.call tickets.schema"; do
+    set -- $c
+    for i in 1 2 3; do cli --url $U --bearer key:builder --call $1 --method $2 --label "describe $1 $2" seq --n 5 --warm 1 >> $R/menger_describe.jsonl; done
+  done
+  kill $MPID; wait $MPID 2>/dev/null || true
+}
+
+describe() { # in process: where _info / hash / schema spend their time (menger's examples/perf5_describe.rs)
+  local E=${DESCRIBE_BIN:-$HOME/.cache/cargo-target/menger-PERF-5/release/examples/perf5_describe}
+  (cd ../../../menger && taskset -c "$SRV_CPUS" "$E" /tmp/menger-PERF-5-describe.db spike/PERF-5/describe 2>&1 | grep -v INFO \
+    | jq -c --arg l "$(cut -d' ' -f1 /proc/loadavg)" '. + {loadavg: $l}' > spike/PERF-5/describe.jsonl)
 }
 
 case "${1:-all}" in

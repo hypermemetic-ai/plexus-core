@@ -1,0 +1,34 @@
+== call start 04:46:43 load 2.96 9.21 7.98 avail 19G
+== call end   04:48:31 load 24.84 13.73 9.65 exit=0
+== stream start 04:48:31 load 24.84 13.73 9.65 avail 16G
+== quiet run restarted with runsteps.sh (the 04:46 call step stopped at 04:48:31 under the suite's load; its 60 rows are results/partial-0450)
+== runner restarted 04:54Z with DEADLINE 05:20Z (a leftover run.sh stream from 04:48 was stopped)
+== runner restarted 04:58Z with QUIET 400 (others' CPU under 4 cores for 15 s; the handoff's rule is load above 8 from elsewhere), DEADLINE 05:20Z
+== call start 04:58:58 waited 41s load 9.94 avail 20G
+== call end   05:01:11 exit=0 133s load 27.99 — others CPU during: max 2218% mean 1110%
+== stream start 05:18:24 waited 1033s load 8.78 avail 19G
+== stream end   05:18:29 exit=0 5s load 8.63 — others CPU during: max 615% mean 349%
+== raw start 05:19:04 waited 35s load 6.39 avail 18G
+== raw end   05:19:44 exit=0 40s load 17.77 — others CPU during: max 903% mean 443%
+== flame start 05:19:59 waited 15s load 14.07 avail 16G
+== flame end   05:20:15 exit=0 16s load 11.96 — others CPU during: max 330% mean 256%
+== syscalls start 05:20:15 waited 0s load 11.96 avail 19G
+== syscalls end   05:20:19 exit=125 4s load 11.08 — no samples
+== menger start 05:20:19 waited 0s load 11.08 avail 19G
+== menger end   05:20:34 exit=0 15s load 9.06 — others CPU during: max 110% mean 61%
+== describe start 05:20:34 waited 0s load 9.06 avail 19G
+== describe end   05:21:02 exit=0 28s load 6.80 — others CPU during: max 526% mean 242%
+== inproc: not quiet after 5s (deadline or WAITMAX); running anyway
+== inproc start 05:21:07 waited 5s load 6.26 avail 19G
+== inproc end   05:21:40 exit=0 33s load 5.00 — others CPU during: max 538% mean 154%
+== codec start 05:21:40 waited 0s load 5.00 avail 19G
+== codec end   05:23:02 exit=0 82s load 2.84 — others CPU during: max 454% mean 206%
+== re-run 05:23Z: call (multi off; current on; allocations) and syscalls (fixed: a container name per scenario), QUIET 150, DEADLINE 05:35Z; the 05:01 rows of those configurations are results/partial-0501
+== re-run restarted 05:26Z with QUIET 400 (as the first pass), DEADLINE 05:35Z
+== call start 05:27:45 waited 105s load 6.78 avail 19G
+== call end   05:29:13 exit=0 88s load 15.78 — others CPU during: max 2263% mean 971%
+== syscalls start 05:31:13 waited 120s load 10.69 avail 19G
+== syscalls end   05:31:26 exit=0 13s load 9.58 — others CPU during: max 246% mean 160%
+== last re-run 05:32Z: call, current-thread only (its 05:27 rows ran at 7-11 cores elsewhere: results/partial-0527), QUIET 400, DEADLINE 05:40Z
+== call start 05:31:49 waited 0s load 7.20 avail 19G
+== call end   05:32:33 exit=0 44s load 10.89 — others CPU during: max 2110% mean 829%

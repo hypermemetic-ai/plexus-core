@@ -94,7 +94,8 @@ pub(crate) fn to_client_item(item: PlexusStreamItem) -> StreamItem {
         })
     }
 
-    match item {
+    match item.decoded() {
+        PlexusStreamItem::Encoded(_) => unreachable!("PERF-17: decoded() reads every Encoded item back"),
         PlexusStreamItem::Data {
             metadata,
             content_type,

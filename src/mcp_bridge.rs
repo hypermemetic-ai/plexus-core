@@ -276,12 +276,14 @@ impl ServerHandler for PlexusMcpBridge {
 
         tokio::pin!(stream);
         while let Some(item) = stream.next().await {
+            let item = item.decoded(); // PERF-17 E1
             // Check cancellation on each iteration
             if ctx.ct.is_cancelled() {
                 return Err(McpError::internal_error("Cancelled", None));
             }
 
             match &item {
+                PlexusStreamItem::Encoded(_) => {}
                 PlexusStreamItem::Progress {
                     message,
                     percentage,

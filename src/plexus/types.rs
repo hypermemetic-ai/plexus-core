@@ -97,6 +97,15 @@ pub enum PlexusStreamItem {
         /// Metadata from calling layer
         metadata: StreamMetadata,
     },
+
+    /// PERF-17 (spike, never merged) E1: a `data` item already encoded —
+    /// its whole JSON (`{"type":"data","metadata":…,"content_type":…,
+    /// "content":…}`) written once from the typed event (`wrap_stream` under
+    /// PERF17_ENCODED=1). Only the WebSocket pipe sends it (as its bytes);
+    /// serde never sees it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    Encoded(Box<serde_json::value::RawValue>),
 }
 
 impl PlexusStreamItem {
@@ -157,6 +166,22 @@ impl PlexusStreamItem {
             Self::Error { metadata, .. } => Some(metadata),
             Self::Done { metadata } => Some(metadata),
             Self::Request { .. } => None,
+            Self::Encoded(_) => None,
+        }
+    }
+
+    /// PERF-17 E1: an `Encoded` item read back into the item it encodes
+    /// (for the consumers that look inside an item: in process, MCP); any
+    /// other item as it is.
+    pub fn decoded(self) -> Self {
+        match self {
+            Self::Encoded(raw) => serde_json::from_str(raw.get()).unwrap_or_else(|e| Self::Error {
+                metadata: StreamMetadata::new(vec![], String::new()),
+                message: format!("PERF-17: an encoded item did not read back: {e}"),
+                code: None,
+                recoverable: false,
+            }),
+            other => other,
         }
     }
 }

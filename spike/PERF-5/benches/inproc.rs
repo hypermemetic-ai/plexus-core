@@ -117,6 +117,22 @@ fn main() {
             b.extend_from_slice(t.as_bytes());
             black_box(b);
         }), "frame");
+        // PERF-17 E1, second half: the item encoded once from the typed event (metadata pre-encoded a stream), then the notification around its bytes
+        let meta_raw = serde_json::value::to_raw_value(&meta).unwrap();
+        #[derive(Serialize)]
+        struct Notif4<'a> { jsonrpc: &'a str, method: &'a str, params: Params4<'a> }
+        #[derive(Serialize)]
+        struct Params4<'a> { subscription: u64, result: &'a RawValue }
+        e(bench("PERF-17 E1: the item encoded once from the typed event (PERF17_ENCODED), the notification around it", || {
+            let it = plexus_core::plexus::perf17::encode_item(&meta_raw, "bench.count", black_box(&ev)).unwrap();
+            let r = serde_json::value::to_raw_value(&Notif4 { jsonrpc: "2.0", method: "perf5.call", params: Params4 { subscription: 2_174_681_772_066_080, result: &it } }).unwrap();
+            let t = r.get();
+            let mut b = Vec::with_capacity(t.len() + 4);
+            b.extend_from_slice(&[0x81, 126]);
+            b.extend_from_slice(&(t.len() as u16).to_be_bytes());
+            b.extend_from_slice(t.as_bytes());
+            black_box(b);
+        }), "frame");
         // the floor: the typed item written once, straight into the frame buffer (PERF-7's shape)
         #[derive(Serialize)]
         struct Typed<'a, T> { #[serde(rename = "type")] t: &'a str, metadata: &'a StreamMetadata, content_type: &'a str, content: &'a T }

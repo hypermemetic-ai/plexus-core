@@ -919,3 +919,5 @@
 {"unix": 1793344353.7, "busy_pct": 15, "mine_pct": 0, "others_pct": 15, "load1": 4.16}
 {"unix": 1793344358.7, "busy_pct": 17, "mine_pct": 0, "others_pct": 17, "load1": 3.83}
 {"unix": 1793344363.7, "busy_pct": 24, "mine_pct": 0, "others_pct": 24, "load1": 3.68}
+{"unix": 1793344368.7, "busy_pct": 22, "mine_pct": 0, "others_pct": 22, "load1": 3.39}
+{"unix": 1793344373.7, "busy_pct": 18, "mine_pct": 0, "others_pct": 18, "load1": 3.12}

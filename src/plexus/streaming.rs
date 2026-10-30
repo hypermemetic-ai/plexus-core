@@ -78,7 +78,17 @@ pub fn wrap_stream<T: Serialize + Send + 'static>(
     // emits the `Set-Cookie` header.
     let projector = CookieProjector::None;
 
+    // PERF-17 E1: the stream's metadata encoded once; each item one typed pass.
+    let encoded_meta: Option<Arc<serde_json::value::RawValue>> = super::perf17::encoded()
+        .then(|| serde_json::value::to_raw_value(&metadata).ok().map(Arc::from))
+        .flatten();
+
     let data_stream = stream.map(move |item| {
+        if let Some(meta) = encoded_meta.as_ref().filter(|_| super::perf17::pipe_encodes()) {
+            if let Some(raw) = super::perf17::encode_item(meta, content_type, &item) {
+                return PlexusStreamItem::Encoded(raw);
+            }
+        }
         let (payload, captured) = serialize_with_credential_capture(&item);
         let (content, _hints) =
             assemble_envelope_content(payload, captured, &projector);

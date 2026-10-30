@@ -934,7 +934,7 @@ fn fill_site_hints_in_schema_stream(
     site: plexus_auth_core::AttachmentSite,
 ) -> PlexusStream {
     use futures::StreamExt;
-    Box::pin(stream.map(move |item| match item {
+    Box::pin(stream.map(move |item| match item.decoded() {
         super::types::PlexusStreamItem::Data {
             metadata,
             content_type,
@@ -1490,7 +1490,8 @@ impl DynamicHub {
             Err(e) => return Some(Err(e)),
         };
         use futures::StreamExt;
-        Some(Ok(Box::pin(stream.map(move |item| match item {
+        // PERF-17 E1: an encoded item is read back before its content is replaced.
+        Some(Ok(Box::pin(stream.map(move |item| match item.decoded() {
             super::types::PlexusStreamItem::Data { metadata, content_type, .. } => {
                 super::types::PlexusStreamItem::Data { metadata, content_type, content: content.clone() }
             }
@@ -2090,7 +2091,7 @@ impl DynamicHub {
                         return Ok(());
                     }
                     match plexus.route(&p.method, call_params, auth).await {
-                        Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
+                        Ok(stream) => super::perf17::PIPE_ENCODES.scope(true, pipe_stream_to_subscription(pending, stream)).await,
                         Err(e) => {
                             let sink = pending.accept().await?;
                             if let Some(raw) = error_item_raw(ns_static, &e) {
@@ -2274,7 +2275,7 @@ impl DynamicHub {
                         return Ok(());
                     }
                     match hub.route(&p.method, call_params, auth).await {
-                        Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
+                        Ok(stream) => super::perf17::PIPE_ENCODES.scope(true, pipe_stream_to_subscription(pending, stream)).await,
                         Err(e) => {
                             // Accept the subscription, then send the error as a stream item.
                             // This preserves the error message and code — returning Err(...)
@@ -2686,9 +2687,9 @@ async fn pipe_stream_to_subscription(
                 jsonrpsee::types::SubscriptionId::Str(s) => jsonrpsee::types::SubscriptionId::Str(std::borrow::Cow::Borrowed(s.as_ref())),
             };
             let msg = if batch.len() == 1 {
-                jsonrpsee::SubscriptionMessage::new(&method, id, &batch[0])?
+                jsonrpsee::SubscriptionMessage::new(&method, id, &super::perf17::Wire(&batch[0]))?
             } else {
-                jsonrpsee::SubscriptionMessage::new(&method, id, &batch)?
+                jsonrpsee::SubscriptionMessage::new(&method, id, &super::perf17::WireBatch(&batch))?
             };
             sink.send(msg).await?;
             if ended {
@@ -2696,12 +2697,12 @@ async fn pipe_stream_to_subscription(
             }
             continue;
         }
-        if one {
+        if one || matches!(item, super::types::PlexusStreamItem::Encoded(_)) {
             let id = match &sub_id {
                 jsonrpsee::types::SubscriptionId::Num(n) => jsonrpsee::types::SubscriptionId::Num(*n),
                 jsonrpsee::types::SubscriptionId::Str(s) => jsonrpsee::types::SubscriptionId::Str(std::borrow::Cow::Borrowed(s.as_ref())),
             };
-            let msg = jsonrpsee::SubscriptionMessage::new(&method, id, &item)?;
+            let msg = jsonrpsee::SubscriptionMessage::new(&method, id, &super::perf17::Wire(&item))?;
             sink.send(msg).await?;
         } else {
             let json = serde_json::value::to_raw_value(&item)?;

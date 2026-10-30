@@ -15,6 +15,15 @@
 //!   once, straight into its notification (`SubscriptionMessage::new`, which
 //!   jsonrpsee passes through whole), instead of `to_raw_value` and then
 //!   jsonrpsee's envelope copying it.
+//! - `PERF17_ENCODED=1` (E1, PERF-7's second half): `wrap_stream` writes
+//!   each item's whole JSON once, straight from the typed event (the
+//!   metadata and content type written once per stream), into an
+//!   `Encoded` item the pipe sends as its bytes — no `Value`, no per-item
+//!   metadata clone. An item that captures a credential takes today's path.
+//!   The content's keys come in the type's order, not sorted as a `Value`
+//!   writes them: the same JSON, not the same bytes. Only a stream the
+//!   WebSocket pipe polls is encoded (the pipe sets `PIPE_ENCODES` for its
+//!   task): whoever reads `route()`'s items in process still gets `Data`.
 //! - `PERF17_GATE_CACHE=1` (E3, PERF-10): the gate's verdict for a call
 //!   that names no target, kept per worker thread by (caller, grant) and the
 //!   gate's grants generation; a refusal is never kept, and a sign-in that
@@ -155,4 +164,86 @@ pub fn cached_check(
         m.insert(key, (generation, r.clone()));
     });
     Ok(r)
+}
+
+/// E1: items encoded once in `wrap_stream`.
+pub fn encoded() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| flag("PERF17_ENCODED"))
+}
+
+/// E1: one `data` item's whole JSON in one typed pass — the metadata already
+/// encoded (written verbatim), the event straight from its type — under the
+/// credential capture; `None` when it captured a credential (today's path
+/// assembles the envelope) or could not be written.
+pub fn encode_item<T: serde::Serialize>(
+    meta: &serde_json::value::RawValue,
+    content_type: &str,
+    item: &T,
+) -> Option<Box<serde_json::value::RawValue>> {
+    use serde::ser::SerializeStruct;
+    struct Enc<'a, T> {
+        meta: &'a serde_json::value::RawValue,
+        content_type: &'a str,
+        content: &'a T,
+    }
+    impl<T: serde::Serialize> serde::Serialize for Enc<'_, T> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let mut st = s.serialize_struct("PlexusStreamItem", 4)?;
+            st.serialize_field("type", "data")?;
+            st.serialize_field("metadata", self.meta)?;
+            st.serialize_field("content_type", self.content_type)?;
+            st.serialize_field("content", self.content)?;
+            st.end()
+        }
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(meta.get().len() + content_type.len() + 192);
+    let (written, captured) = plexus_auth_core::credential::run_with_credential_capture(|| {
+        serde_json::to_writer(&mut buf, &Enc { meta, content_type, content: item }).is_ok()
+    });
+    if !written || !captured.is_empty() {
+        return None;
+    }
+    // serde_json wrote this text: it is valid JSON and UTF-8.
+    let text: Box<str> = String::from_utf8(buf).ok()?.into_boxed_str();
+    // SAFETY: RawValue is #[repr(transparent)] over str (serde_json's own
+    // `RawValue::from_owned` does this); the text is the JSON serde_json just
+    // wrote, so skipping `from_string`'s re-parse keeps its invariant.
+    Some(unsafe { std::mem::transmute::<Box<str>, Box<serde_json::value::RawValue>>(text) })
+}
+
+/// E1: an item as the wire writes it — an `Encoded` one as its bytes.
+pub struct Wire<'a>(pub &'a super::types::PlexusStreamItem);
+
+impl serde::Serialize for Wire<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            super::types::PlexusStreamItem::Encoded(raw) => raw.serialize(s),
+            item => item.serialize(s),
+        }
+    }
+}
+
+/// E1 with E2b: a batch as the wire writes it.
+pub struct WireBatch<'a>(pub &'a [super::types::PlexusStreamItem]);
+
+impl serde::Serialize for WireBatch<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for item in self.0 {
+            seq.serialize_element(&Wire(item))?;
+        }
+        seq.end()
+    }
+}
+
+tokio::task_local! {
+    /// E1: set by the WebSocket pipe for the task that polls a call's stream.
+    pub static PIPE_ENCODES: bool;
+}
+
+/// E1: true while the WebSocket pipe is the one polling this stream.
+pub fn pipe_encodes() -> bool {
+    PIPE_ENCODES.try_with(|v| *v).unwrap_or(false)
 }

@@ -275,12 +275,12 @@ fn closed_loop(url: &str, h: &[(String, String)], call: &str, p: &str, k: u64, s
                 rawws::Msg::Answer { id, sub } => {
                     subs.insert(sub, id);
                 }
-                rawws::Msg::Item { sub, kind: rawws::Kind::Done } => {
+                rawws::Msg::Item { sub, kind: rawws::Kind::Done } | rawws::Msg::Batch { sub, done: true, error: false, .. } => {
                     if let Some(id) = subs.remove(&sub) {
                         finished.push(id);
                     }
                 }
-                rawws::Msg::CallError { .. } | rawws::Msg::Fatal(_) | rawws::Msg::Item { kind: rawws::Kind::Error, .. } => anyhow::bail!("a call failed: {}", String::from_utf8_lossy(pl)),
+                rawws::Msg::CallError { .. } | rawws::Msg::Fatal(_) | rawws::Msg::Item { kind: rawws::Kind::Error, .. } | rawws::Msg::Batch { error: true, .. } => anyhow::bail!("a call failed: {}", String::from_utf8_lossy(pl)),
                 _ => {}
             }
         }

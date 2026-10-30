@@ -2644,6 +2644,10 @@ async fn pipe_stream_to_subscription(
 
     let sink = pending.accept().await?;
     let connection = sink.connection_id().0;
+    // PERF-17 E2b: a batch is built once around its items (jsonrpsee sends
+    // a complete message as it is).
+    let method = sink.method_name().to_string();
+    let sub_id = sink.subscription_id();
     loop {
         let item = tokio::select! {
             biased;
@@ -2653,6 +2657,42 @@ async fn pipe_stream_to_subscription(
         let Some(item) = item else { break };
         if let super::types::PlexusStreamItem::Request { request_id, .. } = &item {
             super::bidirectional::bind_asker(request_id, connection);
+        }
+        // PERF-17 E2b: what else is ready now, up to the cap, in one notification.
+        let cap = super::perf17::batch();
+        if cap > 1 {
+            use futures::FutureExt;
+            let mut batch = vec![item];
+            let mut ended = false;
+            while batch.len() < cap {
+                match stream.next().now_or_never() {
+                    Some(Some(more)) => {
+                        if let super::types::PlexusStreamItem::Request { request_id, .. } = &more {
+                            super::bidirectional::bind_asker(request_id, connection);
+                        }
+                        batch.push(more);
+                    }
+                    Some(None) => {
+                        ended = true;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            let id = match &sub_id {
+                jsonrpsee::types::SubscriptionId::Num(n) => jsonrpsee::types::SubscriptionId::Num(*n),
+                jsonrpsee::types::SubscriptionId::Str(s) => jsonrpsee::types::SubscriptionId::Str(std::borrow::Cow::Borrowed(s.as_ref())),
+            };
+            let msg = if batch.len() == 1 {
+                jsonrpsee::SubscriptionMessage::new(&method, id, &batch[0])?
+            } else {
+                jsonrpsee::SubscriptionMessage::new(&method, id, &batch)?
+            };
+            sink.send(msg).await?;
+            if ended {
+                break;
+            }
+            continue;
         }
         let json = serde_json::value::to_raw_value(&item)?;
         sink.send(json).await?;

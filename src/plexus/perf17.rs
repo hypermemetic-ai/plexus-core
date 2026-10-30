@@ -11,6 +11,11 @@
 //!   cached per (service, method, params, caller) and the gate's grants
 //!   generation; a move of the generation misses. Assumes the activations'
 //!   schemas are fixed once registered (true of every macro activation).
+//! - `PERF17_BATCH=N` (E2b, PERF-8's second half): the items a stream has
+//!   ready when one is taken (polled until `Pending`, never a timer), up to N,
+//!   go as one notification whose `result` is the array of them (PERF-8 names
+//!   it `results`; jsonrpsee's public API writes `result`); a lone item goes
+//!   alone, as today. Every client is sent batches (no negotiation here).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -87,6 +92,11 @@ pub fn view_cache() -> &'static GenCache<std::sync::Arc<super::view::View>> {
     C.get_or_init(Default::default)
 }
 
+/// E2b: at most this many ready items in one notification (0 or 1: off).
+pub fn batch() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("PERF17_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
 
 pub fn encoded_cache() -> &'static GenCache<std::sync::Arc<Vec<Box<serde_json::value::RawValue>>>> {
     static C: OnceLock<GenCache<std::sync::Arc<Vec<Box<serde_json::value::RawValue>>>>> = OnceLock::new();

@@ -133,6 +133,9 @@ pub enum Msg {
     Answer { id: u64, sub: Vec<u8> },
     /// `{"params":{"subscription":SUB,"result":{"type":KIND,…}}}`.
     Item { sub: Vec<u8>, kind: Kind },
+    /// PERF-17 E2b (PERF-8): `{"params":{"subscription":SUB,"result":[item, …]}}` —
+    /// N items in one notification; counted by scanning each item's opening tag.
+    Batch { sub: Vec<u8>, data: u64, done: bool, error: bool },
     /// An error answer to the call itself (counts as its end).
     CallError { id: u64 },
     /// An error the server could not tie to a call (`"id":null`: a frame it
@@ -157,6 +160,12 @@ fn num(b: &[u8]) -> u64 {
 pub fn classify(b: &[u8]) -> Msg {
     if let Some((s, e)) = token_after(b, b"\"subscription\":") {
         let sub = b[s..e].to_vec();
+        if b[e..].starts_with(b",\"result\":[") {
+            let data = memmem::find_iter(&b[e..], b"{\"type\":\"data\"").count() as u64;
+            let done = memmem::find(&b[e..], b"{\"type\":\"done\"").is_some();
+            let error = memmem::find(&b[e..], b"{\"type\":\"error\"").is_some();
+            return Msg::Batch { sub, data, done, error };
+        }
         let kind = match memmem::find(&b[e..], b"\"result\":{\"type\":\"") {
             Some(k) => {
                 let t = &b[e + k + 18..];
@@ -375,10 +384,11 @@ pub fn open_loop_calls_blocking(
                     None
                 }
                 Msg::Item { sub, kind: Kind::Done } => subs.remove(&sub),
-                Msg::Item { sub, kind: Kind::Error } => {
+                Msg::Item { sub, kind: Kind::Error } | Msg::Batch { sub, error: true, .. } => {
                     errors += 1;
                     subs.remove(&sub)
                 }
+                Msg::Batch { sub, done: true, .. } => subs.remove(&sub),
                 Msg::CallError { id } => {
                     errors += 1;
                     Some(id)
@@ -432,6 +442,13 @@ fn wait_done(read: &mut TcpStream, reader: &mut FrameReader, buf: &mut [u8], wri
                 Msg::Fatal(f) => anyhow::bail!("the server could not read a call: {f}"),
                 Msg::Item { kind: Kind::Done, .. } => return Ok(items),
                 Msg::Item { kind: Kind::Data, .. } => items += 1,
+                Msg::Batch { error: true, .. } => anyhow::bail!("the call failed: {}", String::from_utf8_lossy(p)),
+                Msg::Batch { data, done, .. } => {
+                    items += data;
+                    if done {
+                        return Ok(items);
+                    }
+                }
                 _ => {}
             }
         }
@@ -597,10 +614,14 @@ impl Session {
                 }
                 let v: serde_json::Value = serde_json::from_slice(p)?;
                 if let Some(item) = v.pointer("/params/result") {
-                    let t = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    out.push(item.clone());
-                    if t == "done" || t == "error" {
-                        return Ok(out);
+                    // PERF-17 E2b: a batch is an array of items.
+                    let items = match item.as_array() { Some(a) => a.clone(), None => vec![item.clone()] };
+                    for item in items {
+                        let t = item.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                        out.push(item);
+                        if t == "done" || t == "error" {
+                            return Ok(out);
+                        }
                     }
                 } else if v.get("error").is_some() {
                     out.push(v);

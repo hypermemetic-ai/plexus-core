@@ -184,6 +184,8 @@ pub(crate) fn decide(
         None => None,
     };
     match targets {
+        // PERF-17 E3: the verdict for a call that names no target, cached.
+        None if super::perf17::gate_cache() => Ok(Admit::Reach(super::perf17::cached_check(gate, auth, &grant)?)),
         None => Ok(Admit::Reach(gate.check(auth, &grant, None)?)),
         Some(values) if values.is_empty() => Ok(Admit::Reach(gate.check(auth, &grant, None)?)),
         Some(values) => {

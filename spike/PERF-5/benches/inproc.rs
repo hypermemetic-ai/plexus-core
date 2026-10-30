@@ -60,6 +60,8 @@ fn main() {
         let gate = gated.gate().unwrap().clone();
         let grant = Grant::of("bench", "once");
         e(bench("gate.check (Gate::check, repeated)", || { black_box(gate.check(Some(black_box(&auth)), &grant, None).is_ok()); }), "gate");
+        // PERF-17 E3: the same verdict through the per-thread cache keyed by caller, grant and generation
+        e(bench("PERF-17 E3: gate.check through the verdict cache", || { black_box(plexus_core::plexus::perf17::cached_check(&gate, Some(black_box(&auth)), &grant).is_ok()); }), "gate");
     }
 
     if only.is_empty() || only == "frame" {

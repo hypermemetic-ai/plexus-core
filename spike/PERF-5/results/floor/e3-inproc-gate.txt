@@ -1,0 +1,6 @@
+      92 ns   0.0 allocs  block_on(empty)
+     850 ns  22.0 allocs  dispatch.echo_once (plain service, route → drain)
+    1631 ns  45.0 allocs  dispatch.echo_once (gated service, signed in)
+  284839 ns 10015.0 allocs  stream.1000 in process (plain), per call
+     520 ns  20.0 allocs  gate.check (Gate::check, repeated)
+     177 ns   7.0 allocs  PERF-17 E3: gate.check through the verdict cache

@@ -15,6 +15,11 @@
 //!   once, straight into its notification (`SubscriptionMessage::new`, which
 //!   jsonrpsee passes through whole), instead of `to_raw_value` and then
 //!   jsonrpsee's envelope copying it.
+//! - `PERF17_GATE_CACHE=1` (E3, PERF-10): the gate's verdict for a call
+//!   that names no target, kept per worker thread by (caller, grant) and the
+//!   gate's grants generation; a refusal is never kept, and a sign-in that
+//!   ended is caught before (`standing`). The caller is its address plus a
+//!   hash of its user and session, so a reused address is a miss.
 //! - `PERF17_BATCH=N` (E2b, PERF-8's second half): the items a stream has
 //!   ready when one is taken (polled until `Pending`, never a timer), up to N,
 //!   go as one notification whose `result` is the array of them (PERF-8 names
@@ -110,4 +115,44 @@ pub fn batch() -> usize {
 pub fn encoded_cache() -> &'static GenCache<std::sync::Arc<Vec<Box<serde_json::value::RawValue>>>> {
     static C: OnceLock<GenCache<std::sync::Arc<Vec<Box<serde_json::value::RawValue>>>>> = OnceLock::new();
     C.get_or_init(Default::default)
+}
+
+/// E3: the gate's verdict cached per (caller, grant) and grants generation.
+pub fn gate_cache() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| flag("PERF17_GATE_CACHE"))
+}
+
+thread_local! {
+    static VERDICTS: std::cell::RefCell<HashMap<(usize, u64), (u64, plexus_auth_core::grants::Reach)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// E3: `gate.check(auth, grant, None)`, answered from this thread's cache
+/// when the generation has not moved.
+pub fn cached_check(
+    gate: &plexus_auth_core::grants::Gate,
+    auth: Option<&super::auth::AuthContext>,
+    grant: &plexus_auth_core::grants::Grant,
+) -> Result<plexus_auth_core::grants::Reach, plexus_auth_core::grants::Refusal> {
+    use std::hash::{Hash, Hasher};
+    let generation = gate.generation().current();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    grant.as_str().hash(&mut h);
+    if let Some(a) = auth {
+        a.user_id.hash(&mut h);
+        a.session_id.hash(&mut h);
+    }
+    let key = (auth.map(|a| a as *const _ as usize).unwrap_or(0), h.finish());
+    if let Some(r) = VERDICTS.with(|m| m.borrow().get(&key).filter(|(g, _)| *g == generation).map(|(_, r)| r.clone())) {
+        return Ok(r);
+    }
+    let r = gate.check(auth, grant, None)?;
+    VERDICTS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(key, (generation, r.clone()));
+    });
+    Ok(r)
 }

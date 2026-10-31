@@ -9,11 +9,13 @@
 //! are `null`, `-0.0`, `u64::MAX`, `i64::MIN`), strings that need escaping,
 //! a raw JSON field, a credential (whose item is assembled as today's, the
 //! `_credentials` envelope beside it), a plain string, a bare `Value` —
-//! generated from a seed, a thousand items a run. Each is read three ways:
+//! generated from a seed, a thousand items a run. Each is read four ways:
 //! in process (`route()`, today's path: the event to a `Value`), over
-//! plexus-transport's WebSocket (the socket loop's frames) and through the
-//! RPC module (jsonrpsee's sink). The two wire paths must read as the
-//! in-process item, as JSON.
+//! plexus-transport's WebSocket (the socket loop's frames), over the same
+//! socket asking `plexus.msgpack` (PERF-9: each event encoded once as a
+//! msgpack map, read here with rmp-serde) and through the RPC module
+//! (jsonrpsee's sink). The three wire paths must read as the in-process
+//! item, as JSON: JSON → msgpack → JSON, equal as JSON.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -307,6 +309,38 @@ async fn over_socket(url: &str, method: &str, params: &Value) -> Vec<Value> {
     }
 }
 
+/// PERF-9: the same call on a socket that asked for msgpack — every frame a
+/// binary message, a map with no `jsonrpc`, read with rmp-serde.
+async fn over_msgpack_socket(url: &str, method: &str, params: &Value) -> Vec<Value> {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert("Sec-WebSocket-Protocol", "plexus.msgpack, plexus.json".parse().unwrap());
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(resp.headers().get("Sec-WebSocket-Protocol").unwrap(), "plexus.msgpack");
+    let call = json!({"id": 1, "method": "lab.call", "params": {"method": method, "params": params}});
+    ws.send(Message::Binary(rmp_serde::to_vec_named(&call).unwrap().into())).await.unwrap();
+    let mut out = Vec::new();
+    loop {
+        let frame = match tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("a frame in 10 s").unwrap().unwrap() {
+            Message::Binary(b) => rmp_serde::from_slice::<Value>(&b).expect("one msgpack map"),
+            Message::Text(t) => panic!("a text frame on a msgpack socket: {t}"),
+            _ => continue,
+        };
+        assert!(frame.get("jsonrpc").is_none(), "no `jsonrpc` in a msgpack frame: {frame}");
+        if frame.get("result").is_some() {
+            continue; // the subscription's id
+        }
+        let item = frame["params"]["result"].clone();
+        let done = item["type"] == "done";
+        out.push(steady(item));
+        if done {
+            return out;
+        }
+    }
+}
+
 async fn over_module(hub: &Arc<DynamicHub>, method: &str, params: &Value) -> Vec<Value> {
     let module = DynamicHub::arc_into_rpc_module(hub.clone()).unwrap();
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "lab.call", "params": {"method": method, "params": params}});
@@ -345,6 +379,11 @@ async fn the_single_encode_is_todays_frame_as_json_for_every_shape() {
             assert_eq!(wire.len(), here.len(), "{method} seed {seed}: as many items on the socket");
             for (n, (w, h)) in wire.iter().zip(&here).enumerate() {
                 assert_eq!(w, h, "{method} seed {seed} item {n}: the socket's frame is not today's as JSON");
+            }
+            let packed = over_msgpack_socket(&url, method, &params).await;
+            assert_eq!(packed.len(), here.len(), "{method} seed {seed}: as many items in msgpack");
+            for (n, (m, h)) in packed.iter().zip(&here).enumerate() {
+                assert_eq!(m, h, "{method} seed {seed} item {n}: the msgpack frame is not today's as JSON");
             }
             let moduled = over_module(&hub, method, &params).await;
             assert_eq!(moduled, here, "{method} seed {seed}: the module's frames are not today's as JSON");
@@ -386,6 +425,43 @@ async fn the_sockets_frame_is_the_events_own_encoding() {
             assert!(z < a, "the event's keys in its type's order on the wire: {text}");
         }
         if text.contains(r#""result":{"type":"done""#) {
+            break;
+        }
+    }
+    assert!(fields > 0, "the seed reached `fields`");
+}
+
+/// PERF-9: a msgpack frame is the event's own encoding too — a map with its
+/// field names in its type's order (`zulu` before `alpha`), written once
+/// from the event, not through a `Value` (which would sort them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_msgpack_frame_is_the_events_own_encoding() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let module = DynamicHub::arc_into_rpc_module(lab()).unwrap();
+    let (_server, addr) =
+        plexus_transport::websocket::serve_websocket_with(module, plexus_transport::WebSocketConfig::new(0), None, Default::default()).await.unwrap();
+    let mut req = format!("ws://{addr}").into_client_request().unwrap();
+    req.headers_mut().insert("Sec-WebSocket-Protocol", "plexus.msgpack".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let call = json!({"id": 1, "method": "lab.call", "params": {"method": "shapes.all", "params": {"seed": 7, "n": 200}}});
+    ws.send(Message::Binary(rmp_serde::to_vec_named(&call).unwrap().into())).await.unwrap();
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+    let mut fields = 0;
+    loop {
+        let bytes = match tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("a frame in 10 s").unwrap().unwrap() {
+            Message::Binary(b) => b,
+            _ => continue,
+        };
+        // fixstr "type", fixstr "fields": the content's tag, as its first member.
+        if find(&bytes, b"\xa4type\xa6fields").is_some() {
+            fields += 1;
+            let (z, a) = (find(&bytes, b"\xa4zulu").unwrap(), find(&bytes, b"\xa5alpha").unwrap());
+            assert!(z < a, "the event's keys in its type's order on the wire");
+        }
+        let v: Value = rmp_serde::from_slice(&bytes).unwrap();
+        if v["params"]["result"]["type"] == "done" {
             break;
         }
     }

@@ -100,9 +100,9 @@ pub(crate) fn to_client_item(item: PlexusStreamItem) -> StreamItem {
             content_type,
             content,
         } => StreamItem::Data {
-            metadata: meta(metadata),
-            content_type: Some(content_type),
-            content,
+            metadata: meta(std::sync::Arc::unwrap_or_clone(metadata)),
+            content_type: Some(content_type.into_owned()),
+            content: content.into_value(),
         },
         PlexusStreamItem::Progress {
             metadata,

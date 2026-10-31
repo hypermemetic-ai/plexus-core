@@ -121,7 +121,7 @@ async fn items(stream: PlexusStream) -> Vec<Value> {
     stream
         .filter_map(|i| async move {
             match i {
-                PlexusStreamItem::Data { content, .. } => Some(content),
+                PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
                 PlexusStreamItem::Error { message, .. } => Some(json!({"error": message})),
                 _ => None,
             }

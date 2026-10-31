@@ -567,7 +567,7 @@ impl Cache {
 pub(crate) struct Shell(Vec<ShellItem>);
 
 enum ShellItem {
-    Data { provenance: Vec<String>, plexus_hash: HashOf, content_type: String },
+    Data { provenance: Vec<String>, plexus_hash: HashOf, content_type: std::borrow::Cow<'static, str> },
     Done { provenance: Vec<String>, plexus_hash: HashOf },
 }
 
@@ -634,9 +634,9 @@ impl Shell {
             .enumerate()
             .map(|(at, item)| match item {
                 ShellItem::Data { provenance, plexus_hash, content_type } => PlexusStreamItem::Data {
-                    metadata: meta(provenance, plexus_hash),
+                    metadata: meta(provenance, plexus_hash).into(),
                     content_type: content_type.clone(),
-                    content: if Some(at) == last { content.take() } else { content.clone() }.unwrap_or_default(),
+                    content: if Some(at) == last { content.take() } else { content.clone() }.unwrap_or_default().into(),
                 },
                 ShellItem::Done { provenance, plexus_hash } => PlexusStreamItem::Done { metadata: meta(provenance, plexus_hash) },
             })

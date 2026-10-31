@@ -4,9 +4,14 @@
 //! The key architectural principle is "caller wraps" - activations return
 //! typed domain events, and the caller (DynamicHub routing layer) wraps them with metadata.
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use super::wire::Content;
 
 /// Metadata applied by the caller when wrapping activation responses
 ///
@@ -43,14 +48,21 @@ impl StreamMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlexusStreamItem {
+    // PERF-7: nothing in a `data` item is made per item. The metadata is
+    // the stream's, shared by its items; the content type is the method's;
+    // the content is the event encoded once — JSON bytes under the
+    // WebSocket pipe, a `Value` anywhere else — and reads as a `Value`
+    // either way (`Content`). A transformer that rewrites the content
+    // replaces it whole, encoded or not. (The doc comments below are the
+    // schema's descriptions, every `<ns>.call`'s `returns`: unchanged.)
     /// Data payload with caller-applied metadata
     Data {
         /// Metadata from calling layer
-        metadata: StreamMetadata,
+        metadata: Arc<StreamMetadata>,
         /// Type identifier for deserialization (e.g., "health.status")
-        content_type: String,
+        content_type: Cow<'static, str>,
         /// The actual payload (serialized activation event)
-        content: Value,
+        content: Content,
     },
 
     /// Progress update during long-running operations
@@ -115,9 +127,9 @@ impl PlexusStreamItem {
     /// Create a Data item
     pub fn data(metadata: StreamMetadata, content_type: String, content: Value) -> Self {
         Self::Data {
-            metadata,
-            content_type,
-            content,
+            metadata: Arc::new(metadata),
+            content_type: Cow::Owned(content_type),
+            content: Content::from(content),
         }
     }
 
@@ -193,7 +205,7 @@ impl PlexusStreamItem {
     /// Note: Request items don't have metadata as they're server-initiated
     pub fn metadata(&self) -> Option<&StreamMetadata> {
         match self {
-            Self::Data { metadata, .. } => Some(metadata),
+            Self::Data { metadata, .. } => Some(metadata.as_ref()),
             Self::Progress { metadata, .. } => Some(metadata),
             Self::Error { metadata, .. } => Some(metadata),
             Self::Done { metadata } => Some(metadata),

@@ -539,7 +539,7 @@ async fn first(stream: PlexusStream) -> Value {
     let items: Vec<PlexusStreamItem> = stream.collect().await;
     for i in items {
         match i {
-            PlexusStreamItem::Data { content, .. } => return content,
+            PlexusStreamItem::Data { content, .. } => return content.into_value(),
             PlexusStreamItem::Error { .. } => return serde_json::to_value(&i).unwrap(),
             _ => {}
         }

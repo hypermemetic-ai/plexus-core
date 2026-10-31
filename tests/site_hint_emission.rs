@@ -116,7 +116,7 @@ async fn fetch_schema_json(hub: &DynamicHub, method: &str, params: Value) -> Val
             } if content_type.ends_with(".schema")
                 || content_type.ends_with(".method_schema") =>
             {
-                Some(content.clone())
+                Some(content.to_value())
             }
             _ => None,
         })
@@ -239,7 +239,7 @@ async fn non_schema_dispatch_passes_through() {
     let data: Vec<&Value> = items
         .iter()
         .filter_map(|i| match i {
-            PlexusStreamItem::Data { content, .. } => Some(content),
+            PlexusStreamItem::Data { content, .. } => Some(content.value()),
             _ => None,
         })
         .collect();

@@ -938,10 +938,14 @@ fn fill_site_hints_in_schema_stream(
             content_type,
             content,
         } if content_type.ends_with(".schema") || content_type.ends_with(".method_schema") => {
-            let content = match serde_json::from_value::<super::SchemaResult>(content.clone()) {
+            // PERF-7: an encoded content is decoded straight from its bytes.
+            let content = match content.decode::<super::SchemaResult>() {
                 Ok(mut result) => {
                     result.fill_site_hints(&site);
-                    serde_json::to_value(&result).unwrap_or(content)
+                    match serde_json::to_value(&result) {
+                        Ok(v) => v.into(),
+                        Err(_) => content,
+                    }
                 }
                 Err(_) => content,
             };
@@ -1475,9 +1479,11 @@ impl DynamicHub {
         // stay what clients know; only the content is the view's.
         use futures::StreamExt;
         let with = |content: serde_json::Value| {
+            // PERF-7: an encoded item is a `Data` item: its content is
+            // replaced whole, whatever it was made as.
             move |item: super::types::PlexusStreamItem| match item {
                 super::types::PlexusStreamItem::Data { metadata, content_type, .. } => {
-                    super::types::PlexusStreamItem::Data { metadata, content_type, content: content.clone() }
+                    super::types::PlexusStreamItem::Data { metadata, content_type, content: content.clone().into() }
                 }
                 other => other,
             }
@@ -2109,7 +2115,7 @@ impl DynamicHub {
                         None
                     };
                     match plexus.route(&p.method, p.params.unwrap_or_default(), auth).await {
-                        Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
+                        Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
                         Err(e) => {
                             let sink = pending.accept().await?;
                             if let Some(raw) = error_item_raw(ns_static, &e) {
@@ -2138,7 +2144,7 @@ impl DynamicHub {
                         yield HashEvent::Hash { value };
                     };
                     let wrapped = super::streaming::wrap_stream(stream, hash_content_type, vec![ns_static.into()]);
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             }
         )?;
@@ -2176,7 +2182,7 @@ impl DynamicHub {
 
                     let stream = async_stream::stream! { yield result; };
                     let wrapped = super::streaming::wrap_stream(stream, schema_content_type, vec![ns_static.into()]);
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             }
         )?;
@@ -2214,7 +2220,7 @@ impl DynamicHub {
                     );
 
                     // Pipe to subscription (handles Done automatically)
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             }
         )?;
@@ -2276,7 +2282,7 @@ impl DynamicHub {
                     let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>()
                         .map(|arc| arc.as_ref());
                     match hub.route(&p.method, p.params.unwrap_or_default(), auth).await {
-                        Ok(stream) => pipe_stream_to_subscription(pending, stream).await,
+                        Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
                         Err(e) => {
                             // Accept the subscription, then send the error as a stream item.
                             // This preserves the error message and code — returning Err(...)
@@ -2309,7 +2315,7 @@ impl DynamicHub {
                         yield HashEvent::Hash { value };
                     };
                     let wrapped = super::streaming::wrap_stream(stream, hash_content_type, vec![ns_static.into()]);
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             }
         )?;
@@ -2349,7 +2355,7 @@ impl DynamicHub {
                         yield result;
                     };
                     let wrapped = super::streaming::wrap_stream(stream, schema_content_type, vec![ns_static.into()]);
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             }
         )?;
@@ -2386,7 +2392,7 @@ impl DynamicHub {
                     );
 
                     // Pipe to subscription (handles Done automatically)
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             }
         )?;
@@ -2511,7 +2517,7 @@ fn register_child_capability_methods(
             list_method,
             PLEXUS_NOTIF_METHOD,
             list_unsub,
-            move |_params, pending, _ctx, _ext| {
+            move |_params, pending, _ctx, ext| {
                 let router = router_for_list.clone();
                 Box::pin(async move {
                     // Collect names eagerly so the BoxStream's borrow on the
@@ -2541,7 +2547,7 @@ fn register_child_capability_methods(
                         "list_children",
                         vec![ns_static.into()],
                     );
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             },
         )?;
@@ -2557,7 +2563,7 @@ fn register_child_capability_methods(
             search_method,
             PLEXUS_NOTIF_METHOD,
             search_unsub,
-            move |params, pending, _ctx, _ext| {
+            move |params, pending, _ctx, ext| {
                 let router = router_for_search.clone();
                 Box::pin(async move {
                     let p: SearchChildrenParams = params.parse()?;
@@ -2582,7 +2588,7 @@ fn register_child_capability_methods(
                         "search_children",
                         vec![ns_static.into()],
                     );
-                    pipe_stream_to_subscription(pending, wrapped).await
+                    pipe_stream_to_subscription(pending, wrapped, &ext).await
                 })
             },
         )?;
@@ -2615,11 +2621,13 @@ struct RespondParams {
     response_data: Value,
 }
 
-/// Helper to pipe a PlexusStream to a subscription sink.
+/// Pipe a call's stream to its subscription: accept it, then
+/// [`super::wire::pipe`] — each item encoded once and written as one frame
+/// (PERF-7), on the transport's own frames when the call's extensions
+/// carry them.
 ///
-/// Notifications are sent with `method: PLEXUS_NOTIF_METHOD` on the wire,
-/// as set by the `notif_method_name` arg in each `register_subscription` call.
-/// Pipe a call's stream to its subscription.
+/// Notifications are sent with the `notif_method_name` each
+/// `register_subscription` call set.
 ///
 /// BIDIR-13: a `Request` item (an in-call question) is bound to this
 /// subscription's connection before it is sent, so `{ns}.respond` takes its
@@ -2629,26 +2637,11 @@ struct RespondParams {
 /// the question's timeout.
 async fn pipe_stream_to_subscription(
     pending: jsonrpsee::PendingSubscriptionSink,
-    mut stream: PlexusStream,
+    stream: PlexusStream,
+    ext: &http::Extensions,
 ) -> jsonrpsee::core::SubscriptionResult {
-    use futures::StreamExt;
-
     let sink = pending.accept().await?;
-    let connection = sink.connection_id().0;
-    loop {
-        let item = tokio::select! {
-            biased;
-            _ = sink.closed() => return Ok(()),
-            item = stream.next() => item,
-        };
-        let Some(item) = item else { break };
-        if let super::types::PlexusStreamItem::Request { request_id, .. } = &item {
-            super::bidirectional::bind_asker(request_id, connection);
-        }
-        let json = serde_json::value::to_raw_value(&item)?;
-        sink.send(json).await?;
-    }
-    Ok(())
+    super::wire::pipe(sink, stream, ext).await
 }
 
 // ============================================================================

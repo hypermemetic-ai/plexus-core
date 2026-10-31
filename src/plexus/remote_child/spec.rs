@@ -134,6 +134,12 @@ pub struct ChildOptions {
     pub env: Vec<String>,
     /// Restarting (or redialing) a child that died.
     pub backoff: Backoff,
+    /// PERF-9 (spec/13): the encodings asked of the child, in order — over a
+    /// WebSocket in `Sec-WebSocket-Protocol`, on stdio as the first line's
+    /// request. A child that offers msgpack is spoken to in msgpack; one from
+    /// before spec/13 in JSON. Default msgpack, then JSON; empty: ask for
+    /// nothing (JSON, as before).
+    pub encodings: Vec<crate::plexus::wire::WireEncoding>,
 }
 
 impl Default for ChildOptions {
@@ -147,6 +153,7 @@ impl Default for ChildOptions {
             buffer: 1024,
             env: Vec::new(),
             backoff: Backoff::default(),
+            encodings: crate::plexus::wire::WireEncoding::ALL.to_vec(),
         }
     }
 }

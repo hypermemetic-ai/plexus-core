@@ -23,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::spec::{ChildOptions, ChildSpec};
+use crate::plexus::wire::WireEncoding;
 use crate::plexus::types::{PlexusStreamItem, StreamMetadata};
 
 /// A subscription id as the child spelled it (its JSON text: `4`, `"a"`).
@@ -112,6 +113,8 @@ impl Routes {
 pub(super) struct Conn {
     pub name: String,
     pub pid: Option<u32>,
+    /// PERF-9: what the link speaks, settled when it opened (spec/13).
+    pub encoding: WireEncoding,
     /// The child's own namespace (its `_info`'s `backend`).
     pub ns: OnceLock<String>,
     out: mpsc::UnboundedSender<Vec<u8>>,
@@ -165,10 +168,11 @@ struct Kind<'a> {
 }
 
 impl Conn {
-    pub(super) fn new(name: &str, pid: Option<u32>, out: mpsc::UnboundedSender<Vec<u8>>, buffer: usize, counters: Arc<Counters>) -> Arc<Self> {
+    pub(super) fn new(name: &str, pid: Option<u32>, encoding: WireEncoding, out: mpsc::UnboundedSender<Vec<u8>>, buffer: usize, counters: Arc<Counters>) -> Arc<Self> {
         Arc::new(Self {
             name: name.to_string(),
             pid,
+            encoding,
             ns: OnceLock::new(),
             out,
             routes: Mutex::new(Routes::default()),
@@ -188,8 +192,36 @@ impl Conn {
         self.ns.get().map(String::as_str).unwrap_or(&self.name)
     }
 
+    /// A frame to the child, in the link's encoding (under msgpack the
+    /// object as a map, `jsonrpc` left out — spec/13).
     fn send(&self, frame: &Value) {
-        let _ = self.out.send(serde_json::to_vec(frame).unwrap_or_default());
+        let bytes = match self.encoding {
+            WireEncoding::Msgpack => {
+                let mut f = frame.clone();
+                if let Some(m) = f.as_object_mut() {
+                    m.remove("jsonrpc");
+                }
+                crate::plexus::msgpack::to_vec(&f).unwrap_or_default()
+            }
+            _ => serde_json::to_vec(frame).unwrap_or_default(),
+        };
+        let _ = self.out.send(bytes);
+    }
+
+    /// `{ns}.call_unsub [key]` with request id `id` (`key` the subscription
+    /// id's JSON text).
+    fn send_unsub(&self, id: u64, key: &str) {
+        let method = format!("{}.call_unsub", self.ns());
+        match self.encoding {
+            WireEncoding::Json => {
+                let method = serde_json::to_string(&method).unwrap_or_default();
+                let _ = self.out.send(format!(r#"{{"jsonrpc":"2.0","id":{id},"method":{method},"params":[{key}]}}"#).into_bytes());
+            }
+            _ => {
+                let sid = serde_json::from_str::<Value>(key).unwrap_or_else(|_| Value::String(key.to_string()));
+                self.send(&json!({ "id": id, "method": method, "params": [sid] }));
+            }
+        }
     }
 
     /// Open a call: `method` with `params` (a `{ns}.call`'s params, or
@@ -242,9 +274,7 @@ impl Conn {
             r.closing_subs.insert(key.to_string());
             id
         };
-        let method = serde_json::to_string(&format!("{}.call_unsub", self.ns())).unwrap_or_default();
-        let frame = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":{method},"params":[{key}]}}"#);
-        let _ = self.out.send(frame.into_bytes());
+        self.send_unsub(id, key);
     }
 
     /// How many subscriptions are routed now.
@@ -303,8 +333,7 @@ impl Conn {
                 r.closing.insert(uid, key.clone());
                 r.closing_subs.insert(key.clone());
                 drop(r);
-                let method = serde_json::to_string(&format!("{}.call_unsub", self.ns())).unwrap_or_default();
-                let _ = self.out.send(format!(r#"{{"jsonrpc":"2.0","id":{uid},"method":{method},"params":[{key}]}}"#).into_bytes());
+                self.send_unsub(uid, &key);
             }
         }
     }
@@ -415,6 +444,38 @@ pub(super) async fn read_lines<R: AsyncRead + Unpin>(conn: &Conn, r: R) {
     }
 }
 
+/// PERF-9: read length-prefixed msgpack frames from `r` (spec/13), each
+/// crossed to its JSON text for the routing (PERF-13 reads them as bytes).
+pub(super) async fn read_frames<R: AsyncRead + Unpin>(conn: &Conn, r: R) {
+    let mut r = BufReader::with_capacity(1 << 17, r);
+    loop {
+        match crate::plexus::encoding::stdio_read_frame(&mut r, crate::plexus::encoding::MAX_FRAME).await {
+            Ok(Some(Ok(frame))) => match crate::plexus::msgpack::frame_to_json(&frame) {
+                Ok(json) => conn.on_message(&json).await,
+                Err(e) => tracing::warn!(target: "plexus::child", child = %conn.name, "an unreadable frame from the child: {e}"),
+            },
+            Ok(Some(Err(n))) => tracing::warn!(target: "plexus::child", child = %conn.name, "a frame of {n} bytes from the child, over the cap, dropped"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+}
+
+/// PERF-9: the writer under msgpack — everything queued, each frame its
+/// 4-byte length and its map, one write per wakeup (spec/13).
+pub(super) async fn write_frames<W: tokio::io::AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    let mut buf = Vec::new();
+    while let Some(first) = rx.recv().await {
+        buf.clear();
+        crate::plexus::encoding::stdio_frame(&first, &mut buf);
+        while let Ok(more) = rx.try_recv() {
+            crate::plexus::encoding::stdio_frame(&more, &mut buf);
+        }
+        if w.write_all(&buf).await.is_err() || w.flush().await.is_err() {
+            break;
+        }
+    }
+}
+
 /// The writer: everything queued, one write per wakeup, each line whole.
 pub(super) async fn write_lines<W: tokio::io::AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(first) = rx.recv().await {
@@ -513,7 +574,7 @@ impl Shared {
     pub(super) async fn connect_once(self: &Arc<Self>) -> Result<(Arc<Conn>, Value, MountTimings), String> {
         let t0 = Instant::now();
         let conn = match &self.spec {
-            ChildSpec::Stdio { argv, .. } => self.spawn_stdio(argv)?,
+            ChildSpec::Stdio { argv, .. } => self.spawn_stdio(argv).await?,
             ChildSpec::Ws { url, .. } => self.dial_ws(url).await?,
         };
         let asked = async {
@@ -537,7 +598,7 @@ impl Shared {
         }
     }
 
-    fn spawn_stdio(self: &Arc<Self>, argv: &[String]) -> Result<Arc<Conn>, String> {
+    async fn spawn_stdio(self: &Arc<Self>, argv: &[String]) -> Result<Arc<Conn>, String> {
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .env_clear()
@@ -549,17 +610,46 @@ impl Shared {
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| format!("spawning `{}`: {e}", argv[0]))?;
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
+        let (Some(mut stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
             return Err("its pipes were not opened".into());
         };
+        let name = self.name.clone();
+        let span = tracing::info_span!(target: "plexus::child", "plexus::child", name = %name);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                let _e = span.enter();
+                tracing::info!(target: "plexus::child", child = %name, "{l}");
+            }
+        });
+        // PERF-9 (spec/13): the first line asks for an encoding — a request,
+        // so a child from before spec/13 answers it (`-32601`) and is spoken
+        // to in JSON lines.
+        let mut stdout = BufReader::with_capacity(1 << 17, stdout);
+        let encoding = match self.negotiate_stdio(&mut stdin, &mut stdout).await {
+            Ok(e) => e,
+            Err(why) => {
+                let _ = child.start_kill();
+                return Err(why);
+            }
+        };
         let (out, out_rx) = mpsc::unbounded_channel();
-        let conn = Conn::new(&self.name, child.id(), out, self.opts.buffer, Arc::clone(&self.counters));
-        tokio::spawn(write_lines(stdin, out_rx));
+        let conn = Conn::new(&self.name, child.id(), encoding, out, self.opts.buffer, Arc::clone(&self.counters));
+        match encoding {
+            WireEncoding::Msgpack => tokio::spawn(write_frames(stdin, out_rx)),
+            _ => tokio::spawn(write_lines(stdin, out_rx)),
+        };
         let reader = Arc::clone(&conn);
         let shared = Arc::downgrade(self);
         tokio::spawn(async move {
+            let read = async {
+                match reader.encoding {
+                    WireEncoding::Msgpack => read_frames(&reader, stdout).await,
+                    _ => read_lines(&reader, stdout).await,
+                }
+            };
             tokio::select! {
-                _ = read_lines(&reader, stdout) => {}
+                _ = read => {}
                 _ = reader.shutdown.notified() => {
                     let _ = child.start_kill();
                 }
@@ -567,16 +657,44 @@ impl Shared {
             let status = child.wait().await.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
             gone(&shared, &reader, &format!("the process exited ({status})"));
         });
-        let name = self.name.clone();
-        tokio::spawn(async move {
-            let span = tracing::info_span!(target: "plexus::child", "plexus::child", name = %name);
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(l)) = lines.next_line().await {
-                let _e = span.enter();
-                tracing::info!(target: "plexus::child", child = %name, "{l}");
-            }
-        });
         Ok(conn)
+    }
+
+    /// stdio's first line (spec/13): ask for the options' encodings, read the
+    /// child's first line within the timeout. A pick is spoken; a child from
+    /// before spec/13 answers the request `-32601` and is spoken to in JSON
+    /// lines; one that offers none of them is not mounted.
+    async fn negotiate_stdio<W, R>(&self, stdin: &mut W, stdout: &mut BufReader<R>) -> Result<WireEncoding, String>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: AsyncRead + Unpin,
+    {
+        use crate::plexus::encoding::{stdio_ask_line, stdio_read_answer, StdioAnswer};
+        if self.opts.encodings.is_empty() {
+            return Ok(WireEncoding::Json);
+        }
+        let line = stdio_ask_line(0, &self.opts.encodings) + "\n";
+        let asked = async {
+            stdin.write_all(line.as_bytes()).await.map_err(|e| format!("writing its first line: {e}"))?;
+            stdin.flush().await.map_err(|e| format!("writing its first line: {e}"))?;
+            let mut answer = Vec::new();
+            loop {
+                answer.clear();
+                if stdout.read_until(b'\n', &mut answer).await.map_err(|e| format!("reading its first line: {e}"))? == 0 {
+                    return Err("it ended before it answered its first line".to_string());
+                }
+                if answer.iter().any(|b| !b.is_ascii_whitespace()) {
+                    return Ok(answer);
+                }
+            }
+        };
+        let answer = tokio::time::timeout(self.opts.timeout, asked).await.map_err(|_| format!("it did not answer its first line within {:?}", self.opts.timeout))??;
+        match stdio_read_answer(&answer, 0) {
+            StdioAnswer::Picked(e) if self.opts.encodings.contains(&e) => Ok(e),
+            StdioAnswer::Picked(e) => Err(format!("it picked {e}, which was not asked")),
+            StdioAnswer::Refused(offered) => Err(format!("it offers {}, none of {:?}", offered.join(", "), self.opts.encodings)),
+            StdioAnswer::NotAnswered => Ok(WireEncoding::Json),
+        }
     }
 
     #[cfg(feature = "child-ws")]

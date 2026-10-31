@@ -11,8 +11,10 @@
 //! | it does not (jsonrpsee's own sink: stdio, an in-memory module) | the item's bytes go to the sink as one raw value, as before |
 //! | one change fans out to N watchers ([`Shared`]) | the first socket that sends it encodes it, once; every other writes those bytes |
 //!
-//! PERF-8 batches frames from here (`results: […]`), PERF-9 adds an encoding
-//! ([`WireEncoding`]), PERF-13 relays a child's content as bytes.
+//! | the connection speaks msgpack (PERF-9, spec/13) | the event is encoded once as a msgpack map with its field names ([`super::msgpack`]), the frame is the notification's map around it, and the socket sends it as one binary message — no JSON on the path |
+//!
+//! PERF-8 batches frames from here (`results: […]`), PERF-13 relays a
+//! child's content as bytes.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -29,10 +31,11 @@ use super::types::{PlexusStreamItem, StreamMetadata};
 // Content
 // ---------------------------------------------------------------------------
 
-/// A `data` item's content: the method's event, encoded once (JSON bytes),
-/// or a `Value` — whichever the item was made with. Reads as a `Value`
-/// either way ([`Content::value`], `Deref`), the bytes decoded once on
-/// demand; serializes as its JSON. Equal as JSON is equal.
+/// A `data` item's content: the method's event, encoded once (JSON bytes,
+/// or msgpack bytes on a msgpack connection), or a `Value` — whichever the
+/// item was made with. Reads as a `Value` either way ([`Content::value`],
+/// `Deref`), the bytes decoded once on demand; serializes as its JSON (or,
+/// to the msgpack writer, as its msgpack). Equal as JSON is equal.
 #[derive(Clone, Default)]
 pub struct Content(Repr);
 
@@ -42,6 +45,9 @@ enum Repr {
     /// JSON text serde_json wrote (valid by construction), and its `Value`
     /// once someone asked for it.
     Json { text: Bytes, value: OnceLock<Value> },
+    /// PERF-9: one msgpack value (this crate's writer's, or checked), and
+    /// its `Value` once someone asked for it.
+    Msgpack { bytes: Bytes, value: OnceLock<Value> },
 }
 
 impl Default for Repr {
@@ -67,11 +73,30 @@ impl Content {
         Content(Repr::Json { text, value: OnceLock::new() })
     }
 
+    /// Content that is one msgpack value, checked (decoded once, kept as its
+    /// `Value`): a child's content read off a msgpack link (PERF-13).
+    pub fn from_msgpack(bytes: Bytes) -> Result<Self, super::msgpack::Error> {
+        let v = super::msgpack::to_value(&bytes)?;
+        let value = OnceLock::new();
+        let _ = value.set(v);
+        Ok(Content(Repr::Msgpack { bytes, value }))
+    }
+
+    /// msgpack this crate's writer wrote, taken as it is.
+    pub(crate) fn msgpack(bytes: Bytes) -> Self {
+        Content(Repr::Msgpack { bytes, value: OnceLock::new() })
+    }
+
+    fn decode_msgpack(bytes: &[u8]) -> Value {
+        super::msgpack::to_value(bytes).unwrap_or(Value::Null)
+    }
+
     /// The content as a `Value` (encoded bytes decoded once, kept).
     pub fn value(&self) -> &Value {
         match &self.0 {
             Repr::Value(v) => v,
             Repr::Json { text, value } => value.get_or_init(|| serde_json::from_slice(text).unwrap_or(Value::Null)),
+            Repr::Msgpack { bytes, value } => value.get_or_init(|| Self::decode_msgpack(bytes)),
         }
     }
 
@@ -80,6 +105,7 @@ impl Content {
         match self.0 {
             Repr::Value(v) => v,
             Repr::Json { text, value } => value.into_inner().unwrap_or_else(|| serde_json::from_slice(&text).unwrap_or(Value::Null)),
+            Repr::Msgpack { bytes, value } => value.into_inner().unwrap_or_else(|| Self::decode_msgpack(&bytes)),
         }
     }
 
@@ -88,6 +114,7 @@ impl Content {
         match &self.0 {
             Repr::Value(v) => v.clone(),
             Repr::Json { text, value } => value.get().cloned().unwrap_or_else(|| serde_json::from_slice(text).unwrap_or(Value::Null)),
+            Repr::Msgpack { bytes, value } => value.get().cloned().unwrap_or_else(|| Self::decode_msgpack(bytes)),
         }
     }
 
@@ -100,6 +127,8 @@ impl Content {
                 Some(v) => T::deserialize(v),
                 None => serde_json::from_slice(text),
             },
+            // As a JSON reader reads it: through its `Value`.
+            Repr::Msgpack { .. } => T::deserialize(self.value()),
         }
     }
 
@@ -107,21 +136,51 @@ impl Content {
     pub fn json_bytes(&self) -> Option<&Bytes> {
         match &self.0 {
             Repr::Json { text, .. } => Some(text),
-            Repr::Value(_) => None,
+            Repr::Value(_) | Repr::Msgpack { .. } => None,
         }
     }
 
-    /// Whether the content was encoded once from its event (PERF-7).
+    /// The msgpack the content was encoded as, when it was (PERF-9).
+    pub fn msgpack_bytes(&self) -> Option<&Bytes> {
+        match &self.0 {
+            Repr::Msgpack { bytes, .. } => Some(bytes),
+            Repr::Value(_) | Repr::Json { .. } => None,
+        }
+    }
+
+    /// Whether the content was encoded once from its event (PERF-7), in
+    /// either encoding.
     pub fn is_encoded(&self) -> bool {
-        matches!(self.0, Repr::Json { .. })
+        matches!(self.0, Repr::Json { .. } | Repr::Msgpack { .. })
+    }
+
+    /// The size of its encoded bytes (a guess for one that is a `Value`).
+    fn encoded_len(&self) -> usize {
+        match &self.0 {
+            Repr::Json { text, .. } => text.len(),
+            Repr::Msgpack { bytes, .. } => bytes.len(),
+            Repr::Value(_) => 256,
+        }
     }
 
     /// Its JSON text, appended to `out`: the bytes, or the `Value` written.
     fn write_json(&self, out: &mut BytesMut) {
         match &self.0 {
             Repr::Json { text, .. } => out.put_slice(text),
-            Repr::Value(v) => {
-                let _ = serde_json::to_writer((&mut *out).writer(), v);
+            Repr::Value(_) | Repr::Msgpack { .. } => {
+                let _ = serde_json::to_writer((&mut *out).writer(), self.value());
+            }
+        }
+    }
+
+    /// Its msgpack, appended to `out`: the bytes, or the `Value` written.
+    fn write_msgpack(&self, out: &mut BytesMut) {
+        match &self.0 {
+            Repr::Msgpack { bytes, .. } => out.put_slice(bytes),
+            Repr::Value(_) | Repr::Json { .. } => {
+                if super::msgpack::write(out, self.value()).is_err() {
+                    super::msgpack::put_nil(out);
+                }
             }
         }
     }
@@ -168,6 +227,7 @@ impl std::fmt::Debug for Content {
         match &self.0 {
             Repr::Value(v) => v.fmt(f),
             Repr::Json { text, .. } => write!(f, "{}", String::from_utf8_lossy(text)),
+            Repr::Msgpack { .. } => self.value().fmt(f),
         }
     }
 }
@@ -177,23 +237,30 @@ impl std::fmt::Display for Content {
         match &self.0 {
             Repr::Value(v) => v.fmt(f),
             Repr::Json { text, .. } => f.write_str(&String::from_utf8_lossy(text)),
+            Repr::Msgpack { .. } => self.value().fmt(f),
         }
     }
 }
 
 impl Serialize for Content {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if let Repr::Json { text, value } = &self.0 {
-            // serde_json writes a raw value as it is; any other serializer
-            // gets the `Value`.
-            if writing_json() {
-                if let Ok(raw) = serde_json::from_slice::<&RawValue>(text) {
-                    return raw.serialize(s);
+        match &self.0 {
+            // serde_json writes a raw value as it is, and the msgpack writer
+            // its own bytes as they are; any other serializer gets the `Value`.
+            Repr::Json { text, value } => {
+                if writing_json() {
+                    if let Ok(raw) = serde_json::from_slice::<&RawValue>(text) {
+                        return raw.serialize(s);
+                    }
+                }
+                if let Some(v) = value.get() {
+                    return v.serialize(s);
                 }
             }
-            if let Some(v) = value.get() {
-                return v.serialize(s);
+            Repr::Msgpack { bytes, .. } if super::msgpack::writing() => {
+                return super::msgpack::Raw(bytes).serialize(s);
             }
+            _ => {}
         }
         self.value().serialize(s)
     }
@@ -224,14 +291,17 @@ impl schemars::JsonSchema for Content {
 // The connection's encoding and its frames
 // ---------------------------------------------------------------------------
 
-/// The encoding of every frame on a connection, fixed when it opens. JSON
-/// text until PERF-9 adds msgpack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The encoding of every frame on a connection, fixed when it opens
+/// (spec/13; [`super::encoding`] negotiates it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum WireEncoding {
-    /// JSON-RPC 2.0 objects, one text message each.
+    /// JSON-RPC 2.0 objects, one text message each (`plexus.json`).
     #[default]
     Json,
+    /// PERF-9: the same objects as msgpack maps, their field names kept and
+    /// `jsonrpc` left out, one binary message each (`plexus.msgpack`).
+    Msgpack,
 }
 
 /// A frame ready for a socket, in its connection's encoding.
@@ -242,7 +312,8 @@ pub struct WireFrame {
 }
 
 impl WireFrame {
-    /// The frame's bytes (JSON text under [`WireEncoding::Json`]).
+    /// The frame's bytes (JSON text under [`WireEncoding::Json`], one
+    /// msgpack map under [`WireEncoding::Msgpack`]).
     pub fn bytes(&self) -> &Bytes {
         &self.bytes
     }
@@ -403,8 +474,7 @@ impl Buffer {
 
 /// The pipe's encoder, for the task that polls a call's stream.
 struct Encoder {
-    /// The connection's encoding: JSON until PERF-9 reads it here.
-    #[allow(dead_code)]
+    /// The connection's encoding: what the events are encoded as.
     encoding: WireEncoding,
     buffer: RefCell<Buffer>,
     /// How deep the poll is in streams [`wrap_stream`] wrapped: only the
@@ -476,41 +546,100 @@ pub(crate) fn encode<T: Serialize + ?Sized>(event: &T) -> Option<Content> {
         let mut buffer = e.buffer.borrow_mut();
         buffer.room(e.last.get().saturating_mul(2).max(256));
         debug_assert!(buffer.cur.is_empty());
-        let (written, captured) = plexus_auth_core::credential::run_with_credential_capture(|| {
-            let _json = WritingJson::on();
-            serde_json::to_writer((&mut buffer.cur).writer(), event).is_ok()
+        let encoding = e.encoding;
+        let (written, captured) = plexus_auth_core::credential::run_with_credential_capture(|| match encoding {
+            WireEncoding::Json => {
+                let _json = WritingJson::on();
+                serde_json::to_writer((&mut buffer.cur).writer(), event).is_ok()
+            }
+            // PERF-9: a map with its field names, as JSON has them.
+            WireEncoding::Msgpack => super::msgpack::write(&mut buffer.cur, event).is_ok(),
         });
         if !written || !captured.is_empty() {
             buffer.cur.clear();
             return None;
         }
         e.last.set(buffer.cur.len());
-        Some(Content::json(buffer.split()))
+        let bytes = buffer.split();
+        Some(match encoding {
+            WireEncoding::Json => Content::json(bytes),
+            WireEncoding::Msgpack => Content::msgpack(bytes),
+        })
     })
     .ok()
     .flatten()
 }
 
-/// One call's frames: the notification around each item.
+/// One call's frames: the notification around each item, in the
+/// connection's encoding.
 struct Frames {
-    /// `{"jsonrpc":"2.0","method":M,"params":{"subscription":S,"result":`
+    encoding: WireEncoding,
+    /// JSON: `{"jsonrpc":"2.0","method":M,"params":{"subscription":S,"result":`;
+    /// msgpack: the map `{method: M, params: {subscription: S, result:` —
+    /// its counts written ahead, so nothing closes it.
     prefix: Vec<u8>,
-    /// A `data` item's opening, `{"type":"data","metadata":…,"content_type":…,"content":`,
-    /// for the stream's metadata (shared by its items) and content type.
+    /// A `data` item's opening, `{"type":"data","metadata":…,"content_type":…,"content":`
+    /// (in msgpack the same map, its 4 members counted ahead), for the
+    /// stream's metadata (shared by its items) and content type.
     head: Option<(Arc<StreamMetadata>, Cow<'static, str>, Vec<u8>)>,
 }
 
 impl Frames {
-    fn new(method: &str, subscription: &jsonrpsee::types::SubscriptionId<'_>) -> Self {
-        let mut prefix = br#"{"jsonrpc":"2.0","method":"#.to_vec();
-        let _ = serde_json::to_writer(&mut prefix, method);
-        prefix.extend_from_slice(br#","params":{"subscription":"#);
-        let _ = serde_json::to_writer(&mut prefix, subscription);
-        prefix.extend_from_slice(br#","result":"#);
-        Frames { prefix, head: None }
+    fn new(method: &str, subscription: &jsonrpsee::types::SubscriptionId<'_>, encoding: WireEncoding) -> Self {
+        let mut prefix = Vec::with_capacity(64);
+        match encoding {
+            WireEncoding::Json => {
+                prefix.extend_from_slice(br#"{"jsonrpc":"2.0","method":"#);
+                let _ = serde_json::to_writer(&mut prefix, method);
+                prefix.extend_from_slice(br#","params":{"subscription":"#);
+                let _ = serde_json::to_writer(&mut prefix, subscription);
+                prefix.extend_from_slice(br#","result":"#);
+            }
+            WireEncoding::Msgpack => {
+                use super::msgpack::{put_map_len, put_str};
+                let _ = put_map_len(&mut prefix, 2);
+                put_str(&mut prefix, "method");
+                put_str(&mut prefix, method);
+                put_str(&mut prefix, "params");
+                let _ = put_map_len(&mut prefix, 2);
+                put_str(&mut prefix, "subscription");
+                if super::msgpack::write(&mut prefix, subscription).is_err() {
+                    super::msgpack::put_nil(&mut prefix);
+                }
+                put_str(&mut prefix, "result");
+            }
+        }
+        Frames { encoding, prefix, head: None }
     }
 
-    /// `item`'s JSON, written at the end of `out`.
+    /// The opening of a `data` item, through `"content":`, for `metadata`
+    /// and `content_type`.
+    fn data_head(&self, metadata: &StreamMetadata, content_type: &str) -> Vec<u8> {
+        let mut head = Vec::with_capacity(128);
+        match self.encoding {
+            WireEncoding::Json => {
+                head.extend_from_slice(br#"{"type":"data","metadata":"#);
+                let _ = serde_json::to_writer(&mut head, metadata);
+                head.extend_from_slice(br#","content_type":"#);
+                let _ = serde_json::to_writer(&mut head, content_type);
+                head.extend_from_slice(br#","content":"#);
+            }
+            WireEncoding::Msgpack => {
+                use super::msgpack::{put_map_len, put_str};
+                let _ = put_map_len(&mut head, 4);
+                put_str(&mut head, "type");
+                put_str(&mut head, "data");
+                put_str(&mut head, "metadata");
+                let _ = super::msgpack::write(&mut head, metadata);
+                put_str(&mut head, "content_type");
+                put_str(&mut head, content_type);
+                put_str(&mut head, "content");
+            }
+        }
+        head
+    }
+
+    /// `item`, written at the end of `out` in the connection's encoding.
     fn item(&mut self, out: &mut BytesMut, item: &PlexusStreamItem) {
         match item {
             PlexusStreamItem::Data { metadata, content_type, content } => {
@@ -519,35 +648,48 @@ impl Frames {
                     None => true,
                 };
                 if fresh {
-                    let mut head = br#"{"type":"data","metadata":"#.to_vec();
-                    let _ = serde_json::to_writer(&mut head, &**metadata);
-                    head.extend_from_slice(br#","content_type":"#);
-                    let _ = serde_json::to_writer(&mut head, content_type.as_ref());
-                    head.extend_from_slice(br#","content":"#);
+                    let head = self.data_head(metadata, content_type);
                     self.head = Some((metadata.clone(), content_type.clone(), head));
                 }
                 let head = &self.head.as_ref().expect("made above").2;
-                out.reserve(head.len() + content.json_bytes().map_or(64, Bytes::len) + 1);
+                out.reserve(head.len() + content.encoded_len() + 1);
                 out.put_slice(head);
-                content.write_json(out);
-                out.put_u8(b'}');
+                match self.encoding {
+                    WireEncoding::Json => {
+                        content.write_json(out);
+                        out.put_u8(b'}');
+                    }
+                    WireEncoding::Msgpack => content.write_msgpack(out),
+                }
             }
-            other => {
-                let _ = serde_json::to_writer((&mut *out).writer(), other);
-            }
+            other => match self.encoding {
+                WireEncoding::Json => {
+                    let _ = serde_json::to_writer((&mut *out).writer(), other);
+                }
+                WireEncoding::Msgpack => {
+                    let start = out.len();
+                    if super::msgpack::write(out, other).is_err() {
+                        // Not one value: no item at all is better than half of one.
+                        out.truncate(start);
+                        super::msgpack::put_nil(out);
+                    }
+                }
+            },
         }
     }
 
     /// The notification carrying `item`: the frame a socket writes.
     fn frame(&mut self, buffer: &mut Buffer, item: &PlexusStreamItem) -> Bytes {
         let content = match item {
-            PlexusStreamItem::Data { content, .. } => content.json_bytes().map_or(256, Bytes::len),
+            PlexusStreamItem::Data { content, .. } => content.encoded_len(),
             _ => 256,
         };
         buffer.room(self.prefix.len() + content + 256);
         buffer.cur.put_slice(&self.prefix);
         self.item(&mut buffer.cur, item);
-        buffer.cur.put_slice(b"}}");
+        if self.encoding == WireEncoding::Json {
+            buffer.cur.put_slice(b"}}");
+        }
         buffer.split()
     }
 
@@ -580,7 +722,8 @@ pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::P
 async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, frames: Option<FrameSink>) -> jsonrpsee::core::SubscriptionResult {
     use futures::StreamExt;
     let connection = sink.connection_id().0;
-    let mut notification = Frames::new(sink.method_name(), &sink.subscription_id());
+    let encoding = frames.as_ref().map(FrameSink::encoding).unwrap_or_default();
+    let mut notification = Frames::new(sink.method_name(), &sink.subscription_id(), encoding);
     let mut first = true;
     let out: jsonrpsee::core::SubscriptionResult = async {
         loop {
@@ -631,8 +774,9 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
 
 /// An event many streams send — one change fanned out to every watcher.
 /// The first socket that sends it encodes it, once; every other writes
-/// those bytes as they are (PERF-7's fan-out). Anywhere else (in process, a
-/// `Value`, another encoding) it serializes as `T` does. Reads as `T`.
+/// those bytes as they are (PERF-7's fan-out) — once per encoding: the JSON
+/// and the msgpack sockets each share theirs (PERF-9). Anywhere else (in
+/// process, a `Value`) it serializes as `T` does. Reads as `T`.
 ///
 /// An event that carries a credential is not kept encoded: each stream
 /// encodes it, so each assembles its own `_credentials` envelope.
@@ -642,17 +786,20 @@ struct SharedInner<T> {
     value: T,
     /// The JSON the first socket wrote (`None`: never kept — a credential).
     json: OnceLock<Option<Box<RawValue>>>,
+    /// The msgpack the first msgpack socket wrote (`None`: a credential).
+    msgpack: OnceLock<Option<Vec<u8>>>,
 }
 
 impl<T> Shared<T> {
     /// `value`, to be sent by many streams.
     pub fn new(value: T) -> Self {
-        Shared(Arc::new(SharedInner { value, json: OnceLock::new() }))
+        Shared(Arc::new(SharedInner { value, json: OnceLock::new(), msgpack: OnceLock::new() }))
     }
 
-    /// Whether this event has been encoded (a socket has sent it).
+    /// Whether this event has been encoded (a socket has sent it), in
+    /// either encoding.
     pub fn is_encoded(&self) -> bool {
-        matches!(self.0.json.get(), Some(Some(_)))
+        matches!(self.0.json.get(), Some(Some(_))) || matches!(self.0.msgpack.get(), Some(Some(_)))
     }
 }
 
@@ -664,6 +811,19 @@ impl<T: Serialize> Shared<T> {
                 let (text, captured) = plexus_auth_core::credential::run_with_credential_capture(|| serde_json::to_string(&self.0.value));
                 match text {
                     Ok(text) if captured.is_empty() => RawValue::from_string(text).ok(),
+                    _ => None,
+                }
+            })
+            .as_deref()
+    }
+
+    fn encoded_msgpack(&self) -> Option<&[u8]> {
+        self.0
+            .msgpack
+            .get_or_init(|| {
+                let (bytes, captured) = plexus_auth_core::credential::run_with_credential_capture(|| super::msgpack::to_vec(&self.0.value));
+                match bytes {
+                    Ok(bytes) if captured.is_empty() => Some(bytes),
                     _ => None,
                 }
             })
@@ -701,6 +861,10 @@ impl<T: Serialize> Serialize for Shared<T> {
         if writing_json() {
             if let Some(raw) = self.encoded() {
                 return raw.serialize(s);
+            }
+        } else if super::msgpack::writing() {
+            if let Some(bytes) = self.encoded_msgpack() {
+                return super::msgpack::Raw(bytes).serialize(s);
             }
         }
         self.0.value.serialize(s)

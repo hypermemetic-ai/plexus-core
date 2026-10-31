@@ -4,7 +4,7 @@
 //! responses with metadata. Activations return typed domain events, and
 //! the caller uses these helpers to create PlexusStreamItems.
 
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, Stream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::pin::Pin;
@@ -57,45 +57,78 @@ pub fn wrap_stream<T: Serialize + Send + 'static>(
     provenance: Vec<String>,
 ) -> PlexusStream {
     let plexus_hash = PlexusContext::hash();
-    let metadata = StreamMetadata::new(provenance.clone(), plexus_hash.clone());
-    let done_metadata = StreamMetadata::new(provenance, plexus_hash);
-
-    // Per AUTHZ-CRED-CORE-2 §"Risks" #1: acquire the capture path
-    // unconditionally rather than gating on a static
-    // method-returns-credentials flag. The thread-local probe is
-    // nanoseconds; the cost is negligible and removes the
-    // static-knowledge dependency on the `mdCredentials` registry. When
-    // the payload contains no credentials, the captured map is empty,
-    // the envelope assembly emits no `_credentials` key, and the wire
-    // shape is byte-identical to today.
-    //
-    // The cookie projector here is `None` because plexus-core itself
-    // does not know what transport is attached to this stream. The
-    // transport layer (AUTHZ-CRED-CORE-2 follow-up in plexus-transport)
-    // re-runs the cookie projection with `All` at the moment it owns
-    // the HTTP response surface. For now we always leave the cookie
-    // value in the sidecar; the transport may strip it later when it
-    // emits the `Set-Cookie` header.
-    let projector = CookieProjector::None;
-
-    let data_stream = stream.map(move |item| {
-        let (payload, captured) = serialize_with_credential_capture(&item);
-        let (content, _hints) =
-            assemble_envelope_content(payload, captured, &projector);
-        PlexusStreamItem::Data {
-            metadata: metadata.clone(),
-            content_type: content_type.to_string(),
-            content,
-        }
-    });
-
-    let done_stream = stream::once(async move { PlexusStreamItem::Done {
-        metadata: done_metadata,
-    }});
-
-    Box::pin(data_stream.chain(done_stream))
+    let metadata = Arc::new(StreamMetadata::new(provenance.clone(), plexus_hash.clone()));
+    let done = StreamMetadata::new(provenance, plexus_hash);
+    Box::pin(Wrapped { inner: stream, metadata, content_type, done: Some(done), ended: false })
 }
 
+pin_project_lite::pin_project! {
+    /// [`wrap_stream`]'s stream. PERF-7: each event is a `Data` item whose
+    /// metadata is the stream's (shared, not cloned), whose content type is
+    /// the method's, and whose content is the event encoded once — straight
+    /// into the WebSocket pipe's buffer when the pipe polls this stream
+    /// ([`super::wire::pipe`]), as a `Value` anywhere else.
+    struct Wrapped<S> {
+        #[pin]
+        inner: S,
+        metadata: Arc<StreamMetadata>,
+        content_type: &'static str,
+        done: Option<StreamMetadata>,
+        ended: bool,
+    }
+}
+
+impl<S, T> Stream for Wrapped<S>
+where
+    S: Stream<Item = T>,
+    T: Serialize,
+{
+    type Item = PlexusStreamItem;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<PlexusStreamItem>> {
+        use std::task::Poll;
+        let this = self.project();
+        if !*this.ended {
+            // A stream the method polls inside its own (a call it routes and
+            // reads in process) is not the pipe's: one level deeper.
+            match super::wire::nested(|| this.inner.poll_next(cx)) {
+                Poll::Ready(Some(event)) => {
+                    return Poll::Ready(Some(PlexusStreamItem::Data {
+                        metadata: this.metadata.clone(),
+                        content_type: std::borrow::Cow::Borrowed(*this.content_type),
+                        content: content_of(&event),
+                    }))
+                }
+                Poll::Ready(None) => *this.ended = true,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(this.done.take().map(|metadata| PlexusStreamItem::Done { metadata }))
+    }
+}
+
+/// An event's content: encoded once into the pipe's buffer when the pipe
+/// polls this stream (PERF-7), else — and for an event carrying a
+/// credential, whose envelope is assembled as before — a `Value`.
+///
+/// # Dispatch-time credential interception (AUTHZ-CRED-CORE-2)
+///
+/// Either way the serialization runs under the credential capture: a
+/// `Credential<T>` writes its sentinel inline and its value is captured.
+/// An event that captured none is today's payload exactly (encoded, the
+/// same JSON); one that captured any takes the `Value` path, where
+/// [`assemble_envelope_content`] adds its `_credentials` envelope.
+///
+/// The cookie projector is `None` because plexus-core does not know what
+/// transport is attached to this stream; the transport may project later.
+fn content_of<T: Serialize>(event: &T) -> super::wire::Content {
+    if let Some(content) = super::wire::encode(event) {
+        return content;
+    }
+    let (payload, captured) = serialize_with_credential_capture(event);
+    let (content, _hints) = assemble_envelope_content(payload, captured, &CookieProjector::None);
+    super::wire::Content::from(content)
+}
 
 /// Create a bidirectional channel and wrap a stream, merging Request items
 ///

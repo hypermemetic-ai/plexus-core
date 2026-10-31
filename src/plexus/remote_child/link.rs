@@ -684,7 +684,7 @@ async fn ask(conn: &Conn, method: &str, params: Value, timeout: Duration) -> Res
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(PlexusStreamItem::Data { content, .. })) => {
                 if first.is_none() {
-                    first = Some(content);
+                    first = Some(content.into_value());
                 }
             }
             Ok(Some(PlexusStreamItem::Error { message, .. })) => return Err(message),

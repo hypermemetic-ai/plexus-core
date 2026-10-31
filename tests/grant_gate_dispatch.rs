@@ -119,7 +119,7 @@ async fn data(stream: PlexusStream) -> Vec<serde_json::Value> {
     stream
         .filter_map(|i| async move {
             match i {
-                PlexusStreamItem::Data { content, .. } => Some(content),
+                PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
                 _ => None,
             }
         })
@@ -323,7 +323,7 @@ async fn a_stream_follows_grants_as_they_stand() {
     // The first event is checked against the memberships as they stand…
     let first = loop {
         match stream.next().await.unwrap() {
-            PlexusStreamItem::Data { content, .. } => break content,
+            PlexusStreamItem::Data { content, .. } => break content.into_value(),
             _ => continue,
         }
     };

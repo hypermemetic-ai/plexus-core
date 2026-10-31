@@ -305,7 +305,7 @@ impl ServerHandler for PlexusMcpBridge {
                     content, content_type, ..
                 } => {
                     // Buffer data for final result
-                    buffered_data.push(content.clone());
+                    buffered_data.push(content.to_value());
 
                     // Also stream via notifications for real-time consumers
                     let _ = ctx

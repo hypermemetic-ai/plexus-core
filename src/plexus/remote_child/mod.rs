@@ -255,7 +255,7 @@ impl RemoteChild {
             None => serde_json::to_value(&self.inner.schema).unwrap_or_default(),
         };
         Box::pin(futures::stream::iter([
-            PlexusStreamItem::Data { metadata: meta(&ns), content_type: format!("{ns}.schema"), content },
+            PlexusStreamItem::Data { metadata: meta(&ns).into(), content_type: format!("{ns}.schema").into(), content: content.into() },
             PlexusStreamItem::Done { metadata: meta(&ns) },
         ]))
     }

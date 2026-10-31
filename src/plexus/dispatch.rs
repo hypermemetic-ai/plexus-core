@@ -60,16 +60,17 @@ impl PlexusStreamBuilder {
         use futures::StreamExt;
 
         let plexus_hash = PlexusContext::hash();
-        let metadata = StreamMetadata::new(provenance, plexus_hash);
+        let metadata = std::sync::Arc::new(StreamMetadata::new(provenance, plexus_hash));
+        let content_type: std::borrow::Cow<'static, str> = content_type.into();
 
         Box::pin(stream.map(move |item| match item {
             StreamItem::Data(value) => PlexusStreamItem::Data {
                 metadata: metadata.clone(),
                 content_type: content_type.clone(),
-                content: value,
+                content: value.into(),
             },
             StreamItem::Error(err) => PlexusStreamItem::Error {
-                metadata: metadata.clone(),
+                metadata: (*metadata).clone(),
                 message: err.to_string(),
                 code: None,
                 recoverable: false,

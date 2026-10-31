@@ -359,3 +359,35 @@ async fn the_single_encode_is_todays_frame_as_json_for_every_shape() {
     let with_envelope = login.iter().filter(|i| i["content"]["type"] == "login").find(|i| i["content"].get("_credentials").is_some());
     assert!(with_envelope.is_some(), "a credential's item carries `_credentials`");
 }
+
+/// The socket's frames are the events' own encoding: a `fields` item's keys
+/// in its type's order (`zulu` before `alpha`), where a `Value` would sort
+/// them — the frame was written once from the event, not through a `Value`.
+/// Read raw, as the bytes the socket carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sockets_frame_is_the_events_own_encoding() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let module = DynamicHub::arc_into_rpc_module(lab()).unwrap();
+    let (_server, addr) =
+        plexus_transport::websocket::serve_websocket_with(module, plexus_transport::WebSocketConfig::new(0), None, Default::default()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}")).await.unwrap();
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "lab.call", "params": {"method": "shapes.all", "params": {"seed": 7, "n": 200}}});
+    ws.send(Message::Text(call.to_string().into())).await.unwrap();
+    let mut fields = 0;
+    loop {
+        let text = match tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("a frame in 10 s").unwrap().unwrap() {
+            Message::Text(t) => t.to_string(),
+            _ => continue,
+        };
+        if text.contains(r#""content":{"type":"fields""#) {
+            fields += 1;
+            let (z, a) = (text.find(r#""zulu":"#).unwrap(), text.find(r#""alpha":"#).unwrap());
+            assert!(z < a, "the event's keys in its type's order on the wire: {text}");
+        }
+        if text.contains(r#""result":{"type":"done""#) {
+            break;
+        }
+    }
+    assert!(fields > 0, "the seed reached `fields`");
+}

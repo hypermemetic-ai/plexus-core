@@ -109,6 +109,12 @@ pub enum PlexusStreamItem {
         /// Metadata from calling layer
         metadata: StreamMetadata,
     },
+
+    /// NAIVE (PERF-7's red evidence, never merged): a `data` item encoded
+    /// once under the pipe — PERF-17's E1b without its decode-first fix.
+    #[serde(skip)]
+    #[schemars(skip)]
+    Encoded(Box<serde_json::value::RawValue>),
 }
 
 impl PlexusStreamItem {
@@ -198,6 +204,7 @@ impl PlexusStreamItem {
             Self::Error { metadata, .. } => Some(metadata),
             Self::Done { metadata } => Some(metadata),
             Self::Request { .. } => None,
+            Self::Encoded(_) => None,
         }
     }
 }

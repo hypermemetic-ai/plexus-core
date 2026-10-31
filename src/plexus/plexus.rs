@@ -2635,6 +2635,7 @@ async fn pipe_stream_to_subscription(
 
     let sink = pending.accept().await?;
     let connection = sink.connection_id().0;
+    super::streaming::NAIVE_PIPE.scope(true, async move {
     loop {
         let item = tokio::select! {
             biased;
@@ -2645,10 +2646,14 @@ async fn pipe_stream_to_subscription(
         if let super::types::PlexusStreamItem::Request { request_id, .. } = &item {
             super::bidirectional::bind_asker(request_id, connection);
         }
-        let json = serde_json::value::to_raw_value(&item)?;
+        let json = match item {
+            super::types::PlexusStreamItem::Encoded(raw) => raw,
+            item => serde_json::value::to_raw_value(&item)?,
+        };
         sink.send(json).await?;
     }
     Ok(())
+    }).await
 }
 
 // ============================================================================

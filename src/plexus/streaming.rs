@@ -19,6 +19,11 @@ use super::credential_envelope::{
 };
 use super::types::{PlexusStreamItem, StreamMetadata};
 
+tokio::task_local! {
+    /// NAIVE: set by the pipe for the task that polls a call's stream.
+    pub static NAIVE_PIPE: bool;
+}
+
 /// Type alias for boxed stream of PlexusStreamItem
 pub type PlexusStream = Pin<Box<dyn Stream<Item = PlexusStreamItem> + Send>>;
 
@@ -79,6 +84,13 @@ pub fn wrap_stream<T: Serialize + Send + 'static>(
     let projector = CookieProjector::None;
 
     let data_stream = stream.map(move |item| {
+        if NAIVE_PIPE.try_with(|v| *v).unwrap_or(false) {
+            let content = serde_json::to_value(&item).unwrap_or_default();
+            let whole = serde_json::json!({"type": "data", "metadata": metadata, "content_type": content_type, "content": content});
+            if let Ok(raw) = serde_json::value::to_raw_value(&whole) {
+                return PlexusStreamItem::Encoded(raw);
+            }
+        }
         let (payload, captured) = serialize_with_credential_capture(&item);
         let (content, _hints) =
             assemble_envelope_content(payload, captured, &projector);

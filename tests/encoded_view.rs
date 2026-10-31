@@ -119,12 +119,18 @@ fn key(p: &str, agent: &str) -> AuthContext {
 }
 
 /// AUTH-4's gated service: ada an editor on MENGER, root admin everywhere.
-fn gated() -> Arc<DynamicHub> {
+/// With `scopes`, R-5's scope gate is configured too (an empty registry):
+/// its introspection is routed on every call and its content replaced as
+/// the stream is read — the rewrite a lazily encoded item meets on the wire.
+fn gated(scopes: bool) -> Arc<DynamicHub> {
     let backend = Arc::new(MemoryAuthBackend::new("http://127.0.0.1:4456/login"));
     let roles = Arc::new(MemoryRoles::default());
     let memberships = Arc::new(MemoryMemberships::new().with(ADA, "editor", "MENGER").with(ROOT, "admin", "*"));
-    let hub = DynamicHub::new("menger")
-        .register(TicketsActivation)
+    let mut hub = DynamicHub::new("menger").register(TicketsActivation);
+    if scopes {
+        hub = hub.with_scope_registry(plexus_auth_core::ScopeRegistry::builder().build().unwrap());
+    }
+    let hub = hub
         .with_auth(AuthSetup::new(backend, roles.clone(), memberships, Arc::new(Shortcodes)))
         .with_resource_metadata("http://127.0.0.1:4456/.well-known/oauth-protected-resource");
     roles.seed(&hub.declared_roles());
@@ -309,8 +315,16 @@ fn agree(what: &str, wire: &[Value], here: &[Value]) {
 }
 
 #[tokio::test]
-async fn every_caller_reads_on_the_wire_what_it_is_answered_in_process() {
-    let hub = gated();
+async fn behind_the_gate_every_caller_reads_on_the_wire_what_it_is_answered_in_process() {
+    every_caller_reads_what_it_is_answered(gated(false)).await;
+}
+
+#[tokio::test]
+async fn behind_the_scope_gate_too_every_caller_reads_on_the_wire_what_it_is_answered_in_process() {
+    every_caller_reads_what_it_is_answered(gated(true)).await;
+}
+
+async fn every_caller_reads_what_it_is_answered(hub: Arc<DynamicHub>) {
     let (_server, url) = serve(hub.clone()).await;
     let mut seen_views = Vec::new();
     for (name, who) in callers() {

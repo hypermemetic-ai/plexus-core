@@ -282,6 +282,7 @@ impl ServerHandler for PlexusMcpBridge {
             }
 
             match &item {
+                PlexusStreamItem::Encoded(_) => {}
                 PlexusStreamItem::Progress {
                     message,
                     percentage,

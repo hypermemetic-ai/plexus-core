@@ -95,6 +95,7 @@ pub(crate) fn to_client_item(item: PlexusStreamItem) -> StreamItem {
     }
 
     match item {
+        PlexusStreamItem::Encoded(_) => unreachable!("NAIVE: only the pipe encodes"),
         PlexusStreamItem::Data {
             metadata,
             content_type,

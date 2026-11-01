@@ -5,6 +5,33 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0]
+
+Upgrading from 0.6.1, the last published version. 0.6.2 below was never
+published, so its changes reach crates.io here.
+
+### Breaking
+
+| Change | Before | After | What to do |
+|---|---|---|---|
+| `PlexusStreamItem::Data.content` | `Value` | `Content` | Read it with `into_value`; `PlexusStreamItem::data` still takes a `Value` |
+| `PlexusStreamItem::Data.metadata` | `StreamMetadata` | `Arc<StreamMetadata>` | Wrap the value in a struct literal; reads go through the `Arc` |
+| `PlexusStreamItem::Error` | no `fields` | `fields: serde_json::Map<String, Value>` | Name `fields` in a struct literal, or use `..`; empty serializes as before |
+| A response to a bound question | any caller could answer | `BidirError::NotThisCall` from another connection | Add the variant to an exhaustive match; answer from the connection that was asked |
+| A key no parameter claims, under `typed_params` | ignored | `-32602` invalid params | Send only declared keys; the echo activation now refuses them too |
+
+### Added
+
+- `plexus::duplex_gate`, the gate over a duplex call, and `answer_by` in
+  method schemas.
+
+### Not enforced
+
+- `answer_by` is declared and carried in the schema, but no dispatch path
+  checks it. `DuplexGate` is a library: a service must call `DuplexCall::answer`
+  itself. A method that declares `answer_by` is not protected by the
+  declaration alone.
+
 ## [0.6.2] — POLYGLOT-5: the child seam opened
 
 ### Added

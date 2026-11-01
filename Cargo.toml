@@ -1,13 +1,13 @@
 [package]
 name = "plexus-core"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
 license = "AGPL-3.0-only"
 repository = "https://github.com/hypermemetic-ai/plexus-core"
 # DIST-2: the published crate is the library — not the design notes, editor
 # settings or hooks that live beside it in the repository.
-include = ["src/**", "README.md", "CHANGELOG.md", "Cargo.toml"]
+include = ["src/**", "README.md", "CHANGELOG.md", "LICENSE", "Cargo.toml"]
 
 [lib]
 name = "plexus_core"
@@ -69,18 +69,20 @@ tokio-tungstenite = { version = "0.30", optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"], optional = true }
 base64 = { version = "0.22", optional = true }
 
-# Hub macro for activation generation
-plexus-macros = { path = "../plexus-macros", version = "0.6.1" }
+# Hub macro for activation generation. The pairing: macros and core move on
+# the same minor line; only this direction can be a bound, since the macro
+# emits paths into this crate without depending on it.
+plexus-macros = { path = "../plexus-macros", version = "0.7.0" }
 
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
 # Wasm-safe by construction; the dependency only runs this way, since
 # plexus-client must build for wasm32 and plexus-core cannot.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1" }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.7.0" }
 
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.1" }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.2" }
 
 [features]
 # POLYGLOT-5: a WebSocket child is on by default (three small crates);
@@ -103,7 +105,7 @@ required-features = ["child-ws"]
 
 [dev-dependencies]
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.6.1", features = ["ws-native"] }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.7.0", features = ["ws-native"] }
 tempfile = "3"
 # POLYGLOT-5: tests/remote_child.rs signs a WebSocket child's trust in.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
@@ -120,14 +122,15 @@ sha2 = "0.10"
 # reference/echo-rs, taken by path) on a WebSocket under `key` — through
 # plexus-transport, as every service does — and runs the conformance kit
 # against it. A dev-dependency only: plexus-transport depends on this crate.
-plexus-transport = { path = "../plexus-transport", version = "0.5.1", default-features = false }
+# No version: cargo strips it on publish, or neither crate could go first.
+plexus-transport = { path = "../plexus-transport", default-features = false }
 
 # Enable the `test-support` feature for plexus-auth-core in test builds
 # only, so the end-to-end credential-envelope tests in
 # `src/plexus/credential_envelope.rs` can mint real `Credential<T>`
 # values. Added by AUTHZ-CRED-CORE-1B as part of wiring CRED-CORE-2's
 # deferred end-to-end ACs (#1, #2 full, #4 end-to-end, #5 end-to-end).
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.1", features = ["test-support", "adapters"] }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.2", features = ["test-support", "adapters"] }
 
 # PERF-6 (PLEXUS/PERF-6): the one build perf runs and releases use, PERF-1's
 # `profiles` fork built to its recommendation. Release, with LTO across every

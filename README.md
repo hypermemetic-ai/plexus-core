@@ -1,16 +1,16 @@
-# hub-core
+# plexus-core
 
 Core infrastructure for building Plexus RPC services with optional dynamic routing.
 
 ## Overview
 
-hub-core provides the foundation for building Plexus RPC services with hierarchical routing and schema introspection:
+plexus-core provides the foundation for building Plexus RPC services with hierarchical routing and schema introspection:
 
 - **Activation** - Trait for implementing Plexus RPC services/plugins
 - **DynamicHub** - Optional routing layer for hosting multiple activations under one namespace
 - **PlexusMcpBridge** - MCP server integration via rmcp
 - **Handle** - Typed references to plugin method results
-- **hub-macro** - Procedural macro for generating activation boilerplate
+- **plexus-macros** - Procedural macro for generating activation boilerplate
 
 > **Key Insight**: Any activation can be hosted directly as a Plexus RPC server. DynamicHub is just an activation with `.register()` - it's not required infrastructure.
 
@@ -23,12 +23,12 @@ hub-core provides the foundation for building Plexus RPC services with hierarchi
 For a single Plexus RPC service, host it directly without DynamicHub:
 
 ```rust
-use hub_core::activations::echo::Echo;
+use plexus_core::activations::echo::Echo;
 use std::sync::Arc;
 
 // Single activation - no DynamicHub needed
 let echo = Arc::new(Echo::new());
-// Use with hub-transport or your own Plexus RPC server
+// Use with plexus-transport or your own Plexus RPC server
 ```
 
 ### Multiple Activations (Composition)
@@ -36,8 +36,8 @@ let echo = Arc::new(Echo::new());
 For composing multiple Plexus RPC activations under one namespace, use DynamicHub:
 
 ```rust
-use hub_core::plexus::DynamicHub;
-use hub_core::{Activation, PlexusError};
+use plexus_core::plexus::DynamicHub;
+use plexus_core::{Activation, PlexusError};
 use std::sync::Arc;
 
 // Create a dynamic hub with explicit namespace and register your activations
@@ -57,23 +57,22 @@ let stream = hub.route("myactivation.method", json!({})).await?;
 
 ## Creating Activations
 
-Use the `hub-macro` crate to generate activation implementations:
+Use the `plexus-macros` crate to generate activation implementations:
 
 ```rust
-use hub_macro::hub_methods;
 use async_stream::stream;
 
 #[derive(Clone)]
 pub struct MyApp;
 
-#[hub_methods(
+#[plexus_macros::activation(
     namespace = "myapp",
     version = "1.0.0",
     description = "My application"
 )]
 impl MyApp {
     /// Say hello
-    #[hub_method]
+    #[plexus_macros::method]
     async fn hello(&self, name: String) -> impl Stream<Item = MyEvent> + Send + 'static {
         stream! {
             yield MyEvent::Greeting { message: format!("Hello, {}!", name) };
@@ -84,12 +83,12 @@ impl MyApp {
 
 ## MCP Bridge
 
-hub-core includes an MCP server bridge that exposes Plexus RPC activations as MCP tools.
+plexus-core includes an MCP server bridge that exposes Plexus RPC activations as MCP tools.
 
 ### Single Activation
 
 ```rust
-use hub_core::{PlexusMcpBridge, activations::echo::Echo};
+use plexus_core::{PlexusMcpBridge, activations::echo::Echo};
 use std::sync::Arc;
 
 // Bridge a single activation directly
@@ -101,7 +100,7 @@ let bridge = PlexusMcpBridge::new(echo);
 ### Multiple Activations (via DynamicHub)
 
 ```rust
-use hub_core::{DynamicHub, PlexusMcpBridge};
+use plexus_core::{DynamicHub, PlexusMcpBridge};
 use std::sync::Arc;
 
 let hub = Arc::new(
@@ -167,10 +166,10 @@ TransportServer::builder(hub, converter).serve().await?;
 
 ## Example Activations
 
-hub-core includes two minimal example activations:
+plexus-core includes two minimal example activations:
 
 - **health** - Health check endpoint (manual Activation impl)
-- **echo** - Echo messages back (hub-macro generated)
+- **echo** - Echo messages back (plexus-macros generated)
 
 See `src/activations/` for implementation examples.
 

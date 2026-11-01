@@ -3,7 +3,6 @@
 //! This crate provides:
 //! - `DynamicHub` - Dynamic routing hub for activations (implements Plexus RPC protocol)
 //! - `Activation` - Trait for implementing activations
-//! - `PlexusMcpBridge` - MCP server integration
 //! - `Handle` - Typed references to activation method results
 //!
 //! # Example
@@ -29,7 +28,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod activations;
 pub mod builder;
-pub mod mcp_bridge;
 pub mod plexus;
 pub mod plugin_system;
 pub mod request;
@@ -38,7 +36,6 @@ pub mod types;
 
 // Re-export commonly used items
 pub use builder::build_example_hub;
-pub use mcp_bridge::PlexusMcpBridge;
 #[allow(deprecated)]
 pub use plexus::{
     Activation, AuthzDenyReason, ChildCapabilities, ChildRouter, DeprecationInfo, DynamicHub,

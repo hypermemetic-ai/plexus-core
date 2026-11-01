@@ -5,6 +5,19 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+| Change | Before | After | What to do |
+|---|---|---|---|
+| `plexus_core::mcp_bridge`, `plexus_core::PlexusMcpBridge` | public, on rmcp 0.12 | removed | Use `plexus-transport` with feature `mcp`: `with_mcp`, or `ActivationMcpBridge` for an rmcp `ServerHandler` |
+
+### Removed
+
+- The `rmcp` dependency. plexus-core no longer compiles an MCP stack, and
+  `scripts/check-rmcp.sh`, run by `cargo test`, keeps it out.
+
 ## [0.7.0]
 
 Upgrading from 0.6.1, the last published version. 0.6.2 below was never

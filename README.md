@@ -8,7 +8,6 @@ plexus-core provides the foundation for building Plexus RPC services with hierar
 
 - **Activation** - Trait for implementing Plexus RPC services/plugins
 - **DynamicHub** - Optional routing layer for hosting multiple activations under one namespace
-- **PlexusMcpBridge** - MCP server integration via rmcp
 - **Handle** - Typed references to plugin method results
 - **plexus-macros** - Procedural macro for generating activation boilerplate
 
@@ -81,38 +80,9 @@ impl MyApp {
 }
 ```
 
-## MCP Bridge
+## MCP
 
-plexus-core includes an MCP server bridge that exposes Plexus RPC activations as MCP tools.
-
-### Single Activation
-
-```rust
-use plexus_core::{PlexusMcpBridge, activations::echo::Echo};
-use std::sync::Arc;
-
-// Bridge a single activation directly
-let echo = Arc::new(Echo::new());
-let bridge = PlexusMcpBridge::new(echo);
-// Use with rmcp server
-```
-
-### Multiple Activations (via DynamicHub)
-
-```rust
-use plexus_core::{DynamicHub, PlexusMcpBridge};
-use std::sync::Arc;
-
-let hub = Arc::new(
-    DynamicHub::new("myapp")
-        .register(Echo::new())
-        .register(MyApp::new())
-);
-let bridge = PlexusMcpBridge::new(hub);
-// Use with rmcp server
-```
-
-> **Important**: PlexusMcpBridge works with **any** activation. You can bridge a single activation directly, or use DynamicHub to expose multiple activations.
+plexus-core has no MCP code and no rmcp dependency. To serve a service over MCP, use [plexus-transport](https://github.com/hypermemetic-ai/plexus-transport) with its `mcp` feature, or run [plexus-transport-mcp](https://github.com/hypermemetic-ai/plexus-transport-mcp) beside it.
 
 ## Architecture Patterns
 

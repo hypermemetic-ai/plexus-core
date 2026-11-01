@@ -54,9 +54,6 @@ tracing = "0.1"
 # JSON-RPC server
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 
-# MCP server
-rmcp = { version = "0.12", features = ["server", "transport-io", "transport-streamable-http-server"] }
-
 # POLYGLOT-5: the child seam. `--child NAME=stdio:CMD` is split as a shell
 # would split it (shell-words), then run without one.
 shell-words = "1.1"

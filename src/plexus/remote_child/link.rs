@@ -460,14 +460,16 @@ pub(super) async fn read_frames<R: AsyncRead + Unpin>(conn: &Conn, r: R) {
     }
 }
 
-/// PERF-9: the writer under msgpack — everything queued, each frame its
-/// 4-byte length and its map, one write per wakeup (spec/13).
+/// PERF-9: the writer under msgpack — what is queued, up to 64 KiB, each
+/// frame its 4-byte length and its map, one write per wakeup (spec/13).
 pub(super) async fn write_frames<W: tokio::io::AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    const WRITE_BUDGET: usize = 64 * 1024;
     let mut buf = Vec::new();
     while let Some(first) = rx.recv().await {
         buf.clear();
         crate::plexus::encoding::stdio_frame(&first, &mut buf);
-        while let Ok(more) = rx.try_recv() {
+        while buf.len() < WRITE_BUDGET {
+            let Ok(more) = rx.try_recv() else { break };
             crate::plexus::encoding::stdio_frame(&more, &mut buf);
         }
         if w.write_all(&buf).await.is_err() || w.flush().await.is_err() {

@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notification prefix it will not use. A one-item call falls from 50,842
   instructions and 16,048 bytes allocated to about 42,100 and 7,770. Needs
   serde_json 1.0.151.
+- PERF-34: an item's JSON is written by a real scan, not a byte at a time, into
+  the pipe's buffer: SSE2 on any x86-64, AVX2 chosen at run time, a byte at a
+  time elsewhere; no `target-cpu`. A field's name folds to constants at compile
+  time. The bytes are serde_json's, for every value. Down an item's path a ticket
+  body takes 4.0× fewer instructions and 200 rows 5.3×.
 
 ## [0.7.0]
 

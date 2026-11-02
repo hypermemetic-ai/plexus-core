@@ -39,6 +39,11 @@ as a minor version, not a patch.
   `plexus.encoding`. A child from before spec 13 is spoken to in JSON (on a
   socket, after a second dial asking for nothing). A stdio child that answers
   no request at all now fails its mount at that line, within the same timeout.
+- PERF-27: on a transport with no frame sink (stdio, a module called in memory)
+  an item is no longer copied and parsed again on its way to jsonrpsee's sink,
+  and a call leaves its 8 KiB block for its thread's next one. A one-item call:
+  49,437 to 42,343 instructions, 16,120 to 7,893 bytes allocated. Needs
+  serde_json 1.0.151.
 
 ## [0.7.0]
 

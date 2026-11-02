@@ -482,9 +482,11 @@ impl Buffer {
         self.cur.split().freeze()
     }
 
-    /// SKELETON: a call with no connection leaves nothing behind.
-    fn into_idle(self) -> Option<BytesMut> {
-        None
+    /// The block a call with no connection leaves for its thread's next one:
+    /// all of it, with no frame of a call in flight, and not one a stream grew.
+    fn into_idle(mut self) -> Option<BytesMut> {
+        let _ = self.cur.try_reclaim(Self::FIRST);
+        (Self::FIRST..=Self::POOLED).contains(&self.cur.capacity()).then_some(self.cur)
     }
 
     /// The block to give back to the connection's pool: the current one,
@@ -594,6 +596,13 @@ pub(crate) fn encode<T: Serialize + ?Sized>(event: &T) -> Option<Content> {
     })
     .ok()
     .flatten()
+}
+
+thread_local! {
+    /// The block of a call with no frame sink, for this thread's next one.
+    /// Such a call has no connection to keep a block, and it was half of what
+    /// a one-item call allocated (PERF-27).
+    static IDLE: Cell<Option<BytesMut>> = const { Cell::new(None) };
 }
 
 /// One call's frames: the notification around each item, in the
@@ -719,11 +728,28 @@ impl Frames {
         buffer.split()
     }
 
-    /// `item` alone, for jsonrpsee's sink, which wraps it in the notification.
-    fn raw_item(&mut self, buffer: &mut Buffer, item: &PlexusStreamItem) -> Bytes {
-        buffer.room(512);
-        self.item(&mut buffer.cur, item);
-        buffer.split()
+    /// `item` alone, for jsonrpsee's sink, which wraps it in the notification:
+    /// text of its own, its exact size, written once and not read again. The
+    /// copy and the check this took were 6,795 of a one-item call's 49,437
+    /// instructions (PERF-27).
+    fn raw_item(&mut self, item: &PlexusStreamItem) -> Result<Box<RawValue>, serde_json::Error> {
+        if !matches!(item, PlexusStreamItem::Data { .. }) {
+            return serde_json::value::to_raw_value(item);
+        }
+        let mut text = BytesMut::new();
+        self.item(&mut text, item);
+        // This one stays: `Content::from_json` holds text to JSON's grammar, not to UTF-8.
+        let text = String::from_utf8(Vec::from(text)).map_err(serde::ser::Error::custom)?;
+        // SAFETY: one JSON value with nothing around it. `run` passes no sink
+        // only in JSON, where `Frames::item` writes `data_head`'s opening, then
+        // the content, then `}`. The opening is literal keys around values
+        // serde_json wrote into a `Vec`, which cannot fail. The content is one
+        // value: `encode`'s text, whole (a failed write leaves a `Value`
+        // instead); text `Content::from_json` parsed, by the same parse
+        // `RawValue::from_string` would run here; or a `Value`, what msgpack
+        // reads as too, which serde_json writes and cannot fail to.
+        // A debug build parses it here all the same (tests/no_frame_sink.rs).
+        Ok(unsafe { RawValue::from_string_unchecked(text) })
     }
 }
 
@@ -740,7 +766,11 @@ impl Frames {
 pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::PlexusStream, ext: &http::Extensions) -> jsonrpsee::core::SubscriptionResult {
     let frames = ext.get::<FrameSink>().cloned();
     let encoding = frames.as_ref().map(FrameSink::encoding).unwrap_or_default();
-    let buffer = Buffer::from_block(frames.as_ref().and_then(FrameSink::take_block));
+    let block = match &frames {
+        Some(to) => to.take_block(),
+        None => IDLE.try_with(Cell::take).ok().flatten(),
+    };
+    let buffer = Buffer::from_block(block);
     let encoder = Encoder { encoding, buffer: RefCell::new(buffer), depth: Cell::new(0), last: Cell::new(0) };
     WIRE.scope(encoder, run(sink, stream, frames)).await
 }
@@ -771,13 +801,11 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
                     }
                 }
                 None => {
-                    let bytes = WIRE.with(|e| notification.raw_item(&mut e.buffer.borrow_mut(), &item));
-                    drop(item);
                     // jsonrpsee's sink takes a raw value, which it wraps in
-                    // the notification: a copy and a check — the price of a
-                    // transport without frames of its own (stdio, a module
-                    // called in memory).
-                    let raw = RawValue::from_string(String::from_utf8(bytes.to_vec()).unwrap_or_default())?;
+                    // the notification: a copy, the price of a transport
+                    // without frames of its own (stdio, a module called in memory).
+                    let raw = notification.raw_item(&item)?;
+                    drop(item);
                     sink.send(raw).await?;
                 }
             }
@@ -786,9 +814,15 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
     }
     .await;
     drop(stream);
-    if let Some(to) = &frames {
-        if let Some(block) = WIRE.with(|e| std::mem::take(&mut *e.buffer.borrow_mut())).into_block() {
-            to.give_block(block);
+    let buffer = WIRE.with(|e| std::mem::take(&mut *e.buffer.borrow_mut()));
+    match &frames {
+        Some(to) => {
+            if let Some(block) = buffer.into_block() {
+                to.give_block(block);
+            }
+        }
+        None => {
+            let _ = IDLE.try_with(|idle| idle.set(buffer.into_idle()));
         }
     }
     out

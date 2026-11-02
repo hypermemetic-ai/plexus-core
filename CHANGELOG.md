@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-BIDIR-6: the input half of a call.
+BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
+
+### Added (BIDIR-17)
+
+- `InputTable::take_binary`: a WebSocket binary message
+  `[0x01][subscription u64 BE][seq u64 BE][payload]` is one input item, routed
+  with no parse to the same slot and admission as `{ns}.input`, its payload a
+  slice of the message. `input::BINARY_INPUT`, `input::BINARY_HEADER`.
+- `Input<Bytes>`: a binary payload as is, a JSON item as base64; any other
+  input refuses a binary frame (`invalid_input`). Its schema is marked binary
+  (`x-plexus-binary`, base64 as JSON).
+- `bytes` with `serde`, `schemars` with `bytes1`; `base64` always.
+- `Input<T>` as a `Stream` needs `T: 'static`.
 
 ### Breaking
 

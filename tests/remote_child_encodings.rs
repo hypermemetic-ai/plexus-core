@@ -78,6 +78,12 @@ const CALLS: &[(&str, &str)] = &[
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stdio_child_that_offers_msgpack_is_spoken_to_in_msgpack() {
+    // The reference echo offers msgpack from spec/13 on: plexus-wire's main,
+    // once a release carries it; before that a checkout beside this one has none.
+    if !PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plexus-wire/spec/13-encodings.md").is_file() {
+        eprintln!("skipped: the plexus-wire beside this checkout has no spec/13, so its echo-rs offers JSON alone");
+        return;
+    }
     let program = echo_rs().to_string_lossy().into_owned();
     let packed = RemoteChild::connect(stdio("echo", vec![program.clone(), "--stdio".into()]), asking(WireEncoding::ALL.to_vec())).await.unwrap();
     assert_eq!(packed.encoding(), Some(WireEncoding::Msgpack), "echo-rs offers msgpack: the hop speaks it");

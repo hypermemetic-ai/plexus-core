@@ -11,7 +11,7 @@
 //! | the transport offers a [`FrameSink`] (plexus-transport's socket loop) | the frame goes to the socket's writer as it is; the call's first frame is fenced, so it follows the subscription's answer that jsonrpsee queued |
 //! | it does not (jsonrpsee's own sink: stdio, an in-memory module) | the item's bytes go to the sink as one raw value, as before |
 //! | one change fans out to N watchers ([`Shared`]) | the first socket that sends it encodes it, once; every other writes those bytes |
-//! | the client offered `batch` at its upgrade ([`FrameSink::batching`], PERF-8) | the items a stream has ready together, up to the batch, go in one notification whose `results` are their array, the metadata said once; a lone item goes at once, in today's form |
+//! | the client offered `batch` at its upgrade ([`FrameSink::batching`], PERF-8) | the items a stream has ready together, up to the batch and about [`BATCH_BYTES`], go in one notification whose `results` are their array, the metadata said once; a lone item goes at once, in today's form |
 //!
 //! PERF-8 batches frames here (`results: […]`), PERF-9 adds an encoding
 //! ([`WireEncoding`]), PERF-13 relays a child's content as bytes.
@@ -281,6 +281,14 @@ pub struct FrameSink {
 /// The most items one notification carries when the client offered `batch`
 /// at its upgrade (PERF-8, spec/02): a client may ask for fewer.
 pub const MAX_BATCH: usize = 64;
+
+/// Where a batch stops taking items: once what it holds reaches this many
+/// bytes, so a batch of large items stays small. A queue's 1,024 frames are
+/// bounded by frames, not bytes (PERF.115-37): 64 items of 4 KB to a frame
+/// held 280 KB a frame and allocated a 512 KiB block every few frames, and a
+/// ticket body's would hold a megabyte. PERF-17 found a count alone cost a
+/// 4 KB stream 27 %, and said a batch should stop at bytes.
+pub const BATCH_BYTES: usize = 16 * 1024;
 
 /// What the transport's writer reads a [`FrameSink`]'s frames from.
 pub type FrameReceiver = tokio::sync::mpsc::Receiver<WireFrame>;
@@ -766,14 +774,20 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
                     // for a client that takes batches. Never what is not ready
                     // yet: a lone item goes at once, in today's form.
                     let mut ended = false;
-                    let bytes = match (to.batch > 1).then(|| ready_now(&mut stream, &mut ended, connection)).flatten() {
+                    let mut held = size(&item);
+                    let more = to.batch > 1 && held < BATCH_BYTES;
+                    let bytes = match more.then(|| ready_now(&mut stream, &mut ended, connection)).flatten() {
                         None => WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item)),
                         Some(next) => {
+                            held += size(&next);
                             ready.push(item);
                             ready.push(next);
-                            while ready.len() < to.batch && !ended {
+                            while ready.len() < to.batch && held < BATCH_BYTES && !ended {
                                 match ready_now(&mut stream, &mut ended, connection) {
-                                    Some(more) => ready.push(more),
+                                    Some(more) => {
+                                        held += size(&more);
+                                        ready.push(more);
+                                    }
                                     None => break,
                                 }
                             }
@@ -812,6 +826,14 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         }
     }
     out
+}
+
+/// About what an item writes into a batch: its encoded content, or a guess.
+fn size(item: &PlexusStreamItem) -> usize {
+    match item {
+        PlexusStreamItem::Data { content, .. } => content.json_bytes().map_or(256, Bytes::len),
+        _ => 128,
+    }
 }
 
 /// Whether two items' metadata write the same JSON: the same one, or equal
@@ -1650,6 +1672,20 @@ mod tests {
             let v: Value = serde_json::from_slice(frame.bytes()).unwrap();
             assert_eq!(v["params"]["result"]["content"]["n"], 0, "alone, in today's form: {v}");
         });
+    }
+
+    /// A batch of large items stops at its bytes: 4 KB items go four to a
+    /// notification, not 64, and a ticket body goes alone.
+    #[test]
+    fn a_batch_stops_at_its_bytes() {
+        let m = meta(7);
+        let big = |n: u64, size: usize| PlexusStreamItem::Data { metadata: m.clone(), content_type: Cow::Borrowed(CT), content: Content::json(Bytes::from(format!(r#"{{"type":"item","n":{n},"pad":"{}"}}"#, "x".repeat(size)))) };
+        let frames = frames_of(ready((0..20).map(|n| big(n, 4096)).chain([done(7)]).collect()), 64);
+        let sizes: Vec<usize> = frames.iter().map(|f| items_of(f).len()).collect();
+        assert!(sizes.iter().all(|&n| n <= 4), "about 16 KiB a batch: {sizes:?}");
+        assert_eq!(sizes.iter().sum::<usize>(), 21);
+        let frames = frames_of(ready((0..3).map(|n| big(n, 17_000)).chain([done(7)]).collect()), 64);
+        assert!(frames.iter().take(2).all(|f| f["params"].get("result").is_some()), "a body alone, as today: {:?}", frames.iter().map(|f| items_of(f).len()).collect::<Vec<_>>());
     }
 
     /// A client may ask for fewer than 64: no notification carries more.

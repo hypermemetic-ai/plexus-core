@@ -69,13 +69,11 @@ impl PlexusStreamBuilder {
                 content_type: content_type.clone(),
                 content: value.into(),
             },
-            StreamItem::Error(err) => PlexusStreamItem::Error {
-                metadata: (*metadata).clone(),
-                message: err.to_string(),
-                code: None,
-                recoverable: false,
-                fields: Default::default(),
-            },
+            StreamItem::Error(err) => PlexusStreamItem::from_plexus_error(
+                (*metadata).clone(),
+                &err,
+                false,
+            ),
         }))
     }
 }

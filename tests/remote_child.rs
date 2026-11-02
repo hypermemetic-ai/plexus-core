@@ -62,10 +62,12 @@ async fn merged_schema_and_roles_golden() {
     assert_eq!(viewer, ["echo.count", "echo.echo", "echo.fail", "echo.whoami", "rsecho.count", "rsecho.echo"]);
     assert_eq!(editor, ["echo.count", "echo.echo", "echo.fail", "echo.shout", "echo.whoami"]);
     let s = plexus_core::plexus::Activation::plugin_schema(&r.child);
-    let surface: Vec<Value> = s.methods.iter().map(|m| json!({ "name": m.name, "streaming": m.streaming })).collect();
+    // RETURNS-36: the stub (plexus-wire's spec, `streaming`) is read as
+    // 0.8 by its own declaration: `streaming: true` is many, else one.
+    let surface: Vec<Value> = s.methods.iter().map(|m| json!({ "name": m.name, "cardinality": m.cardinality })).collect();
     assert_eq!(serde_json::to_value(&surface).unwrap(), json!([
-        { "name": "echo", "streaming": true }, { "name": "shout", "streaming": false }, { "name": "count", "streaming": true },
-        { "name": "whoami", "streaming": false }, { "name": "fail", "streaming": false }
+        { "name": "echo", "cardinality": "many" }, { "name": "shout", "cardinality": "one" }, { "name": "count", "cardinality": "many" },
+        { "name": "whoami", "cardinality": "one" }, { "name": "fail", "cardinality": "one" }
     ]));
     assert_eq!((s.namespace.as_str(), s.version.as_str()), ("echo", "0.1.0"));
 }
@@ -166,6 +168,10 @@ async fn forbidden_never_reaches_child() {
         let mut v = v.clone();
         v["metadata"]["timestamp"] = json!(0);
         v.as_object_mut().unwrap().remove("roles");
+        // RETURNS-36: and the typed error's copy of them.
+        if let Some(e) = v.get_mut("error").and_then(Value::as_object_mut) {
+            e.remove("roles");
+        }
         v.to_string().replace("rsecho.", "echo.")
     };
     assert_eq!(strip(&child[0]), strip(&inproc[0]), "byte-identical but the activation's name and roles");
@@ -490,7 +496,7 @@ async fn same_answers_as_in_process() {
     let ws = plexus_client::WsTransport::connect(&format!("ws://{addr}"), "service").await.unwrap();
     let a = EchoClient::new(HubTransport::anonymous(inproc));
     let b = EchoClient::new(ws);
-    let shown = |r: Result<plexus_client::ClientEvent<EchoEvent>, plexus_client::ClientError>| format!("{:?}", r.expect("no client error"));
+    let shown = |r: Result<EchoEvent, plexus_client::ClientError>| format!("{:?}", r.expect("no client error"));
     let x: Vec<String> = a.echo("hi".into(), 3).map(shown).collect().await;
     let y: Vec<String> = b.echo("hi".into(), 3).map(shown).collect().await;
     assert_eq!(x, y);

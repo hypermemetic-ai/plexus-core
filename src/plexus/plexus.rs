@@ -13,6 +13,7 @@ use super::{
 };
 use crate::types::Handle;
 use async_stream::stream;
+use plexus_client::{DenyReason, ParamProblem, RemoteError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use futures::Stream;
@@ -36,11 +37,24 @@ use std::sync::Arc;
 // Error Types
 // ============================================================================
 
+/// Why the hub could not or would not run a call — the server side of the
+/// wire's [`RemoteError`].
+///
+/// Every variant converts to a `RemoteError` (`From<&PlexusError>`), which
+/// is what crosses the wire: in an error frame
+/// (`PlexusStreamItem::error(metadata, RemoteError::from(&e), recoverable)`)
+/// and in the `data` of a JSON-RPC rejection ([`plexus_error_to_jsonrpc`]).
 #[derive(Debug, Clone)]
 pub enum PlexusError {
     ActivationNotFound(String),
     MethodNotFound { activation: String, method: String },
-    InvalidParams(String),
+    /// The call's params did not fit the method (RETURNS-6: structured, was
+    /// `InvalidParams(String)`). `param` names the parameter at fault when
+    /// the failure is about one; `problem` says what is wrong with it.
+    InvalidParams {
+        param: Option<String>,
+        problem: ParamProblem,
+    },
     ExecutionError(String),
     HandleNotSupported(String),
     TransportError(TransportErrorKind),
@@ -128,7 +142,23 @@ impl std::fmt::Display for PlexusError {
             PlexusError::MethodNotFound { activation, method } => {
                 write!(f, "Method not found: {}.{}", activation, method)
             }
-            PlexusError::InvalidParams(msg) => write!(f, "Invalid params: {}", msg),
+            // MACRO-15's lines: the parameter's wire name first, so the
+            // message names it (spec/05) — `Invalid params: id: <serde's
+            // message>`, `Invalid params: missing field: id`.
+            PlexusError::InvalidParams { param, problem } => match (param, problem) {
+                (Some(p), ParamProblem::Missing) => {
+                    write!(f, "Invalid params: missing field: {}", p)
+                }
+                (None, ParamProblem::Missing) => {
+                    write!(f, "Invalid params: a required parameter is missing")
+                }
+                (Some(p), ParamProblem::Malformed { detail }) => {
+                    write!(f, "Invalid params: {}: {}", p, detail)
+                }
+                (None, ParamProblem::Malformed { detail }) => {
+                    write!(f, "Invalid params: {}", detail)
+                }
+            },
             PlexusError::ExecutionError(msg) => write!(f, "Execution error: {}", msg),
             PlexusError::HandleNotSupported(activation) => {
                 write!(f, "Handle resolution not supported by activation: {}", activation)
@@ -171,7 +201,88 @@ impl std::fmt::Display for PlexusError {
 
 impl std::error::Error for PlexusError {}
 
-/// Convert PlexusError to a JSON-RPC ErrorObject with semantic error codes.
+impl PlexusError {
+    /// `InvalidParams` naming no one parameter: `detail` says what is wrong
+    /// (`Invalid params: <detail>`).
+    pub fn invalid_params(detail: impl Into<String>) -> Self {
+        PlexusError::InvalidParams { param: None, problem: ParamProblem::Malformed { detail: detail.into() } }
+    }
+
+    /// `InvalidParams` naming the parameter at fault
+    /// (`Invalid params: <param>: <detail>`).
+    pub fn malformed_param(param: impl Into<String>, detail: impl Into<String>) -> Self {
+        PlexusError::InvalidParams {
+            param: Some(param.into()),
+            problem: ParamProblem::Malformed { detail: detail.into() },
+        }
+    }
+}
+
+/// RETURNS-6: the server's failure, as the wire carries it.
+///
+/// | `PlexusError` | `RemoteError` |
+/// |---|---|
+/// | `ActivationNotFound(name)` | `ActivationNotFound { activation: name }` |
+/// | `MethodNotFound { activation, method }` | same |
+/// | `InvalidParams { param, problem }` | same |
+/// | `ExecutionError(msg)` | `Execution { message: msg }` |
+/// | `HandleNotSupported(ns)` | `HandleNotSupported { activation: ns }` |
+/// | `TransportError(kind)` — a hub forwarding upstream failed | `Execution { message: kind.to_string() }` |
+/// | `Unauthenticated(_)` | `Unauthenticated` — the server-side reason stays server-side |
+/// | `Forbidden { reason }` | `Forbidden { reason: DenyReason }` |
+///
+/// `Forbidden` renders at most the single fact the caller already failed
+/// (AUTHZ-CORE-1/5): `MissingScope` names the one unmet scope — the fact
+/// the 0.6 wire already carried in its `Display` line — and
+/// `TenantBoundary` / `NotAccepted` carry nothing.
+impl From<&PlexusError> for RemoteError {
+    fn from(e: &PlexusError) -> Self {
+        match e {
+            PlexusError::ActivationNotFound(name) => RemoteError::ActivationNotFound {
+                activation: name.clone(),
+            },
+            PlexusError::MethodNotFound { activation, method } => RemoteError::MethodNotFound {
+                activation: activation.clone(),
+                method: method.clone(),
+            },
+            PlexusError::InvalidParams { param, problem } => RemoteError::InvalidParams {
+                param: param.clone(),
+                problem: problem.clone(),
+            },
+            PlexusError::ExecutionError(message) => RemoteError::Execution {
+                message: message.clone(),
+            },
+            PlexusError::HandleNotSupported(activation) => RemoteError::HandleNotSupported {
+                activation: activation.clone(),
+            },
+            PlexusError::TransportError(kind) => RemoteError::Execution {
+                message: kind.to_string(),
+            },
+            PlexusError::Unauthenticated(_) => RemoteError::Unauthenticated,
+            PlexusError::Forbidden { reason } => RemoteError::Forbidden {
+                reason: match reason {
+                    AuthzDenyReason::MissingScope { scope } => DenyReason::MissingScope {
+                        scope: scope.as_str().to_string(),
+                    },
+                    AuthzDenyReason::TenantBoundary => DenyReason::TenantBoundary,
+                    AuthzDenyReason::NotAccepted => DenyReason::NotAccepted,
+                    // AUTH-2's refusal, whole: what was needed, where, the
+                    // roles listing it and where the caller holds it.
+                    AuthzDenyReason::MissingGrant { grant, scope, roles, held_on } => {
+                        DenyReason::MissingGrant {
+                            grant: grant.as_str().to_string(),
+                            scope: scope.as_str().to_string(),
+                            roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
+                            held_on: held_on.iter().map(|s| s.as_str().to_string()).collect(),
+                        }
+                    }
+                },
+            },
+        }
+    }
+}
+
+/// Get the semantic JSON-RPC error code for a PlexusError.
 ///
 /// Codes:
 /// - `-32001`: Authentication required (custom app-level error)
@@ -179,28 +290,36 @@ impl std::error::Error for PlexusError {}
 /// - `-32601`: Method/activation not found (standard JSON-RPC)
 /// - `-32602`: Invalid parameters (standard JSON-RPC)
 /// - `-32000`: Generic server error (execution, transport, handle errors)
-/// Get the semantic JSON-RPC error code for a PlexusError.
 fn plexus_error_code(e: &PlexusError) -> i32 {
     match e {
         PlexusError::Unauthenticated(_) => -32001,
         PlexusError::Forbidden { .. } => -32003,
-        PlexusError::InvalidParams(_) => -32602,
+        PlexusError::InvalidParams { .. } => -32602,
         PlexusError::MethodNotFound { .. } | PlexusError::ActivationNotFound(_) => -32601,
         _ => -32000,
     }
 }
 
-/// Convert PlexusError to a JSON-RPC ErrorObject with semantic error codes.
-fn plexus_error_to_jsonrpc(e: &PlexusError) -> jsonrpsee::types::ErrorObjectOwned {
-    jsonrpsee::types::ErrorObject::owned(plexus_error_code(e), e.to_string(), None::<()>)
+/// Convert a PlexusError to a JSON-RPC rejection.
+///
+/// JSON-RPC 2.0 requires `code` and `message`, so they stay: `code` is the
+/// semantic code above, `message` the `RemoteError`'s `Display` line. `data`
+/// always carries the typed [`RemoteError`] (RETURNS-6):
+///
+/// ```text
+/// {"code": -32601, "message": "method not found: tickets.frob",
+///  "data": {"kind": "method_not_found", "activation": "tickets", "method": "frob"}}
+/// ```
+pub fn plexus_error_to_jsonrpc(e: &PlexusError) -> jsonrpsee::types::ErrorObjectOwned {
+    let error = RemoteError::from(e);
+    jsonrpsee::types::ErrorObject::owned(plexus_error_code(e), error.to_string(), Some(error))
 }
 
 /// The error stream item a failed dispatch sends: `{"type":"error",
 /// "metadata", "message", "code", "recoverable"}`, plus — for an auth
 /// refusal — AUTH-2's typed fields (`error_kind`, and for a missing grant
 /// `grant`, `scope`, `roles`, `held_on`; see
-/// [`super::grant_gate::error_fields`]). Extra keys only: a client reading
-/// the item as [`super::types::PlexusStreamItem`] parses it as before.
+/// [`super::types::spec_fields`]), and RETURNS-6's typed `error` beside them.
 pub(crate) fn error_item_raw(ns: &str, e: &PlexusError) -> Option<Box<serde_json::value::RawValue>> {
     serde_json::value::to_raw_value(&error_item(ns, e)).ok()
 }
@@ -211,14 +330,13 @@ pub(crate) fn error_item_raw(ns: &str, e: &PlexusError) -> Option<Box<serde_json
 /// grant) `grant`, `scope`, `roles`, `held_on`. Public so a transport that
 /// renders dispatch errors itself renders them the same way.
 pub fn error_item(ns: &str, e: &PlexusError) -> serde_json::Value {
-    let item = super::types::PlexusStreamItem::Error {
-        metadata: super::types::StreamMetadata::new(vec![ns.into()], super::context::PlexusContext::hash()),
-        message: e.to_string(),
-        code: Some(plexus_error_code(e).to_string()),
-        recoverable: false,
-        // POLYGLOT-5: the typed refusal's fields ride in the item itself.
-        fields: super::grant_gate::error_fields(e).unwrap_or_default(),
-    };
+    // POLYGLOT-5: the typed refusal's fields ride in the item itself, and
+    // RETURNS-6's typed `error` beside them.
+    let item = super::types::PlexusStreamItem::from_plexus_error(
+        super::types::StreamMetadata::new(vec![ns.into()], super::context::PlexusContext::hash()),
+        e,
+        false,
+    );
     serde_json::to_value(&item).unwrap_or(serde_json::Value::Null)
 }
 
@@ -289,17 +407,12 @@ pub trait Activation: Send + Sync + 'static {
 
     /// Return this activation's schema (methods + optional children)
     fn plugin_schema(&self) -> PluginSchema {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
+        // A method of an activation not built with `#[activation]` is known
+        // by its name and help text alone; its hash is that schema's content
+        // hash (RETURNS-10), as a macro-built method's is of its whole schema.
         let methods: Vec<MethodSchema> = self.methods().iter().map(|name| {
             let desc = self.method_help(name).unwrap_or_default();
-            // Compute a simple hash for methods not using hub-macro
-            let mut hasher = DefaultHasher::new();
-            name.hash(&mut hasher);
-            desc.hash(&mut hasher);
-            let hash = format!("{:016x}", hasher.finish());
-            MethodSchema::new(name.to_string(), desc, hash)
+            MethodSchema::new(name.to_string(), desc, String::new()).with_content_hash()
         }).collect();
 
         if let Some(long_desc) = self.long_description() {
@@ -2055,7 +2168,12 @@ impl DynamicHub {
     fn parse_method<'a>(&self, method: &'a str) -> Result<(&'a str, &'a str), PlexusError> {
         let parts: Vec<&str> = method.splitn(2, '.').collect();
         if parts.len() != 2 {
-            return Err(PlexusError::InvalidParams(format!("Invalid method format: {}", method)));
+            return Err(PlexusError::InvalidParams {
+                param: Some("method".into()),
+                problem: ParamProblem::Malformed {
+                    detail: format!("expected `namespace.method`, got `{}`", method),
+                },
+            });
         }
         Ok((parts[0], parts[1]))
     }
@@ -2285,9 +2403,9 @@ impl DynamicHub {
                         Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
                         Err(e) => {
                             // Accept the subscription, then send the error as a stream item.
-                            // This preserves the error message and code — returning Err(...)
+                            // This preserves the typed RemoteError — returning Err(...)
                             // from a subscription handler causes jsonrpsee to wrap it as
-                            // generic -32603, discarding our semantic error code.
+                            // generic -32603, discarding it.
                             let sink = pending.accept().await?;
                             if let Some(raw) = error_item_raw(ns_static, &e) {
                                 let _ = sink.send(raw).await;
@@ -2659,7 +2777,6 @@ async fn pipe_stream_to_subscription(
 impl DynamicHub {
     /// Route a call to a registered activation
     #[plexus_macros::method(
-        streaming,
         description = "Route a call to a registered activation",
         params(
             method = "The method to call (format: namespace.method)",
@@ -2688,13 +2805,7 @@ impl DynamicHub {
                     PlexusContext::hash(),
                 );
                 Box::pin(futures::stream::once(async move {
-                    PlexusStreamItem::Error {
-                        metadata,
-                        message: e.to_string(),
-                        code: None,
-                        recoverable: false,
-                        fields: Default::default(),
-                    }
+                    PlexusStreamItem::from_plexus_error(metadata, &e, false)
                 }))
             }
         }

@@ -91,9 +91,11 @@ impl HubTransport {
 fn refused(ns: &str, e: &PlexusError) -> StreamItem {
     serde_json::from_value(error_item(ns, e)).unwrap_or_else(|_| StreamItem::Error {
         metadata: None,
-        message: e.to_string(),
-        code: None,
         recoverable: false,
+        message: Some(e.to_string()),
+        code: None,
+        error: plexus_client::RemoteError::from(e),
+        fields: Default::default(),
     })
 }
 

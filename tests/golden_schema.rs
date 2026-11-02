@@ -30,6 +30,14 @@
 //! Per IR-4's scope this ticket adds the fixture and the serializer-
 //! stability test here; migrating substrate's test to read this fixture
 //! is a follow-up (IR-8, which is the Solar test migration ticket).
+//!
+//! # Schema 0.7 (RETURNS-5)
+//!
+//! The fixture was rewritten in place for `MethodSchema` 0.7, not
+//! re-captured: each method's 0.6 single-result flag became `"cardinality":
+//! "one"` (every Solar method was single-result), and the two methods that
+//! carried no `returns` (`schema`, `body`) gained the empty schema `{}` —
+//! `returns` is now always present. Nothing else moved.
 
 use plexus_core::plexus::schema::PluginSchema;
 

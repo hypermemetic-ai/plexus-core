@@ -38,13 +38,13 @@ pub struct RsechoActivation;
 #[plexus_macros::activation(version = "1.0.0", description = "in-process echo", roles(viewer = ["echo", "count"]))]
 impl RsechoActivation {
     /// Say `text`, `times` times.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     pub async fn echo(&self, text: String, times: u64) -> impl Stream<Item = EchoEvent> + Send + 'static {
         stream! { for _ in 0..times { yield EchoEvent::Said { text: text.clone() }; } }
     }
 
     /// 1..=to.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     pub async fn count(&self, to: u64) -> impl Stream<Item = EchoEvent> + Send + 'static {
         stream! { for n in 1..=to { yield EchoEvent::N { n }; } }
     }
@@ -58,13 +58,13 @@ pub struct EchoActivation;
 #[plexus_macros::activation(version = "1.0.0", description = "in-process echo, as echo", roles(viewer = ["echo", "count"]))]
 impl EchoActivation {
     /// Say `text`, `times` times.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     pub async fn echo(&self, text: String, times: u64) -> impl Stream<Item = EchoEvent> + Send + 'static {
         stream! { for _ in 0..times { yield EchoEvent::Said { text: text.clone() }; } }
     }
 
     /// 1..=to.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     pub async fn count(&self, to: u64) -> impl Stream<Item = EchoEvent> + Send + 'static {
         stream! { for n in 1..=to { yield EchoEvent::N { n }; } }
     }

@@ -618,8 +618,9 @@ impl Frames {
 
     /// `items`, ready together, in one notification (PERF-8, spec/02):
     /// `{"jsonrpc":"2.0","method":M,"params":{"subscription":S,"metadata":…,"results":[…]}}`.
-    /// The metadata is the first `data` item's, said once: a `data` item that
-    /// shares it leaves its own out; any other item is written whole, as alone.
+    /// The metadata is the first `data` item's, said once: a `data` item whose
+    /// metadata writes the same leaves its own out; any other item is written
+    /// whole, as alone.
     /// One item alone is today's frame.
     fn batch(&mut self, buffer: &mut Buffer, items: &[PlexusStreamItem]) -> Bytes {
         if let [item] = items {
@@ -658,7 +659,7 @@ impl Frames {
                 buffer.cur.put_u8(b',');
             }
             match item {
-                PlexusStreamItem::Data { metadata, content_type, content } if shared.is_some_and(|m| Arc::ptr_eq(m, metadata)) => {
+                PlexusStreamItem::Data { metadata, content_type, content } if shared.is_some_and(|m| same_metadata(m, metadata)) => {
                     if !matches!(&self.bare, Some((ct, _)) if ct == content_type) {
                         let mut bare = Vec::with_capacity(64);
                         bare.extend_from_slice(br#"{"type":"data","content_type":"#);
@@ -811,6 +812,12 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         }
     }
     out
+}
+
+/// Whether two items' metadata write the same JSON: the same one, or equal
+/// (a child's items, relayed, each bring their own copy).
+fn same_metadata(a: &Arc<StreamMetadata>, b: &Arc<StreamMetadata>) -> bool {
+    Arc::ptr_eq(a, b) || (a.timestamp == b.timestamp && a.plexus_hash == b.plexus_hash && a.provenance == b.provenance)
 }
 
 /// The stream's next item if it is ready now: no waiting, so a batch never
@@ -1603,13 +1610,14 @@ mod tests {
     /// the batch's leaves its own out; any other keeps it.
     #[test]
     fn metadata_goes_once_a_batch_where_it_is_the_same() {
-        let (a, b) = (meta(7), meta(8));
-        let frames = frames_of(ready(vec![data(&a, 0), data(&a, 1), data(&b, 2), data(&a, 3), done(9)]), 64);
+        // a child's items, relayed, each bring their own copy of the same
+        let (a, b, copy) = (meta(7), meta(8), meta(7));
+        let frames = frames_of(ready(vec![data(&a, 0), data(&a, 1), data(&b, 2), data(&copy, 3), done(9)]), 64);
         assert_eq!(frames.len(), 1);
         let p = &frames[0]["params"];
         assert_eq!(p["metadata"], serde_json::to_value(&*a).unwrap(), "the batch's, its first data item's");
         let raw = p["results"].as_array().unwrap();
-        assert!(raw[0].get("metadata").is_none() && raw[1].get("metadata").is_none() && raw[3].get("metadata").is_none(), "{raw:?}");
+        assert!(raw[0].get("metadata").is_none() && raw[1].get("metadata").is_none() && raw[3].get("metadata").is_none(), "the same, or an equal copy: {raw:?}");
         assert_eq!(raw[2]["metadata"], serde_json::to_value(&*b).unwrap(), "another stream's metadata stays with its item");
         assert_eq!(raw[4]["metadata"]["timestamp"], 9, "`done` keeps its own");
     }

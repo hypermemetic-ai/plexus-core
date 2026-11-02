@@ -61,6 +61,18 @@ returns/0.7 (RETURNS-1) merged with main. Publish nothing until RETURNS-29.
   `Activation::plugin_schema` use SHA-256 too (`content_hash::hash16_lines`),
   same structure and width. New dependency: `sha2` 0.10.
 
+### Added
+
+- PERF-8: batches. `FrameSink::batching(max)` (and `MAX_BATCH`, 64): for a
+  client that offered `batch` at its upgrade (plexus-transport reads it), the
+  items a stream has ready together go in one notification, `results`, the
+  metadata said once (plexus-wire spec/02); a lone item goes at once in
+  today's form, and a sink that does not batch writes exactly today's frames.
+  A batch stops after the item that brings it to `BATCH_BYTES`, 8 KiB, so a
+  large item goes alone. An item's own path falls from 4,145 instructions to
+  983, 64 to a notification; a row from 5,195 to 2,082 (35 to one), 1 KB from
+  4,917 to 2,113 (8 to one).
+
 ## [0.7.0]
 
 Upgrading from 0.6.1, the last published version. 0.6.2 below was never

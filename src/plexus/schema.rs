@@ -1509,6 +1509,33 @@ impl MethodSchema {
         .with_returns(schema_for!(SchemaResult))
     }
 
+    /// Is this the `schema` entry every activation's macro adds
+    /// ([`auto_schema`](Self::auto_schema) with the activation's grant)?
+    ///
+    /// RETURNS-36: main marked the entry by its fixed hash, `"auto_schema"`;
+    /// under RETURNS-10 its hash is its content hash, so it is known by
+    /// that: the hash `auto_schema()` sealed with this entry's grant has (or
+    /// the old marker, from a peer still sending it). One SHA-256 per grant,
+    /// remembered.
+    pub fn is_auto_schema(&self) -> bool {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static SEALED: OnceLock<Mutex<HashMap<Option<String>, String>>> = OnceLock::new();
+        if self.name != "schema" || !matches!(self.role, MethodRole::Rpc) {
+            return false;
+        }
+        if self.hash == "auto_schema" {
+            return true;
+        }
+        let mut sealed = SEALED.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+        let hash = sealed.entry(self.grant.clone()).or_insert_with(|| {
+            let mut entry = Self::auto_schema();
+            entry.grant = self.grant.clone();
+            entry.content_hash()
+        });
+        *hash == self.hash
+    }
+
     /// SYNAPSE-CC-9: reserved for BIDIR-6 — the schema of the items a client
     /// streams in.
     pub fn with_input(mut self, mut input: schemars::Schema) -> Self {

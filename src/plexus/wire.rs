@@ -4,6 +4,7 @@
 //! | when | then |
 //! | -- | -- |
 //! | a method yields an event under the WebSocket pipe ([`pipe`]) | [`wrap_stream`](super::streaming::wrap_stream) serializes it once, by its own `Serialize`, into the pipe's buffer (a block from its connection's pool); the `Data` item carries it as [`Content`] — JSON bytes, no `Value` |
+//! | the pipe's buffer takes an event's JSON (`json`, PERF-34) | written by a real scan, not a byte at a time, the bytes `serde_json` writes |
 //! | the same event anywhere else (in process, a nested route, a test) | it becomes a `Value` as before: in-process items stay what they cost |
 //! | a transformer reads a `Data` item's content | [`Content`] decodes its bytes once, on demand (`Deref` to `Value`); one that rewrites it replaces the whole [`Content`] — an encoded item is a `Data` item, so no rewrite can miss one (PERF-17's finding: the gated view's rewrite did) |
 //! | the pipe writes an item | the notification's prefix (once a call), the metadata (once a stream), the content type and the content's bytes, and the suffix, into the same buffer: one frame, split off as `Bytes` (no allocation while the block has room) |
@@ -41,8 +42,8 @@ pub struct Content(Repr);
 #[derive(Clone)]
 enum Repr {
     Value(Value),
-    /// JSON text serde_json wrote (valid by construction), and its `Value`
-    /// once someone asked for it.
+    /// JSON text the pipe's writer wrote (valid by construction: the bytes
+    /// serde_json writes), and its `Value` once someone asked for it.
     Json { text: Bytes, value: OnceLock<Value> },
 }
 
@@ -64,7 +65,7 @@ impl Content {
         Ok(Self::json(text))
     }
 
-    /// JSON text serde_json wrote, taken as it is.
+    /// JSON text the pipe's writer wrote, taken as it is.
     pub(crate) fn json(text: Bytes) -> Self {
         Content(Repr::Json { text, value: OnceLock::new() })
     }
@@ -487,7 +488,7 @@ pub(crate) fn encode<T: Serialize + ?Sized>(event: &T) -> Option<Content> {
         debug_assert!(buffer.cur.is_empty());
         let (written, captured) = plexus_auth_core::credential::run_with_credential_capture(|| {
             let _json = WritingJson::on();
-            serde_json::to_writer((&mut buffer.cur).writer(), event).is_ok()
+            json::write(&mut buffer.cur, event).is_ok()
         });
         if !written || !captured.is_empty() {
             buffer.cur.clear();
@@ -943,6 +944,20 @@ mod tests {
         skipped: Option<u8>,
     }
 
+    /// A field's name that wants a look: the first, the next, and one past a block.
+    #[derive(Serialize)]
+    struct Names {
+        #[serde(rename = "a \"first\" name\t")]
+        first: u8,
+        #[serde(rename = "a \\next\\ name")]
+        next: u8,
+        a_name_that_is_longer_than_a_block_of_sixteen: u8,
+        #[serde(rename = "")]
+        empty: u8,
+        #[serde(rename = "é")]
+        past_ascii: u8,
+    }
+
     #[derive(Serialize)]
     struct Flat {
         a: u8,
@@ -1076,6 +1091,7 @@ mod tests {
         same_as_serde_json(&Untagged::Number(1));
         same_as_serde_json(&Untagged::Text("t".into()));
         same_as_serde_json(&Untagged::Fields { s: "s".into() });
+        same_as_serde_json(&Names { first: 1, next: 2, a_name_that_is_longer_than_a_block_of_sixteen: 3, empty: 4, past_ascii: 5 });
     }
 
     #[test]

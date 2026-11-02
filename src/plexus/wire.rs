@@ -400,11 +400,21 @@ struct Buffer {
     block: usize,
     /// Whether a block has been made (or taken from the pool) yet.
     started: bool,
+    /// Blocks made, for the tests.
+    #[cfg(test)]
+    made: usize,
 }
 
 impl Default for Buffer {
     fn default() -> Self {
-        Buffer { cur: BytesMut::new(), spare: Vec::new(), block: Self::FIRST, started: false }
+        Buffer {
+            cur: BytesMut::new(),
+            spare: Vec::new(),
+            block: Self::FIRST,
+            started: false,
+            #[cfg(test)]
+            made: 0,
+        }
     }
 }
 
@@ -416,12 +426,19 @@ impl Buffer {
     const MOST: usize = 512 * 1024;
     /// The largest block a connection keeps for its next call.
     const POOLED: usize = 64 * 1024;
-    /// Blocks kept to be reused.
-    const SPARE: usize = 3;
+    /// Blocks kept to be reused. A stream that outruns its socket has the
+    /// connection's whole queue in flight (1,024 frames), and each item has
+    /// taken its size twice from a block, content and frame: 8.8 MB at 4 KB
+    /// an item. Blocks that hold fewer than that are dropped before they
+    /// come free, and every block filled is a new one (PERF-9: msgpack
+    /// outruns the socket where JSON's escaping did not, 8 KB allocated an
+    /// item at 4 KB). They hold bytes those frames hold anyway, for the
+    /// call's life alone.
+    const SPARE: usize = 32;
 
     fn from_block(block: Option<BytesMut>) -> Self {
         match block {
-            Some(cur) => Buffer { block: cur.capacity().max(Self::FIRST), cur, spare: Vec::new(), started: true },
+            Some(cur) => Buffer { block: cur.capacity().max(Self::FIRST), cur, started: true, ..Buffer::default() },
             None => Buffer::default(),
         }
     }
@@ -444,6 +461,10 @@ impl Buffer {
                     self.block = (self.block * 2).clamp(Self::FIRST, Self::MOST);
                 }
                 self.started = true;
+                #[cfg(test)]
+                {
+                    self.made += 1;
+                }
                 BytesMut::with_capacity(self.block.max(n))
             }
         };
@@ -911,6 +932,30 @@ mod tests {
         assert_eq!(serde_json::to_string(&encoded).unwrap(), serde_json::to_string(&v).unwrap(), "outside the pipe it writes its Value");
         assert_eq!(encoded.into_value(), v);
         assert!(Content::from_json(Bytes::from_static(b"{nope")).is_err());
+    }
+
+    /// PERF-9: a stream that outruns its socket holds the queue's 1,024 frames
+    /// in flight. The blocks in rotation must hold them, or every block filled
+    /// is a new one: at 4 KB an item (8.6 KB of block each, content and frame)
+    /// a fresh block every 60 items, for the stream's life.
+    #[test]
+    fn a_queue_full_of_frames_comes_back_to_blocks_already_made() {
+        let mut b = Buffer::default();
+        let mut in_flight = std::collections::VecDeque::new();
+        let item = [7u8; 8600];
+        let mut ramp = 0;
+        for n in 0..40_000 {
+            b.room(item.len());
+            b.cur.put_slice(&item);
+            in_flight.push_back(b.split());
+            if in_flight.len() > 1024 {
+                in_flight.pop_front();
+            }
+            if n == 20_000 {
+                ramp = b.made;
+            }
+        }
+        assert_eq!(b.made, ramp, "past the ramp ({ramp} blocks), every block is one already made");
     }
 
     #[test]

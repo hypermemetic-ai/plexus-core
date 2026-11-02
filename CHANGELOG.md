@@ -5,6 +5,38 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+BIDIR-6: the input half of a call.
+
+### Breaking
+
+| Change | Before | After | What to do |
+|---|---|---|---|
+| `CallCeiling` (plexus-auth-core) | `max_items` 1,000,000, `max_bytes` 64 MiB by default | no lifetime limit by default; `max_buffered` added, 64 MiB | Set the two only for a method that wants them; use `..Default::default()` in a struct literal |
+| `duplex_gate::InputFrame` | one item | generic over what it holds, with `items` and `overrun` | `InputFrame::new` is unchanged; a struct literal names the new fields |
+| `DuplexRefusal` | seven variants | adds `OutOfSequence`, `InvalidInput` | Add them to an exhaustive match |
+| `DuplexRefusal::to_item` | `error_kind`, facts, `message` | a typed error item (spec/05): `metadata` and `code` too | Nothing, for a reader of those keys |
+| `{ns}.input`, `{ns}.end` | `-32601` | methods of every service | Answer with `not_this_call` naming no call of the socket |
+
+### Added
+
+- `plexus::Input<T>` and `plexus::input`: a method's input half. The socket's
+  `InputTable` takes `{ns}.input` and `{ns}.end` on its reader, the pipe drives
+  `DuplexCall::input` beside the method's stream, and `credit` and `ack` move
+  as the handler consumes.
+- `DuplexGate::admitted` (a call its dispatch decided), `DuplexGate::ungated`,
+  `DuplexCall::credit_line`.
+- `MethodSchema.input` filled.
+
+### Not enforced
+
+- An input half is not forwarded across a hop: a method with `input` on a
+  `RemoteChild` is refused, naming it.
+- A frame of another connection finds no call and is not audited: the table is
+  the connection's, so `not_this_call` is said to a request and a notification
+  is counted (`InputTable::strays`).
+
 ## [0.7.0]
 
 Upgrading from 0.6.1, the last published version. 0.6.2 below was never

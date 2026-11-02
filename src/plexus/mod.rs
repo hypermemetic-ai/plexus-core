@@ -24,6 +24,8 @@ pub mod grant_gate;
 pub mod hub_context;
 // MACRO-2.B3: the in-process transport for the macro-generated typed client.
 pub mod in_process;
+/// BIDIR-6: `Input<T>`, the input half of a call.
+pub mod input;
 /// LOCAL-6: a whole hub, called in memory.
 pub mod hub_transport;
 pub mod method_enum;
@@ -51,6 +53,7 @@ pub use test_validator::TestSessionValidator;
 pub use bidirectional::{BidirChannel, BidirError, SelectOption, StandardBidirChannel, StandardRequest, StandardResponse};
 pub use context::PlexusContext;
 pub use in_process::InProcessTransport;
+pub use input::{Delivered, Input, InputTable};
 pub use hub_transport::HubTransport;
 pub use remote_child::{Backoff, ChildError, ChildMethods, ChildOptions, ChildSpec, ChildStats, MountTimings, RemoteChild};
 #[cfg(feature = "clap")]

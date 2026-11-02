@@ -10,6 +10,7 @@
 //! | the transport offers a [`FrameSink`] (plexus-transport's socket loop) | the frame goes to the socket's writer as it is; the call's first frame is fenced, so it follows the subscription's answer that jsonrpsee queued |
 //! | it does not (jsonrpsee's own sink: stdio, an in-memory module) | the item's bytes go to the sink as one raw value, as before |
 //! | one change fans out to N watchers ([`Shared`]) | the first socket that sends it encodes it, once; every other writes those bytes |
+//! | a call has an input half ([`super::input`]) | [`pipe_duplex`] takes it instead: the same frames and buffer, and beside the method's items the frames of the input half (`credit`, `ack`, `input_closed`), made here since they are this transport's and no method's. [`pipe`] is unchanged by them |
 //!
 //! PERF-8 batches frames from here (`results: […]`), PERF-9 adds an encoding
 //! ([`WireEncoding`]), PERF-13 relays a child's content as bytes.
@@ -551,6 +552,15 @@ impl Frames {
         buffer.split()
     }
 
+    /// The notification carrying `body`, JSON text this side wrote.
+    fn body(&mut self, buffer: &mut Buffer, body: &[u8]) -> Bytes {
+        buffer.room(self.prefix.len() + body.len() + 2);
+        buffer.cur.put_slice(&self.prefix);
+        buffer.cur.put_slice(body);
+        buffer.cur.put_slice(b"}}");
+        buffer.split()
+    }
+
     /// `item` alone, for jsonrpsee's sink, which wraps it in the notification.
     fn raw_item(&mut self, buffer: &mut Buffer, item: &PlexusStreamItem) -> Bytes {
         buffer.room(512);
@@ -623,6 +633,132 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// The pipe of a call with an input half
+// ---------------------------------------------------------------------------
+
+/// [`pipe`] for a call with an input half ([`super::input`]): the subscription
+/// is already accepted, and its first frame is the first `credit`.
+pub(crate) async fn pipe_duplex(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::PlexusStream, duplex: super::input::Duplex) -> jsonrpsee::core::SubscriptionResult {
+    let encoding = duplex.to.encoding();
+    let buffer = Buffer::from_block(duplex.to.take_block());
+    let encoder = Encoder { encoding, buffer: RefCell::new(buffer), depth: Cell::new(0), last: Cell::new(0) };
+    WIRE.scope(encoder, run_duplex(sink, stream, duplex)).await
+}
+
+/// One frame of the input half, as `body` says.
+async fn control(to: &FrameSink, notification: &mut Frames, body: &str, fence: bool) -> Result<(), ()> {
+    let bytes = WIRE.with(|e| notification.body(&mut e.buffer.borrow_mut(), body.as_bytes()));
+    to.tx.send(WireFrame { bytes, fence }).await.map_err(drop)
+}
+
+/// `input_closed`: the half is over, said once, before anything final.
+fn input_closed(reason: &str, ack: Option<u64>) -> String {
+    match ack {
+        Some(seq) => format!(r#"{{"type":"input_closed","reason":{},"ack":{seq}}}"#, Value::from(reason)),
+        None => format!(r#"{{"type":"input_closed","reason":{}}}"#, Value::from(reason)),
+    }
+}
+
+/// What the loop below learned this turn.
+enum Turn {
+    /// The method's next item.
+    Item(Option<PlexusStreamItem>),
+    /// Nothing to write but what the ledger owes.
+    Moved,
+    /// The call is refused.
+    Refused(super::duplex_gate::DuplexRefusal),
+}
+
+async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, duplex: super::input::Duplex) -> jsonrpsee::core::SubscriptionResult {
+    use futures::StreamExt;
+    let super::input::Duplex { ledger, mut gate, inbox, credit, ns, to, slot } = duplex;
+    let mut inbox = Some(inbox);
+    let mut slot = Some(slot);
+    let mut notification = Frames::new(sink.method_name(), &sink.subscription_id());
+    let connection = sink.connection_id().0;
+    let mut acked = 0u64;
+    let out: Result<(), ()> = async {
+        // Fenced behind the subscription's answer (the client holds nothing
+        // yet: it may read this before it has the id).
+        control(&to, &mut notification, &format!(r#"{{"type":"credit","n":{}}}"#, ledger.window()), true).await?;
+        loop {
+            let turn = tokio::select! {
+                biased;
+                _ = sink.closed() => return Ok(()),
+                frame = gate.next(), if inbox.is_some() => match frame {
+                    Some(Ok(batch)) => {
+                        // The handler let go of its input: the next turn says so.
+                        let _ = inbox.as_ref().expect("guarded").send(batch);
+                        Turn::Moved
+                    }
+                    Some(Err(why)) => Turn::Refused(why),
+                    None => {
+                        inbox = None;
+                        Turn::Moved
+                    }
+                },
+                _ = ledger.woken() => Turn::Moved,
+                item = stream.next() => Turn::Item(item),
+            };
+            let (item, refused) = match turn {
+                Turn::Refused(why) => (None, Some(why)),
+                Turn::Item(item) => (Some(item), ledger.take_refusal()),
+                Turn::Moved => (None, ledger.take_refusal()),
+            };
+            if let Some(owed) = ledger.owed(acked) {
+                if let Some(seq) = owed.ack {
+                    control(&to, &mut notification, &format!(r#"{{"type":"ack","seq":{seq}}}"#), false).await?;
+                }
+                acked = owed.done;
+                if owed.credit > 0 {
+                    credit.grant(owed.credit);
+                    control(&to, &mut notification, &format!(r#"{{"type":"credit","n":{}}}"#, owed.credit), false).await?;
+                }
+            }
+            if let Some(why) = refused {
+                // The handler's input ends with the refusal, and the call
+                // with it: nothing the handler says after it goes out.
+                if slot.take().is_some() && !ledger.client_ended() {
+                    control(&to, &mut notification, &input_closed(why.kind(), ledger.last_done()), false).await?;
+                }
+                let item = serde_json::to_string(&why.to_item(&ns)).unwrap_or_default();
+                return control(&to, &mut notification, &item, false).await;
+            }
+            if ledger.abandoned() && slot.is_some() && !ledger.client_ended() {
+                slot = None;
+                inbox = None;
+                control(&to, &mut notification, &input_closed("method_ended", ledger.last_done()), false).await?;
+            }
+            let Some(item) = item else { continue };
+            let Some(item) = item else { return Ok(()) };
+            match &item {
+                PlexusStreamItem::Request { request_id, .. } => {
+                    super::bidirectional::bind_asker(request_id, connection);
+                }
+                // After `done` there is no channel to tell anything on.
+                PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. } => {
+                    inbox = None;
+                    if slot.take().is_some() && !ledger.client_ended() {
+                        control(&to, &mut notification, &input_closed("method_ended", ledger.last_done()), false).await?;
+                    }
+                }
+                _ => {}
+            }
+            let bytes = WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item));
+            drop(item);
+            to.tx.send(WireFrame { bytes, fence: false }).await.map_err(drop)?;
+        }
+    }
+    .await;
+    drop(stream);
+    let _ = out; // Err: the socket is gone, as the call's end says.
+    if let Some(block) = WIRE.with(|e| std::mem::take(&mut *e.buffer.borrow_mut())).into_block() {
+        to.give_block(block);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

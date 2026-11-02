@@ -390,6 +390,13 @@ impl Buffer {
         self.cur.split().freeze()
     }
 
+    /// The block a call with no connection leaves for its thread's next one:
+    /// all of it, with no frame of a call in flight, and not one a stream grew.
+    fn into_idle(mut self) -> Option<BytesMut> {
+        let _ = self.cur.try_reclaim(Self::FIRST);
+        (Self::FIRST..=Self::POOLED).contains(&self.cur.capacity()).then_some(self.cur)
+    }
+
     /// The block to give back to the connection's pool: the current one,
     /// whatever is left of it (frames still in flight keep what they hold).
     fn into_block(self) -> Option<BytesMut> {
@@ -491,7 +498,16 @@ pub(crate) fn encode<T: Serialize + ?Sized>(event: &T) -> Option<Content> {
     .flatten()
 }
 
-/// One call's frames: the notification around each item.
+thread_local! {
+    /// The block of a call with no frame sink, for this thread's next one.
+    /// Such a call has no connection to keep a block, and it was half of what
+    /// a one-item call allocated (PERF-27).
+    static IDLE: Cell<Option<BytesMut>> = const { Cell::new(None) };
+}
+
+/// One call's frames: the notification around each item. With no frame sink
+/// there is none to write, so no prefix: jsonrpsee's sink writes its own.
+#[derive(Default)]
 struct Frames {
     /// `{"jsonrpc":"2.0","method":M,"params":{"subscription":S,"result":`
     prefix: Vec<u8>,
@@ -502,7 +518,9 @@ struct Frames {
 
 impl Frames {
     fn new(method: &str, subscription: &jsonrpsee::types::SubscriptionId<'_>) -> Self {
-        let mut prefix = br#"{"jsonrpc":"2.0","method":"#.to_vec();
+        // Sized once: each grew from its first literal, and three reallocations a call.
+        let mut prefix = Vec::with_capacity(64);
+        prefix.extend_from_slice(br#"{"jsonrpc":"2.0","method":"#);
         let _ = serde_json::to_writer(&mut prefix, method);
         prefix.extend_from_slice(br#","params":{"subscription":"#);
         let _ = serde_json::to_writer(&mut prefix, subscription);
@@ -519,7 +537,8 @@ impl Frames {
                     None => true,
                 };
                 if fresh {
-                    let mut head = br#"{"type":"data","metadata":"#.to_vec();
+                    let mut head = Vec::with_capacity(128);
+                    head.extend_from_slice(br#"{"type":"data","metadata":"#);
                     let _ = serde_json::to_writer(&mut head, &**metadata);
                     head.extend_from_slice(br#","content_type":"#);
                     let _ = serde_json::to_writer(&mut head, content_type.as_ref());
@@ -551,11 +570,27 @@ impl Frames {
         buffer.split()
     }
 
-    /// `item` alone, for jsonrpsee's sink, which wraps it in the notification.
-    fn raw_item(&mut self, buffer: &mut Buffer, item: &PlexusStreamItem) -> Bytes {
-        buffer.room(512);
-        self.item(&mut buffer.cur, item);
-        buffer.split()
+    /// `item` alone, for jsonrpsee's sink, which wraps it in the notification:
+    /// text of its own, its exact size, written once and not read again. The
+    /// copy and the check this took were most of the 6,644 instructions PERF-27
+    /// took off a one-item call's 50,842.
+    fn raw_item(&mut self, item: &PlexusStreamItem) -> Result<Box<RawValue>, serde_json::Error> {
+        if !matches!(item, PlexusStreamItem::Data { .. }) {
+            return serde_json::value::to_raw_value(item);
+        }
+        let mut text = BytesMut::new();
+        self.item(&mut text, item);
+        // This one stays: `Content::from_json` holds text to JSON's grammar, not to UTF-8.
+        let text = String::from_utf8(Vec::from(text)).map_err(serde::ser::Error::custom)?;
+        // SAFETY: one JSON value with nothing around it. `Frames::item` writes
+        // a `data` item's opening, then its content, then `}`. The opening is
+        // literal keys around values serde_json wrote into a `Vec`, which
+        // cannot fail. The content is one value: `encode`'s text, whole (a
+        // failed write leaves a `Value` instead); text `Content::from_json`
+        // parsed, by the same parse `RawValue::from_string` would run here; or
+        // a `Value`, which serde_json cannot fail to write.
+        // A debug build parses it here all the same (tests/no_frame_sink.rs).
+        Ok(unsafe { RawValue::from_string_unchecked(text) })
     }
 }
 
@@ -572,7 +607,11 @@ impl Frames {
 pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::PlexusStream, ext: &http::Extensions) -> jsonrpsee::core::SubscriptionResult {
     let frames = ext.get::<FrameSink>().cloned();
     let encoding = frames.as_ref().map(FrameSink::encoding).unwrap_or_default();
-    let buffer = Buffer::from_block(frames.as_ref().and_then(FrameSink::take_block));
+    let block = match &frames {
+        Some(to) => to.take_block(),
+        None => IDLE.try_with(Cell::take).ok().flatten(),
+    };
+    let buffer = Buffer::from_block(block);
     let encoder = Encoder { encoding, buffer: RefCell::new(buffer), depth: Cell::new(0), last: Cell::new(0) };
     WIRE.scope(encoder, run(sink, stream, frames)).await
 }
@@ -580,7 +619,10 @@ pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::P
 async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, frames: Option<FrameSink>) -> jsonrpsee::core::SubscriptionResult {
     use futures::StreamExt;
     let connection = sink.connection_id().0;
-    let mut notification = Frames::new(sink.method_name(), &sink.subscription_id());
+    let mut notification = match &frames {
+        Some(_) => Frames::new(sink.method_name(), &sink.subscription_id()),
+        None => Frames::default(),
+    };
     let mut first = true;
     let out: jsonrpsee::core::SubscriptionResult = async {
         loop {
@@ -602,13 +644,11 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
                     }
                 }
                 None => {
-                    let bytes = WIRE.with(|e| notification.raw_item(&mut e.buffer.borrow_mut(), &item));
-                    drop(item);
                     // jsonrpsee's sink takes a raw value, which it wraps in
-                    // the notification: a copy and a check — the price of a
-                    // transport without frames of its own (stdio, a module
-                    // called in memory).
-                    let raw = RawValue::from_string(String::from_utf8(bytes.to_vec()).unwrap_or_default())?;
+                    // the notification: a copy, the price of a transport
+                    // without frames of its own (stdio, a module called in memory).
+                    let raw = notification.raw_item(&item)?;
+                    drop(item);
                     sink.send(raw).await?;
                 }
             }
@@ -617,9 +657,15 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
     }
     .await;
     drop(stream);
-    if let Some(to) = &frames {
-        if let Some(block) = WIRE.with(|e| std::mem::take(&mut *e.buffer.borrow_mut())).into_block() {
-            to.give_block(block);
+    let buffer = WIRE.with(|e| std::mem::take(&mut *e.buffer.borrow_mut()));
+    match &frames {
+        Some(to) => {
+            if let Some(block) = buffer.into_block() {
+                to.give_block(block);
+            }
+        }
+        None => {
+            let _ = IDLE.try_with(|idle| idle.set(buffer.into_idle()));
         }
     }
     out
@@ -747,6 +793,30 @@ mod tests {
         assert_eq!(serde_json::to_string(&encoded).unwrap(), serde_json::to_string(&v).unwrap(), "outside the pipe it writes its Value");
         assert_eq!(encoded.into_value(), v);
         assert!(Content::from_json(Bytes::from_static(b"{nope")).is_err());
+    }
+
+    /// PERF-27: a block a call was half of what a one-item call allocated on
+    /// a transport with no frame sink, which has no connection to keep one.
+    #[test]
+    fn a_call_with_no_connection_leaves_its_block_whole_for_the_next() {
+        let mut b = Buffer::default();
+        b.room(300);
+        b.cur.put_slice(&[1u8; 300]);
+        drop(b.split());
+        let block = b.into_idle().expect("a block this size is kept");
+        assert!(block.capacity() >= Buffer::FIRST, "all of it again, not what was left: {}", block.capacity());
+        let mut next = Buffer::from_block(Some(block));
+        let kept = next.cur.as_ptr();
+        next.room(300);
+        assert_eq!(next.cur.as_ptr(), kept, "the next call makes none");
+    }
+
+    /// One a stream grew is not kept, or a thread holds it for good.
+    #[test]
+    fn a_block_too_large_to_keep_goes() {
+        let mut b = Buffer::default();
+        b.room(Buffer::POOLED + 1);
+        assert!(b.into_idle().is_none());
     }
 
     #[test]

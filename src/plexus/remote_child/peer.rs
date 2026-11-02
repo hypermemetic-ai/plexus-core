@@ -156,6 +156,16 @@ mod tests {
         assert!(serde_json::from_value::<PlexusStreamItem>(v).is_ok());
     }
 
+    /// RETURNS-36 (review #4): a kind this build does not know keeps its name
+    /// and its fields — menger's `too_many_writes` with `retry_after_ms`.
+    #[test]
+    fn an_unknown_kind_passes_through_typed() {
+        let o = json!({"code": "too_many_writes", "error_kind": "too_many_writes", "retry_after_ms": 250, "message": "slow down"});
+        let e = remote_error_of(o.as_object().unwrap());
+        assert_eq!(e.kind(), "too_many_writes");
+        assert_eq!(serde_json::to_value(&e).unwrap()["retry_after_ms"], 250, "{e:?}");
+    }
+
     #[test]
     fn other_items_are_not_rewritten() {
         assert!(item(r#"{"type":"data","content":1}"#, "x").is_none());

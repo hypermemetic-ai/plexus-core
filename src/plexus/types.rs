@@ -384,6 +384,23 @@ mod tests {
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
+    /// RETURNS-36 (review #4): `message` is always written, and optional on
+    /// reading — RETURNS-6's error frame, `{type, metadata, recoverable,
+    /// error}`, is valid, as plexus-client reads it.
+    #[test]
+    fn an_error_frame_without_message_reads() {
+        let frame = serde_json::json!({
+            "type": "error",
+            "metadata": {"provenance": ["tickets"], "plexus_hash": "h", "timestamp": 1},
+            "recoverable": false,
+            "error": {"kind": "unauthenticated"}
+        });
+        let item: PlexusStreamItem = serde_json::from_value(frame).expect("a frame without message reads");
+        assert_eq!(item.remote_error(), Some(&RemoteError::Unauthenticated));
+        let written = serde_json::to_value(&item).unwrap();
+        assert!(written.get("message").is_some_and(|m| m.is_string()), "message is always written: {written}");
+    }
+
     /// A 0.6-shaped frame does not parse as 0.7 (no back-compat, RETURNS-1
     /// decision 12): `message`/`code` are gone and `error` is required.
     #[test]

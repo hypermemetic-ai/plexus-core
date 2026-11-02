@@ -203,6 +203,22 @@ async fn items_errors_done_in_order() {
     assert_eq!(e[0]["error_kind"], "teapot");
 }
 
+/// RETURNS-36 (review #4): an error item the service cannot decode is never
+/// skipped — skipped, the call would wait for an end that never comes. It
+/// ends the call with an error naming what could not be read, and the child
+/// is told to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_error_item_it_cannot_read_ends_the_call() {
+    let r = rig(Via::Stdio).await;
+    let sent = unix_ns();
+    let e = tokio::time::timeout(Duration::from_secs(5), route(&r, ADA, "echo.fail", json!({ "kind": "garbled" })))
+        .await
+        .expect("the call ends, it does not hang");
+    assert_eq!(types(&e), ["error"], "{e:?}");
+    assert!(e[0]["message"].as_str().unwrap_or_default().contains("could not read"), "{}", e[0]);
+    assert!(child_event(&r.log, "unsub", sent, Duration::from_secs(2)).await.is_some(), "the child was told");
+}
+
 /// A child's typed refusal crosses whole — `error_kind` and `forbidden`'s
 /// own fields — in the service's stream and on its WebSocket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

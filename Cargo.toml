@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 # Serialization
 serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
 # PERF-7: an item's frame is split off a block as `Bytes`, written as it is.
 bytes = "1.9"
 # PERF-7: wrap_stream's stream, the method's own inside it unboxed.

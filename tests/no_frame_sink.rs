@@ -98,6 +98,27 @@ async fn every_other_kind_of_item_reads_as_itself() {
     .await;
 }
 
+/// `from_json` holds text to JSON's grammar and not to UTF-8, so this is text
+/// no check stands behind but the one kept: the call ends at it, and nothing
+/// that is not JSON reaches the client.
+#[tokio::test]
+async fn text_that_is_not_utf8_ends_the_call() {
+    let m = Arc::new(meta());
+    let items = vec![
+        data(&m, "t", json_bytes("1")),
+        data(&m, "t", Content::from_json(Bytes::from_static(b"\"\xff\"")).unwrap()),
+        data(&m, "t", json_bytes("3")),
+    ];
+    let module = module(items);
+    let (_, mut rx) = module.raw_json_request(r#"{"jsonrpc":"2.0","id":1,"method":"test.sub","params":[]}"#, 1024).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(raw) = rx.recv().await {
+        got.push(serde_json::from_str::<Value>(raw.get()).unwrap());
+    }
+    assert_eq!(got[0]["params"]["result"]["content"], json!(1));
+    assert!(got[1..].iter().all(|n| n["params"]["result"].get("content").is_none()), "{got:?}");
+}
+
 /// A large item, past any first block.
 #[tokio::test]
 async fn a_large_item_reads_as_itself() {

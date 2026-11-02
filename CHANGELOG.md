@@ -5,6 +5,15 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- PERF-27: on a transport with no frame sink (stdio, a module called in memory)
+  an item is no longer copied and parsed again on its way to jsonrpsee's sink,
+  and a call leaves its 8 KiB block for its thread's next one. Needs
+  serde_json 1.0.151.
+
 ## [0.7.0]
 
 Upgrading from 0.6.1, the last published version. 0.6.2 below was never

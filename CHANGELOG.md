@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time. The bytes are serde_json's, for every value. Down an item's path a ticket
   body takes 4.0× fewer instructions and 200 rows 5.3×.
 
+### Added
+
+- PERF-8: batches. `FrameSink::batching(max)` (and `MAX_BATCH`, 64): for a
+  client that offered `batch` at its upgrade (plexus-transport reads it), the
+  items a stream has ready together go in one notification, `results`, the
+  metadata said once (plexus-wire spec/02); a lone item goes at once in
+  today's form, and a sink that does not batch writes exactly today's frames.
+  A batch stops after the item that brings it to `BATCH_BYTES`, 8 KiB, so a
+  large item goes alone. An item's own path falls from 4,145 instructions to
+  983, 64 to a notification; a row from 5,195 to 2,082 (35 to one), 1 KB from
+  4,917 to 2,113 (8 to one).
+
 ## [0.7.0]
 
 Upgrading from 0.6.1, the last published version. 0.6.2 below was never

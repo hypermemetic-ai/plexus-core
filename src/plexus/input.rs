@@ -67,6 +67,9 @@ pub(crate) struct Batch {
 /// One call's input, as its reader, its handler and its pipe share it.
 pub(crate) struct Ledger {
     window: u64,
+    /// Bytes held past which no credit is granted (owner, 2026-11-02: an
+    /// obedient client is slowed, never ended).
+    max_buffered: u64,
     /// What the call holds: received and not consumed.
     held_items: AtomicU64,
     held_bytes: AtomicU64,
@@ -88,9 +91,10 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    fn new(window: u64) -> Self {
+    fn new(window: u64, max_buffered: u64) -> Self {
         Self {
             window,
+            max_buffered,
             held_items: AtomicU64::new(0),
             held_bytes: AtomicU64::new(0),
             done: AtomicU64::new(0),
@@ -154,10 +158,15 @@ impl Ledger {
 
     /// What the pipe owes the client now: `Some` when there is something to
     /// say. The last frame consumed, when it is news, and the items to grant.
-    /// Half a window at a time, and all that is left when the input is done.
+    /// Half a window at a time, and all that is left when the input is done;
+    /// nothing while the call holds `max_buffered` bytes or more, the credit
+    /// kept until the handler drains below it.
     pub(crate) fn owed(&self, acked: u64) -> Option<Owed> {
         let finished = self.finished.load(Ordering::Acquire);
         let ended = self.ended.load(Ordering::Acquire);
+        if !finished && !ended && self.held_bytes.load(Ordering::Acquire) >= self.max_buffered {
+            return None;
+        }
         let done = self.done.load(Ordering::Acquire);
         let consumed = self.consumed.load(Ordering::Acquire);
         let due = consumed - self.returned.load(Ordering::Acquire);
@@ -359,7 +368,6 @@ struct Slot {
     /// `None`: the half is closed to frames (ended, or refused on arrival).
     tx: Option<mpsc::UnboundedSender<InputFrame<Batch>>>,
     ledger: Arc<Ledger>,
-    max_buffered: u64,
 }
 
 /// What became of an input frame.
@@ -458,15 +466,10 @@ impl InputTable {
         slot.next_seq += 1;
         let count = p.items.len() as u64;
         let bytes: u64 = p.items.iter().map(|i| i.get().len() as u64).sum();
+        // Past the window is past credit: what a call holds is bounded by
+        // credit, and its bytes by the credit held back past `max_buffered`.
         let held_items = slot.ledger.held_items.load(Ordering::Acquire);
-        let held_bytes = slot.ledger.held_bytes.load(Ordering::Acquire);
-        let overrun = if held_items + count > slot.ledger.window {
-            Some(Overrun::Credit)
-        } else if held_bytes + bytes > slot.max_buffered {
-            Some(Overrun::Buffered { max: slot.max_buffered })
-        } else {
-            None
-        };
+        let overrun = (held_items + count > slot.ledger.window).then_some(Overrun::Credit);
         if overrun.is_some() {
             let last = InputFrame { from: self.conn, seq: p.seq, item: empty(p.seq), items: 0, bytes: 0, overrun };
             let _ = tx.send(last);
@@ -615,12 +618,12 @@ impl Seam {
             }
         };
         let credit = call.credit_line();
-        let ledger = Arc::new(Ledger::new(ceiling.credit));
+        let ledger = Arc::new(Ledger::new(ceiling.credit, ceiling.max_buffered));
         let (tx, rx) = mpsc::unbounded_channel();
         let (inbox, handler) = mpsc::unbounded_channel();
         let slot = table.attach(
             subscription,
-            Slot { ns: ns.clone(), next_seq: 0, tx: Some(tx), ledger: ledger.clone(), max_buffered: ceiling.max_buffered },
+            Slot { ns: ns.clone(), next_seq: 0, tx: Some(tx), ledger: ledger.clone() },
         );
         // `refused` is for a frame of another connection, and the table is
         // this connection's: nothing reads it.

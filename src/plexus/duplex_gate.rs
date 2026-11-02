@@ -190,8 +190,6 @@ impl DuplexRefusal {
 pub enum Overrun {
     /// More items than the window holds were outstanding: past credit.
     Credit,
-    /// More bytes than the call may hold.
-    Buffered { max: u64 },
     /// Out of sequence.
     Sequence { expected: u64 },
 }
@@ -502,7 +500,6 @@ impl DuplexCall {
         match f.overrun {
             None => {}
             Some(Overrun::Credit) => return Err(self.close(DuplexRefusal::PastCredit { seq: f.seq, credit })),
-            Some(Overrun::Buffered { max }) => return Err(self.close(DuplexRefusal::TooMuchInput { limit: "buffered_bytes", max })),
             Some(Overrun::Sequence { expected }) => return Err(self.close(DuplexRefusal::OutOfSequence { seq: f.seq, expected })),
         }
         if self.items.saturating_add(f.items) > credit {

@@ -23,6 +23,9 @@ use tokio::sync::broadcast;
 /// How many times a [`Change`] was serialized, by anything.
 static ENCODES: AtomicUsize = AtomicUsize::new(0);
 
+/// The tests here read `ENCODES` one at a time.
+static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// One change, as menger's `watch` relays one: a ticket and what moved.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 struct Change {
@@ -101,6 +104,7 @@ async fn next_data(sub: &mut Subscription<Value>) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_change_to_200_watchers_is_encoded_once() {
     const WATCHERS: usize = 200;
+    let _alone = ALONE.lock().await;
     let (changes, _keep) = broadcast::channel(16);
     let hub = Arc::new(DynamicHub::new("feeds").register(FeedActivation { changes: changes.clone() }));
     let module = DynamicHub::arc_into_rpc_module(hub).unwrap();
@@ -135,4 +139,67 @@ async fn one_change_to_200_watchers_is_encoded_once() {
     let encodes = ENCODES.load(Ordering::SeqCst);
     println!("{WATCHERS} watchers, one change: {encodes} encode(s)");
     assert_eq!(encodes, 1, "one change to {WATCHERS} watchers is encoded once, not once a watcher");
+}
+
+/// PERF-9: the same on sockets in both encodings — one encode for each
+/// encoding, however many watchers, and each reads its own. `ENCODES` is the
+/// process's, so this test takes the count alone (`one_change_to_200…` has
+/// finished or not begun: they are serialized by `ALONE`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_change_is_encoded_once_for_each_encoding() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    const WATCHERS: usize = 20;
+    let _alone = ALONE.lock().await;
+    let (changes, _keep) = broadcast::channel(16);
+    let hub = Arc::new(DynamicHub::new("feeds").register(FeedActivation { changes: changes.clone() }));
+    let module = DynamicHub::arc_into_rpc_module(hub).unwrap();
+    let opts = plexus_transport::websocket::UpgradeOptions::default();
+    let (_server, addr) = plexus_transport::websocket::serve_websocket_with(module, plexus_transport::WebSocketConfig::new(0), None, opts).await.unwrap();
+    let url = format!("ws://{addr}");
+    // Half on JSON (jsonrpsee's client), half on msgpack.
+    let mut json_clients = Vec::new();
+    let mut json_watchers = Vec::new();
+    for _ in 0..WATCHERS / 2 {
+        let c = socket(&url).await;
+        let mut p = ObjectParams::new();
+        p.insert("method", "feed.watch").unwrap();
+        p.insert("params", json!({})).unwrap();
+        let mut sub: Subscription<Value> = c.subscribe("feeds.call", p, "feeds.call_unsub").await.unwrap();
+        assert_eq!(next_data(&mut sub).await["type"], "ready");
+        json_clients.push(c);
+        json_watchers.push(sub);
+    }
+    let mut packed = Vec::new();
+    for _ in 0..WATCHERS / 2 {
+        let mut req = url.as_str().into_client_request().unwrap();
+        req.headers_mut().insert("Sec-WebSocket-Protocol", "plexus.msgpack".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let call = json!({"id": 1, "method": "feeds.call", "params": {"method": "feed.watch", "params": {}}});
+        ws.send(Message::Binary(rmp_serde::to_vec_named(&call).unwrap().into())).await.unwrap();
+        // The answer, then `ready`.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("a frame in 10 s").unwrap().unwrap();
+        }
+        packed.push(ws);
+    }
+    let before = ENCODES.load(Ordering::SeqCst);
+    let change = Change { id: "A-1".into(), title: "t".into(), status: "Ready".into(), labels: vec!["x".into()], body: "b".repeat(100) };
+    let want = json!({"id": "A-1", "title": "t", "status": "Ready", "labels": ["x"], "body": "b".repeat(100)});
+    changes.send(Shared::new(change)).unwrap();
+    for sub in &mut json_watchers {
+        assert_eq!(next_data(sub).await, want);
+    }
+    for ws in &mut packed {
+        let frame = loop {
+            match tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("a frame in 10 s").unwrap().unwrap() {
+                Message::Binary(b) => break b,
+                _ => continue,
+            }
+        };
+        let v: Value = rmp_serde::from_slice(&frame).unwrap();
+        assert_eq!(v["params"]["result"]["content"], want, "a msgpack watcher reads the change");
+    }
+    assert_eq!(ENCODES.load(Ordering::SeqCst) - before, 2, "one encode for each encoding, {WATCHERS} watchers");
 }

@@ -9,7 +9,8 @@
 //!
 //! | what | how |
 //! | -- | -- |
-//! | a string under 16 bytes, a field's name above all | loaded whole by two overlapping words, one compare, stored: no loop and no call |
+//! | a field's name | inlined with its field: the compiler sees the name, folds the scan, and writes a clean one as constants |
+//! | a string under 16 bytes | loaded whole by two overlapping words, one compare, stored: no loop and no call |
 //! | a longer one | one pass, each block stored as it is scanned ([`scan`]); a run between escapes takes no copy of its own |
 //! | an x86-64 CPU | SSE2, which they all have; AVX2 where the CPU says so, at run time. No `target-cpu`: test and prod are other machines |
 //! | any other | a byte at a time, as serde_json does |
@@ -17,7 +18,8 @@
 //! | a number | serde_json's own `Formatter`, so it cannot differ |
 //!
 //! A field's name is `&'static str`, but nothing says it is clean: `#[serde(rename
-//! = "a\"b")]` is legal, so it is looked at, once, as one block.
+//! = "a\"b")]` is legal. So nothing is skipped at run time; the compiler does
+//! the looking, and a name that needs escaping still gets its escape.
 //!
 //! Everything else mirrors `serde_json::ser`, state for state: an empty
 //! sequence closes as it opens, a raw value's text goes as it is, a map key

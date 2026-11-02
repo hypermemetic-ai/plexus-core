@@ -505,7 +505,9 @@ thread_local! {
     static IDLE: Cell<Option<BytesMut>> = const { Cell::new(None) };
 }
 
-/// One call's frames: the notification around each item.
+/// One call's frames: the notification around each item. With no frame sink
+/// there is none to write, so no prefix: jsonrpsee's sink writes its own.
+#[derive(Default)]
 struct Frames {
     /// `{"jsonrpc":"2.0","method":M,"params":{"subscription":S,"result":`
     prefix: Vec<u8>,
@@ -516,7 +518,9 @@ struct Frames {
 
 impl Frames {
     fn new(method: &str, subscription: &jsonrpsee::types::SubscriptionId<'_>) -> Self {
-        let mut prefix = br#"{"jsonrpc":"2.0","method":"#.to_vec();
+        // Sized once: each grew from its first literal, and three reallocations a call.
+        let mut prefix = Vec::with_capacity(64);
+        prefix.extend_from_slice(br#"{"jsonrpc":"2.0","method":"#);
         let _ = serde_json::to_writer(&mut prefix, method);
         prefix.extend_from_slice(br#","params":{"subscription":"#);
         let _ = serde_json::to_writer(&mut prefix, subscription);
@@ -533,7 +537,8 @@ impl Frames {
                     None => true,
                 };
                 if fresh {
-                    let mut head = br#"{"type":"data","metadata":"#.to_vec();
+                    let mut head = Vec::with_capacity(128);
+                    head.extend_from_slice(br#"{"type":"data","metadata":"#);
                     let _ = serde_json::to_writer(&mut head, &**metadata);
                     head.extend_from_slice(br#","content_type":"#);
                     let _ = serde_json::to_writer(&mut head, content_type.as_ref());
@@ -567,8 +572,8 @@ impl Frames {
 
     /// `item` alone, for jsonrpsee's sink, which wraps it in the notification:
     /// text of its own, its exact size, written once and not read again. The
-    /// copy and the check this took were 6,795 of a one-item call's 49,437
-    /// instructions (PERF-27).
+    /// copy and the check this took were most of the 6,644 instructions PERF-27
+    /// took off a one-item call's 50,842.
     fn raw_item(&mut self, item: &PlexusStreamItem) -> Result<Box<RawValue>, serde_json::Error> {
         if !matches!(item, PlexusStreamItem::Data { .. }) {
             return serde_json::value::to_raw_value(item);
@@ -614,7 +619,10 @@ pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::P
 async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, frames: Option<FrameSink>) -> jsonrpsee::core::SubscriptionResult {
     use futures::StreamExt;
     let connection = sink.connection_id().0;
-    let mut notification = Frames::new(sink.method_name(), &sink.subscription_id());
+    let mut notification = match &frames {
+        Some(_) => Frames::new(sink.method_name(), &sink.subscription_id()),
+        None => Frames::default(),
+    };
     let mut first = true;
     let out: jsonrpsee::core::SubscriptionResult = async {
         loop {

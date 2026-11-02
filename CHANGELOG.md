@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PERF-27: on a transport with no frame sink (stdio, a module called in memory)
   an item is no longer copied and parsed again on its way to jsonrpsee's sink,
-  and a call leaves its 8 KiB block for its thread's next one. Needs
+  a call leaves its 8 KiB block for its thread's next one, and it builds no
+  notification prefix it will not use. A one-item call falls from 50,842
+  instructions and 16,048 bytes allocated to about 42,100 and 7,770. Needs
   serde_json 1.0.151.
 
 ## [0.7.0]

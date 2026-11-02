@@ -1,6 +1,7 @@
 //! A child over a WebSocket (feature `child-ws`): dialed with the service's
-//! own key proof on the upgrade (spec/00), one JSON-RPC message per text
-//! frame. The key is read from its file at each dial, used to sign, and
+//! own key proof on the upgrade (spec/00), asking for msgpack, then JSON
+//! (spec/13): one msgpack map per binary frame when the child picks msgpack,
+//! one JSON-RPC message per text frame otherwise. The key is read from its file at each dial, used to sign, and
 //! dropped (`SigningKey` zeroizes): never kept, logged, or put in a frame.
 
 use std::path::Path;
@@ -11,7 +12,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
+use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+use crate::plexus::wire::WireEncoding;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::link::{gone, Conn, Shared};
@@ -82,34 +84,67 @@ fn nonce() -> [u8; 32] {
     n
 }
 
+/// The upgrade to `url`, asking for `encodings` (none: no
+/// `Sec-WebSocket-Protocol`, as before spec/13).
+async fn upgrade(
+    shared: &Arc<Shared>,
+    url: &str,
+    encodings: &[WireEncoding],
+) -> Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, WireEncoding), tokio_tungstenite::tungstenite::Error> {
+    let mut req = url.into_client_request()?;
+    if let Some(path) = &shared.opts.key {
+        let key = read_seed(path).map_err(|e| tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(e)))?;
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let proof = key_proof(&key, url.trim_end_matches('/'), &shared.opts.agent, &nonce(), ts);
+        let value = HeaderValue::from_str(&format!("Bearer {proof}")).map_err(|e| tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(e.to_string())))?;
+        req.headers_mut().insert(AUTHORIZATION, value);
+    }
+    if !encodings.is_empty() {
+        let ask = crate::plexus::encoding::ask_header(encodings);
+        req.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_str(&ask).expect("tokens are ASCII"));
+    }
+    let (socket, resp) = tokio_tungstenite::connect_async(req).await?;
+    let picked = resp.headers().get(SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).and_then(WireEncoding::from_token).unwrap_or(WireEncoding::Json);
+    Ok((socket, picked))
+}
+
 pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, String> {
+    use tokio_tungstenite::tungstenite::error::{Error as WsError, ProtocolError, SubProtocolError};
     if url.starts_with("wss://") && !cfg!(feature = "child-wss") {
         return Err("a wss:// child needs plexus-core's `child-wss` feature (TLS)".into());
     }
-    let mut req = url.into_client_request().map_err(|e| format!("`{url}`: {e}"))?;
-    if let Some(path) = &shared.opts.key {
-        let key = read_seed(path)?;
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-        let proof = key_proof(&key, url.trim_end_matches('/'), &shared.opts.agent, &nonce(), ts);
-        let value = HeaderValue::from_str(&format!("Bearer {proof}")).map_err(|e| e.to_string())?;
-        req.headers_mut().insert(AUTHORIZATION, value);
-    }
-    let (socket, _) = tokio_tungstenite::connect_async(req).await.map_err(|e| match e {
-        tokio_tungstenite::tungstenite::Error::Http(resp) => format!("the upgrade to {url} was refused: HTTP {}", resp.status()),
+    let refused = |e: WsError| match e {
+        WsError::Http(resp) => format!("the upgrade to {url} was refused: HTTP {}", resp.status()),
+        WsError::Io(e) if e.kind() == std::io::ErrorKind::Other => e.to_string(),
         e => format!("dialing {url}: {e}"),
-    })?;
+    };
+    // PERF-9 (spec/13): ask for the options' encodings. A child from before
+    // spec/13 answers the 101 naming none, which tungstenite refuses: it is
+    // dialed once more, asking for nothing, and spoken to in JSON.
+    let (socket, encoding) = match upgrade(shared, url, &shared.opts.encodings).await {
+        Ok(s) => s,
+        Err(WsError::Protocol(ProtocolError::SecWebSocketSubProtocolError(SubProtocolError::NoSubProtocol))) => {
+            tracing::debug!(target: "plexus::child", child = %shared.name, "{url} names no encoding (before spec/13): JSON");
+            upgrade(shared, url, &[]).await.map_err(refused)?
+        }
+        Err(e) => return Err(refused(e)),
+    };
     let (mut sink, mut stream) = socket.split();
     let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let conn = Conn::new(&shared.name, None, out, shared.opts.buffer, Arc::clone(&shared.counters));
+    let conn = Conn::new(&shared.name, None, encoding, out, shared.opts.buffer, Arc::clone(&shared.counters));
     let writer = Arc::clone(&conn);
+    let message = move |frame: Vec<u8>| match encoding {
+        WireEncoding::Msgpack => Message::Binary(frame.into()),
+        _ => Message::text(String::from_utf8_lossy(&frame).into_owned()),
+    };
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 first = out_rx.recv() => {
                     let Some(first) = first else { break };
-                    let mut ok = sink.feed(Message::text(String::from_utf8_lossy(&first).into_owned())).await.is_ok();
+                    let mut ok = sink.feed(message(first)).await.is_ok();
                     while let (true, Ok(more)) = (ok, out_rx.try_recv()) {
-                        ok = sink.feed(Message::text(String::from_utf8_lossy(&more).into_owned())).await.is_ok();
+                        ok = sink.feed(message(more)).await.is_ok();
                     }
                     if !ok || sink.flush().await.is_err() {
                         break;
@@ -128,7 +163,15 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     tokio::spawn(async move {
         let why = loop {
             match stream.next().await {
+                // spec/13: a text message on a msgpack socket is a protocol error.
+                Some(Ok(Message::Text(_))) if reader.encoding == WireEncoding::Msgpack => {
+                    break format!("{url} sent a text message on a plexus.msgpack socket");
+                }
                 Some(Ok(Message::Text(t))) => reader.on_message(t.as_bytes()).await,
+                Some(Ok(Message::Binary(b))) if reader.encoding == WireEncoding::Msgpack => match crate::plexus::msgpack::frame_to_json(&b) {
+                    Ok(json) => reader.on_message(&json).await,
+                    Err(e) => tracing::warn!(target: "plexus::child", child = %reader.name, "an unreadable frame from the child: {e}"),
+                },
                 Some(Ok(Message::Binary(b))) => reader.on_message(&b).await,
                 Some(Ok(Message::Close(f))) => break format!("{url} closed the socket ({})", f.map(|f| f.code.to_string()).unwrap_or_else(|| "no code".into())),
                 Some(Ok(_)) => {}

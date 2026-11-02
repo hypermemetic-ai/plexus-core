@@ -221,6 +221,12 @@ impl RemoteChild {
         self.inner.timings
     }
 
+    /// PERF-9: what the link to the child speaks now (spec/13) — msgpack
+    /// when the child offers it; `None` while there is no link.
+    pub fn encoding(&self) -> Option<crate::plexus::wire::WireEncoding> {
+        self.inner.shared.current().map(|c| c.encoding)
+    }
+
     /// Subscriptions routed on the live connection (0 when none is up).
     pub fn routed(&self) -> usize {
         self.inner.shared.current().map_or(0, |c| c.routed())

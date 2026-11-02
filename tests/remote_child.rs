@@ -111,7 +111,9 @@ async fn refuses_start_on_silent_child() {
     let t0 = Instant::now();
     let e = RemoteChild::connect("mute=stdio:sleep 30".parse().unwrap(), ChildOptions { timeout, ..ChildOptions::default() }).await.unwrap_err();
     let took = t0.elapsed();
-    assert!(matches!(&e, ChildError::Start(n, why) if n == "mute" && why.contains("_info")), "{e}");
+    // PERF-9: a stdio child is asked its encoding first (spec/13's first
+    // line, a request): a silent one fails there, within the same timeout.
+    assert!(matches!(&e, ChildError::Start(n, why) if n == "mute" && (why.contains("_info") || why.contains("first line"))), "{e}");
     // The contract is the timeout + 100 ms (alone: 0.30–0.33 s); the slack
     // is for a suite starting twenty children at once on a busy machine.
     assert!(took <= timeout + Duration::from_millis(250), "{took:?}");

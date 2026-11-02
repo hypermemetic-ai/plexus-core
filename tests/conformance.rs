@@ -83,7 +83,7 @@ async fn kit_against(port: u16, serving: tokio::task::JoinHandle<anyhow::Result<
     let key = |n: &str| keys.join(format!("{n}.key")).to_str().unwrap().to_string();
     let expect = wire().join("conformance/expect").join(expect);
     let url = format!("ws://127.0.0.1:{port}");
-    let args: Vec<String> = [
+    let mut args: Vec<String> = [
         "run", "--role", "service", "--url", &url, "--key", &key("admin"), "--viewer-key", &key("viewer"),
         "--max-calls", "0", "--idle-secs", "0", "--max-per-principal", "8", "--origin-allowed", "http://127.0.0.1:1",
         "--expect-fail", expect.to_str().unwrap(),
@@ -91,6 +91,12 @@ async fn kit_against(port: u16, serving: tokio::task::JoinHandle<anyhow::Result<
     .iter()
     .map(|s| s.to_string())
     .collect();
+    // PERF-9: every case in JSON and in msgpack, once the kit beside this
+    // checkout knows spec/13 (plexus-wire's main does with the release that
+    // carries msgpack; before it, the kit's JSON run alone).
+    if wire().join("spec/13-encodings.md").is_file() {
+        args.extend(["--encoding".to_string(), "json,msgpack".to_string()]);
+    }
     let out = tokio::task::spawn_blocking(move || kit(&args.iter().map(String::as_str).collect::<Vec<_>>())).await.unwrap();
     serving.abort();
     out

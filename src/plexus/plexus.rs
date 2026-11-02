@@ -2650,12 +2650,14 @@ async fn serve_call(
     let call: CallParams = params.parse()?;
     let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().cloned() } else { None };
     let seen = service.inner.gate.as_ref().map_or(0, |g| g.generation().current());
-    let seam = super::input::Seam { service: service.clone(), params, pending: Some(pending), ext, seen, opened: None, refused: None };
-    let routed = service.route(&call.method, call.params.unwrap_or_default(), caller.as_deref());
-    // In a block of its own, so the route's future shares its room in this
-    // one with the pipe's (a call's whole size is one allocation per call).
+    // Built in place, in a block of its own: the route's future shares its
+    // room in this one with the pipe's (a call's whole size is one
+    // allocation per call), and nothing moved out of keeps a room of its own.
     let (answer, seam) = {
-        let mut scoped = std::pin::pin!(super::input::CALL.scope(std::cell::RefCell::new(seam), routed));
+        let mut scoped = std::pin::pin!(super::input::CALL.scope(
+            std::cell::RefCell::new(super::input::Seam { service: service.clone(), params, pending: Some(pending), ext, seen, opened: None, refused: None }),
+            service.route(&call.method, call.params.unwrap_or_default(), caller.as_deref()),
+        ));
         let answer = scoped.as_mut().await;
         (answer, scoped.as_mut().take_value().expect("the scope ran to its end").into_inner())
     };

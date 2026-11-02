@@ -284,11 +284,14 @@ pub const MAX_BATCH: usize = 64;
 
 /// Where a batch stops taking items: once what it holds reaches this many
 /// bytes, so a batch of large items stays small. A queue's 1,024 frames are
-/// bounded by frames, not bytes (PERF.115-37): 64 items of 4 KB to a frame
-/// held 280 KB a frame and allocated a 512 KiB block every few frames, and a
-/// ticket body's would hold a megabyte. PERF-17 found a count alone cost a
-/// 4 KB stream 27 %, and said a batch should stop at bytes.
-pub const BATCH_BYTES: usize = 16 * 1024;
+/// bounded by frames, not bytes (PERF.115-37), and each item takes its size
+/// twice from a block: 64 items of 4 KB to a frame held 280 KB a frame and
+/// allocated a 512 KiB block every few frames, 16 KiB still 4,096 B an item
+/// in one run of two, and a ticket body's batch would hold a megabyte. At
+/// 8 KiB a full queue of 4 KB items holds about 18 MB, which the call's 80
+/// spare blocks keep. PERF-17 found a count alone cost a 4 KB stream 27 %, and
+/// said a batch should stop at bytes.
+pub const BATCH_BYTES: usize = 8 * 1024;
 
 /// What the transport's writer reads a [`FrameSink`]'s frames from.
 pub type FrameReceiver = tokio::sync::mpsc::Receiver<WireFrame>;
@@ -774,8 +777,8 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
                     // for a client that takes batches. Never what is not ready
                     // yet: a lone item goes at once, in today's form.
                     let mut ended = false;
-                    let mut held = size(&item);
-                    let more = to.batch > 1 && held < BATCH_BYTES;
+                    let mut held = if to.batch > 1 { size(&item) } else { BATCH_BYTES };
+                    let more = held < BATCH_BYTES;
                     let bytes = match more.then(|| ready_now(&mut stream, &mut ended, connection)).flatten() {
                         None => WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item)),
                         Some(next) => {
@@ -1542,8 +1545,10 @@ mod tests {
         Arc::new(StreamMetadata { provenance: vec!["test".into()], plexus_hash: "ab".into(), timestamp: stamp })
     }
 
+    /// A data item as the pipe's encode makes one: its content already JSON.
     fn data(m: &Arc<StreamMetadata>, n: u64) -> PlexusStreamItem {
-        PlexusStreamItem::Data { metadata: m.clone(), content_type: Cow::Borrowed(CT), content: Content::from(serde_json::json!({"type": "item", "n": n})) }
+        let content = Content::json(Bytes::from(serde_json::to_vec(&serde_json::json!({"type": "item", "n": n})).unwrap()));
+        PlexusStreamItem::Data { metadata: m.clone(), content_type: Cow::Borrowed(CT), content }
     }
 
     fn done(stamp: i64) -> PlexusStreamItem {
@@ -1674,7 +1679,7 @@ mod tests {
         });
     }
 
-    /// A batch of large items stops at its bytes: 4 KB items go four to a
+    /// A batch of large items stops at its bytes: 4 KB items go two to a
     /// notification, not 64, and a ticket body goes alone.
     #[test]
     fn a_batch_stops_at_its_bytes() {
@@ -1682,7 +1687,7 @@ mod tests {
         let big = |n: u64, size: usize| PlexusStreamItem::Data { metadata: m.clone(), content_type: Cow::Borrowed(CT), content: Content::json(Bytes::from(format!(r#"{{"type":"item","n":{n},"pad":"{}"}}"#, "x".repeat(size)))) };
         let frames = frames_of(ready((0..20).map(|n| big(n, 4096)).chain([done(7)]).collect()), 64);
         let sizes: Vec<usize> = frames.iter().map(|f| items_of(f).len()).collect();
-        assert!(sizes.iter().all(|&n| n <= 4), "about 16 KiB a batch: {sizes:?}");
+        assert!(sizes.iter().all(|&n| n <= 2), "about 8 KiB a batch: {sizes:?}");
         assert_eq!(sizes.iter().sum::<usize>(), 21);
         let frames = frames_of(ready((0..3).map(|n| big(n, 17_000)).chain([done(7)]).collect()), 64);
         assert!(frames.iter().take(2).all(|f| f["params"].get("result").is_some()), "a body alone, as today: {:?}", frames.iter().map(|f| items_of(f).len()).collect::<Vec<_>>());

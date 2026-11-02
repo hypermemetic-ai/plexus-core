@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   items a stream has ready together go in one notification, `results`, the
   metadata said once (plexus-wire spec/02); a lone item goes at once in
   today's form, and a sink that does not batch writes exactly today's frames.
-  An item's own path falls from 4,138 instructions to 951, 64 to a
-  notification.
+  A batch stops after the item that brings it to `BATCH_BYTES`, 8 KiB, so a
+  large item goes alone. An item's own path falls from 4,145 instructions to
+  983, 64 to a notification; a row from 5,195 to 2,082 (35 to one), 1 KB from
+  4,917 to 2,113 (8 to one).
 
 ## [0.7.0]
 

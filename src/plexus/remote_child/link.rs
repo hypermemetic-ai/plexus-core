@@ -345,7 +345,15 @@ impl Conn {
                 }
             }
         };
-        let item = match serde_json::from_str::<PlexusStreamItem>(raw.get()) {
+        // RETURNS-36: a peer on plexus-wire's spec as main wrote it is read
+        // into 0.8's shape (`peer::item`) when — only when — it does not
+        // read as 0.8.
+        let parsed = serde_json::from_str::<PlexusStreamItem>(raw.get()).or_else(|e| {
+            super::peer::item(raw.get(), &self.name)
+                .and_then(|v| serde_json::from_value::<PlexusStreamItem>(v).ok())
+                .ok_or(e)
+        });
+        let item = match parsed {
             Ok(item) => item,
             Err(e) => {
                 // An item kind this service does not know (spec/03: a reader

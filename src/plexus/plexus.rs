@@ -2640,8 +2640,9 @@ async fn pipe_stream_to_subscription(
     stream: PlexusStream,
     ext: &http::Extensions,
 ) -> jsonrpsee::core::SubscriptionResult {
-    let sink = pending.accept().await?;
-    super::wire::pipe(sink, stream, ext).await
+    // PERF.115-38 (spike): `pipe_pending` accepts as before unless the client
+    // offered `unary`.
+    super::wire::pipe_pending(pending, stream, ext).await
 }
 
 // ============================================================================

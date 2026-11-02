@@ -270,6 +270,8 @@ impl WireFrame {
 pub struct FrameSink {
     tx: tokio::sync::mpsc::Sender<WireFrame>,
     encoding: WireEncoding,
+    /// PERF.115-38 (spike): what the client offered at the upgrade ([`proto`]).
+    features: u32,
     /// The connection's pool: one spare block a call starts in, so a short
     /// call allocates none.
     spare: Arc<Mutex<Option<BytesMut>>>,
@@ -282,7 +284,18 @@ impl FrameSink {
     /// A connection's frame queue, bounded at `capacity` frames.
     pub fn channel(capacity: usize, encoding: WireEncoding) -> (FrameSink, FrameReceiver) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
-        (FrameSink { tx, encoding, spare: Arc::new(Mutex::new(None)) }, rx)
+        (FrameSink { tx, encoding, features: 0, spare: Arc::new(Mutex::new(None)) }, rx)
+    }
+
+    /// PERF.115-38 (spike): the same sink, its connection's offer recorded.
+    pub fn with_features(mut self, features: u32) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// PERF.115-38 (spike): what the client offered ([`proto`]).
+    pub fn features(&self) -> u32 {
+        self.features
     }
 
     /// The connection's encoding.
@@ -313,6 +326,63 @@ impl FrameSink {
 impl std::fmt::Debug for FrameSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrameSink").field("encoding", &self.encoding).field("closed", &self.tx.is_closed()).finish()
+    }
+}
+
+/// PERF.115-38 (spike, never merged): what a client may offer at the upgrade
+/// (`Plexus-Wire: lean, short, unary, small-ids`), each additive: a client
+/// that offers nothing gets today's frames, byte for byte.
+pub mod proto {
+    /// A stream's `metadata` and `content_type` ride its first item, and again
+    /// only when they change; `done` carries no metadata the stream said.
+    pub const LEAN: u32 = 1;
+    /// A notification without `"jsonrpc":"2.0"` and `method` (spec/01: a
+    /// client never reads a notification's method).
+    pub const SHORT: u32 = 2;
+    /// A call whose stream is complete at its first poll is answered in one
+    /// frame: `{"jsonrpc":"2.0","id":N,"result":{"items":[…]}}`.
+    pub const UNARY: u32 = 4;
+    /// Subscription ids counted per connection from 1 (the transport's).
+    pub const SMALL_IDS: u32 = 8;
+
+    /// The offer's words, comma- or space-separated; an unknown word is no offer.
+    pub fn parse(offer: &str) -> u32 {
+        offer.split(|c: char| c == ',' || c.is_whitespace()).fold(0, |f, w| {
+            f | match w.trim() {
+                "lean" => LEAN,
+                "short" => SHORT,
+                "unary" => UNARY,
+                "small-ids" => SMALL_IDS,
+                _ => 0,
+            }
+        })
+    }
+}
+
+/// PERF.115-38 (spike): a subscribing call's request id, put in its
+/// extensions by the transport when the client offered `unary`. A pipe that
+/// answers the call in one frame says so here, and the transport drops the
+/// answer jsonrpsee makes for the subscription it never accepted.
+#[derive(Clone, Debug)]
+pub struct InlineSlot {
+    /// The request's id, as JSON text.
+    pub id: Arc<str>,
+    answered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl InlineSlot {
+    /// A slot for the request whose id is `id` (JSON text).
+    pub fn new(id: String) -> Self {
+        InlineSlot { id: id.into(), answered: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+
+    /// Whether the call was answered in one frame.
+    pub fn answered(&self) -> bool {
+        self.answered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark(&self) {
+        self.answered.store(true, std::sync::atomic::Ordering::Release)
     }
 }
 
@@ -545,18 +615,32 @@ struct Frames {
     /// A `data` item's opening, `{"type":"data","metadata":…,"content_type":…,"content":`,
     /// for the stream's metadata (shared by its items) and content type.
     head: Option<(Arc<StreamMetadata>, Cow<'static, str>, Vec<u8>)>,
+    /// PERF.115-38 (spike): `lean` offered — the head is said once a stream.
+    lean: bool,
+}
+
+/// PERF.115-38: two metadata the same as JSON (the hop's items each carry
+/// their own copy).
+fn same_meta(a: &StreamMetadata, b: &StreamMetadata) -> bool {
+    a.timestamp == b.timestamp && a.plexus_hash == b.plexus_hash && a.provenance == b.provenance
 }
 
 impl Frames {
-    fn new(method: &str, subscription: &jsonrpsee::types::SubscriptionId<'_>) -> Self {
+    /// PERF.115-38: the notification for what the client offered — without
+    /// `jsonrpc` and `method` under `short`; the head said once under `lean`.
+    fn offered(method: &str, subscription: &jsonrpsee::types::SubscriptionId<'_>, features: u32) -> Self {
         // Sized once: each grew from its first literal, and three reallocations a call.
         let mut prefix = Vec::with_capacity(64);
-        prefix.extend_from_slice(br#"{"jsonrpc":"2.0","method":"#);
-        let _ = serde_json::to_writer(&mut prefix, method);
-        prefix.extend_from_slice(br#","params":{"subscription":"#);
+        if features & proto::SHORT != 0 {
+            prefix.extend_from_slice(br#"{"params":{"subscription":"#);
+        } else {
+            prefix.extend_from_slice(br#"{"jsonrpc":"2.0","method":"#);
+            let _ = serde_json::to_writer(&mut prefix, method);
+            prefix.extend_from_slice(br#","params":{"subscription":"#);
+        }
         let _ = serde_json::to_writer(&mut prefix, subscription);
         prefix.extend_from_slice(br#","result":"#);
-        Frames { prefix, head: None }
+        Frames { prefix, head: None, lean: features & proto::LEAN != 0 }
     }
 
     /// `item`'s JSON, written at the end of `out`.
@@ -564,9 +648,18 @@ impl Frames {
         match item {
             PlexusStreamItem::Data { metadata, content_type, content } => {
                 let fresh = match &self.head {
+                    Some((m, ct, _)) if self.lean => !(Arc::ptr_eq(m, metadata) || same_meta(m, metadata)) || ct != content_type,
                     Some((m, ct, _)) => !Arc::ptr_eq(m, metadata) || ct != content_type,
                     None => true,
                 };
+                if self.lean && !fresh {
+                    // PERF.115-38: said already on this stream.
+                    out.reserve(26 + content.json_bytes().map_or(64, Bytes::len));
+                    out.put_slice(br#"{"type":"data","content":"#);
+                    content.write_json(out);
+                    out.put_u8(b'}');
+                    return;
+                }
                 if fresh {
                     let mut head = Vec::with_capacity(128);
                     head.extend_from_slice(br#"{"type":"data","metadata":"#);
@@ -582,10 +675,38 @@ impl Frames {
                 content.write_json(out);
                 out.put_u8(b'}');
             }
+            PlexusStreamItem::Done { metadata } if self.lean && self.head.as_ref().is_some_and(|(m, _, _)| same_meta(m, metadata)) => {
+                // PERF.115-38: the stream's metadata, said on its first item.
+                out.put_slice(br#"{"type":"done"}"#);
+            }
             other => {
                 let _ = serde_json::to_writer((&mut *out).writer(), other);
             }
         }
+    }
+
+    /// PERF.115-38 (spike): a call complete at its first poll, as the answer
+    /// to its request: `{"jsonrpc":"2.0","id":N,"result":{"items":[…]}}`.
+    fn inline(&mut self, buffer: &mut Buffer, id: &str, items: &[PlexusStreamItem]) -> Bytes {
+        let content: usize = items
+            .iter()
+            .map(|i| match i {
+                PlexusStreamItem::Data { content, .. } => content.json_bytes().map_or(256, Bytes::len),
+                _ => 128,
+            })
+            .sum();
+        buffer.room(64 + id.len() + content + 256 * items.len());
+        buffer.cur.put_slice(br#"{"jsonrpc":"2.0","id":"#);
+        buffer.cur.put_slice(id.as_bytes());
+        buffer.cur.put_slice(br#","result":{"items":["#);
+        for (k, item) in items.iter().enumerate() {
+            if k > 0 {
+                buffer.cur.put_u8(b',');
+            }
+            self.item(&mut buffer.cur, item);
+        }
+        buffer.cur.put_slice(b"]}}");
+        buffer.split()
     }
 
     /// The notification carrying `item`: the frame a socket writes.
@@ -647,20 +768,94 @@ pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::P
     WIRE.scope(encoder, run(sink, stream, frames)).await
 }
 
-async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, frames: Option<FrameSink>) -> jsonrpsee::core::SubscriptionResult {
+/// PERF.115-38 (spike): [`pipe`] for a subscription not yet accepted. With
+/// `unary` offered (an [`InlineSlot`] in the call's extensions and a
+/// [`FrameSink`]), the stream is polled first: complete at that poll, the call
+/// is answered in one frame and never accepted; otherwise it is accepted and
+/// what was ready goes first. Anything else accepts it and pipes, as before.
+pub async fn pipe_pending(pending: jsonrpsee::PendingSubscriptionSink, stream: super::streaming::PlexusStream, ext: &http::Extensions) -> jsonrpsee::core::SubscriptionResult {
+    let to = ext.get::<FrameSink>().filter(|f| f.features & proto::UNARY != 0).cloned();
+    let slot = ext.get::<InlineSlot>().cloned();
+    let (Some(to), Some(slot)) = (to, slot) else {
+        let sink = pending.accept().await?;
+        return pipe(sink, stream, ext).await;
+    };
+    let buffer = Buffer::from_block(to.take_block());
+    let encoder = Encoder { encoding: to.encoding, buffer: RefCell::new(buffer), depth: Cell::new(0), last: Cell::new(0) };
+    WIRE.scope(encoder, inline_or_run(pending, stream, to, slot)).await
+}
+
+/// At most this much of a call is answered inline; past it, notifications.
+const INLINE_ITEMS: usize = 64;
+const INLINE_BYTES: usize = 64 * 1024;
+
+async fn inline_or_run(pending: jsonrpsee::PendingSubscriptionSink, mut stream: super::streaming::PlexusStream, to: FrameSink, slot: InlineSlot) -> jsonrpsee::core::SubscriptionResult {
+    use futures::{FutureExt, StreamExt};
+    let mut ready = Vec::new();
+    let (mut size, mut ended) = (0usize, false);
+    while ready.len() < INLINE_ITEMS && size < INLINE_BYTES {
+        match stream.next().now_or_never() {
+            Some(Some(item)) => {
+                size += match &item {
+                    PlexusStreamItem::Data { content, .. } => content.json_bytes().map_or(256, Bytes::len),
+                    _ => 128,
+                };
+                let terminal = matches!(item, PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. });
+                ready.push(item);
+                if terminal {
+                    ended = true;
+                    break;
+                }
+            }
+            Some(None) => {
+                ended = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    if ended && !ready.iter().any(|i| matches!(i, PlexusStreamItem::Request { .. })) {
+        let mut answer = Frames { lean: to.features & proto::LEAN != 0, ..Frames::default() };
+        let bytes = WIRE.with(|e| answer.inline(&mut e.buffer.borrow_mut(), &slot.id, &ready));
+        drop(ready);
+        drop(stream);
+        // Said before the subscription is dropped: jsonrpsee then answers its
+        // own `InternalError` for it, which the transport drops on this word.
+        slot.mark();
+        drop(pending);
+        let _ = to.tx.send(WireFrame { bytes, fence: false }).await;
+        let buffer = WIRE.with(|e| std::mem::take(&mut *e.buffer.borrow_mut()));
+        if let Some(block) = buffer.into_block() {
+            to.give_block(block);
+        }
+        return Ok(());
+    }
+    let sink = pending.accept().await?;
+    run_from(sink, stream, Some(to), ready).await
+}
+
+async fn run(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::PlexusStream, frames: Option<FrameSink>) -> jsonrpsee::core::SubscriptionResult {
+    run_from(sink, stream, frames, Vec::new()).await
+}
+
+async fn run_from(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, frames: Option<FrameSink>, ready: Vec<PlexusStreamItem>) -> jsonrpsee::core::SubscriptionResult {
     use futures::StreamExt;
     let connection = sink.connection_id().0;
     let mut notification = match &frames {
-        Some(_) => Frames::new(sink.method_name(), &sink.subscription_id()),
+        Some(f) => Frames::offered(sink.method_name(), &sink.subscription_id(), f.features),
         None => Frames::default(),
     };
     let mut first = true;
+    let mut ready = ready.into_iter();
     let out: jsonrpsee::core::SubscriptionResult = async {
         loop {
-            let item = tokio::select! {
-                biased;
-                _ = sink.closed() => return Ok(()),
-                item = stream.next() => item,
+            let item = match ready.next() {
+                Some(item) => Some(item),
+                None => tokio::select! {
+                    biased;
+                    _ = sink.closed() => return Ok(()),
+                    item = stream.next() => item,
+                },
             };
             let Some(item) = item else { return Ok(()) };
             if let PlexusStreamItem::Request { request_id, .. } = &item {

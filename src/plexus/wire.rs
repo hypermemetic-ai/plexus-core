@@ -11,8 +11,9 @@
 //! | the transport offers a [`FrameSink`] (plexus-transport's socket loop) | the frame goes to the socket's writer as it is; the call's first frame is fenced, so it follows the subscription's answer that jsonrpsee queued |
 //! | it does not (jsonrpsee's own sink: stdio, an in-memory module) | the item's bytes go to the sink as one raw value, as before |
 //! | one change fans out to N watchers ([`Shared`]) | the first socket that sends it encodes it, once; every other writes those bytes |
+//! | the client offered `batch` at its upgrade ([`FrameSink::batching`], PERF-8) | the items a stream has ready together, up to the batch, go in one notification whose `results` are their array, the metadata said once; a lone item goes at once, in today's form |
 //!
-//! PERF-8 batches frames from here (`results: […]`), PERF-9 adds an encoding
+//! PERF-8 batches frames here (`results: […]`), PERF-9 adds an encoding
 //! ([`WireEncoding`]), PERF-13 relays a child's content as bytes.
 
 use std::borrow::Cow;
@@ -564,7 +565,15 @@ struct Frames {
     /// A `data` item's opening, `{"type":"data","metadata":…,"content_type":…,"content":`,
     /// for the stream's metadata (shared by its items) and content type.
     head: Option<(Arc<StreamMetadata>, Cow<'static, str>, Vec<u8>)>,
+    /// A batch's (PERF-8): `,"metadata":…,"results":[` for the stream's
+    /// metadata, and a `data` item's opening without it,
+    /// `{"type":"data","content_type":…,"content":`, for its content type.
+    batch: Option<(Arc<StreamMetadata>, Vec<u8>)>,
+    bare: Option<(Cow<'static, str>, Vec<u8>)>,
 }
+
+/// Where a notification's `params` stop and its `result` begins, in [`Frames::prefix`].
+const RESULT: &[u8] = br#","result":"#;
 
 impl Frames {
     fn new(method: &str, subscription: &jsonrpsee::types::SubscriptionId<'_>) -> Self {
@@ -574,8 +583,8 @@ impl Frames {
         let _ = serde_json::to_writer(&mut prefix, method);
         prefix.extend_from_slice(br#","params":{"subscription":"#);
         let _ = serde_json::to_writer(&mut prefix, subscription);
-        prefix.extend_from_slice(br#","result":"#);
-        Frames { prefix, head: None }
+        prefix.extend_from_slice(RESULT);
+        Frames { prefix, head: None, batch: None, bare: None }
     }
 
     /// `item`'s JSON, written at the end of `out`.
@@ -605,6 +614,69 @@ impl Frames {
                 let _ = serde_json::to_writer((&mut *out).writer(), other);
             }
         }
+    }
+
+    /// `items`, ready together, in one notification (PERF-8, spec/02):
+    /// `{"jsonrpc":"2.0","method":M,"params":{"subscription":S,"metadata":…,"results":[…]}}`.
+    /// The metadata is the first `data` item's, said once: a `data` item that
+    /// shares it leaves its own out; any other item is written whole, as alone.
+    /// One item alone is today's frame.
+    fn batch(&mut self, buffer: &mut Buffer, items: &[PlexusStreamItem]) -> Bytes {
+        if let [item] = items {
+            return self.frame(buffer, item);
+        }
+        let shared = items.iter().find_map(|item| match item {
+            PlexusStreamItem::Data { metadata, .. } => Some(metadata),
+            _ => None,
+        });
+        let open = match shared {
+            Some(m) => {
+                if !matches!(&self.batch, Some((had, _)) if Arc::ptr_eq(had, m)) {
+                    let mut open = Vec::with_capacity(128);
+                    open.extend_from_slice(br#","metadata":"#);
+                    let _ = serde_json::to_writer(&mut open, &**m);
+                    open.extend_from_slice(br#","results":["#);
+                    self.batch = Some((m.clone(), open));
+                }
+                &self.batch.as_ref().expect("made above").1[..]
+            }
+            None => br#","results":["#,
+        };
+        let content: usize = items
+            .iter()
+            .map(|item| match item {
+                PlexusStreamItem::Data { content, .. } => content.json_bytes().map_or(64, Bytes::len) + 64,
+                _ => 256,
+            })
+            .sum();
+        let start = &self.prefix[..self.prefix.len() - RESULT.len()];
+        buffer.room(start.len() + open.len() + content + 4);
+        buffer.cur.put_slice(start);
+        buffer.cur.put_slice(open);
+        for (n, item) in items.iter().enumerate() {
+            if n > 0 {
+                buffer.cur.put_u8(b',');
+            }
+            match item {
+                PlexusStreamItem::Data { metadata, content_type, content } if shared.is_some_and(|m| Arc::ptr_eq(m, metadata)) => {
+                    if !matches!(&self.bare, Some((ct, _)) if ct == content_type) {
+                        let mut bare = Vec::with_capacity(64);
+                        bare.extend_from_slice(br#"{"type":"data","content_type":"#);
+                        let _ = serde_json::to_writer(&mut bare, content_type.as_ref());
+                        bare.extend_from_slice(br#","content":"#);
+                        self.bare = Some((content_type.clone(), bare));
+                    }
+                    let bare = &self.bare.as_ref().expect("made above").1;
+                    buffer.cur.reserve(bare.len() + content.json_bytes().map_or(64, Bytes::len) + 1);
+                    buffer.cur.put_slice(bare);
+                    content.write_json(&mut buffer.cur);
+                    buffer.cur.put_u8(b'}');
+                }
+                other => self.item(&mut buffer.cur, other),
+            }
+        }
+        buffer.cur.put_slice(b"]}}");
+        buffer.split()
     }
 
     /// The notification carrying `item`: the frame a socket writes.
@@ -674,6 +746,8 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         None => Frames::default(),
     };
     let mut first = true;
+    // A batch's items, kept for the call: no allocation until two are ready together.
+    let mut ready: Vec<PlexusStreamItem> = Vec::new();
     let out: jsonrpsee::core::SubscriptionResult = async {
         loop {
             let item = tokio::select! {
@@ -687,9 +761,27 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
             }
             match &frames {
                 Some(to) => {
-                    let bytes = WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item));
-                    drop(item);
-                    if to.tx.send(WireFrame { bytes, fence: first }).await.is_err() {
+                    // PERF-8: what else the stream has ready now goes with it,
+                    // for a client that takes batches. Never what is not ready
+                    // yet: a lone item goes at once, in today's form.
+                    let mut ended = false;
+                    let bytes = match (to.batch > 1).then(|| ready_now(&mut stream, &mut ended, connection)).flatten() {
+                        None => WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item)),
+                        Some(next) => {
+                            ready.push(item);
+                            ready.push(next);
+                            while ready.len() < to.batch && !ended {
+                                match ready_now(&mut stream, &mut ended, connection) {
+                                    Some(more) => ready.push(more),
+                                    None => break,
+                                }
+                            }
+                            let bytes = WIRE.with(|e| notification.batch(&mut e.buffer.borrow_mut(), &ready));
+                            ready.clear();
+                            bytes
+                        }
+                    };
+                    if to.tx.send(WireFrame { bytes, fence: first }).await.is_err() || ended {
                         return Ok(());
                     }
                 }
@@ -719,6 +811,25 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         }
     }
     out
+}
+
+/// The stream's next item if it is ready now: no waiting, so a batch never
+/// holds an item back for one that has not come. `ended` once the stream is.
+fn ready_now(stream: &mut super::streaming::PlexusStream, ended: &mut bool, connection: usize) -> Option<PlexusStreamItem> {
+    use futures::StreamExt;
+    match futures::FutureExt::now_or_never(stream.next()) {
+        Some(Some(item)) => {
+            if let PlexusStreamItem::Request { request_id, .. } = &item {
+                super::bidirectional::bind_asker(request_id, connection);
+            }
+            Some(item)
+        }
+        Some(None) => {
+            *ended = true;
+            None
+        }
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,7 +1596,7 @@ mod tests {
         assert!(batched.iter().all(|f| f["params"]["results"].is_array()), "a batch is `results`");
         let unbatched: Vec<Value> = one_each.iter().flat_map(items_of).collect();
         assert_eq!(batched.iter().flat_map(items_of).collect::<Vec<_>>(), unbatched, "the same items, in order, equal as JSON");
-        assert!(batched.iter().all(|f| f["params"]["subscription"] == one_each[0]["params"]["subscription"] && f["method"] == "note"));
+        assert!(batched.iter().all(|f| f["params"]["subscription"] == batched[0]["params"]["subscription"] && f["method"] == "note"), "one call's, on its own method");
     }
 
     /// The metadata goes once a batch where it is the same: a `data` item of

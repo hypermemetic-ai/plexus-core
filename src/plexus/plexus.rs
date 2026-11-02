@@ -2652,12 +2652,17 @@ async fn serve_call(
     let seen = service.inner.gate.as_ref().map_or(0, |g| g.generation().current());
     let seam = super::input::Seam { service: service.clone(), params, pending: Some(pending), ext, seen, opened: None, refused: None };
     let routed = service.route(&call.method, call.params.unwrap_or_default(), caller.as_deref());
-    let mut scoped = std::pin::pin!(super::input::CALL.scope(std::cell::RefCell::new(seam), routed));
-    let answer = scoped.as_mut().await;
-    let seam = scoped.as_mut().take_value().expect("the scope ran to its end").into_inner();
+    // In a block of its own, so the route's future shares its room in this
+    // one with the pipe's (a call's whole size is one allocation per call).
+    let (answer, seam) = {
+        let mut scoped = std::pin::pin!(super::input::CALL.scope(std::cell::RefCell::new(seam), routed));
+        let answer = scoped.as_mut().await;
+        (answer, scoped.as_mut().take_value().expect("the scope ran to its end").into_inner())
+    };
     let super::input::Seam { pending, ext, opened, refused, .. } = seam;
     match (answer, opened) {
-        (Ok(stream), Some(opened)) => super::wire::pipe_duplex(opened.sink, stream, opened.duplex).await,
+        // Boxed: a call with no input half does not carry its room.
+        (Ok(stream), Some(opened)) => Box::pin(super::wire::pipe_duplex(opened.sink, stream, opened.duplex)).await,
         (Ok(stream), None) => {
             let pending = pending.expect("only an open takes it, and an open is `opened`");
             pipe_stream_to_subscription(pending, stream, &ext).await

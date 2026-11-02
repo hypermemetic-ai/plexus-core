@@ -332,11 +332,21 @@ struct Buffer {
     block: usize,
     /// Whether a block has been made (or taken from the pool) yet.
     started: bool,
+    /// Blocks made, for the tests.
+    #[cfg(test)]
+    made: usize,
 }
 
 impl Default for Buffer {
     fn default() -> Self {
-        Buffer { cur: BytesMut::new(), spare: Vec::new(), block: Self::FIRST, started: false }
+        Buffer {
+            cur: BytesMut::new(),
+            spare: Vec::new(),
+            block: Self::FIRST,
+            started: false,
+            #[cfg(test)]
+            made: 0,
+        }
     }
 }
 
@@ -348,12 +358,21 @@ impl Buffer {
     const MOST: usize = 512 * 1024;
     /// The largest block a connection keeps for its next call.
     const POOLED: usize = 64 * 1024;
-    /// Blocks kept to be reused.
-    const SPARE: usize = 3;
+    /// Blocks kept to be reused. A stream that outruns its socket has the
+    /// connection's whole queue in flight (1,024 frames), and each item has
+    /// taken its size twice from a block, content and frame: 8.8 MB at 4 KB an
+    /// item, 36 MB at a ticket body. Blocks that hold fewer than that are
+    /// dropped before they come free, and every block filled is a new one, so
+    /// a faster encode allocates more: three held 8 KB an item at 4 KB and 37 KB
+    /// at a body (PERF-34; PERF-9 found it with msgpack, at b80cb2e). They are
+    /// bytes those frames hold anyway.
+    const SPARE: usize = 80;
+    /// Blocks kept once the queue has drained: what a long watch holds.
+    const DRAINED: usize = 3;
 
     fn from_block(block: Option<BytesMut>) -> Self {
         match block {
-            Some(cur) => Buffer { block: cur.capacity().max(Self::FIRST), cur, spare: Vec::new(), started: true },
+            Some(cur) => Buffer { block: cur.capacity().max(Self::FIRST), cur, started: true, ..Buffer::default() },
             None => Buffer::default(),
         }
     }
@@ -361,7 +380,12 @@ impl Buffer {
     /// Room for `n` more bytes in the current block: it, or a free block, or
     /// a new one.
     fn room(&mut self, n: usize) {
-        if self.cur.capacity() - self.cur.len() >= n || self.cur.try_reclaim(n) {
+        if self.cur.capacity() - self.cur.len() >= n {
+            return;
+        }
+        if self.cur.try_reclaim(n) {
+            // None of this block's frames is left, and older ones went first.
+            self.spare.truncate(Self::DRAINED);
             return;
         }
         // The current block holds unsent frames, or is too small: keep it
@@ -376,6 +400,10 @@ impl Buffer {
                     self.block = (self.block * 2).clamp(Self::FIRST, Self::MOST);
                 }
                 self.started = true;
+                #[cfg(test)]
+                {
+                    self.made += 1;
+                }
                 BytesMut::with_capacity(self.block.max(n))
             }
         };
@@ -822,6 +850,54 @@ mod tests {
         let mut b = Buffer::default();
         b.room(Buffer::POOLED + 1);
         assert!(b.into_idle().is_none());
+    }
+
+    /// A stream that outruns its socket holds the queue's 1,024 frames in
+    /// flight. The blocks in rotation must hold them, or every block filled is
+    /// a new one: at 4 KB an item (8.6 KB of block each, content and frame) a
+    /// fresh block every 60 items, at a ticket body one every 15, for the
+    /// stream's life. Red with 3 spares.
+    #[test]
+    fn a_queue_full_of_frames_comes_back_to_blocks_already_made() {
+        for size in [8_600, 35_500] {
+            let mut b = Buffer::default();
+            let mut in_flight = std::collections::VecDeque::new();
+            let item = vec![7u8; size];
+            let mut ramp = 0;
+            for n in 0..40_000 {
+                b.room(item.len());
+                b.cur.put_slice(&item);
+                in_flight.push_back(b.split());
+                if in_flight.len() > 1024 {
+                    in_flight.pop_front();
+                }
+                if n == 20_000 {
+                    ramp = b.made;
+                }
+            }
+            assert_eq!(b.made, ramp, "at {size} B: past the ramp ({ramp} blocks), every block is one already made");
+        }
+    }
+
+    /// Those blocks are for the burst: a watch that lives on after one holds
+    /// what it held before it.
+    #[test]
+    fn a_drained_queue_lets_its_blocks_go() {
+        let mut b = Buffer::default();
+        let mut in_flight = Vec::new();
+        for _ in 0..4_000 {
+            b.room(35_500);
+            b.cur.put_slice(&[7u8; 35_500]);
+            in_flight.push(b.split());
+        }
+        assert_eq!(b.spare.len(), Buffer::SPARE, "the burst keeps them");
+        drop(in_flight);
+        for _ in 0..200 {
+            b.room(35_500);
+            b.cur.put_slice(&[7u8; 35_500]);
+            drop(b.split());
+        }
+        assert!(b.spare.len() <= Buffer::DRAINED, "drained, it keeps {}", b.spare.len());
     }
 
     #[test]

@@ -711,41 +711,295 @@ pub fn from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Err
 // Frames across: JSON text ↔ msgpack
 // ---------------------------------------------------------------------------
 
+/// How deep a frame nests, as serde_json holds JSON.
+const MAX_DEPTH: usize = 128;
+
 /// A JSON-RPC frame's text as its msgpack frame: the same object as a map,
-/// without `jsonrpc` (spec/13). A batch (an array) is each of its objects so.
+/// without `jsonrpc` (spec/13), its members in the text's order. A batch (an
+/// array) is each of its objects so. Walked once, with no `Value` between: a
+/// socket does this for every answer of the method table's.
 pub fn frame_from_json(json: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut v: Value = serde_json::from_slice(json)?;
-    match &mut v {
-        Value::Object(m) => {
-            m.remove("jsonrpc");
+    use serde::de::Deserializer as _;
+    let mut out = Vec::with_capacity(json.len());
+    let mut de = serde_json::Deserializer::from_slice(json);
+    (&mut de).deserialize_any(FromJson { out: &mut out, frame: true })?;
+    de.end()?;
+    Ok(out)
+}
+
+/// One JSON value, written as msgpack. `frame`: a frame's own level, where
+/// `jsonrpc` is left out.
+struct FromJson<'a> {
+    out: &'a mut Vec<u8>,
+    frame: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for FromJson<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+/// A count written where a one-byte head was held for it, the head widened
+/// when the count needs more.
+fn close_head(out: &mut Vec<u8>, at: usize, n: usize, map: bool) -> Result<(), Error> {
+    let mut head = [0u8; 5];
+    let mut w = &mut head[..];
+    if map {
+        put_map_len(&mut w, n)?;
+    } else {
+        put_array_len(&mut w, n)?;
+    }
+    let used = 5 - w.len();
+    out[at] = head[0];
+    if used > 1 {
+        out.splice(at + 1..at + 1, head[1..used].iter().copied());
+    }
+    Ok(())
+}
+
+/// An object's key: written, or (`jsonrpc`, at a frame's level) left out.
+struct Key<'a> {
+    out: &'a mut Vec<u8>,
+    frame: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Key<'_> {
+    type Value = bool;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Key<'_> {
+    type Value = bool;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an object's key")
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<bool, E> {
+        if self.frame && v == "jsonrpc" {
+            return Ok(false);
         }
-        Value::Array(items) => {
-            for m in items.iter_mut().filter_map(Value::as_object_mut) {
-                m.remove("jsonrpc");
+        put_str(self.out, v);
+        Ok(true)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for FromJson<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        put_nil(self.out);
+        Ok(())
+    }
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<(), E> {
+        put_bool(self.out, v);
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<(), E> {
+        put_uint(self.out, v);
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<(), E> {
+        put_int(self.out, v);
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<(), E> {
+        put_f64(self.out, v);
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<(), E> {
+        put_str(self.out, v);
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let at = self.out.len();
+        self.out.push(0);
+        let mut n = 0;
+        while seq.next_element_seed(FromJson { out: &mut *self.out, frame: self.frame })?.is_some() {
+            n += 1;
+        }
+        close_head(self.out, at, n, false).map_err(serde::de::Error::custom)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let at = self.out.len();
+        self.out.push(0);
+        let mut n = 0;
+        while let Some(kept) = map.next_key_seed(Key { out: &mut *self.out, frame: self.frame })? {
+            if kept {
+                map.next_value_seed(FromJson { out: &mut *self.out, frame: false })?;
+                n += 1;
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
             }
         }
-        _ => {}
+        close_head(self.out, at, n, true).map_err(serde::de::Error::custom)
     }
-    to_vec(&v)
 }
 
 /// A msgpack frame as its JSON-RPC text, `jsonrpc` put back (what the method
-/// table reads). A batch (an array) is each of its maps so.
+/// table reads). A batch (an array) is each of its maps so. Walked once, with
+/// no `Value` between. Refused as [`to_value`] refuses: a `bin`, an `ext`, a
+/// non-str key, a str that is not UTF-8, bytes after the value; and a frame
+/// that is not a map (or a batch).
 pub fn frame_to_json(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut v = to_value(bytes)?;
-    let two = || Value::String("2.0".into());
-    match &mut v {
-        Value::Object(m) => {
-            m.insert("jsonrpc".into(), two());
-        }
-        Value::Array(items) => {
-            for m in items.iter_mut().filter_map(Value::as_object_mut) {
-                m.insert("jsonrpc".into(), two());
+    let mut r = Reader { b: bytes, at: 0 };
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 2 + 32);
+    match r.head()? {
+        Head::Map(n) => r.map_json(n, &mut out, 1, true)?,
+        Head::Array(n) => {
+            out.push(b'[');
+            for i in 0..n {
+                if i > 0 {
+                    out.push(b',');
+                }
+                r.json(&mut out, 1, true)?;
             }
+            out.push(b']');
         }
         _ => return Err(Error::new("a frame is a map (or a batch: an array of maps)")),
     }
-    Ok(serde_json::to_vec(&v)?)
+    if r.at != bytes.len() {
+        return Err(Error::new(format!("{} bytes after the value", bytes.len() - r.at)));
+    }
+    Ok(out)
+}
+
+/// What a value's first bytes say it is.
+enum Head<'a> {
+    Nil,
+    Bool(bool),
+    Uint(u64),
+    Int(i64),
+    Float(f64),
+    Str(&'a str),
+    Array(usize),
+    Map(usize),
+}
+
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        let end = self.at.checked_add(n).filter(|e| *e <= self.b.len()).ok_or_else(|| Error::new("a value cut short"))?;
+        let s = &self.b[self.at..end];
+        self.at = end;
+        Ok(s)
+    }
+
+    fn be<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        let mut a = [0u8; N];
+        a.copy_from_slice(self.take(N)?);
+        Ok(a)
+    }
+
+    fn string(&mut self, n: usize) -> Result<Head<'a>, Error> {
+        std::str::from_utf8(self.take(n)?).map(Head::Str).map_err(|_| Error::new("a str that is not UTF-8"))
+    }
+
+    fn head(&mut self) -> Result<Head<'a>, Error> {
+        let m = self.be::<1>()?[0];
+        Ok(match m {
+            0x00..=0x7f => Head::Uint(m as u64),
+            0x80..=0x8f => Head::Map((m & 0x0f) as usize),
+            0x90..=0x9f => Head::Array((m & 0x0f) as usize),
+            0xa0..=0xbf => return self.string((m & 0x1f) as usize),
+            0xc0 => Head::Nil,
+            0xc2 => Head::Bool(false),
+            0xc3 => Head::Bool(true),
+            0xca => Head::Float(f32::from_be_bytes(self.be()?) as f64),
+            0xcb => Head::Float(f64::from_be_bytes(self.be()?)),
+            0xcc => Head::Uint(self.be::<1>()?[0] as u64),
+            0xcd => Head::Uint(u16::from_be_bytes(self.be()?) as u64),
+            0xce => Head::Uint(u32::from_be_bytes(self.be()?) as u64),
+            0xcf => Head::Uint(u64::from_be_bytes(self.be()?)),
+            0xd0 => Head::Int(i8::from_be_bytes(self.be()?) as i64),
+            0xd1 => Head::Int(i16::from_be_bytes(self.be()?) as i64),
+            0xd2 => Head::Int(i32::from_be_bytes(self.be()?) as i64),
+            0xd3 => Head::Int(i64::from_be_bytes(self.be()?)),
+            0xd9 => {
+                let n = self.be::<1>()?[0] as usize;
+                return self.string(n);
+            }
+            0xda => {
+                let n = u16::from_be_bytes(self.be()?) as usize;
+                return self.string(n);
+            }
+            0xdb => {
+                let n = u32::from_be_bytes(self.be()?) as usize;
+                return self.string(n);
+            }
+            0xdc => Head::Array(u16::from_be_bytes(self.be()?) as usize),
+            0xdd => Head::Array(u32::from_be_bytes(self.be()?) as usize),
+            0xde => Head::Map(u16::from_be_bytes(self.be()?) as usize),
+            0xdf => Head::Map(u32::from_be_bytes(self.be()?) as usize),
+            0xe0..=0xff => Head::Int(m as i8 as i64),
+            // nil's reserved neighbour, `bin` and `ext`: not part of the wire.
+            _ => return Err(Error::new(format!("{m:#04x} is not part of the wire"))),
+        })
+    }
+
+    /// One value as JSON text, at the end of `out`. `frame`: it must be a map
+    /// (a batch's entry), and it is a frame.
+    fn json(&mut self, out: &mut Vec<u8>, depth: usize, frame: bool) -> Result<(), Error> {
+        if depth > MAX_DEPTH {
+            return Err(Error::new("nested too deep"));
+        }
+        let head = self.head()?;
+        if frame && !matches!(head, Head::Map(_)) {
+            return Err(Error::new("a frame is a map (or a batch: an array of maps)"));
+        }
+        match head {
+            Head::Nil => out.extend_from_slice(b"null"),
+            Head::Bool(true) => out.extend_from_slice(b"true"),
+            Head::Bool(false) => out.extend_from_slice(b"false"),
+            Head::Uint(v) => serde_json::to_writer(&mut *out, &v)?,
+            Head::Int(v) => serde_json::to_writer(&mut *out, &v)?,
+            Head::Float(v) => serde_json::to_writer(&mut *out, &v)?,
+            Head::Str(s) => serde_json::to_writer(&mut *out, s)?,
+            Head::Array(n) => {
+                out.push(b'[');
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    self.json(out, depth + 1, false)?;
+                }
+                out.push(b']');
+            }
+            Head::Map(n) => self.map_json(n, out, depth, frame)?,
+        }
+        Ok(())
+    }
+
+    /// `n` members as a JSON object. `frame`: `jsonrpc` first, as the method
+    /// table wants it, whatever the frame says of it.
+    fn map_json(&mut self, n: usize, out: &mut Vec<u8>, depth: usize, frame: bool) -> Result<(), Error> {
+        let open: &[u8] = if frame { br#"{"jsonrpc":"2.0""# } else { b"{" };
+        out.extend_from_slice(open);
+        let mut first = !frame;
+        for _ in 0..n {
+            let Head::Str(key) = self.head()? else { return Err(Error::new("a map key that is not a str")) };
+            if frame && key == "jsonrpc" {
+                self.json(&mut Vec::new(), depth + 1, false)?;
+                continue;
+            }
+            if !std::mem::take(&mut first) {
+                out.push(b',');
+            }
+            serde_json::to_writer(&mut *out, key)?;
+            out.push(b':');
+            self.json(out, depth + 1, false)?;
+        }
+        out.push(b'}');
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -771,7 +1025,7 @@ mod tests {
         assert_eq!(hex(&call), "83 a2 69 64 03 a6 6d 65 74 68 6f 64 ab 6d 65 6e 67 65 72 2e 63 61 6c 6c a6 70 61 72 61 6d 73 82 a6 6d 65 74 68 6f 64 ae 74 69 63 6b 65 74 73 2e 68 65 61 6c 74 68 a6 70 61 72 61 6d 73 80");
         let answer = frame_from_json(br#"{"jsonrpc":"2.0","id":3,"result":7}"#).unwrap();
         assert_eq!(hex(&answer), "82 a2 69 64 03 a6 72 65 73 75 6c 74 07");
-        assert_eq!(frame_to_json(&answer).unwrap(), br#"{"id":3,"jsonrpc":"2.0","result":7}"#.to_vec());
+        assert_eq!(frame_to_json(&answer).unwrap(), br#"{"jsonrpc":"2.0","id":3,"result":7}"#.to_vec());
     }
 
     #[test]
@@ -917,6 +1171,45 @@ mod tests {
         assert!(frame_to_json(&[0x01]).is_err(), "a frame is a map");
         // Float 32 is read (a decoder accepts it).
         assert_eq!(to_value(&[0xca, 0x40, 0x20, 0x00, 0x00]).unwrap(), json!(2.5));
+    }
+
+    /// A frame crosses with no `Value` between, and reads as the `Value` path
+    /// reads it: every number form, every length form, deep, a key that needs
+    /// escaping, `jsonrpc` in the way, refusals.
+    #[test]
+    fn a_frame_crosses_as_its_value_would() {
+        let frame = json!({
+            "id": u64::MAX, "method": "a.call", "neg": [-1, -32, -33, i64::MIN, 0, 127, 128, 65536, u32::MAX as u64 + 1],
+            "params": {"s": "a \"quoted\" \u{1F600} line\nbreak", "long": "x".repeat(70_000), "f": [1.5, 40.0, 1e300, -0.0], "t": true, "n": null,
+                       "many": (0..70_000).map(|i| json!(i)).collect::<Vec<_>>(), "keys": (0..20).map(|i| (format!("k\"{i}"), json!(i))).collect::<serde_json::Map<_, _>>()},
+        });
+        let mut with = frame.clone();
+        with["jsonrpc"] = json!("2.0");
+        let packed = frame_from_json(with.to_string().as_bytes()).unwrap();
+        assert_eq!(to_value(&packed).unwrap(), frame, "to msgpack, `jsonrpc` left out");
+        assert_eq!(rmp_serde::from_slice::<Value>(&packed).unwrap(), frame, "rmp-serde reads it");
+        let back = frame_to_json(&packed).unwrap();
+        assert!(back.starts_with(br#"{"jsonrpc":"2.0","#));
+        assert_eq!(serde_json::from_slice::<Value>(&back).unwrap(), with, "back, `jsonrpc` put back");
+        // A frame that carries `jsonrpc` keeps one.
+        let carried = to_vec(&json!({"jsonrpc": "1.0", "id": 1})).unwrap();
+        assert_eq!(frame_to_json(&carried).unwrap(), br#"{"jsonrpc":"2.0","id":1}"#.to_vec());
+        // Float 32, and any integer form a writer chose.
+        assert_eq!(frame_to_json(&[0x81, 0xa1, b'a', 0xca, 0x40, 0x20, 0x00, 0x00]).unwrap(), br#"{"jsonrpc":"2.0","a":2.5}"#.to_vec());
+        assert_eq!(frame_to_json(&[0x81, 0xa1, b'a', 0xcf, 0, 0, 0, 0, 0, 0, 0, 7]).unwrap(), br#"{"jsonrpc":"2.0","a":7}"#.to_vec());
+        // Refused, as to_value refuses.
+        for bad in [&[0x81, 0xa1, b'a', 0xc4, 0x01, 0x00][..], &[0x81, 0xa1, b'a', 0xd4, 0x01, 0x00], &[0x81, 0x01, 0x02], &[0x81, 0xa1, 0xff, 0x01], &[0x81, 0xa1, b'a'], &[0x80, 0x80], &[0xc1], &[0xdf, 0xff, 0xff, 0xff, 0xff]] {
+            assert!(frame_to_json(bad).is_err(), "{bad:02x?}");
+        }
+        let mut deep = vec![0x81, 0xa1, b'a'];
+        deep.extend(std::iter::repeat_n(0x91, 10_000));
+        deep.push(0xc0);
+        assert!(frame_to_json(&deep).is_err(), "nested too deep, not a stack overflow");
+        assert!(frame_from_json(b"{not json").is_err());
+        assert!(frame_from_json(b"{} {}").is_err(), "two values");
+        // Counts past a fixmap and a fixarray widen their head.
+        let wide: Value = json!({"a": (0..16).collect::<Vec<_>>(), "m": (0..16).map(|i| (i.to_string(), json!(i))).collect::<serde_json::Map<_, _>>()});
+        assert_eq!(to_value(&frame_from_json(wide.to_string().as_bytes()).unwrap()).unwrap(), wide);
     }
 
     #[test]

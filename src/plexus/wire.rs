@@ -390,6 +390,11 @@ impl Buffer {
         self.cur.split().freeze()
     }
 
+    /// SKELETON: a call with no connection leaves nothing behind.
+    fn into_idle(self) -> Option<BytesMut> {
+        None
+    }
+
     /// The block to give back to the connection's pool: the current one,
     /// whatever is left of it (frames still in flight keep what they hold).
     fn into_block(self) -> Option<BytesMut> {
@@ -747,6 +752,30 @@ mod tests {
         assert_eq!(serde_json::to_string(&encoded).unwrap(), serde_json::to_string(&v).unwrap(), "outside the pipe it writes its Value");
         assert_eq!(encoded.into_value(), v);
         assert!(Content::from_json(Bytes::from_static(b"{nope")).is_err());
+    }
+
+    /// PERF-27: a block a call was half of what a one-item call allocated on
+    /// a transport with no frame sink, which has no connection to keep one.
+    #[test]
+    fn a_call_with_no_connection_leaves_its_block_whole_for_the_next() {
+        let mut b = Buffer::default();
+        b.room(300);
+        b.cur.put_slice(&[1u8; 300]);
+        drop(b.split());
+        let block = b.into_idle().expect("a block this size is kept");
+        assert!(block.capacity() >= Buffer::FIRST, "all of it again, not what was left: {}", block.capacity());
+        let mut next = Buffer::from_block(Some(block));
+        let kept = next.cur.as_ptr();
+        next.room(300);
+        assert_eq!(next.cur.as_ptr(), kept, "the next call makes none");
+    }
+
+    /// One a stream grew is not kept, or a thread holds it for good.
+    #[test]
+    fn a_block_too_large_to_keep_goes() {
+        let mut b = Buffer::default();
+        b.room(Buffer::POOLED + 1);
+        assert!(b.into_idle().is_none());
     }
 
     #[test]

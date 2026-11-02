@@ -455,8 +455,6 @@ async fn c_a_frame_the_transport_marked_is_refused_at_admission() {
     let marked = |o| InputFrame { overrun: Some(o), ..frame(1, 3) };
     let open = || dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling::default(), Answerer::Caller).unwrap();
     assert_eq!(open().admit(&marked(Overrun::Credit)).unwrap_err().kind(), "past_credit");
-    let e = open().admit(&marked(Overrun::Buffered { max: 9 })).unwrap_err();
-    assert_eq!((e.kind(), e.to_item("menger")["limit"].as_str(), e.to_item("menger")["max"].as_u64()), ("too_much_input", Some("buffered_bytes"), Some(9)));
     let e = open().admit(&marked(Overrun::Sequence { expected: 2 })).unwrap_err();
     assert_eq!((e.kind(), e.to_item("menger")["expected"].as_u64()), ("out_of_sequence", Some(2)));
 }

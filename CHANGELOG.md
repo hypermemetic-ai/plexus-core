@@ -13,7 +13,7 @@ BIDIR-6: the input half of a call.
 
 | Change | Before | After | What to do |
 |---|---|---|---|
-| `CallCeiling` (plexus-auth-core) | `max_items` 1,000,000, `max_bytes` 64 MiB by default | no lifetime limit by default; `max_buffered` added, 64 MiB | Set the two only for a method that wants them; use `..Default::default()` in a struct literal |
+| `CallCeiling` (plexus-auth-core) | `max_items` 1,000,000, `max_bytes` 64 MiB by default | no lifetime limit by default; `max_buffered` added, 64 MiB, past which credit is held back (never a refusal) | Set the two only for a method that wants them; use `..Default::default()` in a struct literal |
 | `duplex_gate::InputFrame` | one item | generic over what it holds, with `items` and `overrun` | `InputFrame::new` is unchanged; a struct literal names the new fields |
 | `DuplexRefusal` | seven variants | adds `OutOfSequence`, `InvalidInput` | Add them to an exhaustive match |
 | `DuplexRefusal::to_item` | `error_kind`, facts, `message` | a typed error item (spec/05): `metadata` and `code` too | Nothing, for a reader of those keys |

@@ -18,7 +18,9 @@ path = "src/lib.rs"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 # PERF-7: an item's frame is split off a block as `Bytes`, written as it is.
-bytes = "1.9"
+# BIDIR-17: `Input<Bytes>` is an input like any other, so `Bytes` is
+# (de)serializable and has a schema.
+bytes = { version = "1.9", features = ["serde"] }
 # PERF-7: wrap_stream's stream, the method's own inside it unboxed.
 pin-project-lite = "0.2"
 
@@ -39,7 +41,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 
 # Schema generation
-schemars = { version = "1.1", features = ["derive", "uuid1"] }
+schemars = { version = "1.1", features = ["derive", "uuid1", "bytes1"] }
 
 # HTTP types for RawRequestContext
 http = "1"
@@ -67,7 +69,8 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 # network client; `child-wss` adds TLS.
 tokio-tungstenite = { version = "0.30", optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"], optional = true }
-base64 = { version = "0.22", optional = true }
+# BIDIR-17: an `Input<Bytes>` item sent as JSON is base64.
+base64 = "0.22"
 
 # Hub macro for activation generation. The pairing: macros and core move on
 # the same minor line; only this direction can be a bound, since the macro
@@ -91,7 +94,7 @@ default = ["child-ws"]
 # POLYGLOT-5: `ChildArgs`, the child seam's flags, as clap arguments.
 clap = ["dep:clap"]
 # POLYGLOT-5: a child on a WebSocket (ws://), dialed with a key proof.
-child-ws = ["dep:tokio-tungstenite", "dep:ed25519-dalek", "dep:base64"]
+child-ws = ["dep:tokio-tungstenite", "dep:ed25519-dalek"]
 # ... and on wss:// (TLS, webpki roots).
 child-wss = ["child-ws", "tokio-tungstenite/rustls-tls-webpki-roots"]
 

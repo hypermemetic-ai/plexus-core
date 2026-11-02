@@ -18,6 +18,8 @@
 //! | a frame arrives | [`InputTable`] checks its `seq` (a resend below the next one is dropped; past it is `out_of_sequence`) and what the call holds, then queues it; a frame past either bound is marked ([`Overrun`]) and is the last it takes |
 //! | the pipe runs | one task, as any call: it polls [`DuplexCall::input`] (each frame admitted, the generation and the sign-in's expiry selected beside it, so a call whose handler is not reading ends at a revoke all the same), the handler's stream, and the ledger |
 //! | the handler polls for the next item | everything before it counts as consumed: a handler that forwards before it polls reports what was forwarded. Half a window consumed, the pipe writes `ack` and `credit` |
+//! | a WebSocket binary message (BIDIR-17) | `[0x01][subscription: u64 BE][seq: u64 BE][payload]`: one item, routed by [`InputTable::take_binary`] to the same slot and admission as a JSON frame, its payload a slice of the message, never copied; an `Input<Bytes>` gets it as is, an input of JSON items refuses it (`invalid_input`) |
+//! | `Input<Bytes>` over JSON | each item a base64 string, decoded when the handler reads it |
 //! | the handler ends with the half open | `input_closed {reason: "method_ended", ack}`, then `done`; a later frame reaches nothing |
 //! | a refusal | `input_closed {reason, ack}` and the typed error, the handler's stream dropped |
 //!
@@ -52,12 +54,85 @@ use super::plexus::{DynamicHub, PlexusError};
 use super::wire::FrameSink;
 
 /// What a frame's items are while they wait: each item's JSON, sharing the
-/// frame's bytes.
+/// frame's bytes, or (`raw`) a binary frame's payload.
 #[derive(Debug)]
 pub(crate) struct Batch {
     seq: u64,
-    items: Vec<Bytes>,
+    items: Items,
     bytes: u64,
+    raw: bool,
+}
+
+/// A frame's items: one (every binary frame, and most JSON ones) with no
+/// vector to hold it.
+#[derive(Debug)]
+enum Items {
+    One(Option<Bytes>),
+    Many(std::vec::IntoIter<Bytes>),
+}
+
+impl Items {
+    fn len(&self) -> usize {
+        match self {
+            Items::One(o) => o.is_some() as usize,
+            Items::Many(m) => m.len(),
+        }
+    }
+
+    fn next(&mut self) -> Option<Bytes> {
+        match self {
+            Items::One(o) => o.take(),
+            Items::Many(m) => m.next(),
+        }
+    }
+}
+
+/// BIDIR-17: the tag of a binary input frame, `[0x01][subscription: u64
+/// BE][seq: u64 BE][payload]` (PERF-9's msgpack keeps it free).
+pub const BINARY_INPUT: u8 = 0x01;
+
+/// A binary input frame's header: the tag, the subscription, the seq.
+pub const BINARY_HEADER: usize = 17;
+
+/// The schema of an input's items: `Bytes` is marked binary, base64 as JSON
+/// and raw in a binary frame (BIDIR-17); anything else is its own schema.
+/// What the macro's `MethodSchema.input` is.
+#[doc(hidden)]
+pub fn item_schema<T: 'static>(schema: schemars::Schema) -> schemars::Schema {
+    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<Bytes>() {
+        return schema;
+    }
+    schemars::json_schema!({
+        "type": "string",
+        "contentEncoding": "base64",
+        "contentMediaType": "application/octet-stream",
+        "x-plexus-binary": true,
+    })
+}
+
+/// One item as `T`: an `Input<Bytes>` takes a binary frame's payload as it
+/// is and a JSON item as base64; any other `T` is JSON, never a binary frame.
+fn decode<T: DeserializeOwned + 'static>(item: Bytes, raw: bool) -> Result<T, String> {
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Bytes>() {
+        let bytes = if raw { item } else { from_base64(&item)? };
+        // `T` is `Bytes`: moved through an `Option`, nothing allocated.
+        let mut slot = Some(bytes);
+        let any: &mut dyn std::any::Any = &mut slot;
+        return Ok(any.downcast_mut::<Option<T>>().and_then(Option::take).expect("T is Bytes"));
+    }
+    if raw {
+        return Err("a binary frame, for an input of JSON items".into());
+    }
+    serde_json::from_slice::<T>(&item).map_err(|e| e.to_string())
+}
+
+fn from_base64(item: &[u8]) -> Result<Bytes, String> {
+    use base64::Engine;
+    let text: std::borrow::Cow<'_, str> = match serde_json::from_slice::<&str>(item) {
+        Ok(s) => s.into(),
+        Err(_) => serde_json::from_slice::<String>(item).map_err(|e| format!("an item of binary input is a base64 string: {e}"))?.into(),
+    };
+    base64::engine::general_purpose::STANDARD.decode(text.as_bytes()).map(Bytes::from).map_err(|e| format!("an item of binary input is a base64 string: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -245,9 +320,10 @@ struct WireInput {
 
 struct Reading {
     seq: u64,
-    items: std::vec::IntoIter<Bytes>,
+    items: Items,
     count: u64,
     bytes: u64,
+    raw: bool,
 }
 
 impl<T> Input<T> {
@@ -290,7 +366,7 @@ impl<T> std::fmt::Debug for Input<T> {
     }
 }
 
-impl<T: DeserializeOwned> Stream for Input<T> {
+impl<T: DeserializeOwned + 'static> Stream for Input<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
@@ -302,18 +378,18 @@ impl<T: DeserializeOwned> Stream for Input<T> {
 }
 
 impl WireInput {
-    fn poll_item<T: DeserializeOwned>(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+    fn poll_item<T: DeserializeOwned + 'static>(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         loop {
             if self.over {
                 return Poll::Ready(None);
             }
             if let Some(r) = &mut self.cur {
                 if let Some(raw) = r.items.next() {
-                    match serde_json::from_slice::<T>(&raw) {
+                    match decode::<T>(raw, r.raw) {
                         Ok(item) => return Poll::Ready(Some(item)),
-                        Err(e) => {
+                        Err(message) => {
                             self.over = true;
-                            self.ledger.refuse(DuplexRefusal::InvalidInput { seq: r.seq, message: e.to_string() });
+                            self.ledger.refuse(DuplexRefusal::InvalidInput { seq: r.seq, message });
                             return Poll::Ready(None);
                         }
                     }
@@ -323,7 +399,7 @@ impl WireInput {
             }
             match self.rx.poll_recv(cx) {
                 Poll::Ready(Some(b)) => {
-                    self.cur = Some(Reading { seq: b.seq, count: b.items.len() as u64, bytes: b.bytes, items: b.items.into_iter() });
+                    self.cur = Some(Reading { seq: b.seq, count: b.items.len() as u64, bytes: b.bytes, items: b.items, raw: b.raw });
                 }
                 Poll::Ready(None) => {
                     self.over = true;
@@ -451,35 +527,62 @@ impl InputTable {
     /// `{ns}.input`: `params` a slice of `frame`, or `frame` itself.
     pub fn input(&self, ns: &str, params: &[u8], frame: &Bytes) -> Delivered {
         let Ok(p) = serde_json::from_slice::<InputParams>(params) else { return Delivered::Malformed };
+        let count = p.items.len() as u64;
+        let bytes: u64 = p.items.iter().map(|i| i.get().len() as u64).sum();
+        self.arrive(p.subscription, Some(ns), p.seq, count, bytes, false, || match &p.items[..] {
+            [one] => Items::One(Some(shared(frame, one.get().as_bytes()))),
+            many => Items::Many(many.iter().map(|i| shared(frame, i.get().as_bytes())).collect::<Vec<_>>().into_iter()),
+        })
+    }
+
+    /// BIDIR-17: a WebSocket binary message whose first byte is
+    /// [`BINARY_INPUT`]: one item, its payload a slice of `frame`. Run on the
+    /// socket's reader, in arrival order, as [`Self::take_frame`].
+    /// `Malformed` (a short header, another tag) is the transport's to
+    /// answer; a frame naming no call of this connection is counted.
+    pub fn take_binary(&self, frame: &Bytes) -> Delivered {
+        if frame.len() < BINARY_HEADER || frame[0] != BINARY_INPUT {
+            return Delivered::Malformed;
+        }
+        let word = |at: usize| u64::from_be_bytes(frame[at..at + 8].try_into().expect("eight bytes"));
+        let (subscription, seq) = (word(1), word(9));
+        let bytes = (frame.len() - BINARY_HEADER) as u64;
+        let delivered = self.arrive(subscription, None, seq, 1, bytes, true, || Items::One(Some(frame.slice(BINARY_HEADER..))));
+        if delivered == Delivered::NotThisCall {
+            self.strays.fetch_add(1, Ordering::Relaxed);
+        }
+        delivered
+    }
+
+    /// A frame of `count` items for `subscription` (of namespace `ns`, when
+    /// the frame says one): its seq checked, past the window marked, queued.
+    #[allow(clippy::too_many_arguments)]
+    fn arrive(&self, subscription: u64, ns: Option<&str>, seq: u64, count: u64, bytes: u64, raw: bool, items: impl FnOnce() -> Items) -> Delivered {
         let mut slots = lock(&self.slots);
-        let Some(slot) = slots.get_mut(&p.subscription).filter(|s| &*s.ns == ns) else { return Delivered::NotThisCall };
+        let Some(slot) = slots.get_mut(&subscription).filter(|s| ns.is_none_or(|ns| &*s.ns == ns)) else { return Delivered::NotThisCall };
         let Some(tx) = &slot.tx else { return Delivered::Dropped };
-        if p.seq < slot.next_seq {
+        if seq < slot.next_seq {
             return Delivered::Dropped;
         }
-        if p.seq > slot.next_seq {
-            let last = InputFrame { from: self.conn, seq: p.seq, item: empty(p.seq), items: 0, bytes: 0, overrun: Some(Overrun::Sequence { expected: slot.next_seq }) };
+        if seq > slot.next_seq {
+            let last = InputFrame { from: self.conn, seq, item: empty(seq), items: 0, bytes: 0, overrun: Some(Overrun::Sequence { expected: slot.next_seq }) };
             let _ = tx.send(last);
             slot.tx = None;
             return Delivered::Taken;
         }
         slot.next_seq += 1;
-        let count = p.items.len() as u64;
-        let bytes: u64 = p.items.iter().map(|i| i.get().len() as u64).sum();
         // Past the window is past credit: what a call holds is bounded by
         // credit, and its bytes by the credit held back past `max_buffered`.
         let held_items = slot.ledger.held_items.load(Ordering::Acquire);
-        let overrun = (held_items + count > slot.ledger.window).then_some(Overrun::Credit);
-        if overrun.is_some() {
-            let last = InputFrame { from: self.conn, seq: p.seq, item: empty(p.seq), items: 0, bytes: 0, overrun };
+        if held_items + count > slot.ledger.window {
+            let last = InputFrame { from: self.conn, seq, item: empty(seq), items: 0, bytes: 0, overrun: Some(Overrun::Credit) };
             let _ = tx.send(last);
             slot.tx = None;
             return Delivered::Taken;
         }
         slot.ledger.held_items.fetch_add(count, Ordering::AcqRel);
         slot.ledger.held_bytes.fetch_add(bytes, Ordering::AcqRel);
-        let items = p.items.iter().map(|i| shared(frame, i.get().as_bytes())).collect();
-        let _ = tx.send(InputFrame { from: self.conn, seq: p.seq, item: Batch { seq: p.seq, items, bytes }, items: count, bytes, overrun: None });
+        let _ = tx.send(InputFrame { from: self.conn, seq, item: Batch { seq, items: items(), bytes, raw }, items: count, bytes, overrun: None });
         Delivered::Taken
     }
 
@@ -507,7 +610,7 @@ impl InputTable {
 }
 
 fn empty(seq: u64) -> Batch {
-    Batch { seq, items: Vec::new(), bytes: 0 }
+    Batch { seq, items: Items::One(None), bytes: 0, raw: false }
 }
 
 /// `part` of `frame`, as `Bytes` sharing it; a copy when it is not a part of
@@ -646,4 +749,82 @@ pub async fn open<T>(method: &'static str, ceiling: CallCeiling) -> Result<Input
     let sink = pending.accept().await.map_err(|_| PlexusError::ExecutionError("the connection closed".into()))?;
     let _ = CALL.try_with(|seam| seam.borrow_mut().opened = Some(Opened { sink, duplex }));
     Ok(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    struct NoCalls;
+
+    impl CallCounter for NoCalls {
+        fn take_place(&self) -> Result<super::super::duplex_gate::CallPlace, usize> {
+            Err(0)
+        }
+    }
+
+    /// A table with one call's slot at `subscription`, and that call's
+    /// `Input<T>` fed by whatever the table queues.
+    fn one_call<T: DeserializeOwned + Send + 'static>(subscription: u64) -> (Arc<InputTable>, SlotGuard, Input<T>) {
+        let table = InputTable::new(7, Arc::new(NoCalls));
+        let ledger = Arc::new(Ledger::new(64, u64::MAX));
+        let (tx, mut rx) = mpsc::unbounded_channel::<InputFrame<Batch>>();
+        let (inbox, handler) = mpsc::unbounded_channel();
+        let guard = table.attach(subscription, Slot { ns: Arc::from("menger"), next_seq: 0, tx: Some(tx), ledger: ledger.clone() });
+        tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                let _ = inbox.send(f.item);
+            }
+        });
+        (table, guard, Input { source: Source::Wire(WireInput { rx: handler, cur: None, ledger, over: false }) })
+    }
+
+    fn frame(subscription: u64, seq: u64, payload: &[u8]) -> Bytes {
+        let mut f = vec![BINARY_INPUT];
+        f.extend_from_slice(&subscription.to_be_bytes());
+        f.extend_from_slice(&seq.to_be_bytes());
+        f.extend_from_slice(payload);
+        Bytes::from(f)
+    }
+
+    /// Acceptance 4: the payload the handler reads is the received message's
+    /// own bytes, at offset 17: a slice, not a copy.
+    #[tokio::test]
+    async fn a_binary_payload_reaches_the_handler_without_a_copy() {
+        let (table, _slot, mut input) = one_call::<Bytes>(21);
+        let received = frame(21, 0, &[9; 640]);
+        assert_eq!(table.take_binary(&received), Delivered::Taken);
+        let item = input.next().await.unwrap();
+        assert_eq!(item.as_ptr(), received[BINARY_HEADER..].as_ptr(), "the same memory");
+        assert_eq!(item.len(), 640);
+    }
+
+    /// A short header and another tag are malformed; a frame naming no call
+    /// is counted; a resend is dropped.
+    #[tokio::test]
+    async fn take_binary_says_what_became_of_a_frame() {
+        let (table, _slot, _input) = one_call::<Bytes>(21);
+        assert_eq!(table.take_binary(&Bytes::from_static(&[1, 0, 0])), Delivered::Malformed);
+        let mut other = frame(21, 0, b"x").to_vec();
+        other[0] = 2;
+        assert_eq!(table.take_binary(&Bytes::from(other)), Delivered::Malformed);
+        assert_eq!(table.take_binary(&frame(22, 0, b"x")), Delivered::NotThisCall);
+        assert_eq!(table.strays(), 1);
+        assert_eq!(table.take_binary(&frame(21, 0, b"x")), Delivered::Taken);
+        assert_eq!(table.take_binary(&frame(21, 0, b"x")), Delivered::Dropped);
+    }
+
+    /// A JSON item of `Input<Bytes>` is base64; one of any other input is
+    /// JSON, and a binary frame for it is refused.
+    #[test]
+    fn decode_by_the_inputs_type() {
+        assert_eq!(decode::<Bytes>(Bytes::from_static(br#""AAEC/w==""#), false).unwrap(), Bytes::from_static(&[0, 1, 2, 255]));
+        assert_eq!(decode::<Bytes>(Bytes::from_static(br#""AAEC\/w==""#), false).unwrap(), Bytes::from_static(&[0, 1, 2, 255]));
+        assert!(decode::<Bytes>(Bytes::from_static(br#""no!""#), false).is_err());
+        assert!(decode::<Bytes>(Bytes::from_static(b"[1,2]"), false).is_err());
+        assert_eq!(decode::<Bytes>(Bytes::from_static(b"{raw"), true).unwrap(), Bytes::from_static(b"{raw"));
+        assert_eq!(decode::<u32>(Bytes::from_static(b"7"), false).unwrap(), 7);
+        assert!(decode::<u32>(Bytes::from_static(b"7"), true).is_err());
+    }
 }

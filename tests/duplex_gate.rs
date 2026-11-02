@@ -403,7 +403,7 @@ async fn c_an_item_past_the_ceiling_is_too_much_input() {
     let m = members();
     let dg = DuplexGate::new(gate(&m));
     let conn = Calls::new(4);
-    let by_items = CallCeiling { credit: 100, max_items: 3, max_bytes: u64::MAX };
+    let by_items = CallCeiling { credit: 100, max_items: 3, ..CallCeiling::default() };
     let mut call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), by_items, Answerer::Caller).unwrap();
     for s in 0..3 {
         call.admit(&frame(1, s)).unwrap();
@@ -412,12 +412,105 @@ async fn c_an_item_past_the_ceiling_is_too_much_input() {
     assert_eq!(e.kind(), "too_much_input");
     assert_eq!(e.to_item("menger")["limit"], "items");
     assert!(call.admit(&frame(1, 4)).is_err(), "the half stays closed");
-    let by_bytes = CallCeiling { credit: 100, max_items: 100, max_bytes: 40 };
+    let by_bytes = CallCeiling { credit: 100, max_bytes: 40, ..CallCeiling::default() };
     let mut call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), by_bytes, Answerer::Caller).unwrap();
     call.admit(&frame(1, 0)).unwrap(); // {"line":"line 0"} is 17 bytes
     call.admit(&frame(1, 1)).unwrap();
     let e = call.admit(&frame(1, 2)).unwrap_err();
     assert_eq!(e.to_item("menger")["limit"], "bytes");
+}
+
+/// BIDIR-6: credit counts items, a frame may hold several, and `seq` counts
+/// frames: what is refused names the frame.
+#[tokio::test]
+async fn c_credit_counts_items_and_the_refusal_names_the_frame() {
+    let m = members();
+    let dg = DuplexGate::new(gate(&m));
+    let conn = Calls::new(4);
+    let ceiling = CallCeiling { credit: 4, ..CallCeiling::default() };
+    let mut call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), ceiling, Answerer::Caller).unwrap();
+    let batch = |seq, items| InputFrame { items, ..frame(1, seq) };
+    call.admit(&batch(0, 3)).unwrap();
+    let line = call.credit_line();
+    let e = call.admit(&batch(1, 2)).unwrap_err();
+    assert_eq!((e.to_item("menger")["seq"].as_u64(), e.to_item("menger")["credit"].as_u64()), (Some(1), Some(4)));
+    assert_eq!(e.kind(), "past_credit");
+    assert_eq!(line.granted(), 4);
+    assert_eq!(e.to_item("menger")["code"], "past_credit", "a typed error item (spec/05)");
+    assert!(e.to_item("menger")["metadata"].is_object());
+    // A grant through the line is the call's, wherever it holds it.
+    let mut call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), ceiling, Answerer::Caller).unwrap();
+    call.credit_line().grant(2);
+    call.admit(&batch(0, 6)).unwrap();
+}
+
+/// BIDIR-6: what the transport refused on arrival is refused whatever the
+/// credit has become since.
+#[tokio::test]
+async fn c_a_frame_the_transport_marked_is_refused_at_admission() {
+    use plexus_core::plexus::duplex_gate::Overrun;
+    let m = members();
+    let dg = DuplexGate::new(gate(&m));
+    let conn = Calls::new(4);
+    let marked = |o| InputFrame { overrun: Some(o), ..frame(1, 3) };
+    let open = || dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling::default(), Answerer::Caller).unwrap();
+    assert_eq!(open().admit(&marked(Overrun::Credit)).unwrap_err().kind(), "past_credit");
+    let e = open().admit(&marked(Overrun::Buffered { max: 9 })).unwrap_err();
+    assert_eq!((e.kind(), e.to_item("menger")["limit"].as_str(), e.to_item("menger")["max"].as_u64()), ("too_much_input", Some("buffered_bytes"), Some(9)));
+    let e = open().admit(&marked(Overrun::Sequence { expected: 2 })).unwrap_err();
+    assert_eq!((e.kind(), e.to_item("menger")["expected"].as_u64()), ("out_of_sequence", Some(2)));
+}
+
+/// BIDIR-6: nothing ends a call for what has passed through it unless the
+/// method opted in.
+#[tokio::test]
+async fn c_by_default_no_lifetime_ceiling_ends_a_call() {
+    let m = members();
+    let dg = DuplexGate::new(gate(&m));
+    let conn = Calls::new(4);
+    let mut call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling::default(), Answerer::Caller).unwrap();
+    let line = call.credit_line();
+    let huge = InputFrame { items: 1, bytes: u64::MAX / 2, ..frame(1, 0) };
+    for s in 0..2_000_000u64 {
+        line.grant(1);
+        call.admit(&InputFrame { seq: s, ..huge.clone() }).unwrap_or_else(|e| panic!("frame {s}: {}", e.kind()));
+    }
+}
+
+/// BIDIR-6: a call its dispatch decided is not decided again at open; it is
+/// asked when the generation has moved since, every target it named.
+#[tokio::test]
+async fn b_a_call_the_dispatch_decided_is_asked_once_a_move_comes() {
+    let m = members();
+    let dg = DuplexGate::new(gate(&m));
+    let conn = Calls::new(4);
+    let open = |targets: Vec<&str>, seen, recheck| {
+        let targets = targets.into_iter().map(str::to_string).collect();
+        dg.admitted(C1, &conn, as_(ADA), "runs.append_log", targets, seen, recheck, CallCeiling::default(), Answerer::Caller).unwrap()
+    };
+    let seen = dg.gate().generation().current();
+    let mut call = open(vec!["MENGER-1"], seen, true);
+    assert_eq!(dg.gate_checks(), 0, "the dispatch's decision stands");
+    call.admit(&frame(1, 0)).unwrap();
+    assert_eq!(dg.gate_checks(), 0);
+    // A move between the dispatch's check and the open is not missed.
+    m.revoke(ADA);
+    dg.gate().moved(GrantsMove::Revoke);
+    let mut late = open(vec!["MENGER-1"], seen, true);
+    assert_eq!(late.admit(&frame(1, 0)).unwrap_err().kind(), "forbidden");
+    // A method the gate admits whoever calls is asked nothing.
+    let mut public = open(vec![], seen, false);
+    public.admit(&frame(1, 0)).unwrap();
+}
+
+/// BIDIR-6: a service with no gate has calls all the same.
+#[tokio::test]
+async fn an_ungated_service_opens_a_call_and_never_asks() {
+    let dg = DuplexGate::ungated();
+    let conn = Calls::new(1);
+    let mut call = dg.admitted(C1, &conn, None, "runs.append_log", vec![], 0, false, CallCeiling::default(), Answerer::Caller).unwrap();
+    call.admit(&frame(1, 0)).unwrap();
+    assert_eq!(dg.gate_checks(), 0);
 }
 
 // ---------------------------------------------------------------- (d) who answers
@@ -692,7 +785,7 @@ async fn g_every_typed_refusal_is_one_audit_record() {
         .open(sub(3), &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling { credit: 1, ..CallCeiling::default() }, Answerer::Person)
         .unwrap();
     let mut items = dg
-        .open(sub(4), &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling { credit: 9, max_items: 1, max_bytes: u64::MAX }, Answerer::Caller)
+        .open(sub(4), &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling { credit: 9, max_items: 1, ..CallCeiling::default() }, Answerer::Caller)
         .unwrap();
     assert!(dg.open(sub(5), &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling::default(), Answerer::Caller).is_err());
     want.push((sub(5), DuplexRefusalCode::TooManyCalls));
@@ -780,7 +873,7 @@ fn h_an_admitted_frame_allocates_nothing_and_builds_no_record() {
     let (queue, _drain) = AuditQueue::new(8, Arc::new(Kept::default()));
     let dg = DuplexGate::new(gate(&m)).with_audit(queue.clone());
     let conn = Calls::new(4);
-    let ceiling = CallCeiling { credit: u64::MAX, max_items: u64::MAX, max_bytes: u64::MAX };
+    let ceiling = CallCeiling { credit: u64::MAX, ..CallCeiling::default() };
     let mut call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), ceiling, Answerer::Caller).unwrap();
     let frames: Vec<InputFrame> = (0..10_000u64).map(|s| frame(1, s)).collect();
     let before = allocs();
@@ -865,7 +958,7 @@ async fn perf_per_frame_admit() {
     let m = members();
     let dg = DuplexGate::new(gate(&m));
     let conn = Calls::new(4);
-    let ceiling = CallCeiling { credit: u64::MAX, max_items: u64::MAX, max_bytes: u64::MAX };
+    let ceiling = CallCeiling { credit: u64::MAX, ..CallCeiling::default() };
     let mut call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), ceiling, Answerer::Caller).unwrap();
     let frames: Vec<InputFrame> = (0..1_000_000u64).map(|s| frame(1, s)).collect();
     let mut samples = Vec::new();

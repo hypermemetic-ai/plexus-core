@@ -463,7 +463,8 @@ async fn auth_params_are_typed_at_the_wire() {
     let w = world();
     let root = key(ROOT, "r");
     let invalid = |r: Result<Vec<Value>, PlexusError>| match r {
-        Err(PlexusError::InvalidParams(m)) => m,
+        // RETURNS-6: structured; its line is MACRO-15's `<param>: <detail>`.
+        Err(e @ PlexusError::InvalidParams { .. }) => e.to_string().trim_start_matches("Invalid params: ").to_string(),
         other => panic!("expected InvalidParams, got {other:?}"),
     };
     let m = invalid(call(&w, "auth.role_set", json!({"role": "a.b", "grants": []}), Some(&root)).await);
@@ -513,7 +514,10 @@ async fn grant_and_revoke_by_admin_refused_otherwise() {
         wire,
         json!({"type": "error", "error_kind": "forbidden", "grant": "auth.grant", "scope": "MENGER",
                "roles": ["admin"], "held_on": [], "message": "needs auth.grant on MENGER",
-               "code": "-32003", "recoverable": false})
+               "code": "-32003", "recoverable": false,
+               // RETURNS-36: RETURNS-6's typed error beside spec/05's fields.
+               "error": {"kind": "forbidden", "reason": "missing_grant", "grant": "auth.grant",
+                         "scope": "MENGER", "roles": ["admin"], "held_on": []}})
     );
     assert!(matches!(err, PlexusError::Forbidden { .. }));
     // Granting on * needs admin on *.
@@ -526,7 +530,7 @@ async fn grant_and_revoke_by_admin_refused_otherwise() {
     // InvalidParams naming the parameter, before the method runs.
     let err = call(&w, "auth.grant", json!({"principal": "nobody", "role": "viewer", "scope": "MENGER"}), Some(&root)).await.err().unwrap();
     assert!(
-        matches!(&err, PlexusError::InvalidParams(m) if m.starts_with("principal: `nobody` is not a principal")),
+        matches!(&err, e @ PlexusError::InvalidParams { .. } if e.to_string().starts_with("Invalid params: principal: `nobody` is not a principal")),
         "{err:?}"
     );
 
@@ -699,12 +703,12 @@ async fn a_bare_value_reaches_no_target() {
     // Absent params are still no params.
     assert!(call(&w, "tickets.list", Value::Null, Some(&ada)).await.is_ok());
     // Anonymous: the shape is refused before anything is decided.
-    assert!(matches!(call(&w, "tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams(_))));
+    assert!(matches!(call(&w, "tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams { .. })));
 
     // The macro refuses it too, with no gate in front: a method with a
     // target never takes its target as a bare value.
     let bare = Arc::new(DynamicHub::new("menger").register(TicketsActivation));
-    assert!(matches!(bare.route("tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams(_))));
+    assert!(matches!(bare.route("tickets.get", json!("MENGER-1"), None).await, Err(PlexusError::InvalidParams { .. })));
     assert!(bare.route("tickets.get", json!({"id": "MENGER-1"}), None).await.is_ok());
 }
 

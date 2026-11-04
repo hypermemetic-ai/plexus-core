@@ -15,17 +15,16 @@
 //!
 //! # The error layers, preserved
 //!
-//! The three transports are meant to be interchangeable, which means they
-//! must agree on *which layer* a failure belongs to:
+//! The transports are meant to be interchangeable, which means they must
+//! agree on *which layer* a failure belongs to — and over the wire a service
+//! answers a call it cannot dispatch with a typed error frame, not a broken
+//! connection (RETURNS-9):
 //!
-//! | Failure | Layer | Why |
+//! | Failure | Becomes | Why |
 //! |---|---|---|
-//! | [`Activation::call`] returns `Err(PlexusError)` | transport | the request never produced a stream — unknown method, dispatch refused, scope gate denied. Same class as "the connection failed". |
-//! | the stream contains a [`PlexusStreamItem::Error`] | in-band | the activation answered, and the answer is an error. |
-//! | the [`MethodRef`]'s namespace is not this activation's | transport | nothing was dispatched. |
-//!
-//! Collapsing the first two would make this transport report a different
-//! error layer than the wire ones for the same failure.
+//! | [`Activation::call`] returns `Err(PlexusError)` | one error frame: `RemoteError::from(&e)`, provenance the activation, not recoverable, no `done` | what a service's `call` route sends for the same failure — unknown method, missing or malformed param, scope gate denied — so a client sees `ClientError::Remote(RemoteError)` in-process exactly as it would over a socket |
+//! | the stream contains a [`PlexusStreamItem::Error`] | that frame | the activation answered, and the answer is an error. |
+//! | the [`MethodRef`]'s namespace is not this activation's | a `TransportError` (protocol) | nothing was dispatched: the client was wired to the wrong transport, which no server would answer for. |
 //!
 //! # Not a way to skip the hub
 //!
@@ -36,10 +35,13 @@
 //! [`HubTransport`](super::hub_transport::HubTransport) (LOCAL-6).
 
 use futures::StreamExt;
-use plexus_client::{ItemStream, MethodRef, StreamItem, StreamMetadata, Transport, TransportError};
+use plexus_client::{
+    ItemStream, MethodRef, StreamItem, StreamMetadata, Transport, TransportError,
+};
 use serde_json::Value;
 
 use super::auth::AuthContext;
+use super::context::PlexusContext;
 use super::plexus::Activation;
 use super::types::PlexusStreamItem;
 
@@ -47,7 +49,8 @@ use super::types::PlexusStreamItem;
 ///
 /// ```ignore
 /// let client = TicketsClient::new(InProcessTransport::new(Tickets::new(store)));
-/// let tickets = client.list_all(None, None).await?;
+/// let health = client.health().await?;                                    // one item
+/// let tickets: Vec<_> = client.list(None, None).try_collect().await?;     // many
 /// ```
 #[derive(Debug, Clone)]
 pub struct InProcessTransport<A> {
@@ -106,24 +109,27 @@ pub(crate) fn to_client_item(item: PlexusStreamItem) -> StreamItem {
         },
         PlexusStreamItem::Progress {
             metadata,
-            message,
-            percentage,
+            content_type,
+            content,
         } => StreamItem::Progress {
             metadata: meta(metadata),
-            message,
-            percentage,
+            content_type: Some(content_type),
+            content,
         },
         PlexusStreamItem::Error {
             metadata,
+            recoverable,
             message,
             code,
-            recoverable,
-            ..
+            error,
+            fields,
         } => StreamItem::Error {
             metadata: meta(metadata),
-            message,
-            code,
             recoverable,
+            message: Some(message),
+            code,
+            error,
+            fields,
         },
         PlexusStreamItem::Request {
             request_id,
@@ -167,9 +173,17 @@ impl<A: Activation> Transport for InProcessTransport<A> {
                     // `call` succeeded: the activation owns the outcome from
                     // here, including any in-band `error` item.
                     Ok(stream) => stream.map(|item| Ok(to_client_item(item))).left_stream(),
-                    // `call` failed: nothing was answered.
+                    // `call` failed: the call failed, typed — one error
+                    // frame, as a service's `call` route sends it (no `done`).
                     Err(e) => futures::stream::once(async move {
-                        Err(TransportError::other(e.to_string()))
+                        Ok(to_client_item(PlexusStreamItem::from_plexus_error(
+                            super::types::StreamMetadata::new(
+                                vec![self.activation.namespace().to_string()],
+                                PlexusContext::hash(),
+                            ),
+                            &e,
+                            false,
+                        )))
                     })
                     .right_stream(),
                 }

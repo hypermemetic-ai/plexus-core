@@ -23,12 +23,17 @@ Stream ends with:    PlexusStreamItem::Done { metadata }
 ```rust
 pub enum PlexusStreamItem {
     Data { metadata, content_type, content: Value },
-    Progress { metadata, message, percentage: Option<f32> },
-    Error { metadata, message, code: Option<String>, recoverable: bool },
+    Progress { metadata, content_type, content: Value },   // the method's progress `P` (default `Note`)
+    Error { metadata, recoverable: bool, error: RemoteError },
     Done { metadata },
     Request { ... },  // For bidirectional communication
 }
 ```
+
+0.7 (RETURNS-6): the error frame carries a typed `plexus_client::RemoteError`
+(`kind`-tagged) in place of `message` / `code` — build it as
+`PlexusStreamItem::error(metadata, RemoteError::from(&e), recoverable)`; the
+progress frame carries the call's `content_type` and a typed progress value.
 
 ## PlexusStream Type
 
@@ -44,14 +49,11 @@ Defined in `plexus-core/src/plexus/streaming.rs`. The macro handles wrapping aut
 // Wrap a typed stream with metadata and auto-appended Done event
 wrap_stream(stream, content_type, provenance) -> PlexusStream
 
-// Single-item error stream
-error_stream(message, provenance, recoverable) -> PlexusStream
+// Single-item error frame
+error_stream(error: RemoteError, provenance, recoverable) -> PlexusStream
 
-// Error stream with error code
-error_stream_with_code(message, code, provenance, recoverable) -> PlexusStream
-
-// Single-item progress event
-progress_stream(message, percentage, provenance) -> PlexusStream
+// Single-item progress frame for the call `content_type`
+progress_stream(content_type, content: Value, provenance) -> PlexusStream
 
 // Single-item done event
 done_stream(provenance) -> PlexusStream

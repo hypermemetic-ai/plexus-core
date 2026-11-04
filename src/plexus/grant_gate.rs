@@ -125,7 +125,7 @@ fn target_values(params: &Value, param: &str) -> Result<Option<Vec<String>>, Ple
         _ => None,
     };
     let unreadable = || {
-        PlexusError::InvalidParams(format!("`{param}` names what this call acts on: a string, or a list of strings"))
+        PlexusError::malformed_param(param, "names what this call acts on: a string, or a list of strings")
     };
     match v {
         Value::Null => Ok(None),
@@ -141,8 +141,8 @@ fn target_values(params: &Value, param: &str) -> Result<Option<Vec<String>>, Ple
 fn params_shape(params: &Value) -> Result<(), PlexusError> {
     match params {
         Value::Object(_) | Value::Null => Ok(()),
-        _ => Err(PlexusError::InvalidParams(
-            "params must be an object naming each parameter, e.g. {\"id\": \"…\"}: a gated method takes no bare value".into(),
+        _ => Err(PlexusError::invalid_params(
+            "params must be an object naming each parameter, e.g. {\"id\": \"…\"}: a gated method takes no bare value",
         )),
     }
 }
@@ -196,49 +196,8 @@ pub(crate) fn decide(
     }
 }
 
-/// The wire rendering of a refusal's facts, merged into the error stream
-/// item (`{"type":"error", …}`) beside its `message` and `code`:
-/// `error_kind` always for an auth refusal, and for a missing grant its
-/// `grant`, `scope`, `roles` and `held_on`. Additive: a client that reads
-/// only `message` sees what it always saw.
-pub(crate) fn error_fields(e: &PlexusError) -> Option<serde_json::Map<String, Value>> {
-    let mut m = serde_json::Map::new();
-    match e {
-        PlexusError::Unauthenticated(_) => {
-            m.insert("error_kind".into(), "unauthenticated".into());
-        }
-        PlexusError::Forbidden { reason } => {
-            m.insert("error_kind".into(), "forbidden".into());
-            match reason {
-                AuthzDenyReason::MissingGrant { grant, scope, roles, held_on } => {
-                    m.insert("grant".into(), grant.as_str().into());
-                    m.insert("scope".into(), scope.as_str().into());
-                    m.insert("roles".into(), roles.iter().map(|r| Value::from(r.as_str())).collect());
-                    m.insert("held_on".into(), held_on.iter().map(|s| Value::from(s.as_str())).collect());
-                }
-                AuthzDenyReason::MissingScope { scope } => {
-                    m.insert("reason".into(), "missing_scope".into());
-                    m.insert("scope".into(), scope.as_str().into());
-                }
-                AuthzDenyReason::TenantBoundary => {
-                    m.insert("reason".into(), "tenant_boundary".into());
-                }
-                AuthzDenyReason::NotAccepted => {
-                    m.insert("reason".into(), "not_accepted".into());
-                }
-            }
-        }
-        // AUTH-13: params the gate (or the method) cannot read.
-        PlexusError::InvalidParams(_) => {
-            m.insert("error_kind".into(), "invalid_params".into());
-        }
-        _ => return None,
-    }
-    Some(m)
-}
-
 /// A refusal as a client reads it back from an error stream item — the
-/// typed view of [`error_fields`]' `forbidden` shape.
+/// typed view of the `forbidden` shape [`super::types::spec_fields`] writes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForbiddenItem {
     pub grant: String,

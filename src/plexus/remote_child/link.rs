@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::spec::{ChildOptions, ChildSpec};
 use crate::plexus::types::{PlexusStreamItem, StreamMetadata};
+use plexus_client::RemoteError;
 
 /// A subscription id as the child spelled it (its JSON text: `4`, `"a"`).
 pub(super) type SubKey = String;
@@ -34,26 +35,39 @@ pub(super) fn meta(name: &str) -> StreamMetadata {
 
 /// `child_unavailable` (spec/12 rule 5): one error, and the end.
 pub(super) fn unavailable(name: &str, why: &str) -> PlexusStreamItem {
-    let mut f = serde_json::Map::new();
-    f.insert("child".into(), name.into());
-    f.insert("reason".into(), why.into());
-    PlexusStreamItem::typed_error(meta(name), format!("child {name} is unavailable: {why}"), "child_unavailable", true, f)
+    PlexusStreamItem::error(meta(name), RemoteError::ChildUnavailable { child: name.into(), reason: why.into() }, true)
 }
 
 /// `child_timeout`: the child did not open the call in the service's time.
 pub(super) fn timed_out(name: &str, timeout: Duration) -> PlexusStreamItem {
-    let mut f = serde_json::Map::new();
-    f.insert("child".into(), name.into());
-    f.insert("timeout_ms".into(), (timeout.as_millis() as u64).into());
-    PlexusStreamItem::typed_error(meta(name), format!("child {name} did not open the call in {timeout:?}"), "child_timeout", true, f)
+    let error = RemoteError::ChildTimeout { child: name.into(), timeout_ms: timeout.as_millis() as u64 };
+    let mut item = PlexusStreamItem::error(meta(name), error, true);
+    if let PlexusStreamItem::Error { message, .. } = &mut item {
+        *message = format!("child {name} did not open the call in {timeout:?}");
+    }
+    item
 }
 
 /// `too_many_calls` (spec/05, 09): as a connection's limit answers.
 pub(super) fn too_many(name: &str, max: usize) -> PlexusStreamItem {
-    let mut f = serde_json::Map::new();
-    f.insert("max".into(), max.into());
-    f.insert("child".into(), name.into());
-    PlexusStreamItem::typed_error(meta(name), format!("too many calls open on child {name} (at most {max}): close one, or call again later"), "too_many_calls", true, f)
+    PlexusStreamItem::error(meta(name), RemoteError::TooManyCalls { max: max as u64, child: Some(name.into()) }, true)
+}
+
+/// A call the child refused at the JSON-RPC layer (`{code, message,
+/// data?}`): its `data` when that is a typed [`RemoteError`] (RETURNS-6),
+/// else what its code says; spec/05's `message` and `code` as it sent them.
+fn refused(name: &str, e: &Value) -> PlexusStreamItem {
+    let code = e.get("code").map(|c| match c {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    let message = e.get("message").and_then(Value::as_str).unwrap_or("the child refused the call").to_string();
+    let error = e
+        .get("data")
+        .and_then(|d| serde_json::from_value::<RemoteError>(d.clone()).ok())
+        .unwrap_or_else(|| super::peer::remote_error_of_code(e.get("code").and_then(Value::as_i64).unwrap_or(-32000), &message));
+    let fields = crate::plexus::types::spec_fields(&error);
+    PlexusStreamItem::Error { metadata: meta(name), message, code, recoverable: false, error, fields }
 }
 
 /// Counters that outlive a connection.
@@ -75,7 +89,15 @@ pub(super) enum OpenFail {
 
 struct Opening {
     reply: oneshot::Sender<Result<SubKey, OpenFail>>,
-    items: mpsc::Sender<PlexusStreamItem>,
+    items: Sub,
+}
+
+/// An open call's items: where they go, and the method called — the
+/// `content_type` a progress item as main wrote it (none of its own) is
+/// named for (RETURNS-36, re-review #3).
+struct Sub {
+    tx: mpsc::Sender<PlexusStreamItem>,
+    method: Arc<str>,
 }
 
 /// How long after its `true` an unsubscribed call's late item is still the
@@ -86,7 +108,7 @@ const TAIL: Duration = Duration::from_millis(250);
 #[derive(Default)]
 struct Routes {
     pending: HashMap<u64, Opening>,
-    subs: HashMap<SubKey, mpsc::Sender<PlexusStreamItem>>,
+    subs: HashMap<SubKey, Sub>,
     /// Unsubscribes sent and not yet answered, and those answered within
     /// [`TAIL`]: their late items are the cancel's tail, dropped quietly
     /// (not "unasked").
@@ -204,21 +226,16 @@ impl Conn {
             if !self.alive() {
                 return Err(unavailable(&self.name, "the connection has closed"));
             }
-            r.pending.insert(id, Opening { reply, items: tx });
+            // a `{ns}.call`'s params name the method called (`echo.count`)
+            let called = params.get("method").and_then(Value::as_str).unwrap_or(method);
+            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into() } });
         }
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         match tokio::time::timeout(timeout, answer).await {
             Ok(Ok(Ok(key))) => Ok((key, rx)),
             Ok(Ok(Err(OpenFail::Gone(why)))) => Err(unavailable(&self.name, &why)),
             Ok(Err(_)) => Err(unavailable(&self.name, "the connection closed before the call opened")),
-            Ok(Ok(Err(OpenFail::Refused(e)))) => {
-                let code = e.get("code").map(|c| match c {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                });
-                let message = e.get("message").and_then(Value::as_str).unwrap_or("the child refused the call").to_string();
-                Err(PlexusStreamItem::Error { metadata: meta(&self.name), message, code, recoverable: false, fields: Default::default() })
-            }
+            Ok(Ok(Err(OpenFail::Refused(e)))) => Err(refused(&self.name, &e)),
             Err(_) => {
                 let mut r = self.routes.lock().unwrap();
                 if r.pending.remove(&id).is_some() {
@@ -316,10 +333,10 @@ impl Conn {
     }
 
     async fn route(&self, key: SubKey, raw: &RawValue) {
-        let tx = {
+        let (tx, method) = {
             let mut r = self.routes.lock().unwrap();
             match r.subs.get(&key) {
-                Some(tx) => tx.clone(),
+                Some(sub) => (sub.tx.clone(), Arc::clone(&sub.method)),
                 None => {
                     r.expire_tails(Instant::now());
                     if !r.closing_subs.contains(&key) {
@@ -331,14 +348,34 @@ impl Conn {
                 }
             }
         };
-        let item = match serde_json::from_str::<PlexusStreamItem>(raw.get()) {
+        // RETURNS-36: a peer on plexus-wire's spec as main wrote it is read
+        // into 0.8's shape (`peer::item`) when — only when — it does not
+        // read as 0.8.
+        let parsed = serde_json::from_str::<PlexusStreamItem>(raw.get()).or_else(|e| {
+            super::peer::item(raw.get(), &method)
+                .and_then(|v| serde_json::from_value::<PlexusStreamItem>(v).ok())
+                .ok_or(e)
+        });
+        let item = match parsed {
             Ok(item) => item,
             Err(e) => {
-                // An item kind this service does not know (spec/03: a reader
-                // skips it) — or one that does not read at all.
                 let kind = serde_json::from_str::<Kind<'_>>(raw.get()).map(|k| k.kind.into_owned()).unwrap_or_default();
-                tracing::debug!(target: "plexus::child", child = %self.name, subscription = %key, %kind, "an item kind not relayed: {e}");
-                return;
+                if kind != "error" {
+                    // An item kind this service does not know (spec/03: a
+                    // reader skips it) — or one that does not read at all.
+                    tracing::debug!(target: "plexus::child", child = %self.name, subscription = %key, %kind, "an item kind not relayed: {e}");
+                    return;
+                }
+                // RETURNS-36 (review #4): an error item is the call's end
+                // (spec/03); skipped, the call would wait for an end that
+                // never comes. It ends here, naming what could not be read,
+                // and the child is told to stop.
+                tracing::warn!(target: "plexus::child", child = %self.name, subscription = %key, "an error item not read: {e}");
+                self.unsubscribe(&key);
+                let error = plexus_client::RemoteError::Execution {
+                    message: format!("child {} sent an error item this service could not read: {e}", self.name),
+                };
+                PlexusStreamItem::error(meta(&self.name), error, false)
             }
         };
         if matches!(item, PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. }) {
@@ -366,7 +403,7 @@ impl Conn {
             r.abandoned.clear();
             (std::mem::take(&mut r.subs), std::mem::take(&mut r.pending))
         };
-        for (_, tx) in subs {
+        for (_, Sub { tx, .. }) in subs {
             match tx.try_send(unavailable(&self.name, why)) {
                 Err(mpsc::error::TrySendError::Full(item)) => {
                     tokio::spawn(async move {

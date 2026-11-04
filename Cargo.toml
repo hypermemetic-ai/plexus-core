@@ -1,6 +1,6 @@
 [package]
 name = "plexus-core"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
 license = "AGPL-3.0-only"
@@ -41,6 +41,10 @@ anyhow = "1.0"
 # Schema generation
 schemars = { version = "1.1", features = ["derive", "uuid1"] }
 
+# RETURNS-10: schema content hashes — SHA-256 of a method's canonical schema
+# JSON, truncated to 16 hex (`plexus::content_hash`). RustCrypto, pure Rust.
+sha2 = "0.10"
+
 # HTTP types for RawRequestContext
 http = "1"
 
@@ -72,12 +76,14 @@ base64 = { version = "0.22", optional = true }
 # Hub macro for activation generation. The pairing: macros and core move on
 # the same minor line; only this direction can be a bound, since the macro
 # emits paths into this crate without depending on it.
-plexus-macros = { path = "../plexus-macros", version = "0.7.0" }
+plexus-macros = { path = "../plexus-macros", version = "0.8.0" }
 
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
 # Wasm-safe by construction; the dependency only runs this way, since
 # plexus-client must build for wasm32 and plexus-core cannot.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.7.0" }
+# RETURNS-6: `schema` — the error frame carries plexus-client's `RemoteError`,
+# and `PlexusStreamItem` derives `JsonSchema`.
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", features = ["schema"] }
 
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code
@@ -105,7 +111,7 @@ required-features = ["child-ws"]
 
 [dev-dependencies]
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.7.0", features = ["ws-native"] }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", features = ["ws-native"] }
 tempfile = "3"
 # POLYGLOT-5: tests/remote_child.rs signs a WebSocket child's trust in.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

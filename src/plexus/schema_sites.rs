@@ -73,11 +73,18 @@ fn walk_plugin(plugin: &PluginSchema, mode: Mode) -> Vec<String> {
         if let Some(p) = &m.params {
             w.params(&path, &json(p));
         }
-        match &m.returns {
-            Some(r) => w.root(&format!("{path} returns"), &json(r)),
-            None => w.untyped(&format!("{path} returns")),
+        // RETURNS-5: `returns` is always present; the empty schema (any
+        // value, what `MethodSchema::new` starts at) is a return no type
+        // was given for.
+        let returns = json(&m.returns);
+        if returns == Value::Bool(true) || returns.as_object().is_some_and(|o| o.is_empty()) {
+            w.untyped(&format!("{path} returns"));
+        } else {
+            w.root(&format!("{path} returns"), &returns);
         }
         for (what, s) in [
+            ("error", &m.error),
+            ("progress", &m.progress),
             ("request_type", &m.request_type),
             ("response_type", &m.response_type),
             ("input", &m.input),

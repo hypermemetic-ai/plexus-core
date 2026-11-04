@@ -115,7 +115,7 @@ impl DuplexRefusal {
         match self {
             Self::Gate(PlexusError::Forbidden { .. }) => "forbidden",
             Self::Gate(PlexusError::Unauthenticated(_)) => "unauthenticated",
-            Self::Gate(PlexusError::InvalidParams(_)) => "invalid_params",
+            Self::Gate(PlexusError::InvalidParams { .. }) => "invalid_params",
             Self::Gate(_) => "error",
             other => other.code().as_str(),
         }

@@ -108,7 +108,7 @@
           }
         }
       },
-      "streaming": false,
+      "cardinality": "one",
       "bidirectional": false,
       "http_method": "POST",
       "role": {
@@ -229,7 +229,7 @@
           }
         }
       },
-      "streaming": false,
+      "cardinality": "one",
       "bidirectional": false,
       "http_method": "POST",
       "role": {
@@ -240,7 +240,8 @@
       "name": "schema",
       "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "hash": "auto_schema",
-      "streaming": false,
+      "returns": {},
+      "cardinality": "one",
       "bidirectional": false,
       "http_method": "POST",
       "role": {
@@ -251,7 +252,8 @@
       "name": "body",
       "description": "Look up a celestial body by name (case-insensitive).",
       "hash": "",
-      "streaming": false,
+      "returns": {},
+      "cardinality": "one",
       "bidirectional": false,
       "http_method": "POST",
       "role": {

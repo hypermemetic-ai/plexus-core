@@ -62,10 +62,12 @@ async fn merged_schema_and_roles_golden() {
     assert_eq!(viewer, ["echo.count", "echo.echo", "echo.fail", "echo.whoami", "rsecho.count", "rsecho.echo"]);
     assert_eq!(editor, ["echo.count", "echo.echo", "echo.fail", "echo.shout", "echo.whoami"]);
     let s = plexus_core::plexus::Activation::plugin_schema(&r.child);
-    let surface: Vec<Value> = s.methods.iter().map(|m| json!({ "name": m.name, "streaming": m.streaming })).collect();
+    // RETURNS-36: the stub (plexus-wire's spec, `streaming`) is read as
+    // 0.8 by its own declaration: `streaming: true` is many, else one.
+    let surface: Vec<Value> = s.methods.iter().map(|m| json!({ "name": m.name, "cardinality": m.cardinality })).collect();
     assert_eq!(serde_json::to_value(&surface).unwrap(), json!([
-        { "name": "echo", "streaming": true }, { "name": "shout", "streaming": false }, { "name": "count", "streaming": true },
-        { "name": "whoami", "streaming": false }, { "name": "fail", "streaming": false }
+        { "name": "echo", "cardinality": "many" }, { "name": "shout", "cardinality": "one" }, { "name": "count", "cardinality": "many" },
+        { "name": "whoami", "cardinality": "one" }, { "name": "fail", "cardinality": "one" }
     ]));
     assert_eq!((s.namespace.as_str(), s.version.as_str()), ("echo", "0.1.0"));
 }
@@ -166,6 +168,10 @@ async fn forbidden_never_reaches_child() {
         let mut v = v.clone();
         v["metadata"]["timestamp"] = json!(0);
         v.as_object_mut().unwrap().remove("roles");
+        // RETURNS-36: and the typed error's copy of them.
+        if let Some(e) = v.get_mut("error").and_then(Value::as_object_mut) {
+            e.remove("roles");
+        }
         v.to_string().replace("rsecho.", "echo.")
     };
     assert_eq!(strip(&child[0]), strip(&inproc[0]), "byte-identical but the activation's name and roles");
@@ -195,6 +201,47 @@ async fn items_errors_done_in_order() {
     let e = route(&r, ADA, "echo.fail", json!({ "kind": "teapot" })).await;
     assert_eq!(types(&e), ["error"]);
     assert_eq!(e[0]["error_kind"], "teapot");
+}
+
+/// RETURNS-36 (review #4): an error item the service cannot decode is never
+/// skipped — skipped, the call would wait for an end that never comes. It
+/// ends the call with an error naming what could not be read, and the child
+/// is told to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_error_item_it_cannot_read_ends_the_call() {
+    let r = rig(Via::Stdio).await;
+    let sent = unix_ns();
+    let e = tokio::time::timeout(Duration::from_secs(5), route(&r, ADA, "echo.fail", json!({ "kind": "garbled" })))
+        .await
+        .expect("the call ends, it does not hang");
+    assert_eq!(types(&e), ["error"], "{e:?}");
+    assert!(e[0]["message"].as_str().unwrap_or_default().contains("could not read"), "{}", e[0]);
+    assert!(child_event(&r.log, "unsub", sent, Duration::from_secs(2)).await.is_some(), "the child was told");
+}
+
+/// RETURNS-36 (re-review #3): a progress item as main wrote it carries no
+/// `content_type`; the seam names it the call's method — the child's
+/// `echo.fail`, as its data items say — never the mount's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_main_wire_progress_is_named_for_the_calls_method() {
+    let r = rig(Via::Stdio).await;
+    let p = route(&r, ADA, "echo.fail", json!({ "kind": "progress" })).await;
+    assert_eq!(types(&p), ["progress", "done"], "{p:?}");
+    assert_eq!(p[0]["content_type"], "echo.fail", "{}", p[0]);
+    assert_eq!(p[0]["content"], json!({ "message": "halfway", "percentage": 50.0 }));
+}
+
+/// RETURNS-36 (re-review #4): a child's error item with no `message` is
+/// passed on with none — not `""` — so a reader shows the typed error's own
+/// line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_error_item_without_a_message_is_passed_on_without_one() {
+    let r = rig(Via::Stdio).await;
+    let e = route(&r, ADA, "echo.fail", json!({ "kind": "bare" })).await;
+    assert_eq!(types(&e), ["error"], "{e:?}");
+    assert!(e[0].get("message").is_none(), "no message made up: {}", e[0]);
+    assert_eq!(e[0]["error"]["kind"], "teapot", "{}", e[0]);
+    assert_eq!(e[0]["error_kind"], "teapot", "{}", e[0]);
 }
 
 /// A child's typed refusal crosses whole — `error_kind` and `forbidden`'s
@@ -490,7 +537,7 @@ async fn same_answers_as_in_process() {
     let ws = plexus_client::WsTransport::connect(&format!("ws://{addr}"), "service").await.unwrap();
     let a = EchoClient::new(HubTransport::anonymous(inproc));
     let b = EchoClient::new(ws);
-    let shown = |r: Result<plexus_client::ClientEvent<EchoEvent>, plexus_client::ClientError>| format!("{:?}", r.expect("no client error"));
+    let shown = |r: Result<EchoEvent, plexus_client::ClientError>| format!("{:?}", r.expect("no client error"));
     let x: Vec<String> = a.echo("hi".into(), 3).map(shown).collect().await;
     let y: Vec<String> = b.echo("hi".into(), 3).map(shown).collect().await;
     assert_eq!(x, y);

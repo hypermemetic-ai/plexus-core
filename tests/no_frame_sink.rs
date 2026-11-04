@@ -90,8 +90,8 @@ async fn data_whose_metadata_changes_reads_as_itself() {
 #[tokio::test]
 async fn every_other_kind_of_item_reads_as_itself() {
     holds(vec![
-        PlexusStreamItem::progress(meta(), "half \"way\"".into(), Some(50.0)),
-        PlexusStreamItem::error(meta(), "it broke \\ badly".into(), Some("E1".into()), true),
+        PlexusStreamItem::progress(meta(), "t".into(), json!({"message": "half \"way\"", "percentage": 50.0})),
+        PlexusStreamItem::error(meta(), plexus_client::RemoteError::Execution { message: "it broke \\ badly".into() }, true),
         PlexusStreamItem::request("r1".into(), json!({"ask": "\"this\""}), 5000),
         PlexusStreamItem::done(meta()),
     ])

@@ -188,7 +188,7 @@ impl Below {
         let grants = child
             .methods
             .iter()
-            .filter(|m| matches!(m.role, MethodRole::Rpc) && !(m.name == "schema" && m.hash == "auto_schema"))
+            .filter(|m| matches!(m.role, MethodRole::Rpc) && !m.is_auto_schema())
             .map(|m| (m.grant_or(&child.namespace), m.public))
             .collect();
         Below { namespace: child.namespace.clone(), grants }
@@ -357,7 +357,7 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, base: &Described, at: usiz
     let mut kept = Vec::new();
     let mut schema_entry = None;
     for (i, m) in schema.methods.iter().enumerate() {
-        let is_schema_entry = m.name == "schema" && matches!(m.role, MethodRole::Rpc) && m.hash == "auto_schema";
+        let is_schema_entry = m.is_auto_schema();
         if is_schema_entry {
             schema_entry = Some((i, m.held_on.clone()));
             continue;

@@ -73,7 +73,7 @@ struct FeedActivation {
 #[plexus_macros::activation(version = "1.0.0", description = "One change, many watchers")]
 impl FeedActivation {
     /// Every change, from now on.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     async fn watch(&self) -> impl Stream<Item = FeedEvent> + Send + 'static {
         let mut rx = self.changes.subscribe();
         stream! {

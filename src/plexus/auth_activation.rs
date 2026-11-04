@@ -461,7 +461,7 @@ impl Catalog {
     pub(crate) fn add(&self, schema: &PluginSchema) {
         let mut map = self.0.write().unwrap_or_else(|p| p.into_inner());
         for m in &schema.methods {
-            if (m.name == "schema" && m.hash == "auto_schema") || !matches!(m.role, MethodRole::Rpc) {
+            if m.is_auto_schema() || !matches!(m.role, MethodRole::Rpc) {
                 continue;
             }
             let grant = m.grant_or(&schema.namespace);

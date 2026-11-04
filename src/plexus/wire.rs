@@ -277,6 +277,10 @@ pub struct FrameSink {
     spare: Arc<Mutex<Option<BytesMut>>>,
     /// The most items one notification carries (PERF-8): 0 or 1, one an item.
     batch: usize,
+    /// BIDIR-6: the connection's input halves. Carried here, not as an entry
+    /// of its own in the extensions, which every call clones: an entry is an
+    /// allocation a call (call.one_item's +2 allocations, +192 bytes).
+    inputs: Option<Arc<super::input::InputTable>>,
 }
 
 /// The most items one notification carries when the client offered `batch`
@@ -301,7 +305,7 @@ impl FrameSink {
     /// A connection's frame queue, bounded at `capacity` frames.
     pub fn channel(capacity: usize, encoding: WireEncoding) -> (FrameSink, FrameReceiver) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
-        (FrameSink { tx, encoding, spare: Arc::new(Mutex::new(None)), batch: 0 }, rx)
+        (FrameSink { tx, encoding, spare: Arc::new(Mutex::new(None)), batch: 0, inputs: None }, rx)
     }
 
     /// The same sink for a client that takes batches (it offered `batch` at
@@ -310,6 +314,19 @@ impl FrameSink {
     pub fn batching(mut self, max: usize) -> Self {
         self.batch = max;
         self
+    }
+
+    /// BIDIR-6: the same sink carrying the connection's input halves, where a
+    /// method with an `Input` finds its table.
+    pub fn with_inputs(mut self, table: Arc<super::input::InputTable>) -> Self {
+        self.inputs = Some(table);
+        self
+    }
+
+    /// BIDIR-6: the connection's input halves, when its transport carries
+    /// them.
+    pub fn inputs(&self) -> Option<&Arc<super::input::InputTable>> {
+        self.inputs.as_ref()
     }
 
     /// The most items one notification carries: 0 or 1, one an item.

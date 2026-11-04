@@ -3128,7 +3128,8 @@ fn register_input_methods(module: &mut RpcModule<()>, ns: &'static str) -> Resul
         }
     }
     fn table(ext: &http::Extensions) -> Result<&Arc<InputTable>, ErrorObjectOwned> {
-        ext.get::<Arc<InputTable>>()
+        ext.get::<super::wire::FrameSink>()
+            .and_then(super::wire::FrameSink::inputs)
             .ok_or_else(|| ErrorObjectOwned::owned(-32601, "this transport carries no input half: call over a WebSocket", None::<()>))
     }
 

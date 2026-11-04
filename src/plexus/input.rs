@@ -11,7 +11,7 @@
 //!
 //! | when | then |
 //! | -- | -- |
-//! | a socket opens | the transport puts an [`InputTable`] in its calls' extensions (a connection's, so a frame of another socket reaches nothing) and hands it each input frame on its reader, inline, in arrival order, zero-copy: no task and no decode per frame |
+//! | a socket opens | the transport puts an [`InputTable`] on the [`FrameSink`] its calls' extensions carry (`FrameSink::with_inputs`; a connection's, so a frame of another socket reaches nothing) and hands it each input frame on its reader, inline, in arrival order, zero-copy: no task and no decode per frame |
 //! | `{ns}.call` dispatches | [`serve_call`](super::plexus)'s seam (`CALL`, a task-local) holds the unaccepted subscription; a method with no `Input` never looks at it, so its call is what it was |
 //! | a method with `Input` dispatches | [`open`], after its params and its gate, before its body: the [`DuplexCall`] taken with the gate's decision standing, the slot in the table **before** the subscription is accepted (so a frame sent on reading the id finds it), the subscription accepted, the `Input` handed to the method |
 //! | anywhere with no seam or no table (stdio, HTTP, MCP, in process) | [`open`] refuses, naming the method: the call fails, it does not hang |
@@ -461,7 +461,7 @@ pub enum Delivered {
 
 /// A connection's open input halves, keyed by subscription, the slot of
 /// BIDIR-5's rule: (connection, subscription). The transport makes one a
-/// connection, puts it in its calls' extensions and hands it frames.
+/// connection, puts it on its calls' [`FrameSink`] (`with_inputs`) and hands it frames.
 pub struct InputTable {
     conn: ConnId,
     calls: Arc<dyn CallCounter>,
@@ -691,7 +691,10 @@ impl Seam {
     /// Everything of an open but the acceptance: the gate's decision taken
     /// up, the call's place taken, the slot in the table.
     fn open<T>(&mut self, method: &str, ceiling: CallCeiling) -> Result<(Input<T>, PendingSubscriptionSink, Duplex), PlexusError> {
-        let (Some(table), Some(to)) = (self.ext.get::<Arc<InputTable>>().cloned(), self.ext.get::<FrameSink>().cloned()) else {
+        let Some(to) = self.ext.get::<FrameSink>().cloned() else {
+            return Err(unserved(method));
+        };
+        let Some(table) = to.inputs().cloned() else {
             return Err(unserved(method));
         };
         let Some(pending) = self.pending.as_ref() else {

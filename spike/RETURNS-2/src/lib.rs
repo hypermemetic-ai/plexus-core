@@ -70,7 +70,7 @@ pub fn sort_required(v: &mut Value) {
 
 /// SHA-256, first 8 bytes, lowercase hex: 16 characters — the width of
 /// today's `{:016x}` and of synapse's `plexus_hash` validator, and the
-/// format hub-codegen's `hash.rs` and synapse-cc's `Merge.hs` already use.
+/// format service-codegen's `hash.rs` and synapse-cc's `Merge.hs` already use.
 pub fn hash16(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()

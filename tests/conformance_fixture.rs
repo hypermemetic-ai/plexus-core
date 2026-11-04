@@ -109,7 +109,7 @@ fn calls() -> Vec<Call> {
     serde_json::from_str(&read("calls.json")).expect("calls.json is a list of calls")
 }
 
-/// The fixture activation's hash, as `schema.json` pins it — what a hub
+/// The fixture activation's hash, as `schema.json` pins it — what a service
 /// serving the fixture as its own root puts in every frame's `plexus_hash`.
 fn plugin_hash() -> String {
     value(&read("schema.json"))["hash"]

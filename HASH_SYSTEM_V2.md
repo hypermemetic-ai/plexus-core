@@ -17,7 +17,7 @@
 > - The **roll-up** is SHA-256/16 of its inputs, one per line
 >   (`content_hash::hash16_lines`): `self_hash` of the method hashes,
 >   `children_hash` of the child hashes, `hash` of `self_hash` and (for a
->   hub) `children_hash`.
+>   service) `children_hash`.
 >
 > Any consumer can recompute every hash from the schema JSON a server sends
 > (the conformance fixture's tests do, in Rust and by hand). The code

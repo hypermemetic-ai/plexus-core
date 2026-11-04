@@ -1008,7 +1008,7 @@ impl PluginSchema {
     /// - `self_hash` = `hash16_lines(methods[*].hash)`
     /// - `children_hash` = `hash16_lines(children[*].hash)`, `None` for a leaf
     /// - `hash` = `hash16_lines([self_hash, children_hash])`, the second only
-    ///   for a hub
+    ///   for a service
     ///
     /// Same structure and width as the `DefaultHasher` roll-up it replaces,
     /// whose output std does not promise across Rust releases.
@@ -1390,7 +1390,7 @@ impl PluginSchema {
     /// auth capabilities imply a site — service authors write nothing.
     ///
     /// RETURNS-10: filled after the hashes are computed, so the hints are
-    /// not covered by them — they come from the serving hub's
+    /// not covered by them — they come from the serving service's
     /// configuration, not the activation's code, and re-hashing on every
     /// schema response is the per-call cost the hashes are cached to avoid.
     ///
@@ -2394,16 +2394,16 @@ mod tests {
         assert_eq!(leaf.children_hash, None);
 
         let kid = ChildSummary { namespace: "k".into(), description: "".into(), hash: "cccccccccccccccc".into() };
-        let hub = PluginSchema::hub("p", "1", "", vec![a, b], vec![kid]);
-        assert_eq!(hub.self_hash, leaf.self_hash, "children don't touch self_hash");
+        let service = PluginSchema::hub("p", "1", "", vec![a, b], vec![kid]);
+        assert_eq!(service.self_hash, leaf.self_hash, "children don't touch self_hash");
         let children_hash = hash16(b"cccccccccccccccc\n");
-        assert_eq!(hub.children_hash.as_deref(), Some(children_hash.as_str()));
-        assert_eq!(hub.hash, hash16(format!("{}\n{}\n", hub.self_hash, children_hash).as_bytes()));
+        assert_eq!(service.children_hash.as_deref(), Some(children_hash.as_str()));
+        assert_eq!(service.hash, hash16(format!("{}\n{}\n", service.self_hash, children_hash).as_bytes()));
         // Pinned (computed independently with Python's hashlib): the roll-up
         // is a wire contract — synapse-cc locks compare it across machines —
         // so its bytes may not drift.
         assert_eq!(
-            (leaf.self_hash.as_str(), leaf.hash.as_str(), hub.hash.as_str()),
+            (leaf.self_hash.as_str(), leaf.hash.as_str(), service.hash.as_str()),
             ("4140cd727c96fc78", "03a069b51ff1b744", "22db23bea1fbad28")
         );
         assert_eq!(children_hash, "f631be22675d9426");

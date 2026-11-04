@@ -77,7 +77,7 @@ fn write_canonical(value: &Value, out: &mut String) {
 
 /// SHA-256 of `bytes`, its first 8 bytes as 16 lowercase hex characters —
 /// the width every Plexus hash has always had (`{:016x}`), and the format
-/// synapse's `plexus_hash` check, hub-codegen and synapse-cc expect.
+/// synapse's `plexus_hash` check, service-codegen and synapse-cc expect.
 pub fn hash16(bytes: &[u8]) -> String {
     Sha256::digest(bytes)[..8]
         .iter()

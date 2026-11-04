@@ -37,7 +37,7 @@ use std::sync::Arc;
 // Error Types
 // ============================================================================
 
-/// Why the hub could not or would not run a call — the server side of the
+/// Why the service could not or would not run a call — the server side of the
 /// wire's [`RemoteError`].
 ///
 /// Every variant converts to a `RemoteError` (`From<&PlexusError>`), which
@@ -227,7 +227,7 @@ impl PlexusError {
 /// | `InvalidParams { param, problem }` | same |
 /// | `ExecutionError(msg)` | `Execution { message: msg }` |
 /// | `HandleNotSupported(ns)` | `HandleNotSupported { activation: ns }` |
-/// | `TransportError(kind)` — a hub forwarding upstream failed | `Execution { message: kind.to_string() }` |
+/// | `TransportError(kind)` — a service forwarding upstream failed | `Execution { message: kind.to_string() }` |
 /// | `Unauthenticated(_)` | `Unauthenticated` — the server-side reason stays server-side |
 /// | `Forbidden { reason }` | `Forbidden { reason: DenyReason }` |
 ///

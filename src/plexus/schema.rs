@@ -1510,30 +1510,40 @@ impl MethodSchema {
     }
 
     /// Is this the `schema` entry every activation's macro adds
-    /// ([`auto_schema`](Self::auto_schema) with the activation's grant)?
+    /// ([`auto_schema`](Self::auto_schema))?
     ///
-    /// RETURNS-36: main marked the entry by its fixed hash, `"auto_schema"`;
-    /// under RETURNS-10 its hash is its content hash, so it is known by
-    /// that: the hash `auto_schema()` sealed with this entry's grant has (or
-    /// the old marker, from a peer still sending it). One SHA-256 per grant,
-    /// remembered.
+    /// RETURNS-36: known by what every 0.8.x build writes alike, never by a
+    /// hash recomputed with this build (review #11): named `schema`, an Rpc
+    /// of one item with no error and no progress, its params `{method?}`
+    /// alone and its `returns` titled `SchemaResult` — or main's fixed
+    /// marker hash, `"auto_schema"`, from a peer still sending it. A method
+    /// an author named `schema` with other params or another return is not
+    /// it.
     pub fn is_auto_schema(&self) -> bool {
-        use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
-        static SEALED: OnceLock<Mutex<HashMap<Option<String>, String>>> = OnceLock::new();
         if self.name != "schema" || !matches!(self.role, MethodRole::Rpc) {
             return false;
         }
         if self.hash == "auto_schema" {
             return true;
         }
-        let mut sealed = SEALED.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
-        let hash = sealed.entry(self.grant.clone()).or_insert_with(|| {
-            let mut entry = Self::auto_schema();
-            entry.grant = self.grant.clone();
-            entry.content_hash()
-        });
-        *hash == self.hash
+        let params_are_method_alone = self
+            .params
+            .as_ref()
+            .and_then(|p| p.as_object())
+            .and_then(|o| o.get("properties"))
+            .and_then(|p| p.as_object())
+            .is_some_and(|props| props.len() == 1 && props.contains_key("method"));
+        let returns_schema_result = self
+            .returns
+            .as_object()
+            .and_then(|o| o.get("title"))
+            .and_then(|t| t.as_str())
+            == Some("SchemaResult");
+        self.cardinality == Cardinality::One
+            && self.error.is_none()
+            && self.progress.is_none()
+            && params_are_method_alone
+            && returns_schema_result
     }
 
     /// SYNAPSE-CC-9: reserved for BIDIR-6 — the schema of the items a client

@@ -411,7 +411,9 @@ mod tests {
         let item: PlexusStreamItem = serde_json::from_value(frame).expect("a frame without message reads");
         assert_eq!(item.remote_error(), Some(&RemoteError::Unauthenticated));
         let written = serde_json::to_value(&item).unwrap();
-        assert!(written.get("message").is_some_and(|m| m.is_string()), "message is always written: {written}");
+        // RETURNS-36 (re-review #4): read without one, written without one —
+        // a relay makes up no `""` for a reader to show over the typed error.
+        assert!(written.get("message").is_none(), "no message made up: {written}");
     }
 
     /// A 0.6-shaped frame does not parse as 0.7 (no back-compat, RETURNS-1

@@ -231,6 +231,19 @@ async fn a_main_wire_progress_is_named_for_the_calls_method() {
     assert_eq!(p[0]["content"], json!({ "message": "halfway", "percentage": 50.0 }));
 }
 
+/// RETURNS-36 (re-review #4): a child's error item with no `message` is
+/// passed on with none — not `""` — so a reader shows the typed error's own
+/// line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_error_item_without_a_message_is_passed_on_without_one() {
+    let r = rig(Via::Stdio).await;
+    let e = route(&r, ADA, "echo.fail", json!({ "kind": "bare" })).await;
+    assert_eq!(types(&e), ["error"], "{e:?}");
+    assert!(e[0].get("message").is_none(), "no message made up: {}", e[0]);
+    assert_eq!(e[0]["error"]["kind"], "teapot", "{}", e[0]);
+    assert_eq!(e[0]["error_kind"], "teapot", "{}", e[0]);
+}
+
 /// A child's typed refusal crosses whole — `error_kind` and `forbidden`'s
 /// own fields — in the service's stream and on its WebSocket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -22,5 +22,5 @@ mod types;
 
 pub use build::{build, build_one, IrBuildError, TypeSource};
 pub use json::canonical;
-pub use serve::{answer, roots, IrCache, IrError, ServiceIr};
+pub use serve::{answer, roots, IrCache, IrError, IrKey, ServiceIr, IR_CACHE_BYTES, IR_CACHE_ENTRIES};
 pub use types::*;

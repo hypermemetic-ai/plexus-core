@@ -223,6 +223,13 @@ impl Described {
         }
     }
 
+    /// RETURNS-40: every static child's whole path (`tickets.commits`), as
+    /// the service describes it — what `ir` may be asked for below an
+    /// activation.
+    pub(crate) fn nested(&self) -> impl Iterator<Item = &str> {
+        self.below.iter().map(|b| b.namespace.as_str())
+    }
+
     /// The envelope kept for an introspection answer (`key`: its method and params).
     pub(crate) fn shell(&self, key: &str) -> Option<Arc<Shell>> {
         self.shells.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned()

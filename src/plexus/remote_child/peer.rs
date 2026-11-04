@@ -87,6 +87,8 @@ pub(super) fn remote_error_of(o: &Map<String, Value>) -> RemoteError {
         None => String::new(),
     };
     match o.get("error_kind").and_then(Value::as_str).unwrap_or(code.as_str()) {
+        // spec/05: activation or method not found. RETURNS-36 (review #5).
+        "-32601" => not_found(&message),
         "invalid_params" | "-32602" => RemoteError::InvalidParams { param: None, problem: ParamProblem::Malformed { detail: message } },
         "unauthenticated" | "-32001" => RemoteError::Unauthenticated,
         "forbidden" | "-32003" => RemoteError::Forbidden {
@@ -119,6 +121,26 @@ pub(super) fn remote_error_of(o: &Map<String, Value>) -> RemoteError {
         }
         _ => RemoteError::Execution { message },
     }
+}
+
+/// `-32601`'s two meanings, from spec/05's message (`Activation not found:
+/// x`, `Method not found: a.b`); a bare one is a method not found.
+fn not_found(message: &str) -> RemoteError {
+    if let Some(activation) = message.strip_prefix("Activation not found: ") {
+        return RemoteError::ActivationNotFound { activation: activation.trim().to_string() };
+    }
+    let path = message.strip_prefix("Method not found: ").unwrap_or_default().trim();
+    let (activation, method) = path.rsplit_once('.').unwrap_or(("", path));
+    RemoteError::MethodNotFound { activation: activation.to_string(), method: method.to_string() }
+}
+
+/// A JSON-RPC refusal's code read as spec/05's (`refused` in link.rs):
+/// the same typing as an error item's.
+pub(super) fn remote_error_of_code(code: i64, message: &str) -> RemoteError {
+    let mut o = Map::new();
+    o.insert("code".into(), Value::from(code.to_string()));
+    o.insert("message".into(), Value::from(message));
+    remote_error_of(&o)
 }
 
 #[cfg(test)]

@@ -65,14 +65,7 @@ fn refused(name: &str, e: &Value) -> PlexusStreamItem {
     let error = e
         .get("data")
         .and_then(|d| serde_json::from_value::<RemoteError>(d.clone()).ok())
-        .unwrap_or_else(|| match e.get("code").and_then(Value::as_i64) {
-            Some(-32602) => RemoteError::InvalidParams {
-                param: None,
-                problem: plexus_client::ParamProblem::Malformed { detail: message.clone() },
-            },
-            Some(-32001) => RemoteError::Unauthenticated,
-            _ => RemoteError::Execution { message: message.clone() },
-        });
+        .unwrap_or_else(|| super::peer::remote_error_of_code(e.get("code").and_then(Value::as_i64).unwrap_or(-32000), &message));
     let fields = crate::plexus::types::spec_fields(&error);
     PlexusStreamItem::Error { metadata: meta(name), message, code, recoverable: false, error, fields }
 }

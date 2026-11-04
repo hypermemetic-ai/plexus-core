@@ -416,8 +416,16 @@ impl Activation for RemoteChild {
         if method == "schema" {
             return Ok(self.schema_stream(&params));
         }
-        if !self.inner.schema.methods.iter().any(|m| m.name == method) {
+        let Some(m) = self.inner.schema.methods.iter().find(|m| m.name == method) else {
             return Err(PlexusError::MethodNotFound { activation: self.name().to_string(), method: method.to_string() });
+        };
+        // BIDIR-6: a hop forwards no input half yet; the far side would wait
+        // for items that never come.
+        if m.input.is_some() {
+            return Err(PlexusError::ExecutionError(format!(
+                "`{}.{method}` takes an input stream, and a hop to a remote child does not forward one yet",
+                self.name()
+            )));
         }
         Ok(self.forward(method, params, auth).await)
     }

@@ -825,6 +825,9 @@ pub struct MethodSchema {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<MethodExample>,
 
+    // BIDIR-6 fills this now. The doc comment below is left as it stands: it
+    // is this field's description in `{ns}.schema`'s own `returns`, so a word
+    // of it moves every service's hash, and with it the metadata of every item.
     /// SYNAPSE-CC-9: reserved for BIDIR-6 — the JSON Schema of the items a
     /// client streams *in* to this method (`Input<T>`). Always `None` until
     /// BIDIR-6 fills it; absent from the wire while `None`, so a schema

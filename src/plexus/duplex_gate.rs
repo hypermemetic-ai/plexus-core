@@ -14,7 +14,8 @@
 //! | open, past the connection's calls | count it as any call | `too_many_calls {max}` | never opens |
 //! | an input frame from another connection | compare connection ids | `not_this_call` (to the sender) | no |
 //! | an input frame past credit | compare `seq` with the credit granted | `past_credit {seq, credit}` | yes |
-//! | an input frame past the call's ceiling | count items and bytes | `too_much_input {limit, max}` | yes |
+//! | an input frame past a ceiling its method opted into, or past what one call may hold | count items and bytes | `too_much_input {limit, max}` | yes |
+//! | an input frame out of sequence | the transport compares `seq` with the next expected | `out_of_sequence {seq, expected}` | yes |
 //! | the gate's grants generation moves (grant, revoke, role edit, team, sign-out) | [`Gate::check`] once per call | `forbidden` / `unauthenticated` | yes, items after it dropped |
 //! | the sign-in's expiry | the call's own timer: the caller proves no one | `unauthenticated` | yes |
 //! | a question answered | [`Answerer`]: own connection; a person; or a grant on the target ([`Gate::check`] once per answer) | `not_this_call` / `person_required` / `forbidden` | no |
@@ -34,9 +35,10 @@
 //! never waits ([`DuplexGate::with_audit`]): an admitted frame allocates
 //! nothing.
 //!
-//! BIDIR-6's call slot, keyed by `(connection, subscription)`, holds the
-//! [`DuplexCall`] and feeds [`DuplexCall::input`] the frames of one
-//! `{ns}.input {subscription, seq, items}` each.
+//! BIDIR-6's call slot ([`super::input`]), keyed by `(connection,
+//! subscription)`, feeds [`DuplexCall::input`] one [`InputFrame`] for each
+//! `{ns}.input {subscription, seq, items}`. `seq` counts frames; credit counts
+//! items, so a frame carries how many it holds.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -48,12 +50,15 @@ use plexus_auth_core::duplex::is_person;
 /// caller of this module needs no second import.
 pub use plexus_auth_core::duplex::{Answerer, CallCeiling, CallRef, DuplexRefusalCode};
 pub use plexus_auth_core::grants::{GrantsGeneration, GrantsMove};
-use plexus_auth_core::grants::{Gate, Grant};
+use plexus_auth_core::grants::{Gate, Grant, Membership, Memberships, Resolve, RoleTable, ScopeRef};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
 use super::auth::AuthContext;
+use super::context::PlexusContext;
 use super::plexus::{error_item, PlexusError};
+use super::types::{spec_code, spec_fields, PlexusStreamItem, StreamMetadata};
+use super::RemoteError;
 
 /// A connection, as the transport numbers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,6 +112,10 @@ pub enum DuplexRefusal {
     PersonRequired,
     /// The input half is already closed (a frame after the end).
     InputClosed,
+    /// A frame out of sequence, on a socket that delivers in order.
+    OutOfSequence { seq: u64, expected: u64 },
+    /// An item of frame `seq` that does not decode as the method's type.
+    InvalidInput { seq: u64, message: String },
 }
 
 impl DuplexRefusal {
@@ -133,6 +142,8 @@ impl DuplexRefusal {
             Self::TooMuchInput { .. } => DuplexRefusalCode::TooMuchInput,
             Self::PersonRequired => DuplexRefusalCode::PersonRequired,
             Self::InputClosed => DuplexRefusalCode::InputClosed,
+            Self::OutOfSequence { .. } => DuplexRefusalCode::OutOfSequence,
+            Self::InvalidInput { .. } => DuplexRefusalCode::InvalidInput,
         }
     }
 
@@ -150,8 +161,9 @@ impl DuplexRefusal {
         }
     }
 
-    /// The error item: a gate refusal exactly as `{ns}.call` sends one;
-    /// the rest `{"type":"error","error_kind":…, <facts>, "message"}`.
+    /// The error item: a gate refusal exactly as `{ns}.call` sends one; the
+    /// rest a typed error item (spec/05), `error_kind` and its facts beside
+    /// `message`.
     pub fn to_item(&self, ns: &str) -> Value {
         let (message, facts) = match self {
             Self::Gate(e) => return error_item(ns, e),
@@ -161,31 +173,98 @@ impl DuplexRefusal {
             Self::TooMuchInput { limit, max } => (format!("this call takes at most {max} {limit} of input"), json!({ "limit": limit, "max": max })),
             Self::PersonRequired => ("this question needs a person's answer".into(), json!({})),
             Self::InputClosed => ("the input half is closed".into(), json!({})),
+            Self::OutOfSequence { seq, expected } => (format!("input frame {seq} is out of sequence: {expected} comes next"), json!({ "seq": seq, "expected": expected })),
+            Self::InvalidInput { seq, message } => (format!("an item of input frame {seq} is not this method's input: {message}"), json!({ "seq": seq })),
         };
-        let mut item = json!({ "type": "error", "error_kind": self.kind(), "message": message, "recoverable": false });
-        if let (Some(o), Value::Object(f)) = (item.as_object_mut(), facts) {
-            o.extend(f);
-        }
-        item
+        let Value::Object(facts) = facts else { unreachable!("facts are an object") };
+        let metadata = StreamMetadata::new(vec![ns.into()], PlexusContext::hash());
+        // RETURNS-36: an error item carries its typed `RemoteError`; a kind
+        // the vocabulary does not know is `Other`, its facts its fields.
+        let error = match self {
+            Self::TooManyCalls { max } => RemoteError::TooManyCalls { max: *max as u64, child: None },
+            _ => RemoteError::Other(plexus_client::OtherError { kind: self.kind().to_string(), fields: facts }),
+        };
+        let item = PlexusStreamItem::Error {
+            metadata,
+            message,
+            code: Some(spec_code(&error)),
+            recoverable: false,
+            fields: spec_fields(&error),
+            error,
+        };
+        serde_json::to_value(&item).unwrap_or(Value::Null)
     }
 }
 
+/// What the transport found wrong with a frame when it arrived. It holds
+/// nothing past the first one, so the frame says so and goes through the
+/// same admission as any other, whenever that comes: [`DuplexCall::admit`]
+/// refuses it, whatever the credit has become since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overrun {
+    /// More items than the window holds were outstanding: past credit.
+    Credit,
+    /// Out of sequence.
+    Sequence { expected: u64 },
+    /// A frame of no items: a broken client (`invalid_input`).
+    Empty,
+}
+
 /// One input frame as the transport hands it over: which connection sent
-/// it, its `seq`, the item, and its size on the wire.
+/// it, its `seq`, what it holds, how many items that is, and their size on
+/// the wire.
 #[derive(Debug, Clone)]
-pub struct InputFrame {
+pub struct InputFrame<I = Value> {
     pub from: ConnId,
     pub seq: u64,
-    pub item: Value,
+    pub item: I,
+    /// Items in the frame: what credit counts.
+    pub items: u64,
     pub bytes: u64,
+    /// `Some`: the transport refused it on arrival.
+    pub overrun: Option<Overrun>,
 }
 
 impl InputFrame {
-    /// A frame whose size is its item's JSON (a transport has the raw
+    /// A frame of one item, its size its JSON (a transport has the raw
     /// length already).
     pub fn new(from: ConnId, seq: u64, item: Value) -> Self {
         let bytes = serde_json::to_vec(&item).map(|v| v.len() as u64).unwrap_or(0);
-        Self { from, seq, item, bytes }
+        Self { from, seq, item, items: 1, bytes, overrun: None }
+    }
+}
+
+/// The credit a call has granted, shared with whoever grants it: the
+/// transport's pipe grants as the handler consumes, on a call that
+/// [`DuplexCall::input`] has taken.
+#[derive(Debug, Clone)]
+pub struct CreditLine(Arc<AtomicU64>);
+
+impl CreditLine {
+    /// `n` more items.
+    pub fn grant(&self, n: u64) {
+        let _ = self.0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| Some(c.saturating_add(n)));
+    }
+
+    /// Every item granted so far.
+    pub fn granted(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// The gate of a service that has none: nobody holds anything, and its
+/// generation is nobody's to move, so a call is never asked again.
+struct Nobody;
+
+impl Memberships for Nobody {
+    fn held(&self, _who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
+        Vec::new()
+    }
+}
+
+impl Resolve for Nobody {
+    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
+        None
     }
 }
 
@@ -204,6 +283,14 @@ impl DuplexGate {
     /// `gate`'s generation ([`Gate::generation`]) moves.
     pub fn new(gate: Gate) -> Self {
         Self { gate, checks: Arc::new(AtomicU64::new(0)), audit: None, clock: Arc::new(wall_clock) }
+    }
+
+    /// The duplex gate of a service with no [`Gate`]: as a call on it
+    /// dispatches ungated, a duplex call opens with [`admitted`](Self::admitted)
+    /// and is never asked again; credit, the ceilings and the sign-in's expiry
+    /// hold as on any other.
+    pub fn ungated() -> Self {
+        Self::new(Gate::new(Arc::new(Nobody), Arc::new(RoleTable::new()), Arc::new(Nobody)))
     }
 
     /// Every typed refusal to `audit` (one record each, never waiting).
@@ -263,6 +350,49 @@ impl DuplexGate {
         if let Err(e) = self.check(caller.as_deref(), &grant, target) {
             return Err(self.audited(at, caller.as_deref(), &grant, e));
         }
+        let targets = target.map(str::to_string).into_iter().collect();
+        self.opened(at, calls, caller, grant, targets, seen, moves, true, ceiling, answer_by)
+    }
+
+    /// BIDIR-6: open a call the service's dispatch has already decided, so
+    /// the decision is still made once. `seen` is the generation read before
+    /// that decision: a move since is found at the first frame (or at once,
+    /// by [`DuplexCall::input`]). `recheck` false: the method is one the gate
+    /// admits whoever calls (`public`, a signed-in grant), so a move asks
+    /// nothing; the sign-in's expiry still holds. `targets`: every value the
+    /// dispatch checked, asked again together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admitted(
+        &self,
+        at: impl Into<CallRef>,
+        calls: &dyn CallCounter,
+        caller: Option<Arc<AuthContext>>,
+        grant: &str,
+        targets: Vec<String>,
+        seen: u64,
+        recheck: bool,
+        ceiling: CallCeiling,
+        answer_by: Answerer,
+    ) -> Result<DuplexCall, DuplexRefusal> {
+        let mut moves = self.gate.generation().subscribe();
+        moves.mark_changed();
+        self.opened(at.into(), calls, caller, Grant::new(grant), targets, seen, moves, recheck, ceiling, answer_by)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn opened(
+        &self,
+        at: CallRef,
+        calls: &dyn CallCounter,
+        caller: Option<Arc<AuthContext>>,
+        grant: Grant,
+        targets: Vec<String>,
+        seen: u64,
+        moves: watch::Receiver<u64>,
+        recheck: bool,
+        ceiling: CallCeiling,
+        answer_by: Answerer,
+    ) -> Result<DuplexCall, DuplexRefusal> {
         let place = match calls.take_place() {
             Ok(p) => p,
             Err(max) => return Err(self.audited(at, caller.as_deref(), &grant, DuplexRefusal::TooManyCalls { max })),
@@ -273,11 +403,12 @@ impl DuplexGate {
             at,
             caller,
             grant,
-            target: target.map(str::to_string),
+            targets,
+            recheck,
             seen,
             moves,
             ceiling,
-            credit: ceiling.credit,
+            credit: CreditLine(Arc::new(AtomicU64::new(ceiling.credit))),
             items: 0,
             bytes: 0,
             closed: None,
@@ -294,11 +425,12 @@ pub struct DuplexCall {
     at: CallRef,
     caller: Option<Arc<AuthContext>>,
     grant: Grant,
-    target: Option<String>,
+    targets: Vec<String>,
+    recheck: bool,
     seen: u64,
     moves: watch::Receiver<u64>,
     ceiling: CallCeiling,
-    credit: u64,
+    credit: CreditLine,
     items: u64,
     bytes: u64,
     closed: Option<DuplexRefusal>,
@@ -324,7 +456,13 @@ impl DuplexCall {
 
     /// The callee grants `n` more items (the `credit { n }` output item).
     pub fn grant_credit(&mut self, n: u64) {
-        self.credit = self.credit.saturating_add(n);
+        self.credit.grant(n);
+    }
+
+    /// The handle to go on granting by, once [`input`](Self::input) has the
+    /// call.
+    pub fn credit_line(&self) -> CreditLine {
+        self.credit.clone()
     }
 
     fn refuse(&self, why: DuplexRefusal) -> DuplexRefusal {
@@ -340,7 +478,14 @@ impl DuplexCall {
     /// The caller, verified again (the generation moved): one gate check.
     pub fn reverify(&mut self) -> Result<(), DuplexRefusal> {
         let now = self.dg.gate.generation().current();
-        match self.dg.check(self.caller.as_deref(), &self.grant, self.target.as_deref()) {
+        let asked = if !self.recheck {
+            Ok(())
+        } else if self.targets.is_empty() {
+            self.dg.check(self.caller.as_deref(), &self.grant, None)
+        } else {
+            self.targets.iter().try_for_each(|t| self.dg.check(self.caller.as_deref(), &self.grant, Some(t)))
+        };
+        match asked {
             Ok(()) => {
                 self.seen = now;
                 Ok(())
@@ -357,7 +502,7 @@ impl DuplexCall {
     }
 
     /// Admit one input frame — no gate check unless the generation moved.
-    pub fn admit(&mut self, f: &InputFrame) -> Result<(), DuplexRefusal> {
+    pub fn admit<I>(&mut self, f: &InputFrame<I>) -> Result<(), DuplexRefusal> {
         if self.closed.is_some() {
             return Err(self.refuse(DuplexRefusal::InputClosed));
         }
@@ -367,17 +512,27 @@ impl DuplexCall {
         if self.dg.gate.generation().current() != self.seen {
             self.reverify()?;
         }
-        if f.seq >= self.credit {
-            return Err(self.close(DuplexRefusal::PastCredit { seq: f.seq, credit: self.credit }));
+        let credit = self.credit.granted();
+        match f.overrun {
+            None => {}
+            Some(Overrun::Credit) => return Err(self.close(DuplexRefusal::PastCredit { seq: f.seq, credit })),
+            Some(Overrun::Sequence { expected }) => return Err(self.close(DuplexRefusal::OutOfSequence { seq: f.seq, expected })),
+            Some(Overrun::Empty) => return Err(self.close(DuplexRefusal::InvalidInput { seq: f.seq, message: "an input frame with no items".into() })),
         }
-        if self.items + 1 > self.ceiling.max_items {
+        if f.items == 0 {
+            return Err(self.close(DuplexRefusal::InvalidInput { seq: f.seq, message: "an input frame with no items".into() }));
+        }
+        if self.items.saturating_add(f.items) > credit {
+            return Err(self.close(DuplexRefusal::PastCredit { seq: f.seq, credit }));
+        }
+        if self.items.saturating_add(f.items) > self.ceiling.max_items {
             return Err(self.close(DuplexRefusal::TooMuchInput { limit: "items", max: self.ceiling.max_items }));
         }
-        if self.bytes + f.bytes > self.ceiling.max_bytes {
+        if self.bytes.saturating_add(f.bytes) > self.ceiling.max_bytes {
             return Err(self.close(DuplexRefusal::TooMuchInput { limit: "bytes", max: self.ceiling.max_bytes }));
         }
-        self.items += 1;
-        self.bytes += f.bytes;
+        self.items = self.items.saturating_add(f.items);
+        self.bytes = self.bytes.saturating_add(f.bytes);
         Ok(())
     }
 
@@ -395,7 +550,7 @@ impl DuplexCall {
                 _ => refused(DuplexRefusal::PersonRequired),
             },
             Answerer::Caller | Answerer::Person => refused(DuplexRefusal::NotThisCall),
-            Answerer::Grant(g) => match self.dg.check(who, &Grant::new(g.clone()), self.target.as_deref()) {
+            Answerer::Grant(g) => match self.dg.check(who, &Grant::new(g.clone()), self.targets.first().map(String::as_str)) {
                 Ok(()) => Ok(()),
                 Err(e) => refused(e),
             },
@@ -407,9 +562,10 @@ impl DuplexCall {
     /// call ends at a revoke. A frame from another connection is refused to
     /// its sender on `refused` and the call runs on; any other refusal is
     /// the stream's last item, and what follows is never read (dropped).
-    pub fn input<S>(mut self, frames: S, refused: mpsc::UnboundedSender<(ConnId, Value)>) -> impl Stream<Item = Result<Value, DuplexRefusal>> + Send + 'static
+    pub fn input<S, I>(mut self, frames: S, refused: mpsc::UnboundedSender<(ConnId, Value)>) -> impl Stream<Item = Result<I, DuplexRefusal>> + Send + 'static
     where
-        S: Stream<Item = InputFrame> + Send + 'static,
+        S: Stream<Item = InputFrame<I>> + Send + 'static,
+        I: Send + 'static,
     {
         let ns = self.grant.as_str().split('.').next().unwrap_or("").to_string();
         let expires = self

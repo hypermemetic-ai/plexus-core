@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
+
+### Added (BIDIR-17)
+
+- `InputTable::take_binary`: a WebSocket binary message
+  `[0x01][subscription u64 BE][seq u64 BE][payload]` is one input item, routed
+  with no parse to the same slot and admission as `{ns}.input`, its payload a
+  slice of the message. `input::BINARY_INPUT`, `input::BINARY_HEADER`.
+- `Input<Bytes>`: a binary payload as is, a JSON item as base64; any other
+  input refuses a binary frame (`invalid_input`). Its schema is marked binary
+  (`x-plexus-binary`, base64 as JSON).
+- `bytes` with `serde`, `schemars` with `bytes1`; `base64` always.
+- `Input<T>` as a `Stream` needs `T: 'static`.
+
+### Breaking
+
+| Change | Before | After | What to do |
+|---|---|---|---|
+| `CallCeiling` (plexus-auth-core) | `max_items` 1,000,000, `max_bytes` 64 MiB by default | no lifetime limit by default; `max_buffered` added, 64 MiB, past which credit is held back (never a refusal) | Set the two only for a method that wants them; use `..Default::default()` in a struct literal |
+| `duplex_gate::InputFrame` | one item | generic over what it holds, with `items` and `overrun` | `InputFrame::new` is unchanged; a struct literal names the new fields |
+| `DuplexRefusal` | seven variants | adds `OutOfSequence`, `InvalidInput` | Add them to an exhaustive match |
+| `DuplexRefusal::to_item` | `error_kind`, facts, `message` | a typed error item (spec/05): `metadata` and `code` too | Nothing, for a reader of those keys |
+| `{ns}.input`, `{ns}.end` | `-32601` | methods of every service | Answer with `not_this_call` naming no call of the socket |
+
+### Added
+
+- `plexus::Input<T>` and `plexus::input`: a method's input half. The socket's
+  `InputTable` takes `{ns}.input` and `{ns}.end` on its reader, the pipe drives
+  `DuplexCall::input` beside the method's stream, and `credit` and `ack` move
+  as the handler consumes.
+- `DuplexGate::admitted` (a call its dispatch decided), `DuplexGate::ungated`,
+  `DuplexCall::credit_line`.
+- `MethodSchema.input` filled.
+- `FrameSink::with_inputs`, `FrameSink::inputs`: a transport hands its
+  connection's `InputTable` to its calls on the sink they already carry (an
+  extensions entry of its own is an allocation every call).
+- BIDIR-17 review: the input half runs from the open, not from the route's
+  answer, so a handler may read its input before it returns its stream, and
+  a cancel or a lost socket in that window ends the call and frees its
+  place and slot. A frame of no items is `invalid_input` (`Overrun::Empty`).
+  A refused item leaves the handler's `Input` pending, never `None`.
+  `Delivered::Refused`: a frame refused on arrival; a request for it, or for
+  a call of this socket that has ended, is answered `false`.
+- A method with no `Input` costs what it did: its `{ns}.call` future holds
+  nothing of the input half (BIDIR-17; `tests/call_allocation.rs`).
+
+### Not enforced
+
+- An input half is not forwarded across a hop: a method with `input` on a
+  `RemoteChild` is refused, naming it.
+- A frame of another connection finds no call and is not audited: the table is
+  the connection's, so `not_this_call` is said to a request and a notification
+  is counted (`InputTable::strays`).
 ### Added (RETURNS-40: the service writes its IR)
 
 - `plexus::ir` — synapse's IR 3.0 builder in Rust (`build`, `build_one`, `canonical`), equal to synapse's `buildIRFromSchemas` / `buildIRFromSchema` byte for byte in synapse's canonical form, refusals included; a title collision refuses its activation in `build`'s walk (RETURNS-36 review #9) and fails `build_one`.

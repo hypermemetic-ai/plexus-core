@@ -1,0 +1,911 @@
+//! BIDIR-6: the input half of a call. A method declares one parameter
+//! [`Input<T>`] and reads what its caller streams into the live call.
+//!
+//! ```text
+//! → {ns}.call {method, params}        ← the subscription id, then credit {n: window}
+//! → {ns}.input {subscription, seq, items: [T…]}   (seq counts frames from 0)
+//!                                     ← ack {seq}, credit {n}, as the handler consumes
+//! → {ns}.end {subscription, seq}      (seq: the number of frames sent)
+//!                                     ← the method's items, done
+//! ```
+//!
+//! | when | then |
+//! | -- | -- |
+//! | a socket opens | the transport puts an [`InputTable`] on the [`FrameSink`] its calls' extensions carry (`FrameSink::with_inputs`; a connection's, so a frame of another socket reaches nothing) and hands it each input frame on its reader, inline, in arrival order, zero-copy: no task and no decode per frame |
+//! | `{ns}.call` dispatches | [`serve_call`](super::plexus)'s seam (`CALL`, a task-local) holds the unaccepted subscription; a method with no `Input` never looks at it, so its call is what it was |
+//! | a method with `Input` dispatches | [`open`], after its params and its gate, before its body: the [`DuplexCall`] taken with the gate's decision standing, the slot in the table **before** the subscription is accepted (so a frame sent on reading the id finds it), the subscription accepted, the `Input` handed to the method |
+//! | anywhere with no seam or no table (stdio, HTTP, MCP, in process) | [`open`] refuses, naming the method: the call fails, it does not hang |
+//! | a frame arrives | [`InputTable`] checks its `seq` (a resend below the next one is dropped; past it is `out_of_sequence`), that it holds an item (an empty frame is `invalid_input`), and what the call holds, then queues it; a frame past any of these is marked ([`Overrun`]) and is the last it takes |
+//! | the pipe runs | one task, as any call: it polls [`DuplexCall::input`] (each frame admitted, the generation and the sign-in's expiry selected beside it, so a call whose handler is not reading ends at a revoke all the same), the handler's stream, and the ledger |
+//! | the handler polls for the next item | everything before it counts as consumed: a handler that forwards before it polls reports what was forwarded. Half a window consumed, the pipe writes `ack` and `credit` |
+//! | a WebSocket binary message (BIDIR-17) | `[0x01][subscription: u64 BE][seq: u64 BE][payload]`: one item, routed by [`InputTable::take_binary`] to the same slot and admission as a JSON frame, its payload a slice of the message, never copied; an `Input<Bytes>` gets it as is, an input of JSON items refuses it (`invalid_input`) |
+//! | `Input<Bytes>` over JSON | each item a base64 string, decoded when the handler reads it |
+//! | the handler ends with the half open | `input_closed {reason: "method_ended", ack}`, then `done`; a later frame reaches nothing |
+//! | a refusal | `input_closed {reason, ack}` and the typed error, the handler's stream dropped; its `Input` never yields again (a refusal is not an end, so code after its read loop never runs) |
+//! | the handler reads its input before it returns its stream | the pipe starts at the open, not at the route's answer: credit and items flow, and a cancel or a lost socket ends the call, while the route is still resolving |
+//!
+//! `credit` is what the handler consumes, not a number anyone chose
+//! (BIDIR-6's first decision): a client that obeys it meets no refusal.
+//! Order is arrival: the socket's reader takes frames in order, so `seq` is
+//! for `ack` and `end`, not for reassembly.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use futures::stream::Stream;
+use http::Extensions;
+use jsonrpsee::types::{Params, SubscriptionId};
+use jsonrpsee::{PendingSubscriptionSink, SubscriptionSink};
+use plexus_auth_core::duplex::{Answerer, CallCeiling, CallRef};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use serde_json::Value;
+use tokio::sync::{mpsc, Notify};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+
+use super::auth::AuthContext;
+use super::duplex_gate::{CallCounter, ConnId, CreditLine, DuplexCall, DuplexRefusal, InputFrame, Overrun};
+use super::plexus::{DynamicHub, PlexusError};
+use super::wire::FrameSink;
+
+/// What a frame's items are while they wait: each item's JSON, sharing the
+/// frame's bytes, or (`raw`) a binary frame's payload.
+#[derive(Debug)]
+pub(crate) struct Batch {
+    seq: u64,
+    items: Items,
+    bytes: u64,
+    raw: bool,
+}
+
+/// A frame's items: one (every binary frame, and most JSON ones) with no
+/// vector to hold it.
+#[derive(Debug)]
+enum Items {
+    One(Option<Bytes>),
+    Many(std::vec::IntoIter<Bytes>),
+}
+
+impl Items {
+    fn len(&self) -> usize {
+        match self {
+            Items::One(o) => o.is_some() as usize,
+            Items::Many(m) => m.len(),
+        }
+    }
+
+    fn next(&mut self) -> Option<Bytes> {
+        match self {
+            Items::One(o) => o.take(),
+            Items::Many(m) => m.next(),
+        }
+    }
+}
+
+/// BIDIR-17: the tag of a binary input frame, `[0x01][subscription: u64
+/// BE][seq: u64 BE][payload]` (PERF-9's msgpack keeps it free).
+pub const BINARY_INPUT: u8 = 0x01;
+
+/// A binary input frame's header: the tag, the subscription, the seq.
+pub const BINARY_HEADER: usize = 17;
+
+/// The schema of an input's items: `Bytes` is marked binary, base64 as JSON
+/// and raw in a binary frame (BIDIR-17); anything else is its own schema.
+/// What the macro's `MethodSchema.input` is.
+#[doc(hidden)]
+pub fn item_schema<T: 'static>(schema: schemars::Schema) -> schemars::Schema {
+    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<Bytes>() {
+        return schema;
+    }
+    schemars::json_schema!({
+        "type": "string",
+        "contentEncoding": "base64",
+        "contentMediaType": "application/octet-stream",
+        "x-plexus-binary": true,
+    })
+}
+
+/// One item as `T`: an `Input<Bytes>` takes a binary frame's payload as it
+/// is and a JSON item as base64; any other `T` is JSON, never a binary frame.
+fn decode<T: DeserializeOwned + 'static>(item: Bytes, raw: bool) -> Result<T, String> {
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Bytes>() {
+        let bytes = if raw { item } else { from_base64(&item)? };
+        // `T` is `Bytes`: moved through an `Option`, nothing allocated.
+        let mut slot = Some(bytes);
+        let any: &mut dyn std::any::Any = &mut slot;
+        return Ok(any.downcast_mut::<Option<T>>().and_then(Option::take).expect("T is Bytes"));
+    }
+    if raw {
+        return Err("a binary frame, for an input of JSON items".into());
+    }
+    serde_json::from_slice::<T>(&item).map_err(|e| e.to_string())
+}
+
+fn from_base64(item: &[u8]) -> Result<Bytes, String> {
+    use base64::Engine;
+    let text: std::borrow::Cow<'_, str> = match serde_json::from_slice::<&str>(item) {
+        Ok(s) => s.into(),
+        Err(_) => serde_json::from_slice::<String>(item).map_err(|e| format!("an item of binary input is a base64 string: {e}"))?.into(),
+    };
+    base64::engine::general_purpose::STANDARD.decode(text.as_bytes()).map(Bytes::from).map_err(|e| format!("an item of binary input is a base64 string: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// The ledger: what the handler has consumed, for the pipe to report
+// ---------------------------------------------------------------------------
+
+/// One call's input, as its reader, its handler and its pipe share it.
+pub(crate) struct Ledger {
+    window: u64,
+    /// Bytes held past which no credit is granted (owner, 2026-11-02: an
+    /// obedient client is slowed, never ended).
+    max_buffered: u64,
+    /// What the call holds: received and not consumed.
+    held_items: AtomicU64,
+    held_bytes: AtomicU64,
+    /// One past the last frame consumed whole: 0, none yet.
+    done: AtomicU64,
+    /// Items consumed.
+    consumed: AtomicU64,
+    /// `consumed` at the last grant, the pipe's.
+    returned: AtomicU64,
+    /// The client sent `end`.
+    ended: AtomicBool,
+    /// The handler saw the end of its input.
+    finished: AtomicBool,
+    /// The handler let go of its input before the end.
+    abandoned: AtomicBool,
+    refused: AtomicBool,
+    refusal: Mutex<Option<DuplexRefusal>>,
+    wake: Notify,
+}
+
+impl Ledger {
+    fn new(window: u64, max_buffered: u64) -> Self {
+        Self {
+            window,
+            max_buffered,
+            held_items: AtomicU64::new(0),
+            held_bytes: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            consumed: AtomicU64::new(0),
+            returned: AtomicU64::new(0),
+            ended: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
+            refusal: Mutex::new(None),
+            wake: Notify::new(),
+        }
+    }
+
+    fn half(&self) -> u64 {
+        (self.window / 2).max(1)
+    }
+
+    /// Frame `seq` is consumed: the handler has polled past its last item.
+    fn frame_done(&self, seq: u64, items: u64, bytes: u64) {
+        self.held_items.fetch_sub(items, Ordering::AcqRel);
+        self.held_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.done.store(seq + 1, Ordering::Release);
+        let consumed = self.consumed.fetch_add(items, Ordering::AcqRel) + items;
+        if consumed - self.returned.load(Ordering::Acquire) >= self.half() {
+            self.wake.notify_one();
+        }
+    }
+
+    fn input_finished(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    fn refuse(&self, why: DuplexRefusal) {
+        *lock(&self.refusal) = Some(why);
+        self.refused.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    pub(crate) fn window(&self) -> u64 {
+        self.window
+    }
+
+    pub(crate) async fn woken(&self) {
+        self.wake.notified().await
+    }
+
+    /// A refusal the handler's side made (an item that does not decode).
+    pub(crate) fn take_refusal(&self) -> Option<DuplexRefusal> {
+        if !self.refused.load(Ordering::Acquire) {
+            return None;
+        }
+        lock(&self.refusal).take()
+    }
+
+    /// What the pipe owes the client now: `Some` when there is something to
+    /// say. The last frame consumed, when it is news, and the items to grant.
+    /// Half a window at a time, and all that is left when the input is done;
+    /// nothing while the call holds `max_buffered` bytes or more, the credit
+    /// kept until the handler drains below it.
+    pub(crate) fn owed(&self, acked: u64) -> Option<Owed> {
+        let finished = self.finished.load(Ordering::Acquire);
+        let ended = self.ended.load(Ordering::Acquire);
+        if !finished && !ended && self.held_bytes.load(Ordering::Acquire) >= self.max_buffered {
+            return None;
+        }
+        let done = self.done.load(Ordering::Acquire);
+        let consumed = self.consumed.load(Ordering::Acquire);
+        let due = consumed - self.returned.load(Ordering::Acquire);
+        if due < self.half() && !(finished && done > acked) {
+            return None;
+        }
+        self.returned.store(consumed, Ordering::Release);
+        Some(Owed { ack: (done > acked).then(|| done - 1), done, credit: if finished || ended { 0 } else { due } })
+    }
+
+    /// The last frame consumed whole, for `input_closed`.
+    pub(crate) fn last_done(&self) -> Option<u64> {
+        self.done.load(Ordering::Acquire).checked_sub(1)
+    }
+
+    pub(crate) fn client_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+}
+
+/// [`Ledger::owed`]'s answer.
+pub(crate) struct Owed {
+    pub(crate) ack: Option<u64>,
+    pub(crate) done: u64,
+    pub(crate) credit: u64,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ---------------------------------------------------------------------------
+// Input<T>: what the handler reads
+// ---------------------------------------------------------------------------
+
+/// The input half of a call: the items its caller streams in, as `T`, in
+/// order, ending at the caller's `end`.
+///
+/// A method takes at most one, as a parameter, and reads it as any `Stream`:
+///
+/// ```ignore
+/// #[plexus_macros::method]
+/// pub async fn tokens(&self, run: RunId, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+///     ingest_stream(self.store.clone(), run, tokens.into_stream())
+/// }
+/// ```
+///
+/// An item counts as consumed when the handler polls for the next one, so
+/// the credit the caller is given is what the handler has taken: a handler
+/// that forwards an item before it polls reports what was forwarded.
+///
+/// A refusal (an item that does not decode, a revoked grant, a client past
+/// its credit) is not an end: the stream never yields again, and the call
+/// ends with that error, the handler dropped. So code after a read loop (a
+/// commit) runs only when the client ended its input.
+pub struct Input<T> {
+    source: Source<T>,
+}
+
+enum Source<T> {
+    /// A live call's: what the pipe admitted.
+    Wire(WireInput),
+    /// Any stream: an activation's trait called in process, a test.
+    Stream(Pin<Box<dyn Stream<Item = T> + Send + 'static>>),
+}
+
+struct WireInput {
+    rx: mpsc::UnboundedReceiver<Batch>,
+    cur: Option<Reading>,
+    ledger: Arc<Ledger>,
+    over: bool,
+    /// An item was refused: the pipe ends the call, and until it drops the
+    /// handler nothing more is read (never `None`, which is a clean end).
+    refused: bool,
+}
+
+struct Reading {
+    seq: u64,
+    items: Items,
+    count: u64,
+    bytes: u64,
+    raw: bool,
+}
+
+impl<T> Input<T> {
+    /// The items as a `Stream`: `Input` is one, so this only says so.
+    pub fn into_stream(self) -> Self {
+        self
+    }
+
+    /// An input that reads `stream`: a method called with no wire under it.
+    pub fn from_stream(stream: impl Stream<Item = T> + Send + 'static) -> Self {
+        Self { source: Source::Stream(Box::pin(stream)) }
+    }
+}
+
+impl<T: DeserializeOwned + Send + 'static> Input<T> {
+    /// The input as a boxed stream (what an activation's trait method takes).
+    pub fn into_boxed(self) -> Pin<Box<dyn Stream<Item = T> + Send + 'static>> {
+        match self.source {
+            Source::Stream(s) => s,
+            wire => Box::pin(Input { source: wire }),
+        }
+    }
+}
+
+/// An activation's trait hands its input over boxed.
+impl<T> From<Pin<Box<dyn Stream<Item = T> + Send + 'static>>> for Input<T> {
+    fn from(stream: Pin<Box<dyn Stream<Item = T> + Send + 'static>>) -> Self {
+        Self { source: Source::Stream(stream) }
+    }
+}
+
+impl<T> std::fmt::Debug for Input<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Input");
+        match &self.source {
+            Source::Wire(w) => d.field("window", &w.ledger.window).field("over", &w.over),
+            Source::Stream(_) => d.field("window", &"none: a stream"),
+        };
+        d.finish()
+    }
+}
+
+impl<T: DeserializeOwned + 'static> Stream for Input<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match &mut self.get_mut().source {
+            Source::Wire(wire) => wire.poll_item(cx),
+            Source::Stream(stream) => stream.as_mut().poll_next(cx),
+        }
+    }
+}
+
+impl WireInput {
+    fn poll_item<T: DeserializeOwned + 'static>(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        loop {
+            if self.refused {
+                return Poll::Pending;
+            }
+            if self.over {
+                return Poll::Ready(None);
+            }
+            if let Some(r) = &mut self.cur {
+                if let Some(raw) = r.items.next() {
+                    match decode::<T>(raw, r.raw) {
+                        Ok(item) => return Poll::Ready(Some(item)),
+                        Err(message) => {
+                            self.over = true;
+                            self.refused = true;
+                            self.ledger.refuse(DuplexRefusal::InvalidInput { seq: r.seq, message });
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                self.ledger.frame_done(r.seq, r.count, r.bytes);
+                self.cur = None;
+            }
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(b)) => {
+                    self.cur = Some(Reading { seq: b.seq, count: b.items.len() as u64, bytes: b.bytes, items: b.items, raw: b.raw });
+                }
+                Poll::Ready(None) => {
+                    self.over = true;
+                    self.ledger.input_finished();
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Drop for WireInput {
+    fn drop(&mut self) {
+        if !self.over {
+            self.ledger.abandon();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The table: a connection's open input halves
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct InputParams<'a> {
+    subscription: u64,
+    seq: u64,
+    #[serde(borrow)]
+    items: Vec<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct EndParams {
+    subscription: u64,
+    seq: u64,
+}
+
+struct Slot {
+    ns: Arc<str>,
+    next_seq: u64,
+    /// `None`: the half is closed to frames (ended, or refused on arrival).
+    tx: Option<mpsc::UnboundedSender<InputFrame<Batch>>>,
+    ledger: Arc<Ledger>,
+}
+
+/// What became of an input frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivered {
+    /// It reached the call.
+    Taken,
+    /// A resend, or a frame after the half closed (the call over included):
+    /// dropped, safely.
+    Dropped,
+    /// Refused on arrival (past credit, out of sequence, no items): the call
+    /// ends with that error. A request is answered `false`.
+    Refused,
+    /// It names no call of this connection (`not_this_call`).
+    NotThisCall,
+    /// It is not an input frame's shape.
+    Malformed,
+}
+
+/// A connection's open input halves, keyed by subscription, the slot of
+/// BIDIR-5's rule: (connection, subscription). The transport makes one a
+/// connection, puts it on its calls' [`FrameSink`] (`with_inputs`) and hands it frames.
+pub struct InputTable {
+    conn: ConnId,
+    calls: Arc<dyn CallCounter>,
+    slots: Mutex<HashMap<u64, Slot>>,
+    /// The last [`CLOSED_KEPT`] calls that had a slot here, so a frame after
+    /// a call ended is a late one (`Dropped`), not a stranger's.
+    closed: Mutex<std::collections::VecDeque<u64>>,
+    open: AtomicUsize,
+    strays: AtomicU64,
+}
+
+/// How many ended calls a connection remembers for [`InputTable`]'s late
+/// frames: a frame later than this many calls is a stranger's.
+const CLOSED_KEPT: usize = 256;
+
+impl std::fmt::Debug for InputTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputTable").field("conn", &self.conn).field("open", &self.open.load(Ordering::Relaxed)).finish()
+    }
+}
+
+impl InputTable {
+    /// The table of connection `conn`, its calls counted by `calls`.
+    pub fn new(conn: u64, calls: Arc<dyn CallCounter>) -> Arc<Self> {
+        Arc::new(Self { conn: ConnId(conn), calls, slots: Mutex::new(HashMap::new()), closed: Mutex::default(), open: AtomicUsize::new(0), strays: AtomicU64::new(0) })
+    }
+
+    /// Whether no input half is open: one load, so a connection with none
+    /// reads its frames as it always did.
+    pub fn idle(&self) -> bool {
+        self.open.load(Ordering::Acquire) == 0
+    }
+
+    /// Input frames that named no call of this connection and could not be
+    /// told so (a notification has no answer): counted, dropped.
+    pub fn strays(&self) -> u64 {
+        self.strays.load(Ordering::Relaxed)
+    }
+
+    /// A whole inbound message, if it is an input notification: `true`, it
+    /// is taken. Run on the socket's reader, in arrival order. A frame with
+    /// an `id` goes through the method table, which answers it.
+    pub fn take_frame(&self, data: &Bytes) -> bool {
+        #[derive(Deserialize)]
+        struct Shape<'a> {
+            #[serde(borrow)]
+            method: &'a str,
+            #[serde(borrow, default)]
+            id: Option<&'a RawValue>,
+            #[serde(borrow, default)]
+            params: Option<&'a RawValue>,
+        }
+        let Ok(shape) = serde_json::from_slice::<Shape>(data) else { return false };
+        if shape.id.is_some() {
+            return false;
+        }
+        let Some((ns, name)) = shape.method.rsplit_once('.') else { return false };
+        let params = shape.params.map_or(&b"null"[..], |p| p.get().as_bytes());
+        let delivered = match name {
+            "input" => self.input(ns, params, data),
+            "end" => self.end(ns, params),
+            _ => return false,
+        };
+        if matches!(delivered, Delivered::NotThisCall | Delivered::Malformed) {
+            self.strays.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// `{ns}.input`: `params` a slice of `frame`, or `frame` itself.
+    pub fn input(&self, ns: &str, params: &[u8], frame: &Bytes) -> Delivered {
+        let Ok(p) = serde_json::from_slice::<InputParams>(params) else { return Delivered::Malformed };
+        let count = p.items.len() as u64;
+        let bytes: u64 = p.items.iter().map(|i| i.get().len() as u64).sum();
+        self.arrive(p.subscription, Some(ns), p.seq, count, bytes, false, || match &p.items[..] {
+            [one] => Items::One(Some(shared(frame, one.get().as_bytes()))),
+            many => Items::Many(many.iter().map(|i| shared(frame, i.get().as_bytes())).collect::<Vec<_>>().into_iter()),
+        })
+    }
+
+    /// BIDIR-17: a WebSocket binary message whose first byte is
+    /// [`BINARY_INPUT`]: one item, its payload a slice of `frame`. Run on the
+    /// socket's reader, in arrival order, as [`Self::take_frame`].
+    /// `Malformed` (a short header, another tag) is the transport's to
+    /// answer; a frame naming no call of this connection is counted.
+    pub fn take_binary(&self, frame: &Bytes) -> Delivered {
+        if frame.len() < BINARY_HEADER || frame[0] != BINARY_INPUT {
+            return Delivered::Malformed;
+        }
+        let word = |at: usize| u64::from_be_bytes(frame[at..at + 8].try_into().expect("eight bytes"));
+        let (subscription, seq) = (word(1), word(9));
+        let bytes = (frame.len() - BINARY_HEADER) as u64;
+        let delivered = self.arrive(subscription, None, seq, 1, bytes, true, || Items::One(Some(frame.slice(BINARY_HEADER..))));
+        if delivered == Delivered::NotThisCall {
+            self.strays.fetch_add(1, Ordering::Relaxed);
+        }
+        delivered
+    }
+
+    /// A frame of `count` items for `subscription` (of namespace `ns`, when
+    /// the frame says one): its seq checked, past the window marked, queued.
+    #[allow(clippy::too_many_arguments)]
+    fn arrive(&self, subscription: u64, ns: Option<&str>, seq: u64, count: u64, bytes: u64, raw: bool, items: impl FnOnce() -> Items) -> Delivered {
+        let mut slots = lock(&self.slots);
+        let Some(slot) = slots.get_mut(&subscription).filter(|s| ns.is_none_or(|ns| &*s.ns == ns)) else { return self.gone(subscription) };
+        let Some(tx) = &slot.tx else { return Delivered::Dropped };
+        if seq < slot.next_seq {
+            return Delivered::Dropped;
+        }
+        if seq > slot.next_seq {
+            let last = InputFrame { from: self.conn, seq, item: empty(seq), items: 0, bytes: 0, overrun: Some(Overrun::Sequence { expected: slot.next_seq }) };
+            let _ = tx.send(last);
+            slot.tx = None;
+            return Delivered::Refused;
+        }
+        slot.next_seq += 1;
+        // A frame of nothing is a broken client: it would pass credit and
+        // queue without bound.
+        if count == 0 {
+            let last = InputFrame { from: self.conn, seq, item: empty(seq), items: 0, bytes: 0, overrun: Some(Overrun::Empty) };
+            let _ = tx.send(last);
+            slot.tx = None;
+            return Delivered::Refused;
+        }
+        // Past the window is past credit: what a call holds is bounded by
+        // credit, and its bytes by the credit held back past `max_buffered`.
+        let held_items = slot.ledger.held_items.load(Ordering::Acquire);
+        if held_items + count > slot.ledger.window {
+            let last = InputFrame { from: self.conn, seq, item: empty(seq), items: 0, bytes: 0, overrun: Some(Overrun::Credit) };
+            let _ = tx.send(last);
+            slot.tx = None;
+            return Delivered::Refused;
+        }
+        slot.ledger.held_items.fetch_add(count, Ordering::AcqRel);
+        slot.ledger.held_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let _ = tx.send(InputFrame { from: self.conn, seq, item: Batch { seq, items: items(), bytes, raw }, items: count, bytes, overrun: None });
+        Delivered::Taken
+    }
+
+    /// `{ns}.end`: its `seq` is the number of frames sent. Since frames come
+    /// in order, one that says otherwise has lost count.
+    pub fn end(&self, ns: &str, params: &[u8]) -> Delivered {
+        let Ok(p) = serde_json::from_slice::<EndParams>(params) else { return Delivered::Malformed };
+        let mut slots = lock(&self.slots);
+        let Some(slot) = slots.get_mut(&p.subscription).filter(|s| &*s.ns == ns) else { return self.gone(p.subscription) };
+        let Some(tx) = slot.tx.take() else { return Delivered::Dropped };
+        if p.seq == slot.next_seq {
+            slot.ledger.ended.store(true, Ordering::Release);
+            Delivered::Taken
+        } else {
+            let last = InputFrame { from: self.conn, seq: p.seq, item: empty(p.seq), items: 0, bytes: 0, overrun: Some(Overrun::Sequence { expected: slot.next_seq }) };
+            let _ = tx.send(last);
+            Delivered::Refused
+        }
+    }
+
+    /// A frame for no open slot: a late one when the call was this
+    /// connection's (`Dropped`), else a stranger's.
+    fn gone(&self, subscription: u64) -> Delivered {
+        if lock(&self.closed).contains(&subscription) {
+            Delivered::Dropped
+        } else {
+            Delivered::NotThisCall
+        }
+    }
+
+    fn attach(self: &Arc<Self>, subscription: u64, slot: Slot) -> SlotGuard {
+        lock(&self.slots).insert(subscription, slot);
+        self.open.fetch_add(1, Ordering::AcqRel);
+        SlotGuard { table: self.clone(), subscription }
+    }
+}
+
+fn empty(seq: u64) -> Batch {
+    Batch { seq, items: Items::One(None), bytes: 0, raw: false }
+}
+
+/// `part` of `frame`, as `Bytes` sharing it; a copy when it is not a part of
+/// it (a request form's params reach here from the method table).
+fn shared(frame: &Bytes, part: &[u8]) -> Bytes {
+    let (start, end) = (frame.as_ptr() as usize, frame.as_ptr() as usize + frame.len());
+    let p = part.as_ptr() as usize;
+    if p >= start && p + part.len() <= end {
+        frame.slice_ref(part)
+    } else {
+        Bytes::copy_from_slice(part)
+    }
+}
+
+/// A call's place in the table: gone when the pipe ends, or when the half
+/// closes before it does.
+pub(crate) struct SlotGuard {
+    table: Arc<InputTable>,
+    subscription: u64,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        lock(&self.table.slots).remove(&self.subscription);
+        let mut closed = lock(&self.table.closed);
+        if closed.len() == CLOSED_KEPT {
+            closed.pop_front();
+        }
+        closed.push_back(self.subscription);
+        drop(closed);
+        self.table.open.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The seam between `{ns}.call` and the method's dispatch
+// ---------------------------------------------------------------------------
+
+/// What `{ns}.call` hands the dispatch, for a method that turns out to have
+/// an input half: nothing is built here, so a method without one costs a
+/// move. Everything of it comes back when the dispatch is over.
+pub(crate) struct Seam {
+    pub(crate) service: DynamicHub,
+    /// The call's params as they came (read again only by [`open`]).
+    pub(crate) params: Params<'static>,
+    pub(crate) pending: Option<PendingSubscriptionSink>,
+    pub(crate) ext: Extensions,
+    /// The grants generation before the dispatch's decision.
+    pub(crate) seen: u64,
+    /// Where [`open`] leaves the accepted call: shared, since the pipe starts
+    /// from it while the route is still resolving (a handler may read its
+    /// input before it returns its stream).
+    pub(crate) opened: Arc<Mutex<Option<Opened>>>,
+    /// A refusal at open, as its item (`too_many_calls {max}`).
+    pub(crate) refused: Option<Value>,
+}
+
+/// A call its [`open`] accepted.
+pub(crate) struct Opened {
+    pub(crate) sink: SubscriptionSink,
+    pub(crate) duplex: Duplex,
+}
+
+/// What the pipe drives.
+pub(crate) struct Duplex {
+    pub(crate) ledger: Arc<Ledger>,
+    pub(crate) gate: Pin<Box<dyn Stream<Item = Result<Batch, DuplexRefusal>> + Send>>,
+    pub(crate) inbox: mpsc::UnboundedSender<Batch>,
+    pub(crate) credit: CreditLine,
+    pub(crate) ns: Arc<str>,
+    pub(crate) to: FrameSink,
+    pub(crate) slot: SlotGuard,
+}
+
+tokio::task_local! {
+    pub(crate) static CALL: RefCell<Seam>;
+}
+
+/// The refusal for everywhere that carries no input half.
+fn unserved(method: &str) -> PlexusError {
+    PlexusError::ExecutionError(format!(
+        "`{method}` takes an input stream, and this transport carries none: call it over a WebSocket"
+    ))
+}
+
+impl Seam {
+    /// Everything of an open but the acceptance: the gate's decision taken
+    /// up, the call's place taken, the slot in the table.
+    fn open<T>(&mut self, method: &str, ceiling: CallCeiling) -> Result<(Input<T>, PendingSubscriptionSink, Duplex), PlexusError> {
+        let Some(to) = self.ext.get::<FrameSink>().cloned() else {
+            return Err(unserved(method));
+        };
+        let Some(table) = to.inputs().cloned() else {
+            return Err(unserved(method));
+        };
+        let Some(pending) = self.pending.as_ref() else {
+            return Err(unserved(method));
+        };
+        let SubscriptionId::Num(subscription) = pending.subscription_id() else {
+            return Err(PlexusError::ExecutionError(format!("`{method}`: an input half needs integer subscription ids")));
+        };
+        let call: super::plexus::CallParams = self.params.parse().map_err(|e| PlexusError::invalid_params(e.to_string()))?;
+        // A method's own body routing to another: the subscription is the
+        // call's, and that one has no caller to stream to it.
+        if !call.method.ends_with(method) {
+            return Err(unserved(method));
+        }
+        let terms = self.service.input_terms(&call.method, call.params.as_ref().unwrap_or(&Value::Null))?;
+        let ns: Arc<str> = Arc::from(self.service.runtime_namespace());
+        let caller = self.ext.get::<Arc<AuthContext>>().cloned();
+        let at = CallRef { conn: table.conn.0, subscription };
+        let opened = self.service.duplex_gate().admitted(at, &*table.calls, caller, &terms.grant, terms.targets, self.seen, terms.recheck, ceiling, Answerer::Caller);
+        let call: DuplexCall = match opened {
+            Ok(c) => c,
+            Err(why) => {
+                let item = why.to_item(&ns);
+                let message = item.get("message").and_then(Value::as_str).unwrap_or("refused").to_string();
+                self.refused = Some(item);
+                return Err(PlexusError::ExecutionError(message));
+            }
+        };
+        let credit = call.credit_line();
+        let ledger = Arc::new(Ledger::new(ceiling.credit, ceiling.max_buffered));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (inbox, handler) = mpsc::unbounded_channel();
+        let slot = table.attach(
+            subscription,
+            Slot { ns: ns.clone(), next_seq: 0, tx: Some(tx), ledger: ledger.clone() },
+        );
+        // `refused` is for a frame of another connection, and the table is
+        // this connection's: nothing reads it.
+        let (not_ours, _) = mpsc::unbounded_channel();
+        let gate = Box::pin(call.input(UnboundedReceiverStream::new(rx), not_ours));
+        let pending = self.pending.take().expect("checked above");
+        let input = Input { source: Source::Wire(WireInput { rx: handler, cur: None, ledger: ledger.clone(), over: false, refused: false }) };
+        Ok((input, pending, Duplex { ledger, gate, inbox, credit, ns, to, slot }))
+    }
+}
+
+/// Open the input half of the call being dispatched (the macro's dispatch of
+/// a method with an [`Input`] parameter). `method` names it to a refusal.
+pub async fn open<T>(method: &'static str, ceiling: CallCeiling) -> Result<Input<T>, PlexusError> {
+    let (input, pending, duplex) = CALL
+        .try_with(|seam| seam.borrow_mut().open::<T>(method, ceiling))
+        .unwrap_or_else(|_| Err(unserved(method)))?;
+    // The slot is in the table: a frame the client sends on reading this
+    // answer finds it.
+    let sink = pending.accept().await.map_err(|_| PlexusError::ExecutionError("the connection closed".into()))?;
+    let _ = CALL.try_with(|seam| *lock(&seam.borrow().opened) = Some(Opened { sink, duplex }));
+    Ok(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    struct NoCalls;
+
+    impl CallCounter for NoCalls {
+        fn take_place(&self) -> Result<super::super::duplex_gate::CallPlace, usize> {
+            Err(0)
+        }
+    }
+
+    /// A table with one call's slot at `subscription`, and that call's
+    /// `Input<T>` fed by whatever the table queues.
+    fn one_call<T: DeserializeOwned + Send + 'static>(subscription: u64) -> (Arc<InputTable>, SlotGuard, Input<T>) {
+        let table = InputTable::new(7, Arc::new(NoCalls));
+        let ledger = Arc::new(Ledger::new(64, u64::MAX));
+        let (tx, mut rx) = mpsc::unbounded_channel::<InputFrame<Batch>>();
+        let (inbox, handler) = mpsc::unbounded_channel();
+        let guard = table.attach(subscription, Slot { ns: Arc::from("menger"), next_seq: 0, tx: Some(tx), ledger: ledger.clone() });
+        tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                let _ = inbox.send(f.item);
+            }
+        });
+        (table, guard, Input { source: Source::Wire(WireInput { rx: handler, cur: None, ledger, over: false, refused: false }) })
+    }
+
+    fn frame(subscription: u64, seq: u64, payload: &[u8]) -> Bytes {
+        let mut f = vec![BINARY_INPUT];
+        f.extend_from_slice(&subscription.to_be_bytes());
+        f.extend_from_slice(&seq.to_be_bytes());
+        f.extend_from_slice(payload);
+        Bytes::from(f)
+    }
+
+    /// Acceptance 4: the payload the handler reads is the received message's
+    /// own bytes, at offset 17: a slice, not a copy.
+    #[tokio::test]
+    async fn a_binary_payload_reaches_the_handler_without_a_copy() {
+        let (table, _slot, mut input) = one_call::<Bytes>(21);
+        let received = frame(21, 0, &[9; 640]);
+        assert_eq!(table.take_binary(&received), Delivered::Taken);
+        let item = input.next().await.unwrap();
+        assert_eq!(item.as_ptr(), received[BINARY_HEADER..].as_ptr(), "the same memory");
+        assert_eq!(item.len(), 640);
+    }
+
+    /// A short header and another tag are malformed; a frame naming no call
+    /// is counted; a resend is dropped.
+    #[tokio::test]
+    async fn take_binary_says_what_became_of_a_frame() {
+        let (table, _slot, _input) = one_call::<Bytes>(21);
+        assert_eq!(table.take_binary(&Bytes::from_static(&[1, 0, 0])), Delivered::Malformed);
+        let mut other = frame(21, 0, b"x").to_vec();
+        other[0] = 2;
+        assert_eq!(table.take_binary(&Bytes::from(other)), Delivered::Malformed);
+        assert_eq!(table.take_binary(&frame(22, 0, b"x")), Delivered::NotThisCall);
+        assert_eq!(table.strays(), 1);
+        assert_eq!(table.take_binary(&frame(21, 0, b"x")), Delivered::Taken);
+        assert_eq!(table.take_binary(&frame(21, 0, b"x")), Delivered::Dropped);
+    }
+
+    /// A JSON item of `Input<Bytes>` is base64; one of any other input is
+    /// JSON, and a binary frame for it is refused.
+    #[test]
+    fn decode_by_the_inputs_type() {
+        assert_eq!(decode::<Bytes>(Bytes::from_static(br#""AAEC/w==""#), false).unwrap(), Bytes::from_static(&[0, 1, 2, 255]));
+        assert_eq!(decode::<Bytes>(Bytes::from_static(br#""AAEC\/w==""#), false).unwrap(), Bytes::from_static(&[0, 1, 2, 255]));
+        assert!(decode::<Bytes>(Bytes::from_static(br#""no!""#), false).is_err());
+        assert!(decode::<Bytes>(Bytes::from_static(b"[1,2]"), false).is_err());
+        assert_eq!(decode::<Bytes>(Bytes::from_static(b"{raw"), true).unwrap(), Bytes::from_static(b"{raw"));
+        assert_eq!(decode::<u32>(Bytes::from_static(b"7"), false).unwrap(), 7);
+        assert!(decode::<u32>(Bytes::from_static(b"7"), true).is_err());
+    }
+
+    /// BIDIR-17 review: a frame of no items is refused on arrival and closes
+    /// the half; a frame of a call that has ended is late, not a stranger's.
+    #[tokio::test]
+    async fn the_table_says_refused_late_and_stranger_apart() {
+        let (table, slot, _input) = one_call::<u32>(21);
+        let empty = Bytes::from_static(br#"{"subscription":21,"seq":0,"items":[]}"#);
+        assert_eq!(table.input("menger", &empty, &empty), Delivered::Refused);
+        let next = Bytes::from_static(br#"{"subscription":21,"seq":1,"items":[1]}"#);
+        assert_eq!(table.input("menger", &next, &next), Delivered::Dropped, "the half closed with the refusal");
+        drop(slot);
+        assert_eq!(table.input("menger", &next, &next), Delivered::Dropped, "the call is over: late");
+        assert_eq!(table.end("menger", br#"{"subscription":21,"seq":2}"#), Delivered::Dropped);
+        let other = Bytes::from_static(br#"{"subscription":22,"seq":0,"items":[1]}"#);
+        assert_eq!(table.input("menger", &other, &other), Delivered::NotThisCall);
+    }
+
+    /// BIDIR-17 review: an item that does not decode is no end: the input
+    /// stays pending (the pipe ends the call), and the refusal is the ledger's.
+    #[tokio::test]
+    async fn a_refused_item_leaves_the_input_pending() {
+        let (table, _slot, mut input) = one_call::<u32>(21);
+        let frame = Bytes::from_static(br#"{"subscription":21,"seq":0,"items":[1,"x"]}"#);
+        assert_eq!(table.input("menger", &frame, &frame), Delivered::Taken);
+        assert_eq!(input.next().await, Some(1));
+        let next = tokio::time::timeout(std::time::Duration::from_millis(50), input.next()).await;
+        assert!(next.is_err(), "pending, not an end: {next:?}");
+        let Source::Wire(wire) = &input.source else { unreachable!() };
+        assert!(matches!(wire.ledger.take_refusal(), Some(DuplexRefusal::InvalidInput { seq: 0, .. })));
+    }
+}

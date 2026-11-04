@@ -1129,6 +1129,8 @@ struct DynamicHubInner {
     ///
     /// [`AuditRecord`]: plexus_auth_core::AuditRecord
     audit_sink: Arc<dyn plexus_auth_core::AuditSink>,
+    /// BIDIR-6: see [`DynamicHub::duplex_gate`].
+    duplex_gate: std::sync::OnceLock<super::duplex_gate::DuplexGate>,
     /// Lazily-built index from full dotted method path
     /// (`<activation>.<method>`, hub-own methods under
     /// `<hub-ns>.<method>`) to the gate-relevant schema facts. Built once
@@ -1137,6 +1139,10 @@ struct DynamicHubInner {
     /// gated dispatch are not in the index (registration is builder-time,
     /// before serving, in every supported composition).
     gate_index: std::sync::OnceLock<HashMap<String, super::scope_gate::MethodGateInfo>>,
+    /// BIDIR-6: every method path the service knows, and whether it takes an
+    /// `Input` (see [`DynamicHub::may_take_input`]). Built once, on the first
+    /// call.
+    input_index: std::sync::OnceLock<HashMap<String, bool>>,
     /// AUTH-2 — the grant gate: when set, every call is decided by it
     /// before routing (default deny). `None` (the default): dispatch exactly
     /// as before it existed. See [`super::grant_gate`].
@@ -1293,7 +1299,9 @@ impl DynamicHub {
                 scope_registry: None,
                 default_deny: false,
                 audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
+                duplex_gate: std::sync::OnceLock::new(),
                 gate_index: std::sync::OnceLock::new(),
+                input_index: std::sync::OnceLock::new(),
                 gate: None,
                 signed_in_grants: std::collections::BTreeSet::new(),
                 resource_metadata: None,
@@ -1909,6 +1917,53 @@ impl DynamicHub {
         self.inner.scope_registry.as_deref()
     }
 
+    /// BIDIR-6: what a call with an input half is held to when it is asked
+    /// again: the grant and targets the gate decided it on. Read only when a
+    /// method with an `Input` opens, so no other call pays for it.
+    pub(crate) fn input_terms(&self, method: &str, params: &Value) -> Result<InputTerms, PlexusError> {
+        if self.inner.gate.is_none() {
+            return Ok(InputTerms { grant: method.to_string(), targets: Vec::new(), recheck: false });
+        }
+        let info = self.gate_index().get(method);
+        let grant = info.and_then(|i| i.grant.clone()).unwrap_or_else(|| method.to_string());
+        let open = info.is_some_and(|i| i.public) || self.inner.signed_in_grants.contains(grant.as_str());
+        let targets = match info.and_then(|i| i.target.as_deref()) {
+            Some(param) => super::grant_gate::target_values(params, param)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        Ok(InputTerms { grant, targets, recheck: !open })
+    }
+
+    /// BIDIR-6: the gate over this service's duplex calls, made when the
+    /// first one opens (in the runtime, which runs its audit's drain).
+    pub(crate) fn duplex_gate(&self) -> &super::duplex_gate::DuplexGate {
+        self.inner.duplex_gate.get_or_init(|| match &self.inner.gate {
+            Some(gate) => {
+                let (audit, drain) = plexus_auth_core::audit::AuditQueue::new(1024, self.inner.audit_sink.clone());
+                tokio::spawn(drain);
+                super::duplex_gate::DuplexGate::new((**gate).clone()).with_audit(audit)
+            }
+            None => super::duplex_gate::DuplexGate::ungated(),
+        })
+    }
+
+    /// BIDIR-6: whether `method` (a `{ns}.call`'s dotted path) may take an
+    /// `Input`: `false` only for a method this service's schemas show has
+    /// none — its own, each activation's, each static child's. A path they do
+    /// not show (a dynamic child's) may.
+    pub(crate) fn may_take_input(&self, method: &str) -> bool {
+        let index = self.inner.input_index.get_or_init(|| {
+            let own = Activation::plugin_schema(self).methods.into_iter().map(|m| (format!("{}.{}", self.inner.namespace, m.name), m.input.is_some()));
+            let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
+            let theirs = schemas.flat_map(|schema| {
+                let ns = schema.namespace;
+                schema.methods.into_iter().map(move |m| (format!("{ns}.{}", m.name), m.input.is_some()))
+            });
+            own.chain(theirs).collect()
+        });
+        index.get(method).copied().unwrap_or(true)
+    }
+
     /// The gate's path→schema-facts index; built once on first gated
     /// dispatch. See the field docs on `DynamicHubInner::gate_index`.
     fn gate_index(&self) -> &HashMap<String, super::scope_gate::MethodGateInfo> {
@@ -2470,29 +2525,15 @@ impl DynamicHub {
             call_unsub,
             move |params, pending, _ctx, ext| {
                 let plexus = plexus_for_call.clone();
-                Box::pin(async move {
-                    let p: CallParams = params.parse()?;
-                    // AUTH-4: a gated hub reads the connection's identity
-                    // (as arc_into_rpc_module always has); a hub without a
-                    // gate dispatches anonymously here, as before.
-                    let auth = if plexus.inner.gate.is_some() {
-                        ext.get::<std::sync::Arc<super::auth::AuthContext>>().map(|a| a.as_ref())
-                    } else {
-                        None
-                    };
-                    match plexus.route(&p.method, p.params.unwrap_or_default(), auth).await {
-                        Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
-                        Err(e) => {
-                            let sink = pending.accept().await?;
-                            if let Some(raw) = error_item_raw(ns_static, &e) {
-                                let _ = sink.send(raw).await;
-                            }
-                            Ok(())
-                        }
-                    }
-                })
+                // AUTH-4: a gated hub reads the connection's identity (as
+                // arc_into_rpc_module always has); a hub without a gate
+                // dispatches anonymously here, as before.
+                let identified = plexus.inner.gate.is_some();
+                serve_call(plexus, params, pending, ext, ns_static, identified)
             }
         )?;
+
+        register_input_methods(&mut module, ns_static)?;
 
         // Register {ns}.hash subscription
         let plexus_for_hash = self.clone();
@@ -2642,28 +2683,12 @@ impl DynamicHub {
             call_unsub,
             move |params, pending, _ctx, ext| {
                 let hub = hub_for_call.clone();
-                Box::pin(async move {
-                    let p: CallParams = params.parse()?;
-                    // Extract auth context from Extensions (if present)
-                    let auth = ext.get::<std::sync::Arc<super::auth::AuthContext>>()
-                        .map(|arc| arc.as_ref());
-                    match hub.route(&p.method, p.params.unwrap_or_default(), auth).await {
-                        Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
-                        Err(e) => {
-                            // Accept the subscription, then send the error as a stream item.
-                            // This preserves the typed RemoteError — returning Err(...)
-                            // from a subscription handler causes jsonrpsee to wrap it as
-                            // generic -32603, discarding it.
-                            let sink = pending.accept().await?;
-                            if let Some(raw) = error_item_raw(ns_static, &e) {
-                                let _ = sink.send(raw).await;
-                            }
-                            Ok(())
-                        }
-                    }
-                })
+                let hub = (*hub).clone();
+                serve_call(hub, params, pending, ext, ns_static, true)
             }
         )?;
+
+        register_input_methods(&mut module, ns_static)?;
 
         // Register {ns}.hash subscription
         let hub_for_hash = hub.clone();
@@ -2971,10 +2996,17 @@ struct SearchChildrenParams {
 
 /// Params for {ns}.call
 #[derive(Debug, serde::Deserialize)]
-struct CallParams {
-    method: String,
+pub(crate) struct CallParams {
+    pub(crate) method: String,
     #[serde(default)]
-    params: Option<Value>,
+    pub(crate) params: Option<Value>,
+}
+
+/// BIDIR-6: [`DynamicHub::input_terms`]' answer.
+pub(crate) struct InputTerms {
+    pub(crate) grant: String,
+    pub(crate) targets: Vec<String>,
+    pub(crate) recheck: bool,
 }
 
 /// Params for {ns}.schema (SYNAPSE-CC-9: the published type)
@@ -2985,6 +3017,154 @@ use super::schema::SchemaParams;
 struct RespondParams {
     request_id: String,
     response_data: Value,
+}
+
+/// `{ns}.call`: route the call, then pipe what it answers.
+///
+/// The call's future is boxed here, and is its one allocation of that size,
+/// so it is chosen before it is made: a method the service knows has no
+/// `Input` is routed and piped as it was before BIDIR-6,
+/// holding nothing of the input half (the seam inline in one future for both
+/// was 1,024 bytes more a call, and the params kept beside it 176 more);
+/// any other ([`DynamicHub::may_take_input`]) is [`serve_seamed`]. A
+/// dispatch error is sent as a stream item on the
+/// accepted subscription: this preserves its message and code, where
+/// returning it from a subscription handler has jsonrpsee wrap it as generic
+/// -32603.
+fn serve_call(
+    service: DynamicHub,
+    params: jsonrpsee::types::Params<'static>,
+    pending: jsonrpsee::PendingSubscriptionSink,
+    ext: http::Extensions,
+    ns: &'static str,
+    identified: bool,
+) -> CallFuture {
+    // Read here, not in the future: the choice of future is made on it, and
+    // the plain one then holds neither the params' text nor the method name.
+    let call: CallParams = match params.parse() {
+        Ok(call) => call,
+        Err(e) => return Box::pin(async move { Err(e.into()) }),
+    };
+    if service.may_take_input(&call.method) {
+        return Box::pin(serve_seamed(service, call, params, pending, ext, ns, identified));
+    }
+    let CallParams { method, params: args } = call;
+    Box::pin(async move {
+        let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().map(|a| a.as_ref()) } else { None };
+        match service.route(&method, args.unwrap_or_default(), caller).await {
+            Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
+            Err(e) => {
+                let sink = pending.accept().await?;
+                if let Some(raw) = error_item_raw(ns, &e) {
+                    let _ = sink.send(raw).await;
+                }
+                Ok(())
+            }
+        }
+    })
+}
+
+/// A `{ns}.call`'s future, boxed: one allocation a call, the size of the
+/// path it takes.
+type CallFuture = std::pin::Pin<Box<dyn std::future::Future<Output = jsonrpsee::core::SubscriptionResult> + Send>>;
+
+/// [`serve_call`] for a method that may take an `Input`: the route runs
+/// inside [`super::input::CALL`], holding the unaccepted subscription and the
+/// extensions, and a method with an `Input` parameter takes them there
+/// (BIDIR-6); one without leaves them.
+async fn serve_seamed(
+    service: DynamicHub,
+    call: CallParams,
+    params: jsonrpsee::types::Params<'static>,
+    pending: jsonrpsee::PendingSubscriptionSink,
+    ext: http::Extensions,
+    ns: &'static str,
+    identified: bool,
+) -> jsonrpsee::core::SubscriptionResult {
+    let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().cloned() } else { None };
+    let seen = service.inner.gate.as_ref().map_or(0, |g| g.generation().current());
+    let opened = Arc::new(std::sync::Mutex::new(None::<super::input::Opened>));
+    let take = || opened.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut scoped = std::pin::pin!(super::input::CALL.scope(
+        std::cell::RefCell::new(super::input::Seam { service: service.clone(), params, pending: Some(pending), ext, seen, opened: opened.clone(), refused: None }),
+        service.route(&call.method, call.params.unwrap_or_default(), caller.as_deref()),
+    ));
+    // The route runs until it answers, or until the method has opened its
+    // input half: a handler may read its input before it returns its stream,
+    // so from the open the pipe runs (credit, items, cancel) beside the
+    // route still resolving.
+    let answered = std::future::poll_fn(|cx| match std::future::Future::poll(scoped.as_mut(), cx) {
+        std::task::Poll::Ready(answer) => std::task::Poll::Ready(Some(answer)),
+        std::task::Poll::Pending if opened.lock().unwrap_or_else(|e| e.into_inner()).is_some() => std::task::Poll::Ready(None),
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    })
+    .await;
+    let Some(answer) = answered else {
+        let super::input::Opened { sink, duplex } = take().expect("opened, the route still resolving");
+        let mut routing = std::pin::pin!(async { scoped.as_mut().await.map_err(|e| error_item(ns, &e)) });
+        return Box::pin(super::wire::pipe_duplex(sink, super::wire::Output::Routing(routing.as_mut()), duplex)).await;
+    };
+    let super::input::Seam { pending, ext, refused, .. } = scoped.as_mut().take_value().expect("the scope ran to its end").into_inner();
+    match (answer, take()) {
+        // Boxed: a call with no input half does not carry its room.
+        (Ok(stream), Some(opened)) => Box::pin(super::wire::pipe_duplex(opened.sink, super::wire::Output::Ready(stream), opened.duplex)).await,
+        (Ok(stream), None) => {
+            let pending = pending.expect("only an open takes it, and an open is `opened`");
+            pipe_stream_to_subscription(pending, stream, &ext).await
+        }
+        (Err(e), opened) => {
+            let sink = match (opened, pending) {
+                (Some(opened), _) => opened.sink,
+                (None, Some(pending)) => pending.accept().await?,
+                (None, None) => return Ok(()),
+            };
+            let raw = match refused {
+                Some(item) => serde_json::value::to_raw_value(&item).ok(),
+                None => error_item_raw(ns, &e),
+            };
+            if let Some(raw) = raw {
+                let _ = sink.send(raw).await;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// BIDIR-6: `{ns}.input` and `{ns}.end` in the method table, for a client
+/// that sends them as requests and wants an answer (`true`: it reached the
+/// call; `false`: a resend, or the half has closed). The notification, which
+/// is what a client normally sends, is taken on the socket's reader before
+/// the table. Sync methods, so a request is run in place, in order.
+fn register_input_methods(module: &mut RpcModule<()>, ns: &'static str) -> Result<(), jsonrpsee::core::RegisterMethodError> {
+    use super::input::{Delivered, InputTable};
+    use jsonrpsee::types::ErrorObjectOwned;
+
+    fn answer(delivered: Delivered) -> Result<bool, ErrorObjectOwned> {
+        match delivered {
+            Delivered::Taken => Ok(true),
+            Delivered::Dropped | Delivered::Refused => Ok(false),
+            Delivered::NotThisCall => Err(ErrorObjectOwned::owned(
+                -32003,
+                "not_this_call: input comes from the connection that opened the call",
+                Some(serde_json::json!({"error_kind": "not_this_call"})),
+            )),
+            Delivered::Malformed => Err(ErrorObjectOwned::owned(-32602, "invalid params: subscription, seq and items", None::<()>)),
+        }
+    }
+    fn table(ext: &http::Extensions) -> Result<&Arc<InputTable>, ErrorObjectOwned> {
+        ext.get::<super::wire::FrameSink>()
+            .and_then(super::wire::FrameSink::inputs)
+            .ok_or_else(|| ErrorObjectOwned::owned(-32601, "this transport carries no input half: call over a WebSocket", None::<()>))
+    }
+
+    let input_method: &'static str = Box::leak(format!("{ns}.input").into_boxed_str());
+    let end_method: &'static str = Box::leak(format!("{ns}.end").into_boxed_str());
+    module.register_method(input_method, move |params, _ctx, ext| {
+        let frame = bytes::Bytes::copy_from_slice(params.as_str().unwrap_or("null").as_bytes());
+        answer(table(ext)?.input(ns, &frame, &frame))
+    })?;
+    module.register_method(end_method, move |params, _ctx, ext| answer(table(ext)?.end(ns, params.as_str().unwrap_or("null").as_bytes())))?;
+    Ok(())
 }
 
 /// Pipe a call's stream to its subscription: accept it, then

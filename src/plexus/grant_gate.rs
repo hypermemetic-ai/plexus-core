@@ -116,7 +116,7 @@ pub(crate) fn say_ended(e: PlexusError, ended: Option<&str>) -> PlexusError {
 /// gate cannot read as a scope — an object, or a list holding anything but
 /// scalars — is refused, never skipped (skipped, it would be decided as
 /// "no target": held anywhere).
-fn target_values(params: &Value, param: &str) -> Result<Option<Vec<String>>, PlexusError> {
+pub(crate) fn target_values(params: &Value, param: &str) -> Result<Option<Vec<String>>, PlexusError> {
     let Some(v) = params.get(param) else { return Ok(None) };
     let one = |v: &Value| match v {
         Value::String(s) => Some(s.clone()),

@@ -2353,6 +2353,27 @@ mod tests {
         }
     }
 
+    /// RETURNS-36 (review #11): the `schema` entry is known by what every
+    /// 0.8.x build writes alike — not by a hash recomputed with this build,
+    /// which a peer whose plexus-core differs by a patch (a doc comment in
+    /// `SchemaResult`, say) does not share.
+    #[test]
+    fn the_schema_entry_is_known_across_patches() {
+        let ours = MethodSchema::auto_schema().with_grant("echo.schema").with_content_hash();
+        assert!(ours.is_auto_schema());
+        // Another patch's: the same entry, its `returns` documented otherwise.
+        let mut theirs = MethodSchema::auto_schema().with_grant("echo.schema");
+        let mut returns = serde_json::to_value(&theirs.returns).unwrap();
+        returns["description"] = serde_json::json!("another patch's words");
+        theirs.returns = serde_json::from_value(returns).unwrap();
+        let theirs = theirs.with_content_hash();
+        assert_ne!(theirs.hash, ours.hash);
+        assert!(theirs.is_auto_schema(), "a 0.8.x peer's schema entry, another patch");
+        // A method named `schema` that is not the entry: other params.
+        let user = MethodSchema::new("schema", "mine", "").with_params(schema_for!(String)).with_content_hash();
+        assert!(!user.is_auto_schema());
+    }
+
     #[test]
     fn returns10_rollup_is_sha256_of_the_hashes_one_per_line() {
         let a = MethodSchema::new("a", "", "aaaaaaaaaaaaaaaa");

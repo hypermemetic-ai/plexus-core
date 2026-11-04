@@ -105,10 +105,12 @@ pub enum PlexusStreamItem {
         recoverable: bool,
         /// spec/05: the human line — never parsed for meaning. For a failed
         /// dispatch, the server's `PlexusError` as it reads; else the
-        /// [`RemoteError`]'s `Display`. Always written; optional on reading
-        /// (RETURNS-6's frame has none, as plexus-client reads it): a frame
-        /// without one reads as an empty line.
-        #[serde(default)]
+        /// [`RemoteError`]'s `Display`. Optional on reading (RETURNS-6's
+        /// frame has none, as plexus-client reads it): a frame without one
+        /// reads as empty, and is written back without one — a relay makes
+        /// up no `""` for a reader to show over the typed error (RETURNS-36,
+        /// re-review #4). Every frame this crate builds has one.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         message: String,
         /// spec/05: the JSON-RPC code in decimal (`"-32601"`), or — for a
         /// refusal with none — its `error_kind` (`"too_many_calls"`).
@@ -411,7 +413,9 @@ mod tests {
         let item: PlexusStreamItem = serde_json::from_value(frame).expect("a frame without message reads");
         assert_eq!(item.remote_error(), Some(&RemoteError::Unauthenticated));
         let written = serde_json::to_value(&item).unwrap();
-        assert!(written.get("message").is_some_and(|m| m.is_string()), "message is always written: {written}");
+        // RETURNS-36 (re-review #4): read without one, written without one —
+        // a relay makes up no `""` for a reader to show over the typed error.
+        assert!(written.get("message").is_none(), "no message made up: {written}");
     }
 
     /// A 0.6-shaped frame does not parse as 0.7 (no back-compat, RETURNS-1

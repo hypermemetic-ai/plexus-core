@@ -24,6 +24,8 @@ pub mod forward_registry;
 /// AUTH-2: the grant gate in dispatch, and the task-local reach.
 pub mod grant_gate;
 pub mod hub_context;
+/// RETURNS-40: the IR a service writes of itself — IR 3.0, as synapse builds it.
+pub mod ir;
 // MACRO-2.B3: the in-process transport for the macro-generated typed client.
 pub mod in_process;
 /// LOCAL-6: a whole hub, called in memory.

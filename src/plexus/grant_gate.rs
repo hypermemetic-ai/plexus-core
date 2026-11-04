@@ -13,7 +13,7 @@
 //! | call | anonymous | signed in |
 //! |---|---|---|
 //! | `public` method | runs (empty reach) | runs (its reach) |
-//! | introspection: `<ns>.schema`, the hub's `hash` / `hashes` / `schema` | runs | runs |
+//! | introspection: `<ns>.schema`, the hub's `hash` / `hashes` / `schema` / `ir` | runs | runs |
 //! | method with a `target`, value present | `Unauthenticated` | allowed iff a role held on a scope in the value's chain lists the grant, and every ceiling layer allows it there |
 //! | method without a target (or the target param absent / null) | `Unauthenticated` | allowed iff the grant is held anywhere (within the ceiling) |
 //! | method no schema describes (a nested child path) | `Unauthenticated` | as "without a target", grant = the dotted path |
@@ -162,7 +162,7 @@ pub(crate) fn decide(
     let (ns, method) = full_path.split_once('.').unwrap_or((full_path, ""));
     let introspection = method == "schema"
         || method.ends_with(".schema")
-        || (ns == hub_ns && matches!(method, "hash" | "hashes"));
+        || (ns == hub_ns && matches!(method, "hash" | "hashes" | "ir"));
     if introspection {
         return Ok(Admit::Open);
     }

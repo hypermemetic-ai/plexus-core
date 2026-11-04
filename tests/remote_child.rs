@@ -219,6 +219,18 @@ async fn an_error_item_it_cannot_read_ends_the_call() {
     assert!(child_event(&r.log, "unsub", sent, Duration::from_secs(2)).await.is_some(), "the child was told");
 }
 
+/// RETURNS-36 (re-review #3): a progress item as main wrote it carries no
+/// `content_type`; the seam names it the call's method — the child's
+/// `echo.fail`, as its data items say — never the mount's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_main_wire_progress_is_named_for_the_calls_method() {
+    let r = rig(Via::Stdio).await;
+    let p = route(&r, ADA, "echo.fail", json!({ "kind": "progress" })).await;
+    assert_eq!(types(&p), ["progress", "done"], "{p:?}");
+    assert_eq!(p[0]["content_type"], "echo.fail", "{}", p[0]);
+    assert_eq!(p[0]["content"], json!({ "message": "halfway", "percentage": 50.0 }));
+}
+
 /// A child's typed refusal crosses whole — `error_kind` and `forbidden`'s
 /// own fields — in the service's stream and on its WebSocket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

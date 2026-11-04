@@ -148,10 +148,17 @@ pub const IR_CACHE_ENTRIES: usize = 128;
 /// menger's whole-service IR, 565 KB).
 pub const IR_CACHE_BYTES: usize = 64 << 20;
 
-/// What a service keeps of its `ir` answers (RETURNS-40 review #4): least
-/// recently used first out, bounded by entries and by bytes, never cleared
-/// whole; one build per key at a time — a later asker waits for the build
-/// under way and is answered from it; a refusal is not kept.
+/// What a service keeps of its `ir` answers (RETURNS-40 review #4, re-review
+/// #1, #2): one build per key at a time — a later asker of a key waits for
+/// the build under way, and when the asker building it goes the next waiter
+/// takes the build over; bounded at the ask — a slot being built counts
+/// toward the entries, and an ask with no room (every slot building) builds
+/// without keeping; a slot whose every asker has gone before it was built
+/// is removed (a blocking build under way then finishes and its answer is
+/// dropped); built answers kept least recently used out, by entries and by
+/// bytes, an answer past the byte bound never kept, a slot being built
+/// never evicted; a refusal never kept. The lock is held for O(log n) work
+/// alone.
 pub struct IrCache {
     state: Mutex<CacheState>,
     builds: AtomicUsize,
@@ -162,15 +169,22 @@ pub struct IrCache {
 #[derive(Default)]
 struct CacheState {
     slots: HashMap<IrKey, Slot>,
+    /// The built slots, by when each was last used: the least recently
+    /// used first. A slot being built is not here, so never evicted.
+    lru: BTreeMap<u64, IrKey>,
     tick: u64,
     bytes: usize,
+    next_id: u64,
 }
 
 struct Slot {
+    /// Which slot this is: a key removed and asked again is another.
+    id: u64,
     cell: Arc<OnceCell<ServiceIr>>,
-    used: u64,
-    /// The answer's bytes once built (0 while it is built).
-    bytes: usize,
+    /// The asks waiting on it.
+    waiters: usize,
+    /// Once built and kept: when it was last used, and its bytes.
+    built: Option<(u64, usize)>,
 }
 
 impl Default for IrCache {
@@ -179,9 +193,32 @@ impl Default for IrCache {
     }
 }
 
+/// One ask waiting on a slot; gone (finished or cancelled), it says so.
+struct Waiter<'a> {
+    cache: &'a IrCache,
+    key: &'a IrKey,
+    id: u64,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let mut st = self.cache.state();
+        let gone = match st.slots.get_mut(self.key) {
+            Some(slot) if slot.id == self.id => {
+                slot.waiters -= 1;
+                slot.waiters == 0 && slot.built.is_none()
+            }
+            _ => false,
+        };
+        if gone {
+            st.slots.remove(self.key);
+        }
+    }
+}
+
 impl IrCache {
     pub fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
-        IrCache { state: Mutex::new(CacheState::default()), builds: AtomicUsize::new(0), max_entries: max_entries.max(1), max_bytes, }
+        IrCache { state: Mutex::new(CacheState::default()), builds: AtomicUsize::new(0), max_entries: max_entries.max(1), max_bytes }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, CacheState> {
@@ -195,14 +232,13 @@ impl IrCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<ServiceIr, IrError>>,
     {
-        let cell = {
-            let mut st = self.state();
-            st.tick += 1;
-            let tick = st.tick;
-            let slot = st.slots.entry(key.clone()).or_insert_with(|| Slot { cell: Arc::new(OnceCell::new()), used: tick, bytes: 0 });
-            slot.used = tick;
-            slot.cell.clone()
+        let joined = self.join(&key);
+        let Some((id, cell)) = joined else {
+            // no room beside the slots being built: built, not kept
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            return build().await;
         };
+        let _waiting = Waiter { cache: self, key: &key, id };
         let answer = cell
             .get_or_try_init(|| {
                 self.builds.fetch_add(1, Ordering::SeqCst);
@@ -210,43 +246,72 @@ impl IrCache {
             })
             .await
             .cloned();
-        match &answer {
-            Ok(ir) => self.settle(&key, &cell, ir.0.get().len()),
-            Err(_) => {
-                // not kept: the next asker builds again
-                let mut st = self.state();
-                if st.slots.get(&key).is_some_and(|s| Arc::ptr_eq(&s.cell, &cell) && s.cell.get().is_none()) {
-                    st.slots.remove(&key);
-                }
-            }
+        if let Ok(ir) = &answer {
+            self.settle(&key, id, ir.0.get().len());
         }
         answer
     }
 
-    /// Count a built answer's bytes, then drop the least recently used
-    /// others while past either bound.
-    fn settle(&self, key: &IrKey, cell: &Arc<OnceCell<ServiceIr>>, bytes: usize) {
+    /// Wait on `key`'s slot — made when there is room — counted as one of
+    /// its askers; `None` when every slot is being built.
+    fn join(&self, key: &IrKey) -> Option<(u64, Arc<OnceCell<ServiceIr>>)> {
         let mut st = self.state();
-        let counted = match st.slots.get_mut(key) {
-            Some(slot) if Arc::ptr_eq(&slot.cell, cell) && slot.bytes == 0 => {
-                slot.bytes = bytes;
-                true
+        st.tick += 1;
+        let tick = st.tick;
+        if let Some(slot) = st.slots.get_mut(key) {
+            slot.waiters += 1;
+            let used = slot.built.map(|(used, _)| used);
+            if let Some((_, bytes)) = slot.built {
+                slot.built = Some((tick, bytes));
             }
-            _ => false,
-        };
-        if counted {
-            st.bytes += bytes;
+            let joined = (slot.id, slot.cell.clone());
+            if let Some(used) = used {
+                st.lru.remove(&used);
+                st.lru.insert(tick, key.clone());
+            }
+            return Some(joined);
         }
-        while st.slots.len() > self.max_entries || st.bytes > self.max_bytes {
-            let oldest = st.slots.iter().filter(|(k, _)| *k != key).min_by_key(|(_, s)| s.used).map(|(k, _)| k.clone());
-            let Some(k) = oldest else { break };
-            if let Some(gone) = st.slots.remove(&k) {
-                st.bytes -= gone.bytes;
+        while st.slots.len() >= self.max_entries {
+            let Some((_, oldest)) = st.lru.pop_first() else { return None };
+            if let Some(gone) = st.slots.remove(&oldest) {
+                st.bytes -= gone.built.map_or(0, |(_, b)| b);
+            }
+        }
+        st.next_id += 1;
+        let id = st.next_id;
+        let cell = Arc::new(OnceCell::new());
+        st.slots.insert(key.clone(), Slot { id, cell: cell.clone(), waiters: 1, built: None });
+        Some((id, cell))
+    }
+
+    /// Keep a built answer — unless it is past the byte bound — then drop
+    /// the least recently used others while past it.
+    fn settle(&self, key: &IrKey, id: u64, bytes: usize) {
+        let mut st = self.state();
+        let fresh = matches!(st.slots.get(key), Some(slot) if slot.id == id && slot.built.is_none());
+        if !fresh {
+            return;
+        }
+        if bytes > self.max_bytes {
+            st.slots.remove(key);
+            return;
+        }
+        st.tick += 1;
+        let tick = st.tick;
+        if let Some(slot) = st.slots.get_mut(key) {
+            slot.built = Some((tick, bytes));
+        }
+        st.lru.insert(tick, key.clone());
+        st.bytes += bytes;
+        while st.bytes > self.max_bytes {
+            let Some((_, oldest)) = st.lru.pop_first() else { break };
+            if let Some(gone) = st.slots.remove(&oldest) {
+                st.bytes -= gone.built.map_or(0, |(_, b)| b);
             }
         }
     }
 
-    /// How many answers are kept.
+    /// How many slots there are: answers kept, and answers being built.
     pub fn len(&self) -> usize {
         self.state().slots.len()
     }

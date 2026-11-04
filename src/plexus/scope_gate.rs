@@ -178,6 +178,34 @@ pub(crate) async fn enforce(
     auth: Option<&AuthContext>,
     client_ip: Option<IpAddr>,
 ) -> Result<(), PlexusError> {
+    decide(registry, default_deny, Some(sink), full_path, schema_info, auth, client_ip).await
+}
+
+/// RETURNS-40 review #4: whether the gate would let `auth` call
+/// `full_path` — [`enforce`]'s decision, written to no audit sink: what a
+/// service asks of a call it is not making (its `ir`, deciding which of the
+/// schemas asked the caller is answered; the `ir` call itself is enforced,
+/// and audited, once).
+pub(crate) async fn answers(
+    registry: &ScopeRegistry,
+    default_deny: bool,
+    full_path: &str,
+    schema_info: Option<&MethodGateInfo>,
+    auth: Option<&AuthContext>,
+) -> bool {
+    decide(registry, default_deny, None, full_path, schema_info, auth, None).await.is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide(
+    registry: &ScopeRegistry,
+    default_deny: bool,
+    sink: Option<&Arc<dyn AuditSink>>,
+    full_path: &str,
+    schema_info: Option<&MethodGateInfo>,
+    auth: Option<&AuthContext>,
+    client_ip: Option<IpAddr>,
+) -> Result<(), PlexusError> {
     let started = Instant::now();
 
     // The audit record (and the registry) speak validated MethodPath. A
@@ -304,7 +332,7 @@ pub(crate) async fn enforce(
 /// `tracing::error` with the record's correlation id — dispatch proceeds
 /// with the gate's decision regardless (AUTHZ-CORE-5 acceptance 9).
 async fn emit(
-    sink: &Arc<dyn AuditSink>,
+    sink: Option<&Arc<dyn AuditSink>>,
     method: MethodPath,
     auth: Option<&AuthContext>,
     required: &[Scope],
@@ -312,6 +340,7 @@ async fn emit(
     started: Instant,
     client_ip: Option<IpAddr>,
 ) {
+    let Some(sink) = sink else { return };
     let (originator, session_id) = match auth {
         Some(a) if a.is_authenticated() => (
             Some(UserId::new(a.user_id.clone())),

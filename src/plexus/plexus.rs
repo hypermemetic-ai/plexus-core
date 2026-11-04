@@ -1715,9 +1715,16 @@ impl DynamicHub {
         let permitted = match self.inner.scope_registry.is_some() || self.inner.default_deny {
             false => None,
             true => {
+                // re-review #4: decided for the names under the roots asked
+                // alone, and written to no audit sink — the `ir` call was
+                // enforced, and audited, once
                 let mut answered = Vec::new();
                 for name in view.names(&self.inner.namespace) {
-                    if self.scope_answers(&self.schema_method(&name), caller).await {
+                    let under = roots.iter().any(|r| {
+                        let r = r.join(".");
+                        r.is_empty() || name == r || name.starts_with(&format!("{r}."))
+                    });
+                    if under && self.scope_answers(&self.schema_method(&name), caller).await {
                         answered.push(name);
                     }
                 }
@@ -1784,22 +1791,26 @@ impl DynamicHub {
     /// call itself would meet.
     async fn scope_answers(&self, method: &str, caller: Option<&super::auth::AuthContext>) -> bool {
         let registry = self.inner.scope_registry.as_deref().unwrap_or_else(|| super::scope_gate::empty_registry());
-        super::scope_gate::enforce(registry, self.inner.default_deny, &self.inner.audit_sink, method, self.gate_index().get(method), caller, None)
-            .await
-            .is_ok()
+        super::scope_gate::answers(registry, self.inner.default_deny, method, self.gate_index().get(method), caller).await
     }
 
     /// The schema at `path` as the snapshot answers it — what `<path>.schema`
     /// answers the caller: the service's own and each activation's from the
     /// view, a static child's (which no view shapes) as its activation
-    /// answers it, routed past the grant gate as the wire routes it.
+    /// answers it, asked of the activation as the route asks it.
     async fn ir_schema(&self, view: &IrView, path: &[String], caller: Option<&super::auth::AuthContext>) -> Option<Value> {
         use futures::StreamExt;
         let shown = match path {
             [] => Some(view.root()),
             [ns] => view.top(ns),
-            _ => {
-                let stream = self.route_ungated(&self.schema_method(&path.join(".")), Value::Null, caller, None).await.ok()?;
+            [top, below @ ..] => {
+                // asked of its activation as the route asks it past both
+                // gates — the scope gate decided this name already, silently
+                let activation = self.inner.activations.get(top.as_str())?;
+                let mut stream = activation.call(&format!("{}.schema", below.join(".")), Value::Null, caller, None).await.ok()?;
+                if let Some(site) = self.derived_site_hint() {
+                    stream = fill_site_hints_in_schema_stream(stream, site);
+                }
                 let items: Vec<super::types::PlexusStreamItem> = stream.collect().await;
                 return items.into_iter().find_map(|item| match item {
                     super::types::PlexusStreamItem::Data { content_type, content, .. } if content_type.ends_with(".schema") => {
@@ -1825,19 +1836,21 @@ impl DynamicHub {
             Some(Value::Array(a)) => a,
             Some(_) => return Err(PlexusError::malformed_param("namespaces", "a list of namespaces")),
         };
-        // the cheap bound first: no service has more names than this
+        // the cheap bound first, read with no schema built: no view shows
+        // more than the service has — said without the service's size
+        // (re-review #3), which the caller's view may not show
         let most = 1 + self.inner.activations.len() + self.inner.nested_count();
         if asked.len() > most {
             return Err(PlexusError::malformed_param(
                 "namespaces",
-                format!("{} namespaces asked; this service has at most {most}", asked.len()),
+                format!("{} namespaces asked; more than this service shows you", asked.len()),
             ));
         }
         let names: std::collections::HashSet<String> = self.ir_view(caller).names(&self.inner.namespace).into_iter().collect();
         if asked.len() > names.len() {
             return Err(PlexusError::malformed_param(
                 "namespaces",
-                format!("{} namespaces asked; this service has {}", asked.len(), names.len()),
+                format!("{} namespaces asked; this service shows you {}", asked.len(), names.len()),
             ));
         }
         for n in asked {

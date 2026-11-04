@@ -1139,6 +1139,10 @@ struct DynamicHubInner {
     /// gated dispatch are not in the index (registration is builder-time,
     /// before serving, in every supported composition).
     gate_index: std::sync::OnceLock<HashMap<String, super::scope_gate::MethodGateInfo>>,
+    /// BIDIR-6: every method path the service knows, and whether it takes an
+    /// `Input` (see [`DynamicHub::may_take_input`]). Built once, on the first
+    /// call.
+    input_index: std::sync::OnceLock<HashMap<String, bool>>,
     /// AUTH-2 — the grant gate: when set, every call is decided by it
     /// before routing (default deny). `None` (the default): dispatch exactly
     /// as before it existed. See [`super::grant_gate`].
@@ -1297,6 +1301,7 @@ impl DynamicHub {
                 audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
                 duplex_gate: std::sync::OnceLock::new(),
                 gate_index: std::sync::OnceLock::new(),
+                input_index: std::sync::OnceLock::new(),
                 gate: None,
                 signed_in_grants: std::collections::BTreeSet::new(),
                 resource_metadata: None,
@@ -1940,6 +1945,23 @@ impl DynamicHub {
             }
             None => super::duplex_gate::DuplexGate::ungated(),
         })
+    }
+
+    /// BIDIR-6: whether `method` (a `{ns}.call`'s dotted path) may take an
+    /// `Input`: `false` only for a method this service's schemas show has
+    /// none — its own, each activation's, each static child's. A path they do
+    /// not show (a dynamic child's) may.
+    pub(crate) fn may_take_input(&self, method: &str) -> bool {
+        let index = self.inner.input_index.get_or_init(|| {
+            let own = Activation::plugin_schema(self).methods.into_iter().map(|m| (format!("{}.{}", self.inner.namespace, m.name), m.input.is_some()));
+            let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
+            let theirs = schemas.flat_map(|schema| {
+                let ns = schema.namespace;
+                schema.methods.into_iter().map(move |m| (format!("{ns}.{}", m.name), m.input.is_some()))
+            });
+            own.chain(theirs).collect()
+        });
+        index.get(method).copied().unwrap_or(true)
     }
 
     /// The gate's path→schema-facts index; built once on first gated
@@ -2999,12 +3021,14 @@ struct RespondParams {
 
 /// `{ns}.call`: route the call, then pipe what it answers.
 ///
-/// The route runs inside [`super::input::CALL`], holding the unaccepted
-/// subscription and the extensions: a method with an `Input` parameter takes
-/// them there (BIDIR-6), and one without leaves them, so its call is what it
-/// was. A dispatch error is sent as a stream item on the accepted
-/// subscription: this preserves its message and code, where returning it from
-/// a subscription handler has jsonrpsee wrap it as generic -32603.
+/// A method the service knows has no `Input` is routed and piped as it was
+/// before BIDIR-6: this future is the one call's allocation, and it holds
+/// nothing of the input half (a seam inline in it was 1,024 bytes more a
+/// call). Any other ([`DynamicHub::may_take_input`]) goes through
+/// [`serve_seamed`], boxed. A dispatch error is sent as a stream item on the
+/// accepted subscription: this preserves its message and code, where
+/// returning it from a subscription handler has jsonrpsee wrap it as generic
+/// -32603.
 async fn serve_call(
     service: DynamicHub,
     params: jsonrpsee::types::Params<'static>,
@@ -3014,6 +3038,35 @@ async fn serve_call(
     identified: bool,
 ) -> jsonrpsee::core::SubscriptionResult {
     let call: CallParams = params.parse()?;
+    if service.may_take_input(&call.method) {
+        return Box::pin(serve_seamed(service, call, params, pending, ext, ns, identified)).await;
+    }
+    let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().map(|a| a.as_ref()) } else { None };
+    match service.route(&call.method, call.params.unwrap_or_default(), caller).await {
+        Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
+        Err(e) => {
+            let sink = pending.accept().await?;
+            if let Some(raw) = error_item_raw(ns, &e) {
+                let _ = sink.send(raw).await;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// [`serve_call`] for a method that may take an `Input`: the route runs
+/// inside [`super::input::CALL`], holding the unaccepted subscription and the
+/// extensions, and a method with an `Input` parameter takes them there
+/// (BIDIR-6); one without leaves them.
+async fn serve_seamed(
+    service: DynamicHub,
+    call: CallParams,
+    params: jsonrpsee::types::Params<'static>,
+    pending: jsonrpsee::PendingSubscriptionSink,
+    ext: http::Extensions,
+    ns: &'static str,
+    identified: bool,
+) -> jsonrpsee::core::SubscriptionResult {
     let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().cloned() } else { None };
     let seen = service.inner.gate.as_ref().map_or(0, |g| g.generation().current());
     // Built in place, in a block of its own: the route's future shares its
@@ -3856,4 +3909,29 @@ mod tests {
     // asserts the live behavior. Splitting it that way avoids forcing the
     // unit test to construct a working RpcSubscriptionSink, which is not
     // straightforward in the bare jsonrpsee API.
+}
+
+#[cfg(test)]
+mod serve_call_size {
+    /// A future's size, from the async fn that makes it, never called.
+    fn future_of<A, B, C, D, E, G, Fut>(_: fn(A, B, C, D, E, G) -> Fut) -> usize {
+        std::mem::size_of::<Fut>()
+    }
+    fn future_of7<A, B, C, D, E, G, H, Fut>(_: fn(A, B, C, D, E, G, H) -> Fut) -> usize {
+        std::mem::size_of::<Fut>()
+    }
+
+    /// BIDIR-6: a call's future is its one allocation, and a method with no
+    /// `Input` must not carry the input half's seam in it (it did: 1,024
+    /// bytes more on call.one_item). The seam is boxed apart, so `{ns}.call`'s
+    /// future is the plain route-and-pipe's, smaller than the seamed one.
+    #[test]
+    fn the_call_future_carries_no_seam() {
+        type P = jsonrpsee::types::Params<'static>;
+        type S = jsonrpsee::PendingSubscriptionSink;
+        let call: fn(super::DynamicHub, P, S, http::Extensions, &'static str, bool) -> _ = super::serve_call;
+        let seamed: fn(super::DynamicHub, super::CallParams, P, S, http::Extensions, &'static str, bool) -> _ = super::serve_seamed;
+        let (call, seamed) = (future_of(call), future_of7(seamed));
+        assert!(call + std::mem::size_of::<super::super::input::Seam>() <= seamed, "serve_call {call} B, serve_seamed {seamed} B");
+    }
 }

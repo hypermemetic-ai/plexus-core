@@ -15,7 +15,7 @@
 //!
 //! | the peer sends | read as |
 //! |---|---|
-//! | a method without `cardinality` | `"many"` when it says `"streaming": true`, else `"one"` (its own declaration of how it is presented) |
+//! | a method without `cardinality` | `"many"` when it says `"streaming": true`, `"one"` when `false` (its own declaration); one that says neither is refused |
 //! | a method without `returns` | the empty schema: no type given (what `MethodSchema::new` starts at) |
 //! | a progress frame without `content` | `content` = `{message, percentage}` (the default progress type, `Note`) |
 //! | an error frame without `error` | `error` from its `error_kind` and fields, else its `code` ([`remote_error_of`]) |
@@ -27,23 +27,34 @@
 use plexus_client::{DenyReason, ParamProblem, RemoteError};
 use serde_json::{Map, Value};
 
-/// A child's schema (its JSON) with each method read into 0.8's shape.
-pub(super) fn schema(mut raw: Value) -> Value {
+/// A child's schema (its JSON) with each method read into 0.8's shape; a
+/// method that states neither `cardinality` nor `streaming` is refused,
+/// naming it (plexus-protocol's `cardinalityOf`: one rule on both sides).
+pub(super) fn schema(mut raw: Value) -> Result<Value, String> {
     if let Some(methods) = raw.get_mut("methods").and_then(Value::as_array_mut) {
         for m in methods.iter_mut().filter_map(Value::as_object_mut) {
-            method(m);
+            method(m)?;
         }
     }
-    raw
+    Ok(raw)
 }
 
-fn method(m: &mut Map<String, Value>) {
+fn method(m: &mut Map<String, Value>) -> Result<(), String> {
     if !m.contains_key("cardinality") {
-        let many = m.get("streaming").and_then(Value::as_bool).unwrap_or(false);
+        let many = match m.get("streaming") {
+            Some(Value::Bool(b)) => *b,
+            _ => {
+                let name = m.get("name").and_then(Value::as_str).unwrap_or("?");
+                return Err(format!(
+                    "its method `{name}` states neither cardinality (plexus 0.8) nor streaming (0.7.0)"
+                ));
+            }
+        };
         m.insert("cardinality".into(), Value::from(if many { "many" } else { "one" }));
     }
     m.remove("streaming");
     m.entry("returns").or_insert(Value::Object(Map::new()));
+    Ok(())
 }
 
 /// An item that did not read as 0.8: the same item in 0.8's shape, when it
@@ -155,7 +166,7 @@ mod tests {
             {"name": "echo", "streaming": true},
             {"name": "shout", "streaming": false},
             {"name": "now", "cardinality": "many", "returns": {"type": "string"}},
-        ]}));
+        ]})).unwrap();
         assert_eq!(s["methods"][0], json!({"name": "echo", "cardinality": "many", "returns": {}}));
         assert_eq!(s["methods"][1], json!({"name": "shout", "cardinality": "one", "returns": {}}));
         assert_eq!(s["methods"][2], json!({"name": "now", "cardinality": "many", "returns": {"type": "string"}}), "0.8 untouched");

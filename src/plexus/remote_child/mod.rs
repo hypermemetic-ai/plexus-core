@@ -127,7 +127,7 @@ impl std::fmt::Debug for RemoteChild {
 /// roles' grants requalified (`{ns}.m` → `<mount>.m`). A child mounting
 /// children of its own is refused, naming the method.
 fn mount_schema(name: &str, raw: Value) -> Result<PluginSchema, String> {
-    let mut schema: PluginSchema = serde_json::from_value(peer::schema(raw)).map_err(|e| format!("its schema does not read: {e}"))?;
+    let mut schema: PluginSchema = serde_json::from_value(peer::schema(raw)?).map_err(|e| format!("its schema does not read: {e}"))?;
     if let Some(m) = schema.methods.iter().find(|m| m.role != MethodRole::Rpc) {
         return Err(format!("its method `{}` is a child ({:?}): a child mounting children is not served", m.name, m.role));
     }

@@ -93,7 +93,7 @@ fn handle_not_supported_maps_to_handle_not_supported() {
     );
 }
 
-/// A hub forwarding upstream failed: an execution failure whose message is
+/// A service forwarding upstream failed: an execution failure whose message is
 /// the transport error's `Display`.
 #[test]
 fn transport_error_maps_to_execution_with_the_kinds_display() {
@@ -228,7 +228,7 @@ fn every_jsonrpc_rejection_carries_its_remote_error() {
 
 // ------------------------------------------- error frames from dispatch
 
-/// Subscribe to `plexus.call` on the hub's JSON-RPC module and return the
+/// Subscribe to `plexus.call` on the service's JSON-RPC module and return the
 /// first frame it sends.
 async fn first_call_frame(module: jsonrpsee::RpcModule<()>, method: &str) -> serde_json::Value {
     let mut params = jsonrpsee::core::params::ObjectParams::new();
@@ -290,9 +290,9 @@ async fn the_call_subscription_reports_a_routing_failure_as_a_typed_error_frame(
 /// frames arrive wrapped as data content — `call` yields
 /// `PlexusStreamItem`s and dispatch wraps every item; that predates 0.7.)
 #[tokio::test]
-async fn the_hubs_call_method_reports_a_routing_failure_as_a_typed_error_frame() {
-    let hub = DynamicHub::new("plexus").register(EchoActivation::new());
-    let stream = Activation::call(&hub, "call", json!({"method": "nope.x"}), None, None)
+async fn the_services_call_method_reports_a_routing_failure_as_a_typed_error_frame() {
+    let service = DynamicHub::new("plexus").register(EchoActivation::new());
+    let stream = Activation::call(&service, "call", json!({"method": "nope.x"}), None, None)
         .await
         .expect("plexus.call itself dispatches");
     let items: Vec<PlexusStreamItem> = stream.collect().await;
@@ -325,8 +325,8 @@ async fn the_hubs_call_method_reports_a_routing_failure_as_a_typed_error_frame()
 /// A method name with no `.` is a malformed `method` param.
 #[tokio::test]
 async fn a_method_without_a_namespace_is_a_malformed_method_param() {
-    let hub = DynamicHub::new("plexus").register(EchoActivation::new());
-    let err = match hub.route("noperiod", json!({}), None).await {
+    let service = DynamicHub::new("plexus").register(EchoActivation::new());
+    let err = match service.route("noperiod", json!({}), None).await {
         Err(e) => e,
         Ok(_) => panic!("routing `noperiod` must fail"),
     };

@@ -1008,7 +1008,7 @@ impl PluginSchema {
     /// - `self_hash` = `hash16_lines(methods[*].hash)`
     /// - `children_hash` = `hash16_lines(children[*].hash)`, `None` for a leaf
     /// - `hash` = `hash16_lines([self_hash, children_hash])`, the second only
-    ///   for a hub
+    ///   for a service
     ///
     /// Same structure and width as the `DefaultHasher` roll-up it replaces,
     /// whose output std does not promise across Rust releases.
@@ -1390,7 +1390,7 @@ impl PluginSchema {
     /// auth capabilities imply a site — service authors write nothing.
     ///
     /// RETURNS-10: filled after the hashes are computed, so the hints are
-    /// not covered by them — they come from the serving hub's
+    /// not covered by them — they come from the serving service's
     /// configuration, not the activation's code, and re-hashing on every
     /// schema response is the per-call cost the hashes are cached to avoid.
     ///
@@ -1510,30 +1510,40 @@ impl MethodSchema {
     }
 
     /// Is this the `schema` entry every activation's macro adds
-    /// ([`auto_schema`](Self::auto_schema) with the activation's grant)?
+    /// ([`auto_schema`](Self::auto_schema))?
     ///
-    /// RETURNS-36: main marked the entry by its fixed hash, `"auto_schema"`;
-    /// under RETURNS-10 its hash is its content hash, so it is known by
-    /// that: the hash `auto_schema()` sealed with this entry's grant has (or
-    /// the old marker, from a peer still sending it). One SHA-256 per grant,
-    /// remembered.
+    /// RETURNS-36: known by what every 0.8.x build writes alike, never by a
+    /// hash recomputed with this build (review #11): named `schema`, an Rpc
+    /// of one item with no error and no progress, its params `{method?}`
+    /// alone and its `returns` titled `SchemaResult` — or main's fixed
+    /// marker hash, `"auto_schema"`, from a peer still sending it. A method
+    /// an author named `schema` with other params or another return is not
+    /// it.
     pub fn is_auto_schema(&self) -> bool {
-        use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
-        static SEALED: OnceLock<Mutex<HashMap<Option<String>, String>>> = OnceLock::new();
         if self.name != "schema" || !matches!(self.role, MethodRole::Rpc) {
             return false;
         }
         if self.hash == "auto_schema" {
             return true;
         }
-        let mut sealed = SEALED.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
-        let hash = sealed.entry(self.grant.clone()).or_insert_with(|| {
-            let mut entry = Self::auto_schema();
-            entry.grant = self.grant.clone();
-            entry.content_hash()
-        });
-        *hash == self.hash
+        let params_are_method_alone = self
+            .params
+            .as_ref()
+            .and_then(|p| p.as_object())
+            .and_then(|o| o.get("properties"))
+            .and_then(|p| p.as_object())
+            .is_some_and(|props| props.len() == 1 && props.contains_key("method"));
+        let returns_schema_result = self
+            .returns
+            .as_object()
+            .and_then(|o| o.get("title"))
+            .and_then(|t| t.as_str())
+            == Some("SchemaResult");
+        self.cardinality == Cardinality::One
+            && self.error.is_none()
+            && self.progress.is_none()
+            && params_are_method_alone
+            && returns_schema_result
     }
 
     /// SYNAPSE-CC-9: reserved for BIDIR-6 — the schema of the items a client
@@ -2353,6 +2363,27 @@ mod tests {
         }
     }
 
+    /// RETURNS-36 (review #11): the `schema` entry is known by what every
+    /// 0.8.x build writes alike — not by a hash recomputed with this build,
+    /// which a peer whose plexus-core differs by a patch (a doc comment in
+    /// `SchemaResult`, say) does not share.
+    #[test]
+    fn the_schema_entry_is_known_across_patches() {
+        let ours = MethodSchema::auto_schema().with_grant("echo.schema").with_content_hash();
+        assert!(ours.is_auto_schema());
+        // Another patch's: the same entry, its `returns` documented otherwise.
+        let mut theirs = MethodSchema::auto_schema().with_grant("echo.schema");
+        let mut returns = serde_json::to_value(&theirs.returns).unwrap();
+        returns["description"] = serde_json::json!("another patch's words");
+        theirs.returns = serde_json::from_value(returns).unwrap();
+        let theirs = theirs.with_content_hash();
+        assert_ne!(theirs.hash, ours.hash);
+        assert!(theirs.is_auto_schema(), "a 0.8.x peer's schema entry, another patch");
+        // A method named `schema` that is not the entry: other params.
+        let user = MethodSchema::new("schema", "mine", "").with_params(schema_for!(String)).with_content_hash();
+        assert!(!user.is_auto_schema());
+    }
+
     #[test]
     fn returns10_rollup_is_sha256_of_the_hashes_one_per_line() {
         let a = MethodSchema::new("a", "", "aaaaaaaaaaaaaaaa");
@@ -2363,16 +2394,16 @@ mod tests {
         assert_eq!(leaf.children_hash, None);
 
         let kid = ChildSummary { namespace: "k".into(), description: "".into(), hash: "cccccccccccccccc".into() };
-        let hub = PluginSchema::hub("p", "1", "", vec![a, b], vec![kid]);
-        assert_eq!(hub.self_hash, leaf.self_hash, "children don't touch self_hash");
+        let service = PluginSchema::hub("p", "1", "", vec![a, b], vec![kid]);
+        assert_eq!(service.self_hash, leaf.self_hash, "children don't touch self_hash");
         let children_hash = hash16(b"cccccccccccccccc\n");
-        assert_eq!(hub.children_hash.as_deref(), Some(children_hash.as_str()));
-        assert_eq!(hub.hash, hash16(format!("{}\n{}\n", hub.self_hash, children_hash).as_bytes()));
+        assert_eq!(service.children_hash.as_deref(), Some(children_hash.as_str()));
+        assert_eq!(service.hash, hash16(format!("{}\n{}\n", service.self_hash, children_hash).as_bytes()));
         // Pinned (computed independently with Python's hashlib): the roll-up
         // is a wire contract — synapse-cc locks compare it across machines —
         // so its bytes may not drift.
         assert_eq!(
-            (leaf.self_hash.as_str(), leaf.hash.as_str(), hub.hash.as_str()),
+            (leaf.self_hash.as_str(), leaf.hash.as_str(), service.hash.as_str()),
             ("4140cd727c96fc78", "03a069b51ff1b744", "22db23bea1fbad28")
         );
         assert_eq!(children_hash, "f631be22675d9426");

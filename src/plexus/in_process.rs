@@ -16,13 +16,13 @@
 //! # The error layers, preserved
 //!
 //! The transports are meant to be interchangeable, which means they must
-//! agree on *which layer* a failure belongs to — and over the wire a hub
+//! agree on *which layer* a failure belongs to — and over the wire a service
 //! answers a call it cannot dispatch with a typed error frame, not a broken
 //! connection (RETURNS-9):
 //!
 //! | Failure | Becomes | Why |
 //! |---|---|---|
-//! | [`Activation::call`] returns `Err(PlexusError)` | one error frame: `RemoteError::from(&e)`, provenance the activation, not recoverable, no `done` | what a hub's `call` route sends for the same failure — unknown method, missing or malformed param, scope gate denied — so a client sees `ClientError::Remote(RemoteError)` in-process exactly as it would over a socket |
+//! | [`Activation::call`] returns `Err(PlexusError)` | one error frame: `RemoteError::from(&e)`, provenance the activation, not recoverable, no `done` | what a service's `call` route sends for the same failure — unknown method, missing or malformed param, scope gate denied — so a client sees `ClientError::Remote(RemoteError)` in-process exactly as it would over a socket |
 //! | the stream contains a [`PlexusStreamItem::Error`] | that frame | the activation answered, and the answer is an error. |
 //! | the [`MethodRef`]'s namespace is not this activation's | a `TransportError` (protocol) | nothing was dispatched: the client was wired to the wrong transport, which no server would answer for. |
 //!
@@ -174,7 +174,7 @@ impl<A: Activation> Transport for InProcessTransport<A> {
                     // here, including any in-band `error` item.
                     Ok(stream) => stream.map(|item| Ok(to_client_item(item))).left_stream(),
                     // `call` failed: the call failed, typed — one error
-                    // frame, as a hub's `call` route sends it (no `done`).
+                    // frame, as a service's `call` route sends it (no `done`).
                     Err(e) => futures::stream::once(async move {
                         Ok(to_client_item(PlexusStreamItem::from_plexus_error(
                             super::types::StreamMetadata::new(

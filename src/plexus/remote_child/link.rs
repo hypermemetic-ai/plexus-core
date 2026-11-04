@@ -65,14 +65,7 @@ fn refused(name: &str, e: &Value) -> PlexusStreamItem {
     let error = e
         .get("data")
         .and_then(|d| serde_json::from_value::<RemoteError>(d.clone()).ok())
-        .unwrap_or_else(|| match e.get("code").and_then(Value::as_i64) {
-            Some(-32602) => RemoteError::InvalidParams {
-                param: None,
-                problem: plexus_client::ParamProblem::Malformed { detail: message.clone() },
-            },
-            Some(-32001) => RemoteError::Unauthenticated,
-            _ => RemoteError::Execution { message: message.clone() },
-        });
+        .unwrap_or_else(|| super::peer::remote_error_of_code(e.get("code").and_then(Value::as_i64).unwrap_or(-32000), &message));
     let fields = crate::plexus::types::spec_fields(&error);
     PlexusStreamItem::Error { metadata: meta(name), message, code, recoverable: false, error, fields }
 }
@@ -356,11 +349,23 @@ impl Conn {
         let item = match parsed {
             Ok(item) => item,
             Err(e) => {
-                // An item kind this service does not know (spec/03: a reader
-                // skips it) — or one that does not read at all.
                 let kind = serde_json::from_str::<Kind<'_>>(raw.get()).map(|k| k.kind.into_owned()).unwrap_or_default();
-                tracing::debug!(target: "plexus::child", child = %self.name, subscription = %key, %kind, "an item kind not relayed: {e}");
-                return;
+                if kind != "error" {
+                    // An item kind this service does not know (spec/03: a
+                    // reader skips it) — or one that does not read at all.
+                    tracing::debug!(target: "plexus::child", child = %self.name, subscription = %key, %kind, "an item kind not relayed: {e}");
+                    return;
+                }
+                // RETURNS-36 (review #4): an error item is the call's end
+                // (spec/03); skipped, the call would wait for an end that
+                // never comes. It ends here, naming what could not be read,
+                // and the child is told to stop.
+                tracing::warn!(target: "plexus::child", child = %self.name, subscription = %key, "an error item not read: {e}");
+                self.unsubscribe(&key);
+                let error = plexus_client::RemoteError::Execution {
+                    message: format!("child {} sent an error item this service could not read: {e}", self.name),
+                };
+                PlexusStreamItem::error(meta(&self.name), error, false)
             }
         };
         if matches!(item, PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. }) {

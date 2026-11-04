@@ -6,7 +6,7 @@
 //! client's calls land in `Activation::call` and come back as typed items.
 //!
 //! RETURNS-9: a dispatch that fails (`Activation::call` returning `Err`) is a
-//! typed error frame here, as it is from a hub's `call` route — so the
+//! typed error frame here, as it is from a service's `call` route — so the
 //! client sees `ClientError::Remote(RemoteError)` in-process exactly as it
 //! would over a socket.
 
@@ -145,7 +145,7 @@ async fn an_activation_error_variant_arrives_as_data() {
 
 /// `Activation::call` returning `Err` is the call failing, typed: one error
 /// frame carrying `RemoteError::from(&e)` — provenance the activation, not
-/// recoverable, no `done` — as a hub's `call` route sends it.
+/// recoverable, no `done` — as a service's `call` route sends it.
 #[tokio::test]
 async fn a_failed_dispatch_is_a_typed_error_frame() {
     let transport = InProcessTransport::new(NotesActivation::default());

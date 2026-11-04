@@ -127,7 +127,7 @@ impl std::fmt::Debug for RemoteChild {
 /// roles' grants requalified (`{ns}.m` → `<mount>.m`). A child mounting
 /// children of its own is refused, naming the method.
 fn mount_schema(name: &str, raw: Value) -> Result<PluginSchema, String> {
-    let mut schema: PluginSchema = serde_json::from_value(peer::schema(raw)).map_err(|e| format!("its schema does not read: {e}"))?;
+    let mut schema: PluginSchema = serde_json::from_value(peer::schema(raw)?).map_err(|e| format!("its schema does not read: {e}"))?;
     if let Some(m) = schema.methods.iter().find(|m| m.role != MethodRole::Rpc) {
         return Err(format!("its method `{}` is a child ({:?}): a child mounting children is not served", m.name, m.role));
     }
@@ -462,6 +462,16 @@ mod tests {
 
     fn m(name: &str) -> Value {
         json!({ "name": name, "description": "", "hash": "x", "streaming": false, "bidirectional": false })
+    }
+
+    /// RETURNS-36 (review #6): no guessing — a method that states neither
+    /// `cardinality` (0.8) nor `streaming` (0.7.0) is refused, naming it, as
+    /// plexus-protocol's `cardinalityOf` refuses it.
+    #[test]
+    fn a_method_stating_neither_cardinality_nor_streaming_is_refused() {
+        let silent = json!({ "name": "quiet", "description": "", "hash": "x" });
+        let e = mount_schema("echo", raw(json!([m("echo"), silent]), json!({}))).unwrap_err();
+        assert!(e.contains("`quiet`") && e.contains("neither cardinality"), "{e}");
     }
 
     #[test]

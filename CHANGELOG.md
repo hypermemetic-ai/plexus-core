@@ -5,7 +5,18 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0]
+
+### Breaking (TRANSPORT-23: no rmcp in plexus-core)
+
+| Change | Before | After | What to do |
+|---|---|---|---|
+| `plexus_core::mcp_bridge`, `plexus_core::PlexusMcpBridge` | public, on rmcp 0.12 | removed | Use `plexus-transport` with feature `mcp`: `with_mcp`, or `ActivationMcpBridge` for an rmcp `ServerHandler` |
+
+### Removed (TRANSPORT-23)
+
+- The `rmcp` dependency. plexus-core no longer compiles an MCP stack, and
+  `scripts/check-rmcp.sh`, run by `cargo test`, keeps it out.
 
 BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
 
@@ -68,9 +79,9 @@ BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
   - **One view**: the IR is built from one snapshot of the caller's view (the service's schema and each activation's from it; a static child's as its activation answers it), never re-checking the gate as it goes; under the R-5 scope gate only the schemas the caller is answered, decided for the namespaces asked alone and written to no audit sink — the `ir` call is audited once.
   - **Kept**: by the view's hash, the roots and — under the scope gate — the namespaces the caller is answered; least recently used out (O(log n)), at most `IR_CACHE_ENTRIES` (128) slots — those being built among them — and `IR_CACHE_BYTES` (64 MiB) of answers, never cleared whole. One build per key at a time: later askers wait for it, and when the asker building it goes, the next takes the build over. An ask with no room (every slot being built) builds without keeping; a slot whose every asker has gone before it was built is removed; a slot being built is never evicted; an answer past the byte bound and a refusal are never kept. The build runs on `spawn_blocking`. `DynamicHub::ir_builds()` counts builds.
 
-### [0.8.0] — unreleased (RETURNS-36: precise returns over main)
+### RETURNS-36: precise returns over main
 
-returns/0.7 (RETURNS-1) merged with main. Publish nothing until RETURNS-29.
+returns/0.7 (RETURNS-1) merged with main.
 
 #### Breaking
 

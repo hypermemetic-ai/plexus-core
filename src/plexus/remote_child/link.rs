@@ -89,7 +89,15 @@ pub(super) enum OpenFail {
 
 struct Opening {
     reply: oneshot::Sender<Result<SubKey, OpenFail>>,
-    items: mpsc::Sender<PlexusStreamItem>,
+    items: Sub,
+}
+
+/// An open call's items: where they go, and the method called — the
+/// `content_type` a progress item as main wrote it (none of its own) is
+/// named for (RETURNS-36, re-review #3).
+struct Sub {
+    tx: mpsc::Sender<PlexusStreamItem>,
+    method: Arc<str>,
 }
 
 /// How long after its `true` an unsubscribed call's late item is still the
@@ -100,7 +108,7 @@ const TAIL: Duration = Duration::from_millis(250);
 #[derive(Default)]
 struct Routes {
     pending: HashMap<u64, Opening>,
-    subs: HashMap<SubKey, mpsc::Sender<PlexusStreamItem>>,
+    subs: HashMap<SubKey, Sub>,
     /// Unsubscribes sent and not yet answered, and those answered within
     /// [`TAIL`]: their late items are the cancel's tail, dropped quietly
     /// (not "unasked").
@@ -218,7 +226,9 @@ impl Conn {
             if !self.alive() {
                 return Err(unavailable(&self.name, "the connection has closed"));
             }
-            r.pending.insert(id, Opening { reply, items: tx });
+            // a `{ns}.call`'s params name the method called (`echo.count`)
+            let called = params.get("method").and_then(Value::as_str).unwrap_or(method);
+            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into() } });
         }
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         match tokio::time::timeout(timeout, answer).await {
@@ -323,10 +333,10 @@ impl Conn {
     }
 
     async fn route(&self, key: SubKey, raw: &RawValue) {
-        let tx = {
+        let (tx, method) = {
             let mut r = self.routes.lock().unwrap();
             match r.subs.get(&key) {
-                Some(tx) => tx.clone(),
+                Some(sub) => (sub.tx.clone(), Arc::clone(&sub.method)),
                 None => {
                     r.expire_tails(Instant::now());
                     if !r.closing_subs.contains(&key) {
@@ -342,7 +352,7 @@ impl Conn {
         // into 0.8's shape (`peer::item`) when — only when — it does not
         // read as 0.8.
         let parsed = serde_json::from_str::<PlexusStreamItem>(raw.get()).or_else(|e| {
-            super::peer::item(raw.get(), &self.name)
+            super::peer::item(raw.get(), &method)
                 .and_then(|v| serde_json::from_value::<PlexusStreamItem>(v).ok())
                 .ok_or(e)
         });
@@ -393,7 +403,7 @@ impl Conn {
             r.abandoned.clear();
             (std::mem::take(&mut r.subs), std::mem::take(&mut r.pending))
         };
-        for (_, tx) in subs {
+        for (_, Sub { tx, .. }) in subs {
             match tx.try_send(unavailable(&self.name, why)) {
                 Err(mpsc::error::TrySendError::Full(item)) => {
                     tokio::spawn(async move {

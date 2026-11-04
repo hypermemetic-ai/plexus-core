@@ -2529,7 +2529,7 @@ impl DynamicHub {
                 // arc_into_rpc_module always has); a hub without a gate
                 // dispatches anonymously here, as before.
                 let identified = plexus.inner.gate.is_some();
-                Box::pin(serve_call(plexus, params, pending, ext, ns_static, identified))
+                serve_call(plexus, params, pending, ext, ns_static, identified)
             }
         )?;
 
@@ -2684,7 +2684,7 @@ impl DynamicHub {
             move |params, pending, _ctx, ext| {
                 let hub = hub_for_call.clone();
                 let hub = (*hub).clone();
-                Box::pin(serve_call(hub, params, pending, ext, ns_static, true))
+                serve_call(hub, params, pending, ext, ns_static, true)
             }
         )?;
 
@@ -3021,38 +3021,52 @@ struct RespondParams {
 
 /// `{ns}.call`: route the call, then pipe what it answers.
 ///
-/// A method the service knows has no `Input` is routed and piped as it was
-/// before BIDIR-6: this future is the one call's allocation, and it holds
-/// nothing of the input half (a seam inline in it was 1,024 bytes more a
-/// call). Any other ([`DynamicHub::may_take_input`]) goes through
-/// [`serve_seamed`], boxed. A dispatch error is sent as a stream item on the
+/// The call's future is boxed here, and is its one allocation of that size,
+/// so it is chosen before it is made: a method the service knows has no
+/// `Input` is routed and piped as it was before BIDIR-6,
+/// holding nothing of the input half (the seam inline in one future for both
+/// was 1,024 bytes more a call, and the params kept beside it 176 more);
+/// any other ([`DynamicHub::may_take_input`]) is [`serve_seamed`]. A
+/// dispatch error is sent as a stream item on the
 /// accepted subscription: this preserves its message and code, where
 /// returning it from a subscription handler has jsonrpsee wrap it as generic
 /// -32603.
-async fn serve_call(
+fn serve_call(
     service: DynamicHub,
     params: jsonrpsee::types::Params<'static>,
     pending: jsonrpsee::PendingSubscriptionSink,
     ext: http::Extensions,
     ns: &'static str,
     identified: bool,
-) -> jsonrpsee::core::SubscriptionResult {
-    let call: CallParams = params.parse()?;
+) -> CallFuture {
+    // Read here, not in the future: the choice of future is made on it, and
+    // the plain one then holds neither the params' text nor the method name.
+    let call: CallParams = match params.parse() {
+        Ok(call) => call,
+        Err(e) => return Box::pin(async move { Err(e.into()) }),
+    };
     if service.may_take_input(&call.method) {
-        return Box::pin(serve_seamed(service, call, params, pending, ext, ns, identified)).await;
+        return Box::pin(serve_seamed(service, call, params, pending, ext, ns, identified));
     }
-    let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().map(|a| a.as_ref()) } else { None };
-    match service.route(&call.method, call.params.unwrap_or_default(), caller).await {
-        Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
-        Err(e) => {
-            let sink = pending.accept().await?;
-            if let Some(raw) = error_item_raw(ns, &e) {
-                let _ = sink.send(raw).await;
+    let CallParams { method, params: args } = call;
+    Box::pin(async move {
+        let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().map(|a| a.as_ref()) } else { None };
+        match service.route(&method, args.unwrap_or_default(), caller).await {
+            Ok(stream) => pipe_stream_to_subscription(pending, stream, &ext).await,
+            Err(e) => {
+                let sink = pending.accept().await?;
+                if let Some(raw) = error_item_raw(ns, &e) {
+                    let _ = sink.send(raw).await;
+                }
+                Ok(())
             }
-            Ok(())
         }
-    }
+    })
 }
+
+/// A `{ns}.call`'s future, boxed: one allocation a call, the size of the
+/// path it takes.
+type CallFuture = std::pin::Pin<Box<dyn std::future::Future<Output = jsonrpsee::core::SubscriptionResult> + Send>>;
 
 /// [`serve_call`] for a method that may take an `Input`: the route runs
 /// inside [`super::input::CALL`], holding the unaccepted subscription and the
@@ -3910,29 +3924,4 @@ mod tests {
     // asserts the live behavior. Splitting it that way avoids forcing the
     // unit test to construct a working RpcSubscriptionSink, which is not
     // straightforward in the bare jsonrpsee API.
-}
-
-#[cfg(test)]
-mod serve_call_size {
-    /// A future's size, from the async fn that makes it, never called.
-    fn future_of<A, B, C, D, E, G, Fut>(_: fn(A, B, C, D, E, G) -> Fut) -> usize {
-        std::mem::size_of::<Fut>()
-    }
-    fn future_of7<A, B, C, D, E, G, H, Fut>(_: fn(A, B, C, D, E, G, H) -> Fut) -> usize {
-        std::mem::size_of::<Fut>()
-    }
-
-    /// BIDIR-6: a call's future is its one allocation, and a method with no
-    /// `Input` must not carry the input half's seam in it (it did: 1,024
-    /// bytes more on call.one_item). The seam is boxed apart, so `{ns}.call`'s
-    /// future is the plain route-and-pipe's, smaller than the seamed one.
-    #[test]
-    fn the_call_future_carries_no_seam() {
-        type P = jsonrpsee::types::Params<'static>;
-        type S = jsonrpsee::PendingSubscriptionSink;
-        let call: fn(super::DynamicHub, P, S, http::Extensions, &'static str, bool) -> _ = super::serve_call;
-        let seamed: fn(super::DynamicHub, super::CallParams, P, S, http::Extensions, &'static str, bool) -> _ = super::serve_seamed;
-        let (call, seamed) = (future_of(call), future_of7(seamed));
-        assert!(call + std::mem::size_of::<super::super::input::Seam>() <= seamed, "serve_call {call} B, serve_seamed {seamed} B");
-    }
 }

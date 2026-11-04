@@ -464,6 +464,16 @@ mod tests {
         json!({ "name": name, "description": "", "hash": "x", "streaming": false, "bidirectional": false })
     }
 
+    /// RETURNS-36 (review #6): no guessing — a method that states neither
+    /// `cardinality` (0.8) nor `streaming` (0.7.0) is refused, naming it, as
+    /// plexus-protocol's `cardinalityOf` refuses it.
+    #[test]
+    fn a_method_stating_neither_cardinality_nor_streaming_is_refused() {
+        let silent = json!({ "name": "quiet", "description": "", "hash": "x" });
+        let e = mount_schema("echo", raw(json!([m("echo"), silent]), json!({}))).unwrap_err();
+        assert!(e.contains("`quiet`") && e.contains("neither cardinality"), "{e}");
+    }
+
     #[test]
     fn the_mount_name_wins_and_roles_are_requalified() {
         let s = mount_schema("echo", raw(json!([m("echo"), m("shout")]), json!({ "viewer": ["stub.echo"], "editor": ["stub.echo", "stub.shout"] }))).unwrap();

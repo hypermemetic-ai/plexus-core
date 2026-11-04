@@ -26,6 +26,7 @@ pub struct TypeSource {
 pub enum IrBuildError {
     /// Two different shapes carry one name in one namespace (RETURNS-13):
     /// a conflict the activation's author resolves; the IR never picks one.
+    /// Only [`build_one`] fails so; [`build`]'s walk refuses that activation.
     TitleCollision { namespace: String, title: String, first: TypeSource, second: TypeSource },
     /// A walk's root no schema was given for.
     MissingSchema { path: Vec<String> },
@@ -72,9 +73,11 @@ pub fn build_one(backend: &str, path: &[String], schema: &Value) -> Result<Ir, I
 /// What synapse's walk builds from each of `roots`, every schema it would
 /// fetch given by path (the root at `[]`): a node's IR from its schema and
 /// its children's (in its `children` order; a child with no schema, or one
-/// synapse could not read, skipped as a walk skips a failed fetch), each
+/// synapse could not read, skipped as a walk skips a failed fetch; one whose
+/// schemas put two shapes under one title refused, not the walk), each
 /// root's merged left to right, then made whole (synapse's
-/// `buildIRFromSchemas`).
+/// `buildIRFromSchemas`). Only a root with no schema, or one that cannot be
+/// read, fails.
 pub fn build(backend: &str, roots: &[Vec<String>], schemas: &BTreeMap<Vec<String>, Value>) -> Result<Ir, IrBuildError> {
     let mut irs = Vec::new();
     for root in roots {
@@ -95,7 +98,35 @@ fn walk(path: &[String], schema: &PluginIn<'_>, schemas: &BTreeMap<Vec<String>, 
         let Ok(parsed) = schema::plugin(v) else { continue };
         child_irs.push(walk(&child, &parsed, schemas)?);
     }
-    plugin_ir(path, schema, child_irs)
+    Ok(plugin_ir_refusing(path, schema, child_irs))
+}
+
+/// synapse's `pluginIRRefusing` (RETURNS-36 review #9): one node as the
+/// walk builds it. A plugin whose schemas put two shapes under one title is
+/// refused, not the walk: its methods and types are left out, a `title`
+/// refusal at its namespace names both sites, and its children are built
+/// as ever.
+fn plugin_ir_refusing(path: &[String], schema: &PluginIn<'_>, child_irs: Vec<Ir>) -> Ir {
+    match plugin_ir(path, schema, child_irs.clone()) {
+        Ok(ir) => ir,
+        Err(err) => {
+            let bare_schema = PluginIn {
+                hash: schema.hash.clone(),
+                methods: Vec::new(),
+                children: schema.children.clone(),
+                request: schema.request,
+                roles: schema.roles.clone(),
+            };
+            let mut bare = plugin_ir(path, &bare_schema, child_irs).unwrap_or_else(|_| Ir::empty());
+            let rendered = err.to_string();
+            let why = rendered.strip_prefix("IR: ").unwrap_or(&rendered);
+            bare.refusals.insert(
+                0,
+                Refusal { site: path.join("."), keyword: "title".into(), variant: None, detail: format!("{why} The activation is left out.") },
+            );
+            bare
+        }
+    }
 }
 
 /// synapse's `mergeIR`: left-biased.

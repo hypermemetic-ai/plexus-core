@@ -52,22 +52,11 @@ impl JsonSchema for ServiceIr {
     }
 }
 
-/// Where a type was read: a method, and which of its schemas (`params`,
-/// `returns`, `error`, `progress` or `input`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct IrTypeSource {
-    pub method: String,
-    pub schema: String,
-}
-
-/// Why a service writes no IR for what was asked.
+/// Why a service writes no IR for what was asked. (A title collision is no
+/// reason: the walk refuses that activation into the IR's `irRefusals`.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IrError {
-    /// Two different types are titled alike in one namespace: one title in
-    /// one namespace is one type, so its author renames one. `message` is
-    /// synapse's own words for it.
-    TitleCollision { namespace: String, title: String, first: IrTypeSource, second: IrTypeSource, message: String },
     /// A namespace asked for is not one the caller's view of the service shows.
     NotFound { namespace: String, message: String },
     /// A schema the service answered is one synapse could not read.
@@ -77,7 +66,7 @@ pub enum IrError {
 impl std::fmt::Display for IrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IrError::TitleCollision { message, .. } | IrError::NotFound { message, .. } | IrError::Unreadable { message, .. } => f.write_str(message),
+            IrError::NotFound { message, .. } | IrError::Unreadable { message, .. } => f.write_str(message),
         }
     }
 }
@@ -117,13 +106,9 @@ pub fn answer(service: &str, roots: &[Vec<String>], schemas: &BTreeMap<Vec<Strin
         Err(e) => {
             let message = e.to_string();
             Err(match e {
-                IrBuildError::TitleCollision { namespace, title, first, second } => IrError::TitleCollision {
-                    namespace,
-                    title,
-                    first: IrTypeSource { method: first.method, schema: first.schema },
-                    second: IrTypeSource { method: second.method, schema: second.schema },
-                    message,
-                },
+                // the walk refuses a title collision into the IR (synapse's
+                // pluginIRRefusing): build() never fails so
+                IrBuildError::TitleCollision { namespace, .. } => IrError::Unreadable { namespace, message },
                 IrBuildError::MissingSchema { path } => IrError::NotFound {
                     message: format!("no namespace {} in this service", if path.is_empty() { service.to_string() } else { dotted(&path) }),
                     namespace: dotted(&path),

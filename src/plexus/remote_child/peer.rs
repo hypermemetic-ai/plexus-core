@@ -24,7 +24,7 @@
 //! fills a field the peer left out. An item that reads as 0.8 is never
 //! looked at again (the relay's path stays one parse).
 
-use plexus_client::{DenyReason, ParamProblem, RemoteError};
+use plexus_client::RemoteError;
 use serde_json::{Map, Value};
 
 /// A child's schema (its JSON) with each method read into 0.8's shape; a
@@ -61,88 +61,22 @@ fn method(m: &mut Map<String, Value>) -> Result<(), String> {
 /// is a progress or an error frame missing what 0.8 adds; `None` otherwise
 /// (an item kind this service does not know is skipped, spec/03).
 pub(super) fn item(raw: &str, content_type: &str) -> Option<Value> {
-    let mut v: Value = serde_json::from_str(raw).ok()?;
+    let v: Value = serde_json::from_str(raw).ok()?;
+    // RETURNS-36: plexus-client's rule (`spec05::item`), one for the client
+    // and the seam; the seam also names the call's content type.
+    let mut v = plexus_client::spec05::item(&v)?;
     let o = v.as_object_mut()?;
-    match o.get("type").and_then(Value::as_str)? {
-        "progress" if !o.contains_key("content") => {
-            let mut note = Map::new();
-            note.insert("message".into(), o.remove("message").unwrap_or(Value::from("")));
-            if let Some(p) = o.remove("percentage") {
-                note.insert("percentage".into(), p);
-            }
-            o.insert("content".into(), Value::Object(note));
-            o.entry("content_type").or_insert(Value::from(content_type));
-        }
-        "error" if !o.contains_key("error") => {
-            let error = remote_error_of(o);
-            o.insert("error".into(), serde_json::to_value(error).ok()?);
-            o.entry("message").or_insert(Value::from(""));
-        }
-        _ => return None,
+    if o.get("type").and_then(Value::as_str) == Some("progress") {
+        o.entry("content_type").or_insert(Value::from(content_type));
     }
     Some(v)
 }
 
-/// spec/05's error fields as the typed [`RemoteError`] they say: by
-/// `error_kind` when there is one, else by `code`; what neither names is the
-/// method failing (`execution`, its `message`).
+/// spec/05's error fields as the typed [`RemoteError`] they say —
+/// plexus-client's rule (`spec05::remote_error`), one for the client and the
+/// seam.
 pub(super) fn remote_error_of(o: &Map<String, Value>) -> RemoteError {
-    let s = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-    let strings = |k: &str| -> Vec<String> {
-        o.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
-    };
-    let message = s("message");
-    let code = match o.get("code") {
-        Some(Value::String(c)) => c.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
-    };
-    match o.get("error_kind").and_then(Value::as_str).unwrap_or(code.as_str()) {
-        // spec/05: activation or method not found. RETURNS-36 (review #5).
-        "-32601" => not_found(&message),
-        "invalid_params" | "-32602" => RemoteError::InvalidParams { param: None, problem: ParamProblem::Malformed { detail: message } },
-        "unauthenticated" | "-32001" => RemoteError::Unauthenticated,
-        "forbidden" | "-32003" => RemoteError::Forbidden {
-            reason: match o.get("reason").and_then(Value::as_str) {
-                Some("missing_scope") => DenyReason::MissingScope { scope: s("scope") },
-                Some("tenant_boundary") => DenyReason::TenantBoundary,
-                Some("not_accepted") => DenyReason::NotAccepted,
-                _ => DenyReason::MissingGrant { grant: s("grant"), scope: s("scope"), roles: strings("roles"), held_on: strings("held_on") },
-            },
-        },
-        "too_many_calls" => RemoteError::TooManyCalls {
-            max: o.get("max").and_then(Value::as_u64).unwrap_or_default(),
-            child: o.get("child").and_then(Value::as_str).map(str::to_string),
-        },
-        "child_unavailable" => RemoteError::ChildUnavailable { child: s("child"), reason: s("reason") },
-        "child_timeout" => RemoteError::ChildTimeout {
-            child: s("child"),
-            timeout_ms: o.get("timeout_ms").and_then(Value::as_u64).unwrap_or_default(),
-        },
-        // RETURNS-36 (review #4): a kind this build does not know, by its
-        // `error_kind`, keeps it and its fields; with no kind at all, the
-        // method failing.
-        other if o.contains_key("error_kind") => {
-            let mut fields = o.clone();
-            fields.remove("error_kind");
-            for k in ["type", "metadata", "code", "recoverable"] {
-                fields.remove(k);
-            }
-            RemoteError::Other(plexus_client::OtherError { kind: other.to_string(), fields })
-        }
-        _ => RemoteError::Execution { message },
-    }
-}
-
-/// `-32601`'s two meanings, from spec/05's message (`Activation not found:
-/// x`, `Method not found: a.b`); a bare one is a method not found.
-fn not_found(message: &str) -> RemoteError {
-    if let Some(activation) = message.strip_prefix("Activation not found: ") {
-        return RemoteError::ActivationNotFound { activation: activation.trim().to_string() };
-    }
-    let path = message.strip_prefix("Method not found: ").unwrap_or_default().trim();
-    let (activation, method) = path.rsplit_once('.').unwrap_or(("", path));
-    RemoteError::MethodNotFound { activation: activation.to_string(), method: method.to_string() }
+    plexus_client::spec05::remote_error(o)
 }
 
 /// A JSON-RPC refusal's code read as spec/05's (`refused` in link.rs):
@@ -157,6 +91,7 @@ pub(super) fn remote_error_of_code(code: i64, message: &str) -> RemoteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plexus_client::DenyReason;
     use crate::plexus::types::PlexusStreamItem;
     use serde_json::json;
 

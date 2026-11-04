@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `rmcp` dependency. plexus-core no longer compiles an MCP stack, and
   `scripts/check-rmcp.sh`, run by `cargo test`, keeps it out.
 
+### Dependencies (PUBLISH-3)
+
+- `plexus-auth-core` 0.3 (was 0.2.2): its `CallCeiling` gained the public
+  field `max_buffered`, which plexus-core's input half reads.
+- `jsonrpsee` 0.26.1 at least (was 0.26): `plexus::input` reads
+  `PendingSubscriptionSink::subscription_id`, which 0.26.0 lacks.
+
 BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
 
 ### Added (BIDIR-17)

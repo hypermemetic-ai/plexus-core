@@ -58,7 +58,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 
 # JSON-RPC server
-jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+# plexus::input reads PendingSubscriptionSink::subscription_id, new in 0.26.1.
+jsonrpsee = { version = "0.26.1", features = ["server", "macros"] }
 
 # POLYGLOT-5: the child seam. `--child NAME=stdio:CMD` is split as a shell
 # would split it (shell-words), then run without one.
@@ -88,7 +89,7 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", fe
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.2" }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.3" }
 
 [features]
 # POLYGLOT-5: a WebSocket child is on by default (three small crates);
@@ -136,7 +137,7 @@ plexus-transport = { path = "../plexus-transport", default-features = false }
 # `src/plexus/credential_envelope.rs` can mint real `Credential<T>`
 # values. Added by AUTHZ-CRED-CORE-1B as part of wiring CRED-CORE-2's
 # deferred end-to-end ACs (#1, #2 full, #4 end-to-end, #5 end-to-end).
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.2.2", features = ["test-support", "adapters"] }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.3", features = ["test-support", "adapters"] }
 
 # PERF-6 (PLEXUS/PERF-6): the one build perf runs and releases use, PERF-1's
 # `profiles` fork built to its recommendation. Release, with LTO across every

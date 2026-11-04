@@ -57,7 +57,8 @@ use tokio::sync::{mpsc, watch};
 use super::auth::AuthContext;
 use super::context::PlexusContext;
 use super::plexus::{error_item, PlexusError};
-use super::types::{PlexusStreamItem, StreamMetadata};
+use super::types::{spec_code, spec_fields, PlexusStreamItem, StreamMetadata};
+use super::RemoteError;
 
 /// A connection, as the transport numbers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,7 +124,7 @@ impl DuplexRefusal {
         match self {
             Self::Gate(PlexusError::Forbidden { .. }) => "forbidden",
             Self::Gate(PlexusError::Unauthenticated(_)) => "unauthenticated",
-            Self::Gate(PlexusError::InvalidParams(_)) => "invalid_params",
+            Self::Gate(PlexusError::InvalidParams { .. }) => "invalid_params",
             Self::Gate(_) => "error",
             other => other.code().as_str(),
         }
@@ -177,7 +178,20 @@ impl DuplexRefusal {
         };
         let Value::Object(facts) = facts else { unreachable!("facts are an object") };
         let metadata = StreamMetadata::new(vec![ns.into()], PlexusContext::hash());
-        let item = PlexusStreamItem::typed_error(metadata, message, self.kind(), false, facts);
+        // RETURNS-36: an error item carries its typed `RemoteError`; a kind
+        // the vocabulary does not know is `Other`, its facts its fields.
+        let error = match self {
+            Self::TooManyCalls { max } => RemoteError::TooManyCalls { max: *max as u64, child: None },
+            _ => RemoteError::Other(plexus_client::OtherError { kind: self.kind().to_string(), fields: facts }),
+        };
+        let item = PlexusStreamItem::Error {
+            metadata,
+            message,
+            code: Some(spec_code(&error)),
+            recoverable: false,
+            fields: spec_fields(&error),
+            error,
+        };
         serde_json::to_value(&item).unwrap_or(Value::Null)
     }
 }

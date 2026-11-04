@@ -5,7 +5,7 @@
 //! routing every call: the method's grant (its schema's `grant`, else
 //! `<activation>.<method>`), held through a role on the scope its target
 //! resolves to (its schema's `target` param, read from the call's params),
-//! within the session's ceiling. A hub without a gate never enters this
+//! within the session's ceiling. A service without a gate never enters this
 //! module and dispatches exactly as before.
 //!
 //! # Decision table (gate set)
@@ -13,7 +13,7 @@
 //! | call | anonymous | signed in |
 //! |---|---|---|
 //! | `public` method | runs (empty reach) | runs (its reach) |
-//! | introspection: `<ns>.schema`, the hub's `hash` / `hashes` / `schema` | runs | runs |
+//! | introspection: `<ns>.schema`, the service's `hash` / `hashes` / `schema` / `ir` | runs | runs |
 //! | method with a `target`, value present | `Unauthenticated` | allowed iff a role held on a scope in the value's chain lists the grant, and every ceiling layer allows it there |
 //! | method without a target (or the target param absent / null) | `Unauthenticated` | allowed iff the grant is held anywhere (within the ceiling) |
 //! | method no schema describes (a nested child path) | `Unauthenticated` | as "without a target", grant = the dotted path |
@@ -38,7 +38,7 @@
 //! and `#[plexus_macros::method]` hands a method that declares a `reach:
 //! Reach` parameter (stripped from the schema, like `auth`) the value of
 //! [`current_reach`]. Outside a gated dispatch, [`current_reach`] is
-//! [`Reach::everywhere`] — what a hub without a gate has always meant. The
+//! [`Reach::everywhere`] — what a service without a gate has always meant. The
 //! reach is live: [`Reach::allows`] / [`Reach::current`] ask the gate again
 //! as it stands, which is how a stream checks each event (IDENTITY-37).
 
@@ -54,7 +54,7 @@ tokio::task_local! {
 }
 
 /// The reach of the call being dispatched: what the gate answered for its
-/// grant. [`Reach::everywhere`] when no gate decided this call (a hub
+/// grant. [`Reach::everywhere`] when no gate decided this call (a service
 /// without a gate, or a call that did not come through a gated dispatch).
 ///
 /// `#[plexus_macros::method]` calls this for a method that declares a
@@ -125,7 +125,7 @@ pub(crate) fn target_values(params: &Value, param: &str) -> Result<Option<Vec<St
         _ => None,
     };
     let unreadable = || {
-        PlexusError::InvalidParams(format!("`{param}` names what this call acts on: a string, or a list of strings"))
+        PlexusError::malformed_param(param, "names what this call acts on: a string, or a list of strings")
     };
     match v {
         Value::Null => Ok(None),
@@ -141,17 +141,17 @@ pub(crate) fn target_values(params: &Value, param: &str) -> Result<Option<Vec<St
 fn params_shape(params: &Value) -> Result<(), PlexusError> {
     match params {
         Value::Object(_) | Value::Null => Ok(()),
-        _ => Err(PlexusError::InvalidParams(
-            "params must be an object naming each parameter, e.g. {\"id\": \"…\"}: a gated method takes no bare value".into(),
+        _ => Err(PlexusError::invalid_params(
+            "params must be an object naming each parameter, e.g. {\"id\": \"…\"}: a gated method takes no bare value",
         )),
     }
 }
 
 /// Decide one call. `full_path` is the dotted method as dispatched;
-/// `hub_ns` the hub's own namespace.
+/// `service_ns` the service's own namespace.
 pub(crate) fn decide(
     gate: &Gate,
-    hub_ns: &str,
+    service_ns: &str,
     full_path: &str,
     info: Option<&MethodGateInfo>,
     params: &Value,
@@ -162,7 +162,7 @@ pub(crate) fn decide(
     let (ns, method) = full_path.split_once('.').unwrap_or((full_path, ""));
     let introspection = method == "schema"
         || method.ends_with(".schema")
-        || (ns == hub_ns && matches!(method, "hash" | "hashes"));
+        || (ns == service_ns && matches!(method, "hash" | "hashes" | "ir"));
     if introspection {
         return Ok(Admit::Open);
     }
@@ -196,49 +196,8 @@ pub(crate) fn decide(
     }
 }
 
-/// The wire rendering of a refusal's facts, merged into the error stream
-/// item (`{"type":"error", …}`) beside its `message` and `code`:
-/// `error_kind` always for an auth refusal, and for a missing grant its
-/// `grant`, `scope`, `roles` and `held_on`. Additive: a client that reads
-/// only `message` sees what it always saw.
-pub(crate) fn error_fields(e: &PlexusError) -> Option<serde_json::Map<String, Value>> {
-    let mut m = serde_json::Map::new();
-    match e {
-        PlexusError::Unauthenticated(_) => {
-            m.insert("error_kind".into(), "unauthenticated".into());
-        }
-        PlexusError::Forbidden { reason } => {
-            m.insert("error_kind".into(), "forbidden".into());
-            match reason {
-                AuthzDenyReason::MissingGrant { grant, scope, roles, held_on } => {
-                    m.insert("grant".into(), grant.as_str().into());
-                    m.insert("scope".into(), scope.as_str().into());
-                    m.insert("roles".into(), roles.iter().map(|r| Value::from(r.as_str())).collect());
-                    m.insert("held_on".into(), held_on.iter().map(|s| Value::from(s.as_str())).collect());
-                }
-                AuthzDenyReason::MissingScope { scope } => {
-                    m.insert("reason".into(), "missing_scope".into());
-                    m.insert("scope".into(), scope.as_str().into());
-                }
-                AuthzDenyReason::TenantBoundary => {
-                    m.insert("reason".into(), "tenant_boundary".into());
-                }
-                AuthzDenyReason::NotAccepted => {
-                    m.insert("reason".into(), "not_accepted".into());
-                }
-            }
-        }
-        // AUTH-13: params the gate (or the method) cannot read.
-        PlexusError::InvalidParams(_) => {
-            m.insert("error_kind".into(), "invalid_params".into());
-        }
-        _ => return None,
-    }
-    Some(m)
-}
-
 /// A refusal as a client reads it back from an error stream item — the
-/// typed view of [`error_fields`]' `forbidden` shape.
+/// typed view of the `forbidden` shape [`super::types::spec_fields`] writes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForbiddenItem {
     pub grant: String,

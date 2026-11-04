@@ -198,7 +198,7 @@ struct ShapesActivation;
 #[plexus_macros::activation(version = "1.0.0", description = "Every shape serde gives an event")]
 impl ShapesActivation {
     /// `n` events from `seed`.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     async fn all(&self, seed: u64, n: u64) -> impl Stream<Item = ShapeEvent> + Send + 'static {
         let minter = CredentialMinter::new_for_test(issuer());
         let mut g = Gen(seed | 1);
@@ -217,7 +217,7 @@ struct TextActivation;
 #[plexus_macros::activation(version = "1.0.0", description = "A string an item")]
 impl TextActivation {
     /// `n` strings from `seed`.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     async fn all(&self, seed: u64, n: u64) -> impl Stream<Item = String> + Send + 'static {
         let mut g = Gen(seed | 1);
         let texts: Vec<String> = (0..n).map(|_| g.text()).collect();
@@ -246,7 +246,7 @@ struct JsonActivation;
 #[plexus_macros::activation(version = "1.0.0", description = "A bare Value an item")]
 impl JsonActivation {
     /// `n` values from `seed`.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     async fn all(&self, seed: u64, n: u64) -> impl Stream<Item = Bare> + Send + 'static {
         let mut g = Gen(seed | 1);
         let values: Vec<Bare> = (0..n).map(|_| Bare(g.value(0))).collect();

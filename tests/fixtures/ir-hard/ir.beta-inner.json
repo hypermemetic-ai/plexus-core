@@ -1,0 +1,2460 @@
+{
+  "irBackend": "xsvc",
+  "irHash": null,
+  "irMetadata": null,
+  "irMethods": {
+    "alpha.inner.leaves": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "leaf page in inner",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "alpha.inner.leaves",
+      "mdGrant": "inner.leaves",
+      "mdName": "leaves",
+      "mdNamespace": "alpha.inner",
+      "mdParams": [],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Page",
+          "qnNamespace": "alpha.inner"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "alpha.inner.note": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "note b in inner",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "alpha.inner.note",
+      "mdGrant": "inner.note",
+      "mdName": "note",
+      "mdNamespace": "alpha.inner",
+      "mdParams": [],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Note",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "alpha.inner.schema": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
+      "mdError": null,
+      "mdFullPath": "alpha.inner.schema",
+      "mdGrant": "inner.schema",
+      "mdName": "schema",
+      "mdNamespace": "alpha.inner",
+      "mdParams": [
+        {
+          "pdDefault": null,
+          "pdDeprecation": null,
+          "pdDescription": "One method's schema instead of the whole activation's.",
+          "pdName": "method",
+          "pdRequired": false,
+          "pdSource": null,
+          "pdType": {
+            "contents": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            },
+            "tag": "RefOptional"
+          }
+        }
+      ],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "SchemaResult",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "alpha.inner.tree": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "tree in inner",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "alpha.inner.tree",
+      "mdGrant": "inner.tree",
+      "mdName": "tree",
+      "mdNamespace": "alpha.inner",
+      "mdParams": [],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Tree",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "beta.dotted": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "dotted",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "beta.dotted",
+      "mdGrant": "beta.dotted",
+      "mdName": "dotted",
+      "mdNamespace": "beta",
+      "mdParams": [
+        {
+          "pdDefault": null,
+          "pdDeprecation": null,
+          "pdDescription": "d",
+          "pdName": "d",
+          "pdRequired": true,
+          "pdSource": null,
+          "pdType": {
+            "contents": {
+              "qnLocalName": "Name",
+              "qnNamespace": "beta.dotted"
+            },
+            "tag": "RefNamed"
+          }
+        }
+      ],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Name",
+          "qnNamespace": "beta.dotted"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "beta.ext": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "ext",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "beta.ext",
+      "mdGrant": "beta.ext",
+      "mdName": "ext",
+      "mdNamespace": "beta",
+      "mdParams": [
+        {
+          "pdDefault": null,
+          "pdDeprecation": null,
+          "pdDescription": "e",
+          "pdName": "e",
+          "pdRequired": true,
+          "pdSource": null,
+          "pdType": {
+            "tag": "RefUnknown"
+          }
+        }
+      ],
+      "mdProgress": null,
+      "mdReturns": {
+        "tag": "RefUnknown"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "beta.nest": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "nest again",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "beta.nest",
+      "mdGrant": "beta.nest",
+      "mdName": "nest",
+      "mdNamespace": "beta",
+      "mdParams": [],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Nest",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "beta.note": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "note b",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "beta.note",
+      "mdGrant": "beta.note",
+      "mdName": "note",
+      "mdNamespace": "beta",
+      "mdParams": [],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Note",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "beta.schema": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
+      "mdError": null,
+      "mdFullPath": "beta.schema",
+      "mdGrant": "beta.schema",
+      "mdName": "schema",
+      "mdNamespace": "beta",
+      "mdParams": [
+        {
+          "pdDefault": null,
+          "pdDeprecation": null,
+          "pdDescription": "One method's schema instead of the whole activation's.",
+          "pdName": "method",
+          "pdRequired": false,
+          "pdSource": null,
+          "pdType": {
+            "contents": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            },
+            "tag": "RefOptional"
+          }
+        }
+      ],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "SchemaResult",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "beta.tree": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "tree twice",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "beta.tree",
+      "mdGrant": "beta.tree",
+      "mdName": "tree",
+      "mdNamespace": "beta",
+      "mdParams": [],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Tree",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    },
+    "beta.trees": {
+      "mdBidirResponseSchema": null,
+      "mdBidirResponseType": null,
+      "mdBidirType": null,
+      "mdCardinality": "one",
+      "mdDescription": "trees again",
+      "mdError": {
+        "contents": {
+          "qnLocalName": "Oops",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdFullPath": "beta.trees",
+      "mdGrant": "beta.trees",
+      "mdName": "trees",
+      "mdNamespace": "beta",
+      "mdParams": [],
+      "mdProgress": null,
+      "mdReturns": {
+        "contents": {
+          "qnLocalName": "Page",
+          "qnNamespace": "beta"
+        },
+        "tag": "RefNamed"
+      },
+      "mdRole": {
+        "kind": "rpc"
+      }
+    }
+  },
+  "irPluginHashes": {
+    "alpha.inner": {
+      "phiChildrenHash": "170f75c0b21362fc",
+      "phiHash": "170f75c0b21362fc",
+      "phiSelfHash": "170f75c0b21362fc"
+    },
+    "beta": {
+      "phiChildrenHash": "76026553cb976cb2",
+      "phiHash": "76026553cb976cb2",
+      "phiSelfHash": "76026553cb976cb2"
+    }
+  },
+  "irPluginRequests": null,
+  "irPlugins": {
+    "alpha.inner": [
+      "leaves",
+      "note",
+      "schema",
+      "tree"
+    ],
+    "beta": [
+      "dotted",
+      "ext",
+      "nest",
+      "note",
+      "schema",
+      "tree",
+      "trees"
+    ]
+  },
+  "irRefusals": [
+    {
+      "rfDetail": "variant 1 is not a string, as the members before it are",
+      "rfKeyword": "oneOf",
+      "rfSite": "beta.Ext",
+      "rfVariant": 1
+    }
+  ],
+  "irTypes": {
+    "alpha.inner.Page": {
+      "tdDescription": "A generic page.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "items",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "Leaf",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "next",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "Page",
+      "tdNamespace": "alpha.inner"
+    },
+    "beta.AttachmentSite": {
+      "tdDescription": "Where the credential is attached on the wire when sent on subsequent\ncalls. The framework's client-side replay machinery reads this to build\nthe outbound request.",
+      "tdKind": {
+        "keDiscriminator": "site",
+        "keVariants": [
+          {
+            "vdDescription": "HTTP header. e.g. `Authorization: <scheme><value>`.",
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "The header name (e.g. `authorization`).",
+                "fdName": "name",
+                "fdRequired": true,
+                "fdType": {
+                  "contents": {
+                    "qnLocalName": "HeaderName",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                }
+              }
+            ],
+            "vdName": "header"
+          },
+          {
+            "vdDescription": "HTTP cookie. e.g. `Cookie: plexus_session=<value>`.",
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "The cookie name (e.g. `plexus_session`).",
+                "fdName": "name",
+                "fdRequired": true,
+                "fdType": {
+                  "contents": {
+                    "qnLocalName": "CookieName",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                }
+              }
+            ],
+            "vdName": "cookie"
+          },
+          {
+            "vdDescription": "First-frame WS auth: included as a parameter to a setup method.",
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "The parameter on that setup call where the credential is passed.",
+                "fdName": "param",
+                "fdRequired": true,
+                "fdType": {
+                  "contents": {
+                    "qnLocalName": "ParamName",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                }
+              },
+              {
+                "fdDefault": null,
+                "fdDescription": "The method that the client calls first on the WS connection.",
+                "fdName": "setup_method",
+                "fdRequired": true,
+                "fdType": {
+                  "contents": {
+                    "qnLocalName": "MethodPath",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                }
+              }
+            ],
+            "vdName": "first_frame"
+          },
+          {
+            "vdDescription": "In-RPC parameter: each call receives this credential as a named\nparameter on the inbound activation. Used for backends without HTTP\ncookie/header support (e.g., pure stdio).",
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "The parameter name on every credential-requiring method.",
+                "fdName": "param",
+                "fdRequired": true,
+                "fdType": {
+                  "contents": {
+                    "qnLocalName": "ParamName",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                }
+              }
+            ],
+            "vdName": "in_rpc_param"
+          }
+        ],
+        "tag": "KindEnum"
+      },
+      "tdName": "AttachmentSite",
+      "tdNamespace": "beta"
+    },
+    "beta.AuthPosture": {
+      "tdDescription": "Declared auth-enforcement posture of the activation a method belongs to.\n\nMirrors `plexus-macros`' RED-6 `auth = \"required\" | \"optional\" | \"mixed\" |\n\"none\"` activation attribute, which until R-1/R-2 (the ROLES+AP merged\nwave) was parsed and compile-enforced but never emitted — invisible to\nevery downstream IR consumer (synapse, hub-codegen, generated clients).\n\nSemantics (compile-time enforcement lives in plexus-macros; this is the\nescaped declaration):\n\n- `Required` — every method is auth-gated (`#[from_auth]`) or explicitly\n  `public`.\n- `Optional` — no enforcement; auth may be asymmetric across methods.\n- `Mixed` — like `Optional`, but the asymmetry is explicitly acknowledged.\n- `None` — affirmatively public activation; no method takes auth.\n\n# Wire back-compat\n\nAdded in R-2 (joint AP-1). Pre-existing readers tolerate the field's\nabsence (`auth_posture` is omitted on the wire when the activation never\ndeclared a posture) and pre-existing IRs that omit the field decode\ncleanly via `#[serde(default)]` on the field site. `#[non_exhaustive]`\nreserves space for future postures without breaking downstream match arms.",
+      "tdKind": {
+        "kseValues": [
+          "required",
+          "optional",
+          "mixed",
+          "none"
+        ],
+        "tag": "KindStringEnum"
+      },
+      "tdName": "AuthPosture",
+      "tdNamespace": "beta"
+    },
+    "beta.Cardinality": {
+      "tdDescription": "How many items a method yields: exactly one, or a stream of them.\n\nRead from the method's signature (RETURNS-1 decision 2): a plain return\ntype (`-> T`, `-> Result<T, E>`) is [`Cardinality::One`]; `-> impl\nStream<Item = …>` is [`Cardinality::Many`]. A reader decides how to present\na method (a single awaited value vs. a stream) from this field alone —\nnever from the presence of a stream type or a guess at the item's shape.\n\nSerialized as `\"one\"` / `\"many\"`.",
+      "tdKind": {
+        "kseValues": [
+          "one",
+          "many"
+        ],
+        "tag": "KindStringEnum"
+      },
+      "tdName": "Cardinality",
+      "tdNamespace": "beta"
+    },
+    "beta.ChildSummary": {
+      "tdDescription": "Summary of a child plugin",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "Human-readable description",
+            "fdName": "description",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Content hash for cache invalidation",
+            "fdName": "hash",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The child's namespace",
+            "fdName": "namespace",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "ChildSummary",
+      "tdNamespace": "beta"
+    },
+    "beta.CookieName": {
+      "tdDescription": "A cookie name (e.g. `\"plexus_session\"`). RFC 6265 token-set validation.\n\nPer AUTHZ-S01-output §1. RFC 6265 defines `cookie-name = token` and `token`\nfrom RFC 7230 §3.2.6: any VCHAR except CTLs, separators, and the\ndelimiters listed in RFC 7230.",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "CookieName",
+      "tdNamespace": "beta"
+    },
+    "beta.CredentialFieldDecl": {
+      "tdDescription": "One entry per credential-bearing field in a method's return type.\n\nPinned by `AUTHZ-CRED-S01-output.md` §4 and `AUTHZ-CRED-CORE-3` §\"Required\nbehavior\". Projected onto `MethodSchema.credentials` at schema-build time\nfrom the `CredentialFieldMarker` registry the `#[derive(Credentials)]` macro\nemits per credential-bearing type (`AUTHZ-CRED-MACRO-1`).\n\n# Field path semantics (Tier B Q-IR-1)\n\n`field_path` is the JSON-object path to the credential field within the\nmethod's return type. v1 always uses object-field paths (one segment per\nfield name walked); array indices and JSON Pointer syntax are intentionally\nexcluded because credentials always live on object fields in v1, never\ninside array elements.\n\nExample: for a return type\n`struct LoginResult { session: Credential<String> }`, the field path is\n`[\"session\"]`. For a nested case\n`struct LoginResult { auth: AuthBundle }` where `AuthBundle` itself\ndeclares a `#[plexus::credential(..)]` field `token: Credential<String>`,\nthe field path is `[\"auth\", \"token\"]`.\n\n# Variant tagging\n\n`variant_tag` is `Some(tag)` when the method's return type is an enum and\nthe credential lives on a single variant. The tag matches the variant\nidentifier as the macro registry records it (e.g. `\"Issued\"` for the\n`LoginEvent::Issued` variant). `None` means the return type is a struct,\nor the credential appears on every variant of the enum (rare).\n\n# Wire back-compat\n\nAdded in `AUTHZ-CRED-CORE-3`. Pre-existing readers tolerate `credentials:\n[]` (the default on `MethodSchema` when no credentials are declared) and\npre-existing IRs that omit the field altogether decode cleanly via\n`#[serde(default)]` on the field site.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON-object path to the credential field within the method's return\ntype. One segment per field-name walk; pinned to object paths (no\narray indices, no JSON Pointer) per Tier B Q-IR-1.",
+            "fdName": "field_path",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The credential's metadata (kind, attach site, scheme, scopes, expiry,\nrefresh/revoke hints, issuer, sensitivity). Carried verbatim so\nconsumers embed identical storage-and-attach logic to the runtime.",
+            "fdName": "metadata",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "CredentialMetadata",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Variant tag when the return type is an enum and the credential lives\non a single variant. `None` for structs.",
+            "fdName": "variant_tag",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "CredentialFieldDecl",
+      "tdNamespace": "beta"
+    },
+    "beta.CredentialIssuer": {
+      "tdDescription": "Identity of the issuing party: the Origin the credential was issued from\nand the method that issued it. Drives the named-session auto-naming\nalgorithm (AUTHZ-CRED-S01-output §5) and ties the credential to its\nlineage in audit.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "Method whose return type carries this credential field.",
+            "fdName": "method",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "MethodPath",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Backend Origin that issued this credential.",
+            "fdName": "origin",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "Origin",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "CredentialIssuer",
+      "tdNamespace": "beta"
+    },
+    "beta.CredentialKind": {
+      "tdDescription": "What kind of credential this is. Tags storage decisions and drives the\nselection filter (`AUTHZ-CRED-CLI-3`). **Closed** for v1 — third crates\ncannot extend the enum; backends with bespoke schemes use the\n[`CredentialKind::Other`] escape valve.\n\nThe cost of going `Other` is loss of generic client integration — a method\nrequiring `Bearer` will not auto-attach an `Other`-kinded credential.",
+      "tdKind": {
+        "keDiscriminator": "kind",
+        "keVariants": [
+          {
+            "vdDescription": "Static or short-lived bearer token (JWT, opaque token).",
+            "vdFields": [],
+            "vdName": "bearer"
+          },
+          {
+            "vdDescription": "Cookie-shaped session credential (server may issue `Set-Cookie`).",
+            "vdFields": [],
+            "vdName": "cookie"
+          },
+          {
+            "vdDescription": "OAuth/OIDC access token (paired with refresh; `refresh_via` populated).",
+            "vdFields": [],
+            "vdName": "oauth_access"
+          },
+          {
+            "vdDescription": "OAuth/OIDC refresh token. Long-lived, used to mint new\n[`CredentialKind::OauthAccess`] credentials.",
+            "vdFields": [],
+            "vdName": "oauth_refresh"
+          },
+          {
+            "vdDescription": "OIDC ID token (informational identity assertion; not for auth).",
+            "vdFields": [],
+            "vdName": "oidc_id"
+          },
+          {
+            "vdDescription": "AWS STS credential set (composite: access_key_id + secret + token + exp).",
+            "vdFields": [],
+            "vdName": "aws_sts"
+          },
+          {
+            "vdDescription": "Macaroon-style capability token with caveats.",
+            "vdFields": [],
+            "vdName": "macaroon"
+          },
+          {
+            "vdDescription": "Custom kind, for backends with bespoke schemes; stored opaquely.",
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "Opaque name supplied by the backend.",
+                "fdName": "name",
+                "fdRequired": true,
+                "fdType": {
+                  "contents": {
+                    "qnLocalName": "CredentialKindName",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                }
+              }
+            ],
+            "vdName": "other"
+          }
+        ],
+        "tag": "KindEnum"
+      },
+      "tdName": "CredentialKind",
+      "tdNamespace": "beta"
+    },
+    "beta.CredentialKindName": {
+      "tdDescription": "Opaque kind name for `CredentialKind::Other`. The framework's\ncompatibility logic treats `Other`-kinded credentials as untagged for\nthe purposes of `requires_credential` matching (per Tier B Q-FLOW-2).",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "CredentialKindName",
+      "tdNamespace": "beta"
+    },
+    "beta.CredentialMetadata": {
+      "tdDescription": "What this credential is and how to attach it on subsequent calls.\n\nEvery metadata field is a typed newtype, never a bare string. The\n[`CredentialMetadata::sensitive`] field is always `true`; it exists on the\nstruct so the metadata is the single source of truth for the redaction\npipeline (AUTHZ-PRIVACY-1).\n\nMetadata is **fixed at mint time**: a `Credential<T>` exposes its metadata\nvia [`Credential::metadata`], but there is no mutable accessor.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "Where the credential is attached on the wire when sent on subsequent\ncalls.",
+            "fdName": "attach_as",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "AttachmentSite",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Hard expiry of the credential value, if known at issue time. Used\nfor proactive refresh and for dropping stale stored credentials.",
+            "fdName": "expires_at",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  "date-time"
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Identity of the issuing party.",
+            "fdName": "issuer",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "CredentialIssuer",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "What kind of credential this is. Tags storage decisions and drives\nselection.",
+            "fdName": "kind",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "CredentialKind",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Optional refresh hint: if this credential expires, call this method\nto obtain a fresh one. The named-session framework handles the swap;\nactivation code is uninvolved.",
+            "fdName": "refresh_via",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "MethodPath",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Optional revocation hint: calling this method invalidates the\ncredential server-side.",
+            "fdName": "revoke_via",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "MethodPath",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Optional prefix prepended to the value at attach time (e.g.,\n`\"Bearer \"` for `Authorization: Bearer <token>`). Stored in the\nmetadata so the client doesn't have to guess.",
+            "fdName": "scheme",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "CredentialScheme",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Which scopes this credential authorizes. Empty set means \"scope\ndecision is server-side; client doesn't filter.\"",
+            "fdName": "scopes",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "Scope",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Sensitivity marker for the redaction pipeline (AUTHZ-PRIVACY-1).\nAlways `true`; present for type-system uniformity so any code that\nreads the metadata has a single source of truth.",
+            "fdName": "sensitive",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "boolean",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "CredentialMetadata",
+      "tdNamespace": "beta"
+    },
+    "beta.CredentialScheme": {
+      "tdDescription": "Credential attach-time prefix, e.g. `\"Bearer \"` (trailing space\nincluded). Pinned by AUTHZ-CRED-S01-output §2.",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "CredentialScheme",
+      "tdNamespace": "beta"
+    },
+    "beta.DeprecationInfo": {
+      "tdDescription": "Structured deprecation metadata attached to a `MethodSchema`.\n\nDownstream consumers (CLI help, docs generators, IDEs) use these fields\nto surface migration guidance to users.\n\n# Example\n\n```\nuse plexus_core::DeprecationInfo;\n\nlet info = DeprecationInfo {\n    since: \"0.5\".into(),\n    removed_in: \"0.6\".into(),\n    message: \"Use `new_method` instead.\".into(),\n};\n```",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "Human-readable migration guidance.",
+            "fdName": "message",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The plexus-core version planned for removal (e.g., `\"0.6\"`).\n\nNot binding — serves as a consumer-visible hint.",
+            "fdName": "removed_in",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The plexus-core version at which deprecation began (e.g., `\"0.5\"`).",
+            "fdName": "since",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "DeprecationInfo",
+      "tdNamespace": "beta"
+    },
+    "beta.HeaderName": {
+      "tdDescription": "An HTTP header name (e.g. `\"Authorization\"`).\n\nStored normalized to lowercase so equality matches the case-insensitive\nHTTP convention. RFC 7230 §3.2 token-set validation applied to the input\nbefore normalization. Per AUTHZ-S01-output §1.",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "HeaderName",
+      "tdNamespace": "beta"
+    },
+    "beta.HttpMethod": {
+      "tdDescription": "HTTP method for REST endpoint routing",
+      "tdKind": {
+        "kseValues": [
+          "GET",
+          "POST",
+          "PUT",
+          "DELETE",
+          "PATCH"
+        ],
+        "tag": "KindStringEnum"
+      },
+      "tdName": "HttpMethod",
+      "tdNamespace": "beta"
+    },
+    "beta.Leaf": {
+      "tdDescription": "A leaf.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "v",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "integer",
+                "int64"
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "Leaf",
+      "tdNamespace": "beta"
+    },
+    "beta.MethodExample": {
+      "tdDescription": "SYNAPSE-13: one worked call of a method — the params it sends and a note\nsaying what it does (`#[plexus_macros::method(example(note = \"…\", params\n= r#\"{…}\"#))]`).",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "What the call does, in a line.",
+            "fdName": "note",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The params object, as the method takes it.",
+            "fdName": "params",
+            "fdRequired": true,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "MethodExample",
+      "tdNamespace": "beta"
+    },
+    "beta.MethodPath": {
+      "tdDescription": "A dotted method path like `auth.login` or `cone.send_message`.\n\nWire form: bare string. Validation: must match\n`^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$`. At least two segments are required\n(the activation namespace plus the method name).\n\nWildcards are NOT allowed — wildcards belong to `Scope` (AUTHZ-CORE-4).\n\nPer AUTHZ-S01-output §1.",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "MethodPath",
+      "tdNamespace": "beta"
+    },
+    "beta.MethodRole": {
+      "tdDescription": "Describes how a method participates in the activation graph.\n\nEvery method on a plugin is exactly one of three kinds:\n\n- `Rpc` — a regular RPC endpoint (the default).\n- `StaticChild` — the method returns a child activation by a static name\n  (no lookup argument). Used by `#[child]`-annotated methods on hubs.\n- `DynamicChild { .. }` — the method gates a dynamic child keyed by its\n  argument. `list_method` optionally names a sibling method that enumerates\n  available keys, and `search_method` optionally names a sibling method\n  that searches keys.\n\nThis tag is consumed by downstream tooling (synapse, synapse-cc,\nintrospection clients) to reconstruct the child graph without a separate\nside-table. Today's macros emit `MethodRole::Rpc` for every method; IR-3\npopulates child roles from `#[child]` annotations.\n\n# Wire back-compat\n\nAdded in IR-2. Serde defaults to `Rpc` for pre-IR schemas.\n`#[non_exhaustive]` reserves space for future variants without breaking\ndownstream match arms.",
+      "tdKind": {
+        "keDiscriminator": "kind",
+        "keVariants": [
+          {
+            "vdDescription": "Method is an RPC endpoint (the default for ordinary methods).",
+            "vdFields": [],
+            "vdName": "rpc"
+          },
+          {
+            "vdDescription": "Method returns a child activation by static name (no lookup arg).",
+            "vdFields": [],
+            "vdName": "static_child"
+          },
+          {
+            "vdDescription": "Method gates a dynamic child keyed by its argument.",
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "Optional sibling method that lists available keys.",
+                "fdName": "list_method",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": [
+                      "string",
+                      null
+                    ],
+                    "tag": "RefPrimitive"
+                  },
+                  "tag": "RefOptional"
+                }
+              },
+              {
+                "fdDefault": null,
+                "fdDescription": "Optional sibling method that searches available keys.",
+                "fdName": "search_method",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": [
+                      "string",
+                      null
+                    ],
+                    "tag": "RefPrimitive"
+                  },
+                  "tag": "RefOptional"
+                }
+              }
+            ],
+            "vdName": "dynamic_child"
+          }
+        ],
+        "tag": "KindEnum"
+      },
+      "tdName": "MethodRole",
+      "tdNamespace": "beta"
+    },
+    "beta.MethodSchema": {
+      "tdDescription": "Schema for a single method exposed by a plugin",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "BIDIR-8: who may answer a question this method asks mid-call\n(`#[method(answer_by = \"person\" | \"grant:<g>\")]`; BIDIR-1\n`answerer`). Absent for the default, `caller` — the call's own\nconnection — so a method without the attribute is byte-identical.",
+            "fdName": "answer_by",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Declared auth posture of the activation this method belongs to.\n\nPopulated by `#[plexus_macros::activation(auth = \"...\")]` (R-1) —\nstamped onto every RPC method of the activation. `None` means the\nactivation never declared a posture (pre-R-1 emissions and\nposture-silent activations are byte-identical on the wire).\n\nAdded in R-2 (joint AP-1). Defaults to `None` via `#[serde(default)]`\nso pre-R IRs decode cleanly; `skip_serializing_if` keeps the wire\nshape unchanged when unset.",
+            "fdName": "auth_posture",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "AuthPosture",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": false,
+            "fdDescription": "Whether this method supports bidirectional communication\n\nWhen true, the server can send requests to the client during method execution\nand wait for responses (e.g., confirmations, prompts, selections).",
+            "fdName": "bidirectional",
+            "fdRequired": false,
+            "fdType": {
+              "contents": [
+                "boolean",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Whether the method yields one item or many — `\"one\"` / `\"many\"`.\n\nRequired on the wire: a schema that does not state its cardinality is\nnot a 0.7 schema, and guessing would reintroduce the disagreement this\nfield exists to end.",
+            "fdName": "cardinality",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "Cardinality",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Credential-bearing fields in this method's return type.\n\nOne entry per `#[plexus::credential(...)]`-annotated field on the\nreturn-type struct/enum, in stable declaration order. Empty when\nthe return type contains no credentials.\n\nAdded in `AUTHZ-CRED-CORE-3`. Defaults to an empty vec via\n`#[serde(default)]` so pre-IR schemas deserialize cleanly. The\n`skip_serializing_if = \"Vec::is_empty\"` clause keeps the wire JSON\nshape unchanged for methods with no credential-bearing fields\n(back-compat per the ticket's \"Wire-format back-compat\" table).\n\nPopulated at schema-build time from the `CredentialFieldMarker`\nregistry emitted by `#[derive(Credentials)]` (`AUTHZ-CRED-MACRO-1`).",
+            "fdName": "credentials",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "CredentialFieldDecl",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "If set, this method is deprecated.\n\nAdded in IR-2. Defaults to `None` via `#[serde(default)]` so pre-IR\nschemas deserialize cleanly.\n\nPopulated by the `#[deprecated(...)]` attribute on the underlying\nmethod (IR-5).",
+            "fdName": "deprecation",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "DeprecationInfo",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Human-readable description of what this method does",
+            "fdName": "description",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON Schema for the method's error type `E` — what the activation says\nwhen it says no (`-> Result<T, E>`). Absent from the wire when the\nmethod is infallible.",
+            "fdName": "error",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "SYNAPSE-13: worked calls of this method, each its params object and a\nnote saying what it does — OpenAPI's `examples`. A client renders them\nas command lines (`synapse … --id MENGER-40 --status Coding`).\n\nOptional on the wire (`serde(default)`, skipped when empty).",
+            "fdName": "examples",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "MethodExample",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "AUTH-3: the grant this method is — `<activation>.<method>`, inherent\n(AUTH-1: \"every method should be its own grant\"). The macro emits it\nfor every method; `None` only on a hand-built or pre-AUTH schema, and\na gate then takes the method's dotted path.\n\nOptional on the wire (`serde(default)`, skipped when unset) so older\nschemas and clients parse unchanged.",
+            "fdName": "grant",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "SYNAPSE-13: the method's group in a listing (`\"read\"`, `\"write\"`, …)\n— one group, like an OpenAPI operation's first tag. Clients list the\nmethods of a group together and alphabetically within it.\n\nOptional on the wire (`serde(default)`, skipped when unset) so older\nschemas and clients parse unchanged.",
+            "fdName": "group",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Content hash of this method's schema (for cache invalidation): 16\nlowercase hex, SHA-256 of every other field as canonical JSON, so it\nchanges whenever anything a client is generated from changes",
+            "fdName": "hash",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "AUTH-4: in a caller's view of a gated hub, where the caller holds this\nmethod's grant (`[\"MENGER\"]`, `[\"*\"]`), within its session's ceiling.\nAbsent outside a caller's view (and on a public method the caller\nholds nowhere).",
+            "fdName": "held_on",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "contents": [
+                    "string",
+                    null
+                  ],
+                  "tag": "RefPrimitive"
+                },
+                "tag": "RefArray"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": "POST",
+            "fdDescription": "HTTP method for REST endpoints (GET, POST, PUT, DELETE, PATCH)\n\nThis field is used by the HTTP gateway to determine which HTTP method\nto use when exposing this method as a REST endpoint. Defaults to POST\nfor backward compatibility.\n\n- GET: Idempotent read operations (no side effects)\n- POST: Create operations or non-idempotent actions (default)\n- PUT: Replace/update operations (idempotent)\n- DELETE: Remove operations (idempotent)\n- PATCH: Partial update operations",
+            "fdName": "http_method",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "HttpMethod",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "SYNAPSE-CC-9: reserved for BIDIR-6 — the JSON Schema of the items a\nclient streams *in* to this method (`Input<T>`). Always `None` until\nBIDIR-6 fills it; absent from the wire while `None`, so a schema\nwithout it is byte-identical to 0.6.1's.",
+            "fdName": "input",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "AUTH-3: the method's `///` doc comment, when it says more than\n`description` (the macro used to drop it whenever `description =\n\"...\"` was given).",
+            "fdName": "long_description",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Method name (e.g., \"echo\", \"check\")",
+            "fdName": "name",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON Schema for the method's parameters (None if no params)",
+            "fdName": "params",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Per-parameter metadata (currently just deprecation).\n\nAdded in IR-5. Defaults to an empty vec via `#[serde(default)]` so\npre-IR schemas deserialize cleanly. Only parameters that carry\nmetadata appear in this list — absence means \"no metadata\" for that\nparameter, not a bug.\n\nPopulated by the `#[deprecated(...)]` attribute on individual\nparameters (IR-5).",
+            "fdName": "params_meta",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "ParamSchema",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON Schema for the method's progress type `P` (an item of\n`Progress<T, P>`), carried by progress frames. Absent from the wire\nwhen the method reports no progress.",
+            "fdName": "progress",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Whether this method is explicitly public — exempt from the\ndefault-deny gate (AUTHZ-CORE-2's `#[plexus::method(public)]`).\n\n`public` and a populated `requires_credential` are mutually exclusive\nby construction: the macro rejects `public` + `scope = \"...\"` at\ncompile time.\n\nAdded in R-2. Defaults to `false` via `#[serde(default)]` so pre-R\nIRs decode cleanly; `skip_serializing_if` keeps the wire shape\nunchanged for non-public methods (i.e., every pre-R method).",
+            "fdName": "public",
+            "fdRequired": false,
+            "fdType": {
+              "contents": [
+                "boolean",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON Schema for the request type sent from server to client\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nrequests the server may send during method execution.",
+            "fdName": "request_type",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "What credential this method requires on input (if any).\n\nDerived implicitly from the method's scope tagging and the\ncredential-graph linkage at schema-build time (per\n`AUTHZ-CRED-CORE-3` §\"Implicit derivation\"):\n\n- `scope = \"...\"` → `RequiredCredential::from_method_scope(scope)`.\n- `public` method → `None` (the absence of this field).\n- target of `refresh_via`/`revoke_via` of another credential →\n  `RequiredCredential::from_refresh_revoke_target(kind, scopes)`.\n\nAdded in `AUTHZ-CRED-CORE-3`. Defaults to `None` via\n`#[serde(default)]` so pre-IR schemas deserialize cleanly. The\n`skip_serializing_if = \"Option::is_none\"` clause keeps the wire JSON\nshape unchanged for public methods and methods with no scope-derived\nrequirement.",
+            "fdName": "requires_credential",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "RequiredCredential",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON Schema for the response type sent from client to server\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nresponses the client should send in reply to server requests.",
+            "fdName": "response_type",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON Schema for the method's item type `T` — what one success carries.\n\nAlways present: every method has a return type. For a `Result<T, E>`\nor `Progress<T, P>` item it is `T` alone — `E` and `P` have fields of\ntheir own. [`MethodSchema::new`] starts it at the empty schema `{}`\n(any value) until [`MethodSchema::with_returns`] sets it.",
+            "fdName": "returns",
+            "fdRequired": true,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": {
+              "kind": "rpc"
+            },
+            "fdDescription": "How this method participates in the activation graph.\n\nAdded in IR-2. Defaults to `MethodRole::Rpc` via `#[serde(default)]`\nso pre-IR schemas deserialize cleanly.\n\nPopulated by the `#[plexus::method]` / `#[child]` macros (IR-3).",
+            "fdName": "role",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "MethodRole",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "AUTH-3: the param that locates what this call acts on\n(`#[plexus_macros::method(target = \"id\")]`). A gate resolves its\nvalue to the scopes it lives in and asks for the grant there; a\nmethod without one is allowed where the grant is held anywhere and\nanswers only from there.",
+            "fdName": "target",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "MethodSchema",
+      "tdNamespace": "beta"
+    },
+    "beta.Nest": {
+      "tdDescription": "Nests.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "a",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "contents": {
+                    "contents": {
+                      "contents": {
+                        "contents": [
+                          "integer",
+                          "uint8"
+                        ],
+                        "tag": "RefPrimitive"
+                      },
+                      "tag": "RefArray"
+                    },
+                    "tag": "RefMap"
+                  },
+                  "tag": "RefOptional"
+                },
+                "tag": "RefArray"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "b",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "contents": {
+                    "qnLocalName": "Leaf",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                },
+                "tag": "RefOptional"
+              },
+              "tag": "RefMap"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "c",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "contents": {
+                    "qnLocalName": "Leaf",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                },
+                "tag": "RefArray"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "d",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                {
+                  "contents": [
+                    "integer",
+                    "uint32"
+                  ],
+                  "tag": "RefPrimitive"
+                },
+                {
+                  "contents": [
+                    "string",
+                    null
+                  ],
+                  "tag": "RefPrimitive"
+                },
+                {
+                  "contents": {
+                    "contents": {
+                      "qnLocalName": "Leaf",
+                      "qnNamespace": "beta"
+                    },
+                    "tag": "RefNamed"
+                  },
+                  "tag": "RefOptional"
+                }
+              ],
+              "tag": "RefTuple"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "e",
+            "fdRequired": true,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "f",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "g",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "Shout",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "i",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                {
+                  "contents": [
+                    "string",
+                    null
+                  ],
+                  "tag": "RefPrimitive"
+                },
+                {
+                  "maxLength": 1,
+                  "minLength": 1
+                }
+              ],
+              "tag": "RefRefined"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "j",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "number",
+                "float"
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "k",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "integer",
+                "uint128"
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "l",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "null",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "m",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  {
+                    "contents": [
+                      "string",
+                      null
+                    ],
+                    "tag": "RefPrimitive"
+                  },
+                  {
+                    "contents": [
+                      "integer",
+                      "int8"
+                    ],
+                    "tag": "RefPrimitive"
+                  }
+                ],
+                "tag": "RefTuple"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "n",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "o",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "boolean",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "p",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "Name",
+                "qnNamespace": "beta.dotted"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "q",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                {
+                  "contents": {
+                    "contents": [
+                      "integer",
+                      "uint8"
+                    ],
+                    "tag": "RefPrimitive"
+                  },
+                  "tag": "RefArray"
+                },
+                {
+                  "maxItems": 4,
+                  "minItems": 4
+                }
+              ],
+              "tag": "RefRefined"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "r",
+            "fdRequired": true,
+            "fdType": {
+              "tag": "RefUnknown"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Unicode — “quoted” é ü 中文 \\u{2028} and a tab\\t here.",
+            "fdName": "t",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "v",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "integer",
+                "int64"
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "with space",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "Nest",
+      "tdNamespace": "beta"
+    },
+    "beta.Note": {
+      "tdDescription": "The note, as beta writes it — a different doc, the same shape.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "beta's text doc",
+            "fdName": "text",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "Note",
+      "tdNamespace": "beta"
+    },
+    "beta.Oops": {
+      "tdDescription": null,
+      "tdKind": {
+        "keDiscriminator": "type",
+        "keVariants": [
+          {
+            "vdDescription": null,
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": null,
+                "fdName": "why",
+                "fdRequired": true,
+                "fdType": {
+                  "contents": [
+                    "string",
+                    null
+                  ],
+                  "tag": "RefPrimitive"
+                }
+              }
+            ],
+            "vdName": "bad"
+          }
+        ],
+        "tag": "KindEnum"
+      },
+      "tdName": "Oops",
+      "tdNamespace": "beta"
+    },
+    "beta.Origin": {
+      "tdDescription": "Backend Origin identifier (typically a URL like `ws://localhost:4444`).\nLocal stub for the canonical `Origin` newtype pinned by\nCLIENTS-S01-output §1. NOTE: the workspace also has an unrelated\n`plexus_core::types::Origin` (plugin-id + method, not URL-shaped); the\nAUTHZ-CRED design uses the URL-shaped Origin from CLIENTS-S01.",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "Origin",
+      "tdNamespace": "beta"
+    },
+    "beta.Page": {
+      "tdDescription": "A generic page.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "items",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "Tree",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "next",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "Page",
+      "tdNamespace": "beta"
+    },
+    "beta.ParamName": {
+      "tdDescription": "Parameter name for in-RPC-parameter and first-frame attachment sites.",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "ParamName",
+      "tdNamespace": "beta"
+    },
+    "beta.ParamSchema": {
+      "tdDescription": "Per-parameter metadata for a method's parameters.\n\n`MethodSchema.params` already carries the fine-grained JSON Schema for the\ncombined parameter object. `ParamSchema` carries orthogonal, parameter-\nscoped metadata that doesn't fit on a JSON Schema node — currently just\ndeprecation info (IR-5).\n\nThe `name` field matches the parameter identifier in the method signature\nso consumers can correlate entries against the `params` JSON Schema's\n`properties` map.\n\nAdded in IR-5. Defaults to an empty list on `MethodSchema` so pre-IR\nschemas deserialize cleanly.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "If set, this parameter is deprecated.\n\nPopulated by `#[deprecated(...)]` (+ optional\n`#[plexus_macros::removed_in(\"...\")]`) on the parameter in the\nmethod signature (IR-5).",
+            "fdName": "deprecation",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "DeprecationInfo",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Parameter name, matching the identifier in the method signature.",
+            "fdName": "name",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "ParamSchema",
+      "tdNamespace": "beta"
+    },
+    "beta.PluginSchema": {
+      "tdDescription": "A plugin's schema with methods and child summaries.\n\nChildren are represented as summaries (namespace, description, hash) rather\nthan full recursive schemas. This enables lazy traversal - clients can fetch\nchild schemas individually via `{namespace}.schema`.\n\n- Leaf plugins have `children = None`\n- Hub plugins have `children = Some([ChildSummary, ...])`",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "Child plugin summaries (None = leaf plugin, Some = hub plugin)\n\n# Deprecated (IR-4)\n\nThis side-table is deterministically derived from the method list's\n`MethodRole` tags (one `ChildSummary` per non-`Rpc` method). It stays\non the wire for back-compat during the 0.5 transition window and is\nslated for removal in 0.6.\n\nConsumers reading child metadata should switch to iterating\n`methods` and filtering by `role != MethodRole::Rpc`. The name field\non each `MethodSchema` is the child's namespace.",
+            "fdName": "children",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "contents": {
+                    "qnLocalName": "ChildSummary",
+                    "qnNamespace": "beta"
+                  },
+                  "tag": "RefNamed"
+                },
+                "tag": "RefArray"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Hash of ONLY child plugin hashes (None for leaf plugins)\nChanges when any child's hash changes (recursively)",
+            "fdName": "children_hash",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "If set, this whole activation is deprecated.\n\nAdded in IR-5. Defaults to `None` via `#[serde(default)]` so pre-IR\nschemas deserialize cleanly.\n\nPopulated by the `#[deprecated(...)]` attribute on the `impl\nActivation for Foo` block (IR-5).",
+            "fdName": "deprecation",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "DeprecationInfo",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Short description of the plugin (max 15 words)",
+            "fdName": "description",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Composite hash = hash(self_hash + children_hash)\nUse this if you want a single hash for the entire subtree",
+            "fdName": "hash",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Detailed description of the plugin (optional)",
+            "fdName": "long_description",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Methods exposed by this plugin",
+            "fdName": "methods",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "MethodSchema",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The plugin's namespace (e.g., \"echo\", \"plexus\")",
+            "fdName": "namespace",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "JSON Schema for the HTTP request type this activation extracts from incoming connections.\n\nPresent when the activation declares `request = MyRequest` in `#[plexus::activation(...)]`.\nThe schema includes `x-plexus-source` extension fields on each property describing\nwhere each field is sourced from (cookie, header, query param, peer address, etc.).\n\nClients can use this to understand what request data the activation expects and\nto generate appropriate authentication/context documentation.",
+            "fdName": "request",
+            "fdRequired": false,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "AUTH-3: this activation's default roles — role name → the grants it\nlists (`<activation>.<method>`, role inclusion already flattened), as\ndeclared by `#[plexus_macros::activation(roles(...))]`. `admin` is\nbuilt in and never listed. Empty (and absent on the wire) when the\nactivation declares none.",
+            "fdName": "roles",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "contents": [
+                    "string",
+                    null
+                  ],
+                  "tag": "RefPrimitive"
+                },
+                "tag": "RefArray"
+              },
+              "tag": "RefMap"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Hash of ONLY this plugin's methods (ignores children): of each\nmethod's `hash`, so it changes whenever any method's schema changes",
+            "fdName": "self_hash",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The plugin's version (e.g., \"1.0.0\")",
+            "fdName": "version",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "AUTH-4: which view of a gated hub this schema answers from —\n`anonymous` (only the door: the public methods) or `caller` (the\nmethods the caller holds). Absent from every schema a hub without a\ngate answers, so those stay byte-identical.",
+            "fdName": "view",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "ViewKind",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "PluginSchema",
+      "tdNamespace": "beta"
+    },
+    "beta.RequiredCredential": {
+      "tdDescription": "What a method requires on input — the implicit-derivation projection of\nscope tagging and credential-graph linkage onto a per-method filter.\n\nPinned by `AUTHZ-CRED-S01-output.md` §4 (Q-SELECT-1 resolution: implicit\nderivation from scope tagging plus refresh/revoke linkage) and\n`AUTHZ-CRED-CORE-3` §\"Implicit derivation\". This ticket explicitly does\nNOT add a `#[plexus::method(requires_credential = { .. })]` attribute\nsurface — the proposal from `AUTHZ-CRED-S01-output` §10 is superseded by\nthe implicit-derivation approach pinned here.\n\n# Matching semantics (consumer-side)\n\nA candidate credential matches this `RequiredCredential` iff:\n1. `kind`: if `Some(k)`, the candidate's `CredentialMetadata.kind`\n   matches `k` (or the kind-subsumption table per `AUTHZ-CRED-CORE-1`\n   accepts the substitution; e.g. `OauthAccess <: Bearer`). If `None`,\n   any kind whose scope set matches is acceptable.\n2. `scopes`: each scope in this set must be wildcard-matched by the\n   candidate's `CredentialMetadata.scopes`. The wildcard rules belong to\n   the `Scope` type itself.\n3. `site_hint`: when populated, prefers the candidate whose\n   `CredentialMetadata.attach_as` equals the hint. Advisory only — a\n   candidate without the hint is not rejected.\n\n# Wire back-compat\n\nAdded in `AUTHZ-CRED-CORE-3`. Pre-existing readers tolerate\n`requires_credential: null` (omitted on the wire when `None`) and\npre-existing IRs that omit the field altogether decode cleanly via\n`#[serde(default)]` on the field site.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "Specific kind a candidate credential must have (e.g.,\n`OauthRefresh`), or `None` for \"any kind whose scope set matches\".",
+            "fdName": "kind",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "CredentialKind",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Required scope set. A candidate credential's metadata scopes must\nwildcard-match each scope in this set.",
+            "fdName": "scopes",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "Scope",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "Preferred attach site for the client to use when the candidate\ncredential has multiple alternates. Advisory only.",
+            "fdName": "site_hint",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "AttachmentSite",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "RequiredCredential",
+      "tdNamespace": "beta"
+    },
+    "beta.SchemaResult": {
+      "tdDescription": "Result of a schema query - either full plugin or single method",
+      "tdKind": {
+        "keDiscriminator": "",
+        "keRepr": "untagged",
+        "keVariants": [
+          {
+            "vdDescription": "Full plugin schema (when no method specified)",
+            "vdFields": [],
+            "vdName": "PluginSchema",
+            "vdRef": {
+              "contents": {
+                "qnLocalName": "PluginSchema",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          },
+          {
+            "vdDescription": "Single method schema (when method specified)",
+            "vdFields": [],
+            "vdName": "MethodSchema",
+            "vdRef": {
+              "contents": {
+                "qnLocalName": "MethodSchema",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          }
+        ],
+        "tag": "KindEnum"
+      },
+      "tdName": "SchemaResult",
+      "tdNamespace": "beta"
+    },
+    "beta.Scope": {
+      "tdDescription": "Atomic capability identifier, e.g. `cone.send_message`. Canonical\n`Scope` newtype pinned by AUTHZ-S01-output §1. The grammar-validated\nconstructor (`Scope::try_new`), wildcard predicate (`is_wildcard`),\nand segment-bounded matching (`Scope::matches`) live in\n`crate::scope_registry` (AUTHZ-CORE-4). The macro-generated\n`Scope::new` below stays unvalidated for wire-decoded values;\nregistry construction goes through `try_new`.",
+      "tdKind": {
+        "kpFormat": null,
+        "kpType": "string",
+        "tag": "KindPrimitive"
+      },
+      "tdName": "Scope",
+      "tdNamespace": "beta"
+    },
+    "beta.Shout": {
+      "tdDescription": "String enum renamed.",
+      "tdKind": {
+        "kseValues": [
+          "x.y",
+          "TWO--WORDS",
+          "PLAIN"
+        ],
+        "tag": "KindStringEnum"
+      },
+      "tdName": "Shout",
+      "tdNamespace": "beta"
+    },
+    "beta.Tree": {
+      "tdDescription": "A recursive tree.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "kids",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "Tree",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefArray"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "name",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "parent",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": {
+                  "qnLocalName": "Tree",
+                  "qnNamespace": "beta"
+                },
+                "tag": "RefNamed"
+              },
+              "tag": "RefOptional"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "Tree",
+      "tdNamespace": "beta"
+    },
+    "beta.ViewKind": {
+      "tdDescription": "AUTH-4: the two views of a gated hub. On the wire, `\"anonymous\"` or\n`\"caller\"`.",
+      "tdKind": {
+        "kseValues": [
+          "anonymous",
+          "caller"
+        ],
+        "tag": "KindStringEnum"
+      },
+      "tdName": "ViewKind",
+      "tdNamespace": "beta"
+    },
+    "beta.dotted.Name": {
+      "tdDescription": "A type whose $defs name has a dot.",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": null,
+            "fdName": "z",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "integer",
+                "uint16"
+              ],
+              "tag": "RefPrimitive"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "dotted.Name",
+      "tdNamespace": "beta"
+    }
+  },
+  "irVersion": "3.0"
+}

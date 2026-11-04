@@ -7,7 +7,8 @@
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
-use plexus_client::{ClientError, ClientEvent};
+use futures::TryStreamExt;
+use plexus_client::ClientError;
 use plexus_core::plexus::{AuthContext, Gate, HubTransport, Membership, Memberships, Resolve, RoleTable, ScopeRef};
 use plexus_core::DynamicHub;
 use schemars::JsonSchema;
@@ -105,7 +106,7 @@ pub struct ClockActivation;
 )]
 impl ClockActivation {
     /// Ticks until the caller stops listening.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     pub async fn ticks(&self) -> impl Stream<Item = TickEvent> + Send + 'static {
         stream! {
             let _flag = DropFlag;
@@ -120,7 +121,7 @@ impl ClockActivation {
     }
 
     /// `n` ticks, then the end.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     pub async fn count(&self, n: u64) -> impl Stream<Item = TickEvent> + Send + 'static {
         stream! { for i in 0..n { yield TickEvent::Tick { n: i }; } }
     }
@@ -179,11 +180,17 @@ fn who(p: &str) -> AuthContext {
 }
 
 /// A refusal as the client sees it: the wire's in-band `error`, with the
-/// gate's code (`-32001` sign in first, `-32003` forbidden).
+/// gate's code (`-32001` sign in first, `-32003` forbidden) — RETURNS-6:
+/// read from the typed `RemoteError` the frame carries.
 fn assert_refused<T: std::fmt::Debug>(r: Result<Vec<T>, ClientError>, want: &str) {
     match r {
-        Err(ClientError::Remote { code, message, .. }) => {
-            assert_eq!(code.as_deref(), Some(want), "{message}");
+        Err(ClientError::Remote(e)) => {
+            let code = match &e {
+                plexus_client::RemoteError::Unauthenticated => "-32001",
+                plexus_client::RemoteError::Forbidden { .. } => "-32003",
+                _ => "other",
+            };
+            assert_eq!(code, want, "{e}");
         }
         other => panic!("expected the gate's refusal, got {other:?}"),
     }
@@ -199,16 +206,16 @@ async fn a_generated_client_reaches_both_activations_and_the_nested_child() {
     let t = HubTransport::anonymous(hub);
     let tickets = TicketsClient::new(t.clone());
     assert_eq!(
-        tickets.get_all("MENGER-1".into()).await.unwrap(),
+        tickets.get("MENGER-1".into()).try_collect::<Vec<_>>().await.unwrap(),
         vec![TicketEvent::Ticket { id: "MENGER-1".into(), by: None }]
     );
     // tickets.commits.link — the child by its path.
     assert_eq!(
-        tickets.commits().link_all("MENGER-1".into(), vec!["abc".into()]).await.unwrap(),
+        tickets.commits().link("MENGER-1".into(), vec!["abc".into()]).try_collect::<Vec<_>>().await.unwrap(),
         vec![TicketEvent::Linked { id: "MENGER-1".into(), commits: vec!["abc".into()], by: None }]
     );
     let clock = ClockClient::new(t);
-    assert_eq!(clock.count_all(3).await.unwrap().len(), 3);
+    assert_eq!(clock.count(3).try_collect::<Vec<_>>().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -217,25 +224,25 @@ async fn the_gate_refuses_without_the_grant_and_answers_with_it() {
 
     // Anonymous: nothing but the hub's anonymous view.
     let anon = TicketsClient::new(HubTransport::anonymous(hub.clone()));
-    assert_refused(anon.get_all("MENGER-1".into()).await, "-32001");
+    assert_refused(anon.get("MENGER-1".into()).try_collect::<Vec<_>>().await, "-32001");
 
     // BOB views everywhere, edits nowhere: get yes, the child's link no.
     let bob = TicketsClient::new(HubTransport::as_(hub.clone(), who(BOB)));
     assert_eq!(
-        bob.get_all("MENGER-1".into()).await.unwrap(),
+        bob.get("MENGER-1".into()).try_collect::<Vec<_>>().await.unwrap(),
         vec![TicketEvent::Ticket { id: "MENGER-1".into(), by: Some(BOB.into()) }],
         "the caller reaches the method",
     );
-    assert_forbidden(bob.commits().link_all("MENGER-1".into(), vec!["abc".into()]).await);
+    assert_forbidden(bob.commits().link("MENGER-1".into(), vec!["abc".into()]).try_collect::<Vec<_>>().await);
 
     // ADA edits MENGER: the link is answered there, refused outside it.
     let ada = TicketsClient::new(HubTransport::as_(hub.clone(), who(ADA)));
     assert_eq!(
-        ada.commits().link_all("MENGER-1".into(), vec!["abc".into()]).await.unwrap(),
+        ada.commits().link("MENGER-1".into(), vec!["abc".into()]).try_collect::<Vec<_>>().await.unwrap(),
         vec![TicketEvent::Linked { id: "MENGER-1".into(), commits: vec!["abc".into()], by: Some(ADA.into()) }]
     );
-    assert_forbidden(ada.commits().link_all("OTHER-1".into(), vec!["abc".into()]).await);
-    assert_forbidden(ada.get_all("OTHER-1".into()).await);
+    assert_forbidden(ada.commits().link("OTHER-1".into(), vec!["abc".into()]).try_collect::<Vec<_>>().await);
+    assert_forbidden(ada.get("OTHER-1".into()).try_collect::<Vec<_>>().await);
 }
 
 #[tokio::test]
@@ -243,7 +250,7 @@ async fn an_unknown_method_is_answered_in_band_as_the_wire_does() {
     let t = HubTransport::anonymous(Arc::new(plain_hub()));
     let mut s = plexus_client::Transport::call(&t, plexus_client::MethodRef::new("nowhere", "x"), serde_json::json!({}));
     match s.next().await {
-        Some(Ok(plexus_client::StreamItem::Error { message, .. })) => assert!(message.contains("nowhere"), "{message}"),
+        Some(Ok(plexus_client::StreamItem::Error { message: Some(message), .. })) => assert!(message.contains("nowhere"), "{message}"),
         other => panic!("expected an in-band error, got {other:?}"),
     }
     assert!(s.next().await.is_none(), "the error is the last item");
@@ -255,7 +262,7 @@ async fn a_long_stream_streams_through_and_dropping_it_drops_the_hubs() {
     let mut ticks = clock.ticks();
     for want in 0..3u64 {
         match ticks.next().await {
-            Some(Ok(ClientEvent::Data(TickEvent::Tick { n }))) => assert_eq!(n, want),
+            Some(Ok(TickEvent::Tick { n })) => assert_eq!(n, want),
             other => panic!("expected tick {want}, got {other:?}"),
         }
     }
@@ -271,11 +278,11 @@ async fn a_long_stream_streams_through_and_dropping_it_drops_the_hubs() {
 async fn conversation<T: plexus_client::Transport>(t: T) -> Vec<String> {
     let tickets = TicketsClient::new(t);
     let mut out = vec![
-        format!("{:?}", tickets.get_all("MENGER-7".into()).await),
-        format!("{:?}", tickets.commits().link_all("MENGER-7".into(), vec!["a".into(), "b".into()]).await),
+        format!("{:?}", tickets.get("MENGER-7".into()).try_collect::<Vec<_>>().await),
+        format!("{:?}", tickets.commits().link("MENGER-7".into(), vec!["a".into(), "b".into()]).try_collect::<Vec<_>>().await),
     ];
     let clock = ClockClient::new(tickets.transport());
-    out.push(format!("{:?}", clock.count_all(4).await));
+    out.push(format!("{:?}", clock.count(4).try_collect::<Vec<_>>().await));
     out
 }
 

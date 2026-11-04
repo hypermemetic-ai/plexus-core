@@ -48,6 +48,79 @@ BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
 - A frame of another connection finds no call and is not audited: the table is
   the connection's, so `not_this_call` is said to a request and a notification
   is counted (`InputTable::strays`).
+### Added (RETURNS-40: the service writes its IR)
+
+- `plexus::ir` — synapse's IR 3.0 builder in Rust (`build`, `build_one`, `canonical`), equal to synapse's `buildIRFromSchemas` / `buildIRFromSchema` byte for byte in synapse's canonical form, refusals included; a title collision refuses its activation in `build`'s walk (RETURNS-36 review #9) and fails `build_one`.
+- `<service>.ir { namespaces? }` on every `DynamicHub` — one IR document for the namespaces asked (none: the whole service), as the caller's view shows it; `Result<ServiceIr, IrError>` (`not_found`, `unreadable`; a title collision is a `title` refusal in the IR). Introspection for the grant gate: it runs for anyone, as `schema` does. `DynamicHub::service_ir` is the same in process. The root's schema lists `ir`, so every service's hash moves once.
+  - **Names**: `namespaces` holds at most the names the caller's view of the service has (the service's own, each activation, each static child below one); more, or a name it has not, is `invalid_params` naming it, before any schema is read (a cheap bound first: 1 + activations + static children, counted at `register`); a refusal says what the caller's view shows, never the service's size.
+  - **One view**: the IR is built from one snapshot of the caller's view (the service's schema and each activation's from it; a static child's as its activation answers it), never re-checking the gate as it goes; under the R-5 scope gate only the schemas the caller is answered, decided for the namespaces asked alone and written to no audit sink — the `ir` call is audited once.
+  - **Kept**: by the view's hash, the roots and — under the scope gate — the namespaces the caller is answered; least recently used out (O(log n)), at most `IR_CACHE_ENTRIES` (128) slots — those being built among them — and `IR_CACHE_BYTES` (64 MiB) of answers, never cleared whole. One build per key at a time: later askers wait for it, and when the asker building it goes, the next takes the build over. An ask with no room (every slot being built) builds without keeping; a slot whose every asker has gone before it was built is removed; a slot being built is never evicted; an answer past the byte bound and a refusal are never kept. The build runs on `spawn_blocking`. `DynamicHub::ir_builds()` counts builds.
+
+### [0.8.0] — unreleased (RETURNS-36: precise returns over main)
+
+returns/0.7 (RETURNS-1) merged with main. Publish nothing until RETURNS-29.
+
+#### Breaking
+
+| Change | Before (0.7.0) | After | What to do |
+|---|---|---|---|
+| `MethodSchema.streaming`, `return_shape` | a flag, a shape | `cardinality` (`"one"` / `"many"`, required), `returns` always present, `error`, `progress` | read `cardinality`; `with_cardinality`, `with_error`, `with_progress` |
+| `MethodSchema.hash`, the roll-up | `DefaultHasher` of tokens | SHA-256/16 of the canonical schema (RETURNS-10) | every hash changes once; `with_content_hash()` last |
+| the `schema` entry's marker | `hash == "auto_schema"` | `MethodSchema::is_auto_schema()` | call it |
+| `PlexusStreamItem::Progress` | `message`, `percentage` | `content_type`, `content` (the method's `P`; `Note` by default) | build with `progress(meta, ct, value)` |
+| `PlexusStreamItem::Error` | `message`, `code`, `fields` | the same, plus `error: RemoteError` (required) | `error(meta, RemoteError, recoverable)` or `from_plexus_error(meta, &e, recoverable)`; `typed_error` is gone |
+| `PlexusError::InvalidParams` | `(String)` | `{ param, problem: ParamProblem }` (same `Display` line) | `PlexusError::invalid_params(..)` / `malformed_param(..)` |
+| `error_stream`, `progress_stream` | strings | a `RemoteError`; a content type and value | — |
+| `RemoteError` | — | re-exported; `From<&PlexusError>`; JSON-RPC rejections carry it as `data` | — |
+
+#### Added
+
+- The per-form wrappers `wrap_one`, `wrap_one_result`, `wrap_result_stream`,
+  `wrap_progress_stream`, `wrap_result_progress_stream` (over PERF-7's
+  single-encode stream).
+- `types::spec_code` / `spec_fields`: spec/05's `code` and flattened fields
+  of a `RemoteError`, which every error item carries beside it.
+- The child seam reads a peer still on plexus-wire's spec as main wrote it
+  (`streaming`, `{message, percentage}`, an error item without `error`) into
+  0.8's shape (`remote_child::peer`).
+
+### Changed
+
+- PERF-27: on a transport with no frame sink (stdio, a module called in memory)
+  an item is no longer copied and parsed again on its way to jsonrpsee's sink,
+  a call leaves its 8 KiB block for its thread's next one, and it builds no
+  notification prefix it will not use. A one-item call falls from 50,842
+  instructions and 16,048 bytes allocated to about 42,100 and 7,770. Needs
+  serde_json 1.0.151.
+- PERF-34: an item's JSON is written by a real scan, not a byte at a time, into
+  the pipe's buffer: SSE2 on any x86-64, AVX2 chosen at run time, a byte at a
+  time elsewhere; no `target-cpu`. A field's name folds to constants at compile
+  time. The bytes are serde_json's, for every value. Down an item's path a ticket
+  body takes 4.0× fewer instructions and 200 rows 5.3×.
+
+- **BREAKING (RETURNS-10, 0.7): every schema hash changes value once.** A
+  method's `hash` is its schema's content hash —
+  `MethodSchema::content_hash()`: the method object minus `hash`, as
+  canonical JSON (`plexus::content_hash::canonical_json`), SHA-256, 16 hex —
+  set by `MethodSchema::with_content_hash()`, which the code
+  `#[plexus_macros::activation]` emits applies once, where it caches the
+  method schemas. A change anywhere in a method's params, `returns`, `error`
+  or `progress` (down to a nested field) moves its hash, its plugin's and
+  every ancestor's. `PluginSchema`'s roll-up and the default
+  `Activation::plugin_schema` use SHA-256 too (`content_hash::hash16_lines`),
+  same structure and width. New dependency: `sha2` 0.10.
+
+### Added
+
+- PERF-8: batches. `FrameSink::batching(max)` (and `MAX_BATCH`, 64): for a
+  client that offered `batch` at its upgrade (plexus-transport reads it), the
+  items a stream has ready together go in one notification, `results`, the
+  metadata said once (plexus-wire spec/02); a lone item goes at once in
+  today's form, and a sink that does not batch writes exactly today's frames.
+  A batch stops after the item that brings it to `BATCH_BYTES`, 8 KiB, so a
+  large item goes alone. An item's own path falls from 4,145 instructions to
+  983, 64 to a notification; a row from 5,195 to 2,082 (35 to one), 1 KB from
+  4,917 to 2,113 (8 to one).
 
 ## [0.7.0]
 

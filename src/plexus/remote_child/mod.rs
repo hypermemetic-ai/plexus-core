@@ -29,6 +29,8 @@
 //! counted ([`ChildStats::unasked`]).
 
 mod link;
+// RETURNS-36: a peer on plexus-wire's spec as main wrote it, read as 0.8.
+mod peer;
 mod spec;
 #[cfg(feature = "child-ws")]
 mod ws;
@@ -125,7 +127,7 @@ impl std::fmt::Debug for RemoteChild {
 /// roles' grants requalified (`{ns}.m` → `<mount>.m`). A child mounting
 /// children of its own is refused, naming the method.
 fn mount_schema(name: &str, raw: Value) -> Result<PluginSchema, String> {
-    let mut schema: PluginSchema = serde_json::from_value(raw).map_err(|e| format!("its schema does not read: {e}"))?;
+    let mut schema: PluginSchema = serde_json::from_value(peer::schema(raw)?).map_err(|e| format!("its schema does not read: {e}"))?;
     if let Some(m) = schema.methods.iter().find(|m| m.role != MethodRole::Rpc) {
         return Err(format!("its method `{}` is a child ({:?}): a child mounting children is not served", m.name, m.role));
     }
@@ -248,7 +250,12 @@ impl RemoteChild {
             Some(m) => match self.inner.schema.methods.iter().find(|x| x.name == m) {
                 Some(ms) => serde_json::to_value(ms).unwrap_or_default(),
                 None => {
-                    let e = PlexusStreamItem::error(meta(&ns), format!("Method '{m}' not found"), Some("-32602".into()), false);
+                    let error = plexus_client::RemoteError::MethodNotFound { activation: ns.clone(), method: m.to_string() };
+                    let mut e = PlexusStreamItem::error(meta(&ns), error, false);
+                    if let PlexusStreamItem::Error { message, code, .. } = &mut e {
+                        *message = format!("Method '{m}' not found");
+                        *code = Some("-32602".into());
+                    }
                     return Box::pin(futures::stream::iter([e]));
                 }
             },
@@ -318,19 +325,19 @@ impl CallStream {
     /// The grant revoked mid-stream: the caller's last item.
     fn revoked(&self) -> PlexusStreamItem {
         let grant = self.reach.grant().map(|g| g.as_str().to_string()).unwrap_or_default();
-        let mut f = serde_json::Map::new();
-        f.insert("error_kind".into(), "forbidden".into());
-        f.insert("grant".into(), grant.clone().into());
-        f.insert("scope".into(), "*".into());
-        f.insert("roles".into(), json!([]));
-        f.insert("held_on".into(), json!([]));
-        PlexusStreamItem::Error {
-            metadata: meta(&self.name),
-            message: format!("Forbidden: `{grant}` is no longer held — the call's grant moved while it ran"),
-            code: Some("-32003".into()),
-            recoverable: false,
-            fields: f,
+        let error = plexus_client::RemoteError::Forbidden {
+            reason: plexus_client::DenyReason::MissingGrant {
+                grant: grant.clone(),
+                scope: "*".into(),
+                roles: Vec::new(),
+                held_on: Vec::new(),
+            },
+        };
+        let mut item = PlexusStreamItem::error(meta(&self.name), error, false);
+        if let PlexusStreamItem::Error { message, .. } = &mut item {
+            *message = format!("Forbidden: `{grant}` is no longer held — the call's grant moved while it ran");
         }
+        item
     }
 }
 
@@ -465,6 +472,16 @@ mod tests {
         json!({ "name": name, "description": "", "hash": "x", "streaming": false, "bidirectional": false })
     }
 
+    /// RETURNS-36 (review #6): no guessing — a method that states neither
+    /// `cardinality` (0.8) nor `streaming` (0.7.0) is refused, naming it, as
+    /// plexus-protocol's `cardinalityOf` refuses it.
+    #[test]
+    fn a_method_stating_neither_cardinality_nor_streaming_is_refused() {
+        let silent = json!({ "name": "quiet", "description": "", "hash": "x" });
+        let e = mount_schema("echo", raw(json!([m("echo"), silent]), json!({}))).unwrap_err();
+        assert!(e.contains("`quiet`") && e.contains("neither cardinality"), "{e}");
+    }
+
     #[test]
     fn the_mount_name_wins_and_roles_are_requalified() {
         let s = mount_schema("echo", raw(json!([m("echo"), m("shout")]), json!({ "viewer": ["stub.echo"], "editor": ["stub.echo", "stub.shout"] }))).unwrap();
@@ -491,10 +508,11 @@ mod tests {
         let back: PlexusStreamItem = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(back.error_kind(), Some("child_unavailable"));
         assert_eq!(serde_json::to_value(&back).unwrap(), v);
-        // An untyped error serializes exactly as before.
-        let plain = PlexusStreamItem::error(meta("x"), "m".into(), Some("c".into()), false);
+        // An error spec/05 gives no kind carries no `error_kind`: its keys
+        // are spec/05's four and RETURNS-6's typed `error` (RETURNS-36).
+        let plain = PlexusStreamItem::error(meta("x"), plexus_client::RemoteError::Execution { message: "m".into() }, false);
         let pv = serde_json::to_value(&plain).unwrap();
         let keys: Vec<_> = pv.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, ["code", "message", "metadata", "recoverable", "type"]);
+        assert_eq!(keys, ["code", "error", "message", "metadata", "recoverable", "type"]);
     }
 }

@@ -700,7 +700,7 @@ impl Seam {
         let SubscriptionId::Num(subscription) = pending.subscription_id() else {
             return Err(PlexusError::ExecutionError(format!("`{method}`: an input half needs integer subscription ids")));
         };
-        let call: super::plexus::CallParams = self.params.parse().map_err(|e| PlexusError::InvalidParams(e.to_string()))?;
+        let call: super::plexus::CallParams = self.params.parse().map_err(|e| PlexusError::invalid_params(e.to_string()))?;
         // A method's own body routing to another: the subscription is the
         // call's, and that one has no caller to stream to it.
         if !call.method.ends_with(method) {

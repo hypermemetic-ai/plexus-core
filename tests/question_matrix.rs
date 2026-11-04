@@ -49,7 +49,7 @@ pub struct AskActivation;
 #[plexus_macros::activation(version = "1.0.0", description = "BIDIR-13: asks confirms")]
 impl AskActivation {
     /// Asks `n` confirms in turn, each waiting `timeout_ms`, and says each answer.
-    #[plexus_macros::method(bidirectional, streaming)]
+    #[plexus_macros::method(bidirectional)]
     pub async fn ask(&self, ctx: &Arc<StandardBidirChannel>, n: u64, timeout_ms: u64) -> impl Stream<Item = AskEvent> + Send + 'static {
         let ctx = ctx.clone();
         let t = Duration::from_millis(timeout_ms);

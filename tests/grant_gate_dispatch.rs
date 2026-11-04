@@ -37,7 +37,7 @@ impl TicketsActivation {
 
     /// A stream that re-asks the gate per event (IDENTITY-37): each id it
     /// would emit is checked against the reach as it stands.
-    #[plexus_macros::method(streaming)]
+    #[plexus_macros::method]
     async fn watch(&self, reach: Reach, ids: Vec<String>) -> impl Stream<Item = String> + Send + 'static {
         stream! {
             for id in ids {
@@ -199,6 +199,15 @@ async fn the_refusal_on_the_wire() {
             "message": "needs tickets.set_status on IDENTITY",
             "code": "-32003",
             "recoverable": false,
+            // RETURNS-36: RETURNS-6's typed error beside spec/05's fields.
+            "error": {
+                "kind": "forbidden",
+                "reason": "missing_grant",
+                "grant": "tickets.set_status",
+                "scope": "IDENTITY",
+                "roles": ["editor", "admin"],
+                "held_on": ["MENGER"],
+            },
         })
     );
     // A client reads it back typed, and an old client still parses the item.

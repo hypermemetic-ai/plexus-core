@@ -154,7 +154,7 @@ fn foreign_keywords_names_a_keyword_outside_the_closed_list() {
 #[test]
 fn the_stream_items_carriers_are_the_json_type() {
     let m = MethodSchema::new("call", "d", "h").with_returns(schema_for!(PlexusStreamItem));
-    let v = serde_json::to_value(m.returns.unwrap()).unwrap();
+    let v = serde_json::to_value(&m.returns).unwrap();
     let variant = |tag: &str| v["oneOf"].as_array().unwrap().iter().find(|x| x["properties"]["type"]["const"] == json!(tag)).cloned().unwrap();
     assert_eq!(variant("data")["properties"]["content"]["type"], json!(JSON_TYPES));
     assert_eq!(variant("request")["properties"]["requestData"]["type"], json!(JSON_TYPES));
@@ -164,7 +164,7 @@ fn the_stream_items_carriers_are_the_json_type() {
 #[test]
 fn schema_results_json_schema_fields_are_the_json_type() {
     let m = MethodSchema::new("schema", "d", "h").with_returns(schema_for!(SchemaResult));
-    let v = serde_json::to_value(m.returns.as_ref().unwrap()).unwrap();
+    let v = serde_json::to_value(&m.returns).unwrap();
     for (ty, field) in [
         ("MethodSchema", "params"), ("MethodSchema", "returns"), ("MethodSchema", "request_type"),
         ("MethodSchema", "response_type"), ("MethodSchema", "input"), ("MethodSchema", "answer_by"),
@@ -205,7 +205,7 @@ fn hashes_returns_the_plugin_hashes_struct() {
     let service = DynamicHub::new("plexus");
     let p = Activation::plugin_schema(&service);
     let hashes = p.methods.iter().find(|m| m.name == "hashes").unwrap();
-    let r = serde_json::to_value(hashes.returns.as_ref().unwrap()).unwrap();
+    let r = serde_json::to_value(&hashes.returns).unwrap();
     assert_eq!(r["title"], json!("PluginHashes"), "{r}");
     assert_eq!(r["type"], json!("object"));
     for f in ["namespace", "self_hash", "hash", "children_hash", "children"] {

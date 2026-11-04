@@ -105,7 +105,10 @@ pub enum PlexusStreamItem {
         recoverable: bool,
         /// spec/05: the human line — never parsed for meaning. For a failed
         /// dispatch, the server's `PlexusError` as it reads; else the
-        /// [`RemoteError`]'s `Display`.
+        /// [`RemoteError`]'s `Display`. Always written; optional on reading
+        /// (RETURNS-6's frame has none, as plexus-client reads it): a frame
+        /// without one reads as an empty line.
+        #[serde(default)]
         message: String,
         /// spec/05: the JSON-RPC code in decimal (`"-32601"`), or — for a
         /// refusal with none — its `error_kind` (`"too_many_calls"`).
@@ -251,9 +254,10 @@ pub fn spec_code(error: &RemoteError) -> String {
         RemoteError::Unauthenticated => "-32001".into(),
         RemoteError::Forbidden { .. } => "-32003".into(),
         RemoteError::HandleNotSupported { .. } | RemoteError::Execution { .. } => "-32000".into(),
-        RemoteError::TooManyCalls { .. } | RemoteError::ChildUnavailable { .. } | RemoteError::ChildTimeout { .. } => {
-            error.kind().into()
-        }
+        RemoteError::TooManyCalls { .. }
+        | RemoteError::ChildUnavailable { .. }
+        | RemoteError::ChildTimeout { .. }
+        | RemoteError::Other(_) => error.kind().into(),
     }
 }
 
@@ -301,6 +305,15 @@ pub fn spec_fields(error: &RemoteError) -> serde_json::Map<String, Value> {
         RemoteError::ChildTimeout { child, timeout_ms } => {
             m.insert("child".into(), child.as_str().into());
             m.insert("timeout_ms".into(), (*timeout_ms).into());
+        }
+        // RETURNS-36: a kind this build does not know keeps its own fields
+        // beside the frame's (not the frame's own keys).
+        RemoteError::Other(other) => {
+            for (k, v) in &other.fields {
+                if !["type", "metadata", "message", "code", "recoverable", "error", "error_kind"].contains(&k.as_str()) {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
         }
     }
     m.insert("error_kind".into(), error.kind().into());

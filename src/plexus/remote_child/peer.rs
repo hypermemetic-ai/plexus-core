@@ -106,6 +106,17 @@ pub(super) fn remote_error_of(o: &Map<String, Value>) -> RemoteError {
             child: s("child"),
             timeout_ms: o.get("timeout_ms").and_then(Value::as_u64).unwrap_or_default(),
         },
+        // RETURNS-36 (review #4): a kind this build does not know, by its
+        // `error_kind`, keeps it and its fields; with no kind at all, the
+        // method failing.
+        other if o.contains_key("error_kind") => {
+            let mut fields = o.clone();
+            fields.remove("error_kind");
+            for k in ["type", "metadata", "code", "recoverable"] {
+                fields.remove(k);
+            }
+            RemoteError::Other(plexus_client::OtherError { kind: other.to_string(), fields })
+        }
         _ => RemoteError::Execution { message },
     }
 }

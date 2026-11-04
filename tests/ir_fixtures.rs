@@ -10,7 +10,8 @@
 //! - RETURNS-40's ir-service fixture: every schema a walk reads
 //!   (`schemas.json`, by dotted path) folded from the root
 //!   (`buildIRFromSchemas`) is `ir.json`, from `alpha` is `ir.alpha.json`;
-//!   the clash service's schemas are refused as `clash.error.txt` says.
+//!   the clash service's walk refuses `clash` (`clash.ir.json`), and that
+//!   plugin alone fails as `clash.one.error.txt` says.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -74,11 +75,23 @@ fn a_subtree_of_it() {
     same("ir-service/expected/ir.alpha.json", &built);
 }
 
+/// RETURNS-36 review #9: the walk refuses the colliding activation (a
+/// `title` refusal at its namespace naming both sites, its methods and types
+/// left out) and builds the rest.
 #[test]
-fn a_title_collision_is_refused_as_synapse_refuses_it() {
-    let err = ir::build("clashsvc", &[vec![]], &schemas("ir-service/expected/clash.schemas.json")).expect_err("two shapes under one title");
+fn a_title_collision_refuses_its_activation_as_synapse_does() {
+    let built = ir::build("clashsvc", &[vec![]], &schemas("ir-service/expected/clash.schemas.json")).expect("the walk goes on");
+    same("ir-service/expected/clash.ir.json", &built);
+    assert_eq!(built.refusals.iter().filter(|r| r.keyword == "title").map(|r| r.site.as_str()).collect::<Vec<_>>(), ["clash"]);
+}
+
+/// The one-plugin entry (buildIRFromSchema) still fails, in synapse's words.
+#[test]
+fn one_colliding_plugin_alone_still_fails() {
+    let schemas = schemas("ir-service/expected/clash.schemas.json");
+    let err = ir::build_one("clashsvc", &["clash".to_string()], &schemas[&vec!["clash".to_string()]]).expect_err("two shapes under one title");
     assert!(matches!(err, IrBuildError::TitleCollision { .. }), "{err:?}");
-    assert_eq!(err.to_string(), read("ir-service/expected/clash.error.txt").trim_end());
+    assert_eq!(err.to_string(), read("ir-service/expected/clash.one.error.txt").trim_end());
 }
 
 #[test]

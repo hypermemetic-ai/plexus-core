@@ -40,6 +40,11 @@ BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
 - `DuplexGate::admitted` (a call its dispatch decided), `DuplexGate::ungated`,
   `DuplexCall::credit_line`.
 - `MethodSchema.input` filled.
+- `FrameSink::with_inputs`, `FrameSink::inputs`: a transport hands its
+  connection's `InputTable` to its calls on the sink they already carry (an
+  extensions entry of its own is an allocation every call).
+- A method with no `Input` costs what it did: its `{ns}.call` future holds
+  nothing of the input half (BIDIR-17; `tests/call_allocation.rs`).
 
 ### Not enforced
 

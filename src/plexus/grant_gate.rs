@@ -5,7 +5,7 @@
 //! routing every call: the method's grant (its schema's `grant`, else
 //! `<activation>.<method>`), held through a role on the scope its target
 //! resolves to (its schema's `target` param, read from the call's params),
-//! within the session's ceiling. A hub without a gate never enters this
+//! within the session's ceiling. A service without a gate never enters this
 //! module and dispatches exactly as before.
 //!
 //! # Decision table (gate set)
@@ -13,7 +13,7 @@
 //! | call | anonymous | signed in |
 //! |---|---|---|
 //! | `public` method | runs (empty reach) | runs (its reach) |
-//! | introspection: `<ns>.schema`, the hub's `hash` / `hashes` / `schema` | runs | runs |
+//! | introspection: `<ns>.schema`, the service's `hash` / `hashes` / `schema` / `ir` | runs | runs |
 //! | method with a `target`, value present | `Unauthenticated` | allowed iff a role held on a scope in the value's chain lists the grant, and every ceiling layer allows it there |
 //! | method without a target (or the target param absent / null) | `Unauthenticated` | allowed iff the grant is held anywhere (within the ceiling) |
 //! | method no schema describes (a nested child path) | `Unauthenticated` | as "without a target", grant = the dotted path |
@@ -38,7 +38,7 @@
 //! and `#[plexus_macros::method]` hands a method that declares a `reach:
 //! Reach` parameter (stripped from the schema, like `auth`) the value of
 //! [`current_reach`]. Outside a gated dispatch, [`current_reach`] is
-//! [`Reach::everywhere`] — what a hub without a gate has always meant. The
+//! [`Reach::everywhere`] — what a service without a gate has always meant. The
 //! reach is live: [`Reach::allows`] / [`Reach::current`] ask the gate again
 //! as it stands, which is how a stream checks each event (IDENTITY-37).
 
@@ -54,7 +54,7 @@ tokio::task_local! {
 }
 
 /// The reach of the call being dispatched: what the gate answered for its
-/// grant. [`Reach::everywhere`] when no gate decided this call (a hub
+/// grant. [`Reach::everywhere`] when no gate decided this call (a service
 /// without a gate, or a call that did not come through a gated dispatch).
 ///
 /// `#[plexus_macros::method]` calls this for a method that declares a
@@ -148,10 +148,10 @@ fn params_shape(params: &Value) -> Result<(), PlexusError> {
 }
 
 /// Decide one call. `full_path` is the dotted method as dispatched;
-/// `hub_ns` the hub's own namespace.
+/// `service_ns` the service's own namespace.
 pub(crate) fn decide(
     gate: &Gate,
-    hub_ns: &str,
+    service_ns: &str,
     full_path: &str,
     info: Option<&MethodGateInfo>,
     params: &Value,
@@ -162,7 +162,7 @@ pub(crate) fn decide(
     let (ns, method) = full_path.split_once('.').unwrap_or((full_path, ""));
     let introspection = method == "schema"
         || method.ends_with(".schema")
-        || (ns == hub_ns && matches!(method, "hash" | "hashes"));
+        || (ns == service_ns && matches!(method, "hash" | "hashes" | "ir"));
     if introspection {
         return Ok(Admit::Open);
     }

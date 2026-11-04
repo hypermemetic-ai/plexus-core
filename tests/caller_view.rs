@@ -266,3 +266,47 @@ async fn without_a_gate_nothing_changes() {
     let h = data(hub.route("menger.hashes", json!({}), None).await.unwrap()).await;
     assert_eq!(h[0]["hash"], hub.compute_hash());
 }
+
+/// RETURNS-40: the service's `ir` is introspection — it runs for anyone,
+/// anonymous included, as `<ns>.schema` does — and answers what the
+/// caller's view shows, no more: built from the very schemas the caller is
+/// answered, so it is equal to what synapse builds from them. Kept per view.
+#[tokio::test]
+async fn ir_is_introspection_and_answers_the_callers_view() {
+    let (hub, _) = hub();
+    let ir_of = |auth: Option<AuthContext>| {
+        let hub = hub.clone();
+        async move {
+            let got = data(hub.route("menger.ir", json!({}), auth.as_ref()).await.expect("ir runs")).await;
+            assert_eq!(got.len(), 1, "{got:?}");
+            got[0]["ok"].clone()
+        }
+    };
+    let methods = |ir: &Value| -> Vec<String> {
+        ir["irMethods"].as_object().unwrap().keys().filter(|k| !k.starts_with('.') && !k.ends_with(".schema")).cloned().collect()
+    };
+
+    // anonymous: the door alone, as the anonymous view shows it
+    let anon = ir_of(None).await;
+    assert!(anon.is_object(), "an anonymous caller is answered: {anon}");
+    assert_eq!(methods(&anon), ["tickets.door"]);
+    // a viewer: what the viewer's view shows
+    let cat = ir_of(Some(who(CAT))).await;
+    assert_eq!(methods(&cat), ["tickets.door", "tickets.get", "tickets.list"]);
+    // admin: everything
+    let root = ir_of(Some(who(ROOT))).await;
+    assert_eq!(methods(&root), ["members.add", "tickets.delete", "tickets.door", "tickets.get", "tickets.list", "tickets.set_status"]);
+
+    // equal to what synapse's walk builds from the schemas that caller is answered
+    let mut schemas = BTreeMap::new();
+    let ada = who(ADA);
+    let root_schema = data(hub.route("menger.schema", Value::Null, Some(&ada)).await.unwrap()).await.remove(0);
+    for child in root_schema["children"].as_array().unwrap() {
+        let ns = child["namespace"].as_str().unwrap().to_string();
+        let s = data(hub.route(&format!("{ns}.schema"), Value::Null, Some(&ada)).await.unwrap()).await.remove(0);
+        schemas.insert(vec![ns], s);
+    }
+    schemas.insert(vec![], root_schema);
+    let walked = plexus_core::plexus::ir::build("menger", &[vec![]], &schemas).unwrap().to_json();
+    assert_eq!(ir_of(Some(ada)).await, walked);
+}

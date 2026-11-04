@@ -1156,6 +1156,19 @@ struct DynamicHubInner {
     /// show, and each caller's view of them — that `_info`, `hash`, `hashes`
     /// and every `<ns>.schema` answer from. See [`super::view`].
     describe: super::view::Cache,
+    /// RETURNS-40: the `ir` answers kept, by the hash the caller sees and
+    /// the namespaces asked. See [`DynamicHub::service_ir`].
+    ir_cache: super::ir::IrCache,
+    /// RETURNS-40: how many static children the registered activations
+    /// have (and theirs), counted as each registers — the cheap bound on
+    /// `ir`'s names, read with no schema built.
+    nested_count: usize,
+}
+
+impl DynamicHubInner {
+    fn nested_count(&self) -> usize {
+        self.nested_count
+    }
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -1182,6 +1195,59 @@ struct DynamicHubInner {
 #[derive(Clone)]
 pub struct DynamicHub {
     inner: Arc<DynamicHubInner>,
+}
+
+/// RETURNS-40: one snapshot of what a caller is shown, an IR is built from.
+struct IrView {
+    base: Arc<super::view::Described>,
+    /// The caller's view under the grant gate; `None`: the whole service.
+    shaped: Option<Arc<super::view::Shaped>>,
+    /// The view's hash (the service's own without a gate).
+    hash: String,
+}
+
+impl IrView {
+    fn root(&self) -> PluginSchema {
+        match &self.shaped {
+            Some(v) => v.service.clone(),
+            None => self.base.service.clone(),
+        }
+    }
+
+    fn top(&self, ns: &str) -> Option<PluginSchema> {
+        match &self.shaped {
+            Some(v) => v.schema_of(&self.base, ns).filter(|_| ns != v.service.namespace),
+            None => self.base.activations.iter().find(|a| a.namespace == ns).cloned(),
+        }
+    }
+
+    fn shows(&self, ns: &str) -> bool {
+        match &self.shaped {
+            Some(v) => v.shows(ns),
+            None => self.base.activations.iter().any(|a| a.namespace == ns),
+        }
+    }
+
+    /// Every namespace the snapshot shows, dotted (`""`: the service's own):
+    /// the root, each activation shown, and each static child below one —
+    /// in a gated view, when the entry that reaches it is shown.
+    fn names(&self, service: &str) -> Vec<String> {
+        let mut out = vec![String::new()];
+        out.extend(self.base.activations.iter().map(|a| a.namespace.clone()).filter(|ns| ns != service && self.shows(ns)));
+        for path in self.base.nested() {
+            let mut segs = path.split('.');
+            let (Some(top), Some(entry)) = (segs.next(), segs.next()) else { continue };
+            let reached = self.shows(top)
+                && match &self.shaped {
+                    Some(v) => v.method_of(&self.base, top, entry).is_some(),
+                    None => true,
+                };
+            if reached {
+                out.push(path.to_string());
+            }
+        }
+        out
+    }
 }
 
 // ============================================================================
@@ -1233,6 +1299,8 @@ impl DynamicHub {
                 resource_metadata: None,
                 auth_catalog: None,
                 describe: Default::default(),
+                ir_cache: Default::default(),
+                nested_count: Default::default(),
             }),
         }
     }
@@ -1624,6 +1692,177 @@ impl DynamicHub {
         Some(Ok(Box::pin(futures::stream::iter(items.into_iter().map(with(content))))))
     }
 
+    /// RETURNS-40: the service's IR of the walks from `namespaces` (dotted
+    /// paths; none: the whole service) as `caller` sees it — what its `ir`
+    /// method answers. Synapse's walk, made in process over **one snapshot**
+    /// of what the caller is shown (RETURNS-40 review #2): the service's own
+    /// schema and each activation's from that one view (a grant that moves
+    /// while the IR is built moves the next view, not this one), a static
+    /// child's as its activation answers it, each child summary followed;
+    /// under the R-5 scope gate only the schemas the caller's own calls are
+    /// answered (#3). Built off the runtime (`spawn_blocking`), once per key
+    /// at a time, and kept by the view's hash, the roots and — under the
+    /// scope gate — what the caller is answered ([`super::ir::IrCache`],
+    /// #4); a refusal is not kept. The IR is [`super::ir::build`]'s, equal
+    /// to synapse's `buildIRFromSchemas` over the same schemas.
+    pub async fn service_ir(
+        &self,
+        namespaces: &[String],
+        caller: Option<&super::auth::AuthContext>,
+    ) -> Result<super::ir::ServiceIr, super::ir::IrError> {
+        let roots = super::ir::roots(&self.inner.namespace, namespaces);
+        let view = self.ir_view(caller);
+        let permitted = match self.inner.scope_registry.is_some() || self.inner.default_deny {
+            false => None,
+            true => {
+                // re-review #4: decided for the names under the roots asked
+                // alone, and written to no audit sink — the `ir` call was
+                // enforced, and audited, once
+                let mut answered = Vec::new();
+                for name in view.names(&self.inner.namespace) {
+                    let under = roots.iter().any(|r| {
+                        let r = r.join(".");
+                        r.is_empty() || name == r || name.starts_with(&format!("{r}."))
+                    });
+                    if under && self.scope_answers(&self.schema_method(&name), caller).await {
+                        answered.push(name);
+                    }
+                }
+                Some(answered)
+            }
+        };
+        let key = super::ir::IrKey { view: view.hash.clone(), roots: roots.clone(), permitted: permitted.clone() };
+        self.inner
+            .ir_cache
+            .get_or_build(key, || async {
+                let mut schemas: BTreeMap<Vec<String>, Value> = BTreeMap::new();
+                let mut todo: Vec<Vec<String>> = roots.clone();
+                while let Some(path) = todo.pop() {
+                    if schemas.contains_key(&path) || permitted.as_ref().is_some_and(|p| !p.contains(&path.join("."))) {
+                        continue;
+                    }
+                    // a schema the caller is not answered is one the walk skips
+                    let Some(schema) = self.ir_schema(&view, &path, caller).await else { continue };
+                    for child in schema.get("children").and_then(Value::as_array).into_iter().flatten() {
+                        if let Some(ns) = child.get("namespace").and_then(Value::as_str) {
+                            let mut next = path.clone();
+                            next.push(ns.to_string());
+                            todo.push(next);
+                        }
+                    }
+                    schemas.insert(path, schema);
+                }
+                let service = self.inner.namespace.clone();
+                tokio::task::spawn_blocking(move || super::ir::answer(&service, &roots, &schemas))
+                    .await
+                    .unwrap_or_else(|e| Err(super::ir::IrError::Unreadable { namespace: String::new(), message: format!("the IR's build failed: {e}") }))
+            })
+            .await
+    }
+
+    /// How many IR builds this service has run — its `ir` answers built
+    /// rather than kept.
+    pub fn ir_builds(&self) -> usize {
+        self.inner.ir_cache.builds()
+    }
+
+    /// RETURNS-40: one snapshot of what `caller` is shown — the caller's view
+    /// under the grant gate (one [`DynamicHub::shaped`]), the whole service
+    /// otherwise.
+    fn ir_view(&self, caller: Option<&super::auth::AuthContext>) -> IrView {
+        match self.inner.gate {
+            Some(_) => {
+                let (base, shaped) = self.shaped(caller);
+                IrView { hash: shaped.hash.clone(), base, shaped: Some(shaped) }
+            }
+            None => {
+                let base = self.described();
+                IrView { hash: base.service.hash.clone(), base, shaped: None }
+            }
+        }
+    }
+
+    /// `<path>.schema` (the service's own `<ns>.schema` at `[]`).
+    fn schema_method(&self, dotted: &str) -> String {
+        if dotted.is_empty() { format!("{}.schema", self.inner.namespace) } else { format!("{dotted}.schema") }
+    }
+
+    /// Whether the R-5 scope gate answers `caller`'s `method` — the gate the
+    /// call itself would meet.
+    async fn scope_answers(&self, method: &str, caller: Option<&super::auth::AuthContext>) -> bool {
+        let registry = self.inner.scope_registry.as_deref().unwrap_or_else(|| super::scope_gate::empty_registry());
+        super::scope_gate::answers(registry, self.inner.default_deny, method, self.gate_index().get(method), caller).await
+    }
+
+    /// The schema at `path` as the snapshot answers it — what `<path>.schema`
+    /// answers the caller: the service's own and each activation's from the
+    /// view, a static child's (which no view shapes) as its activation
+    /// answers it, asked of the activation as the route asks it.
+    async fn ir_schema(&self, view: &IrView, path: &[String], caller: Option<&super::auth::AuthContext>) -> Option<Value> {
+        use futures::StreamExt;
+        let shown = match path {
+            [] => Some(view.root()),
+            [ns] => view.top(ns),
+            [top, below @ ..] => {
+                // asked of its activation as the route asks it past both
+                // gates — the scope gate decided this name already, silently
+                let activation = self.inner.activations.get(top.as_str())?;
+                let mut stream = activation.call(&format!("{}.schema", below.join(".")), Value::Null, caller, None).await.ok()?;
+                if let Some(site) = self.derived_site_hint() {
+                    stream = fill_site_hints_in_schema_stream(stream, site);
+                }
+                let items: Vec<super::types::PlexusStreamItem> = stream.collect().await;
+                return items.into_iter().find_map(|item| match item {
+                    super::types::PlexusStreamItem::Data { content_type, content, .. } if content_type.ends_with(".schema") => {
+                        Some(content.into_value())
+                    }
+                    _ => None,
+                });
+            }
+        };
+        let mut schema = shown?;
+        if let Some(site) = self.derived_site_hint() {
+            schema.fill_site_hints(&site);
+        }
+        serde_json::to_value(super::SchemaResult::Plugin(schema)).ok()
+    }
+
+    /// RETURNS-40 review #1: `ir`'s `namespaces` refused before any work —
+    /// more names than the caller's view of the service has, or a name it
+    /// has not (named), is `invalid_params`.
+    fn check_ir_names(&self, params: &Value, caller: Option<&super::auth::AuthContext>) -> Result<(), PlexusError> {
+        let asked = match params.get("namespaces") {
+            None | Some(Value::Null) => return Ok(()),
+            Some(Value::Array(a)) => a,
+            Some(_) => return Err(PlexusError::malformed_param("namespaces", "a list of namespaces")),
+        };
+        // the cheap bound first, read with no schema built: no view shows
+        // more than the service has — said without the service's size
+        // (re-review #3), which the caller's view may not show
+        let most = 1 + self.inner.activations.len() + self.inner.nested_count();
+        if asked.len() > most {
+            return Err(PlexusError::malformed_param(
+                "namespaces",
+                format!("{} namespaces asked; more than this service shows you", asked.len()),
+            ));
+        }
+        let names: std::collections::HashSet<String> = self.ir_view(caller).names(&self.inner.namespace).into_iter().collect();
+        if asked.len() > names.len() {
+            return Err(PlexusError::malformed_param(
+                "namespaces",
+                format!("{} namespaces asked; this service shows you {}", asked.len(), names.len()),
+            ));
+        }
+        for n in asked {
+            let Some(n) = n.as_str() else { return Err(PlexusError::malformed_param("namespaces", "a list of namespaces")) };
+            let known = n == self.inner.namespace || names.contains(n);
+            if !known {
+                return Err(PlexusError::malformed_param("namespaces", format!("no namespace `{n}` in this service")));
+            }
+        }
+        Ok(())
+    }
+
     /// AUTH-2/AUTH-3: the default roles every registered activation
     /// declares (`#[plexus_macros::activation(roles(...))]`), merged by role
     /// name — what a service seeds its [`Roles`] with
@@ -1870,6 +2109,8 @@ impl DynamicHub {
             }
             catalog.add(&schema);
         }
+        // RETURNS-40: the cheap bound on `ir`'s names, counted here, once
+        inner.nested_count += Activation::static_child_schemas(&activation).len();
         inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
         inner.child_routers.insert(namespace.clone(), Arc::new(activation_for_router));
         inner.pending_rpc.lock().unwrap()
@@ -1911,6 +2152,8 @@ impl DynamicHub {
             }
             catalog.add(&schema);
         }
+        // RETURNS-40: the cheap bound on `ir`'s names, counted here, once
+        inner.nested_count += Activation::static_child_schemas(&activation).len();
         inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
         inner.child_routers.insert(namespace, Arc::new(activation_for_router));
         inner.pending_rpc.lock().unwrap()
@@ -2054,6 +2297,11 @@ impl DynamicHub {
         }
 
         let (namespace, method_name) = self.parse_method(method)?;
+
+        // RETURNS-40 review #1: `ir`'s names, before any work
+        if namespace == self.inner.namespace && method_name == "ir" {
+            self.check_ir_names(&params, auth)?;
+        }
 
         // Handle plexus's own methods
         let stream = if namespace == self.inner.namespace {
@@ -2843,6 +3091,23 @@ impl DynamicHub {
                 }),
             };
         }
+    }
+
+    /// RETURNS-40: the service's IR — IR 3.0, every type once and each
+    /// method referring to them — of the namespaces asked (none: the whole
+    /// service), as the caller sees the service. The one way to ask for
+    /// several schemas; `<ns>.schema` answers one. Equal to what synapse
+    /// builds from the same raw schemas.
+    #[plexus_macros::method(
+        description = "The service's IR (3.0): every type once, each method referring to them — of the namespaces asked, or the whole service",
+        params(namespaces = "The namespaces (dotted paths) to describe; none: the whole service")
+    )]
+    async fn ir(
+        &self,
+        auth: Option<&super::auth::AuthContext>,
+        namespaces: Option<Vec<String>>,
+    ) -> Result<super::ir::ServiceIr, super::ir::IrError> {
+        self.service_ir(&namespaces.unwrap_or_default(), auth).await
     }
 
     // Note: schema() method is auto-generated by hub-macro for all activations

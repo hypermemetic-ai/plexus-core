@@ -27,7 +27,7 @@ use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
 use plexus_auth_core::grants::GrantsGeneration;
 use plexus_auth_core::ScopeRegistry;
-use plexus_core::plexus::{ir, AuthContext, Gate, Membership, Memberships, PlexusStreamItem, Resolve, RoleTable, ScopeRef};
+use plexus_core::plexus::{ir, Activation, AuthContext, Gate, Membership, Memberships, PlexusStreamItem, Resolve, RoleTable, ScopeRef};
 use plexus_core::DynamicHub;
 use serde_json::{json, Value};
 
@@ -67,11 +67,60 @@ fn methods_under(ir: &Value, prefix: &str) -> Vec<String> {
 // dos
 // ---------------------------------------------------------------------------
 
+/// A service whose `beta` counts every time its schema is built: what
+/// `ir` reads of a service, seen from outside it.
+#[derive(Clone)]
+struct Counted(ir_hard_service::Beta);
+
+static SCHEMAS_READ: AtomicUsize = AtomicUsize::new(0);
+
+#[async_trait::async_trait]
+impl Activation for Counted {
+    type Methods = <ir_hard_service::Beta as Activation>::Methods;
+    fn namespace(&self) -> &str {
+        self.0.namespace()
+    }
+    fn version(&self) -> &str {
+        self.0.version()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn methods(&self) -> Vec<&str> {
+        self.0.methods()
+    }
+    async fn call(&self, method: &str, params: Value, auth: Option<&AuthContext>, raw: Option<&plexus_core::request::RawRequestContext>) -> Result<plexus_core::plexus::PlexusStream, plexus_core::plexus::PlexusError> {
+        Activation::call(&self.0, method, params, auth, raw).await
+    }
+    fn into_rpc_methods(self) -> jsonrpsee::core::server::Methods {
+        self.0.into_rpc_methods()
+    }
+    fn plugin_schema(&self) -> plexus_core::plexus::PluginSchema {
+        SCHEMAS_READ.fetch_add(1, Ordering::SeqCst);
+        self.0.plugin_schema()
+    }
+}
+
+#[async_trait::async_trait]
+impl plexus_core::plexus::ChildRouter for Counted {
+    fn router_namespace(&self) -> &str {
+        self.0.router_namespace()
+    }
+    async fn router_call(&self, method: &str, params: Value, auth: Option<&AuthContext>, raw: Option<&plexus_core::request::RawRequestContext>) -> Result<plexus_core::plexus::PlexusStream, plexus_core::plexus::PlexusError> {
+        self.0.router_call(method, params, auth, raw).await
+    }
+    async fn get_child(&self, name: &str) -> Option<Box<dyn plexus_core::plexus::ChildRouter>> {
+        self.0.get_child(name).await
+    }
+}
+
 /// The reviewer's 40,000 names: refused as invalid_params, naming the
-/// parameter, in under a millisecond.
+/// parameter — before any schema is read or any IR built (a generous time
+/// bound beside: the refusal does no work to wait on).
 #[tokio::test]
 async fn dos_forty_thousand_names_are_refused_at_once() {
-    let service = ir_hard_service::service();
+    let service = DynamicHub::new("xsvc").register(ir_hard_service::Alpha).register(Counted(ir_hard_service::Beta));
+    let read_before = SCHEMAS_READ.load(Ordering::SeqCst);
     let names: Vec<String> = (0..40_000).map(|i| format!("n{i}")).collect();
     let params = json!({ "namespaces": names });
     let t = std::time::Instant::now();
@@ -80,8 +129,32 @@ async fn dos_forty_thousand_names_are_refused_at_once() {
     let err = answer.expect_err("refused");
     assert_eq!(err["error"]["kind"], "invalid_params", "{err}");
     assert!(err["message"].as_str().unwrap_or("").contains("namespaces"), "{err}");
-    assert!(took < std::time::Duration::from_millis(1), "refused in {took:?}");
     assert_eq!(service.ir_builds(), 0, "no IR was built");
+    assert_eq!(SCHEMAS_READ.load(Ordering::SeqCst), read_before, "no schema was read");
+    assert!(took < std::time::Duration::from_millis(100), "refused in {took:?}");
+}
+
+/// RETURNS-40 re-review #3: the refusal of too many names says what the
+/// caller's view shows, never how big the service behind it is.
+#[tokio::test]
+async fn dos_too_many_names_is_counted_in_the_callers_view() {
+    let declared = DynamicHub::new("x").register(TicketsActivation).declared_roles();
+    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
+    let rows = Arc::new(Rows { calls: AtomicUsize::new(0), flip_at: usize::MAX, promoted: Mutex::new(false), generation: GrantsGeneration::new() });
+    let gate = Gate::new(rows, Arc::new(roles), Arc::new(Everywhere));
+    // the whole service: menger, tickets, alpha, alpha.inner, beta — five; a stranger sees only menger
+    let service = DynamicHub::new("menger")
+        .register(TicketsActivation)
+        .register(ir_hard_service::Alpha)
+        .register(ir_hard_service::Beta)
+        .with_gate(Arc::new(gate));
+    for asked in [json!(["menger", "tickets"]), json!(["a", "b", "c", "d", "e", "f"])] {
+        let err = ir_of(&service, json!({ "namespaces": asked }), None).await.expect_err("more than the view shows");
+        let msg = err["message"].as_str().unwrap();
+        assert_eq!(err["error"]["kind"], "invalid_params", "{err}");
+        assert!(!msg.contains('5') && !msg.contains("at most"), "the service's size said: {msg}");
+        assert!(msg.contains("shows you"), "{msg}");
+    }
 }
 
 /// More names than the service has is refused; so is a name it has not,
@@ -357,5 +430,37 @@ async fn eq_the_hard_shapes_are_synapses() {
         let served = ir_of(&service, params, None).await.expect("the IR");
         let golden = std::fs::read_to_string(hard(file)).unwrap();
         assert!(ir::canonical(&served) == golden, "{file}: the service's IR is not synapse's");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// audit (re-review #4)
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Sink(Mutex<Vec<plexus_auth_core::AuditRecord>>);
+
+#[async_trait::async_trait]
+impl plexus_auth_core::AuditSink for Sink {
+    async fn write(&self, r: plexus_auth_core::AuditRecord) {
+        self.0.lock().unwrap().push(r);
+    }
+}
+
+/// Under R-5 an `ir` call is audited once — the call itself — however many
+/// schemas its walk decides, kept or built: no Deny for a schema the caller
+/// did not ask for.
+#[tokio::test]
+async fn audit_an_ir_call_once() {
+    let sink = Arc::new(Sink::default());
+    let reg = ScopeRegistry::builder().role("basic", &["xsvc.ir", "xsvc.schema", "beta.*"]).build().unwrap();
+    let service = ir_hard_service::service().with_audit_sink(sink.clone()).with_default_deny(true).with_scope_registry(reg);
+    let basic = authed("u", &["basic"]);
+    for i in 0..3 {
+        let before = sink.0.lock().unwrap().len();
+        ir_of(&service, json!({"namespaces": ["beta"]}), Some(&basic)).await.expect("beta's IR");
+        let records: Vec<String> = sink.0.lock().unwrap()[before..].iter().map(|r| format!("{r:?}")).collect();
+        assert_eq!(records.len(), 1, "call {i}: {records:#?}");
+        assert!(records[0].contains("xsvc.ir"), "call {i}: {records:#?}");
     }
 }

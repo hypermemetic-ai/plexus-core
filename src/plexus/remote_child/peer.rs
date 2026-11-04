@@ -177,6 +177,21 @@ mod tests {
         assert_eq!(serde_json::to_value(&e).unwrap()["retry_after_ms"], 250, "{e:?}");
     }
 
+    /// RETURNS-36 (review #5): `-32601` is not found, as spec/05 says — so a
+    /// REST caller through the seam gets 404, not 500.
+    #[test]
+    fn minus_32601_is_not_found() {
+        let m = json!({"code": "-32601", "message": "Method not found: echo.nosuch"});
+        assert_eq!(
+            remote_error_of(m.as_object().unwrap()),
+            RemoteError::MethodNotFound { activation: "echo".into(), method: "nosuch".into() }
+        );
+        let a = json!({"code": "-32601", "message": "Activation not found: nope"});
+        assert_eq!(remote_error_of(a.as_object().unwrap()), RemoteError::ActivationNotFound { activation: "nope".into() });
+        let bare = json!({"code": -32601, "message": "Method not found"});
+        assert!(matches!(remote_error_of(bare.as_object().unwrap()), RemoteError::MethodNotFound { .. }));
+    }
+
     #[test]
     fn other_items_are_not_rewritten() {
         assert!(item(r#"{"type":"data","content":1}"#, "x").is_none());

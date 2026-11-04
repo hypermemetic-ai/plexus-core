@@ -43,6 +43,13 @@ BIDIR-6: the input half of a call. BIDIR-17: binary input frames.
 - `FrameSink::with_inputs`, `FrameSink::inputs`: a transport hands its
   connection's `InputTable` to its calls on the sink they already carry (an
   extensions entry of its own is an allocation every call).
+- BIDIR-17 review: the input half runs from the open, not from the route's
+  answer, so a handler may read its input before it returns its stream, and
+  a cancel or a lost socket in that window ends the call and frees its
+  place and slot. A frame of no items is `invalid_input` (`Overrun::Empty`).
+  A refused item leaves the handler's `Input` pending, never `None`.
+  `Delivered::Refused`: a frame refused on arrival; a request for it, or for
+  a call of this socket that has ended, is answered `false`.
 - A method with no `Input` costs what it did: its `{ns}.call` future holds
   nothing of the input half (BIDIR-17; `tests/call_allocation.rs`).
 

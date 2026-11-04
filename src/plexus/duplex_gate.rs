@@ -206,6 +206,8 @@ pub enum Overrun {
     Credit,
     /// Out of sequence.
     Sequence { expected: u64 },
+    /// A frame of no items: a broken client (`invalid_input`).
+    Empty,
 }
 
 /// One input frame as the transport hands it over: which connection sent
@@ -515,6 +517,10 @@ impl DuplexCall {
             None => {}
             Some(Overrun::Credit) => return Err(self.close(DuplexRefusal::PastCredit { seq: f.seq, credit })),
             Some(Overrun::Sequence { expected }) => return Err(self.close(DuplexRefusal::OutOfSequence { seq: f.seq, expected })),
+            Some(Overrun::Empty) => return Err(self.close(DuplexRefusal::InvalidInput { seq: f.seq, message: "an input frame with no items".into() })),
+        }
+        if f.items == 0 {
+            return Err(self.close(DuplexRefusal::InvalidInput { seq: f.seq, message: "an input frame with no items".into() }));
         }
         if self.items.saturating_add(f.items) > credit {
             return Err(self.close(DuplexRefusal::PastCredit { seq: f.seq, credit }));

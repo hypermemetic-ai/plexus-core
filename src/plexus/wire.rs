@@ -895,13 +895,38 @@ fn ready_now(stream: &mut super::streaming::PlexusStream, ended: &mut bool, conn
 // The pipe of a call with an input half
 // ---------------------------------------------------------------------------
 
+/// What a call with an input half answers: its stream, or (BIDIR-17's
+/// review) the route that will make it, still resolving because its handler
+/// reads its input first. An error is the item to send.
+pub(crate) enum Output<'a> {
+    Ready(super::streaming::PlexusStream),
+    Routing(std::pin::Pin<&'a mut (dyn std::future::Future<Output = Result<super::streaming::PlexusStream, Value>> + Send + 'a)>),
+}
+
+impl Output<'_> {
+    /// The next turn of the output half: an item, or the route's refusal.
+    async fn next(&mut self) -> Turn {
+        std::future::poll_fn(|cx| loop {
+            match self {
+                Output::Ready(stream) => return stream.as_mut().poll_next(cx).map(Turn::Item),
+                Output::Routing(route) => match route.as_mut().poll(cx) {
+                    std::task::Poll::Ready(Ok(stream)) => *self = Output::Ready(stream),
+                    std::task::Poll::Ready(Err(item)) => return std::task::Poll::Ready(Turn::Failed(item)),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                },
+            }
+        })
+        .await
+    }
+}
+
 /// [`pipe`] for a call with an input half ([`super::input`]): the subscription
 /// is already accepted, and its first frame is the first `credit`.
-pub(crate) async fn pipe_duplex(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::PlexusStream, duplex: super::input::Duplex) -> jsonrpsee::core::SubscriptionResult {
+pub(crate) async fn pipe_duplex(sink: jsonrpsee::SubscriptionSink, out: Output<'_>, duplex: super::input::Duplex) -> jsonrpsee::core::SubscriptionResult {
     let encoding = duplex.to.encoding();
     let buffer = Buffer::from_block(duplex.to.take_block());
     let encoder = Encoder { encoding, buffer: RefCell::new(buffer), depth: Cell::new(0), last: Cell::new(0) };
-    WIRE.scope(encoder, run_duplex(sink, stream, duplex)).await
+    WIRE.scope(encoder, run_duplex(sink, out, duplex)).await
 }
 
 /// One frame of the input half, as `body` says.
@@ -926,9 +951,11 @@ enum Turn {
     Moved,
     /// The call is refused.
     Refused(super::duplex_gate::DuplexRefusal),
+    /// The route answered an error: this item.
+    Failed(Value),
 }
 
-async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, duplex: super::input::Duplex) -> jsonrpsee::core::SubscriptionResult {
+async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, duplex: super::input::Duplex) -> jsonrpsee::core::SubscriptionResult {
     use futures::StreamExt;
     let super::input::Duplex { ledger, mut gate, inbox, credit, ns, to, slot } = duplex;
     let mut inbox = Some(inbox);
@@ -957,9 +984,16 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut stream: super::stream
                     }
                 },
                 _ = ledger.woken() => Turn::Moved,
-                item = stream.next() => Turn::Item(item),
+                turn = output.next() => turn,
             };
+            if let Turn::Failed(item) = turn {
+                if slot.take().is_some() && !ledger.client_ended() {
+                    control(&to, &mut notification, &input_closed("method_ended", ledger.last_done()), false).await?;
+                }
+                return control(&to, &mut notification, &serde_json::to_string(&item).unwrap_or_default(), false).await;
+            }
             let (item, refused) = match turn {
+                Turn::Failed(_) => unreachable!("answered above"),
                 Turn::Refused(why) => (None, Some(why)),
                 Turn::Item(item) => (Some(item), ledger.take_refusal()),
                 Turn::Moved => (None, ledger.take_refusal()),
@@ -1009,7 +1043,7 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut stream: super::stream
         }
     }
     .await;
-    drop(stream);
+    drop(output);
     let _ = out; // Err: the socket is gone, as the call's end says.
     if let Some(block) = WIRE.with(|e| std::mem::take(&mut *e.buffer.borrow_mut())).into_block() {
         to.give_block(block);

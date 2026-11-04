@@ -3083,21 +3083,31 @@ async fn serve_seamed(
 ) -> jsonrpsee::core::SubscriptionResult {
     let caller = if identified { ext.get::<Arc<super::auth::AuthContext>>().cloned() } else { None };
     let seen = service.inner.gate.as_ref().map_or(0, |g| g.generation().current());
-    // Built in place, in a block of its own: the route's future shares its
-    // room in this one with the pipe's (a call's whole size is one
-    // allocation per call), and nothing moved out of keeps a room of its own.
-    let (answer, seam) = {
-        let mut scoped = std::pin::pin!(super::input::CALL.scope(
-            std::cell::RefCell::new(super::input::Seam { service: service.clone(), params, pending: Some(pending), ext, seen, opened: None, refused: None }),
-            service.route(&call.method, call.params.unwrap_or_default(), caller.as_deref()),
-        ));
-        let answer = scoped.as_mut().await;
-        (answer, scoped.as_mut().take_value().expect("the scope ran to its end").into_inner())
+    let opened = Arc::new(std::sync::Mutex::new(None::<super::input::Opened>));
+    let take = || opened.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut scoped = std::pin::pin!(super::input::CALL.scope(
+        std::cell::RefCell::new(super::input::Seam { service: service.clone(), params, pending: Some(pending), ext, seen, opened: opened.clone(), refused: None }),
+        service.route(&call.method, call.params.unwrap_or_default(), caller.as_deref()),
+    ));
+    // The route runs until it answers, or until the method has opened its
+    // input half: a handler may read its input before it returns its stream,
+    // so from the open the pipe runs (credit, items, cancel) beside the
+    // route still resolving.
+    let answered = std::future::poll_fn(|cx| match std::future::Future::poll(scoped.as_mut(), cx) {
+        std::task::Poll::Ready(answer) => std::task::Poll::Ready(Some(answer)),
+        std::task::Poll::Pending if opened.lock().unwrap_or_else(|e| e.into_inner()).is_some() => std::task::Poll::Ready(None),
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    })
+    .await;
+    let Some(answer) = answered else {
+        let super::input::Opened { sink, duplex } = take().expect("opened, the route still resolving");
+        let mut routing = std::pin::pin!(async { scoped.as_mut().await.map_err(|e| error_item(ns, &e)) });
+        return Box::pin(super::wire::pipe_duplex(sink, super::wire::Output::Routing(routing.as_mut()), duplex)).await;
     };
-    let super::input::Seam { pending, ext, opened, refused, .. } = seam;
-    match (answer, opened) {
+    let super::input::Seam { pending, ext, refused, .. } = scoped.as_mut().take_value().expect("the scope ran to its end").into_inner();
+    match (answer, take()) {
         // Boxed: a call with no input half does not carry its room.
-        (Ok(stream), Some(opened)) => Box::pin(super::wire::pipe_duplex(opened.sink, stream, opened.duplex)).await,
+        (Ok(stream), Some(opened)) => Box::pin(super::wire::pipe_duplex(opened.sink, super::wire::Output::Ready(stream), opened.duplex)).await,
         (Ok(stream), None) => {
             let pending = pending.expect("only an open takes it, and an open is `opened`");
             pipe_stream_to_subscription(pending, stream, &ext).await
@@ -3132,7 +3142,7 @@ fn register_input_methods(module: &mut RpcModule<()>, ns: &'static str) -> Resul
     fn answer(delivered: Delivered) -> Result<bool, ErrorObjectOwned> {
         match delivered {
             Delivered::Taken => Ok(true),
-            Delivered::Dropped => Ok(false),
+            Delivered::Dropped | Delivered::Refused => Ok(false),
             Delivered::NotThisCall => Err(ErrorObjectOwned::owned(
                 -32003,
                 "not_this_call: input comes from the connection that opened the call",

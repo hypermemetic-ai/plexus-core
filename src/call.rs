@@ -80,9 +80,13 @@ struct Inner {
     deferred: Option<(Arc<Gate>, Grant)>,
     hop: Option<Hop>,
     /// What a trait-impl method's verifier answered for this call
-    /// (`#[plexus_macros::from_auth(…)]` on the method): [`verified`].
-    verified: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
+    /// (`#[plexus_macros::from_auth(…)]` on the method): [`verified`]. Shared
+    /// by a context narrowed from this one (`with_reach`: the same call);
+    /// another caller's context (`with_auth`, `ungated`) starts its own.
+    verified: Verified,
 }
+
+type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
 
 impl Inner {
     fn with(auth: Option<AuthContext>, reach: Option<Reach>, deferred: Option<(Arc<Gate>, Grant)>, hop: Option<Hop>) -> Self {
@@ -90,7 +94,7 @@ impl Inner {
         if let Some(r) = reach {
             let _ = cell.set(r);
         }
-        Inner { auth, reach: cell, deferred, hop, verified: Mutex::new(None) }
+        Inner { auth, reach: cell, deferred, hop, verified: Verified::default() }
     }
 }
 
@@ -131,9 +135,12 @@ impl CallContext {
         Self(Arc::new(Inner::with(auth.cloned(), self.0.reach.get().cloned(), self.0.deferred.clone(), self.0.hop.clone())))
     }
 
-    /// This context with its reach replaced.
+    /// This context with its reach replaced: the same call, so the same
+    /// verified value (the same slot, set once for both).
     pub(crate) fn with_reach(&self, reach: Reach) -> Self {
-        Self(Arc::new(Inner::with(self.0.auth.clone(), Some(reach), None, self.0.hop.clone())))
+        let mut inner = Inner::with(self.0.auth.clone(), Some(reach), None, self.0.hop.clone());
+        inner.verified = Arc::clone(&self.0.verified);
+        Self(Arc::new(inner))
     }
 
     /// The identity the gate admitted; `None` for an anonymous call, or one

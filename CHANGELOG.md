@@ -26,7 +26,9 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
 - `call::verified::<T>()`: what a trait-impl method's verifier
   (`#[plexus_macros::from_auth(…)]` on the method) answered for the call.
   Set once per call, by the dispatch before the body: a second set is
-  refused (`CallError::AlreadyVerified`) and the verifier's value stands.
+  refused (`CallError::AlreadyVerified`) and the verifier's value stands —
+  inside `with_reach` too, which narrows the same call (another caller's
+  context, `ungated` or a nested route, starts its own).
 - `call::ungated(activation, method, params, auth, raw_ctx)`: one activation
   dispatched as a service with no gate dispatches it — in a context admitting
   `auth` everywhere, said by the caller of the function. The leaf path for a

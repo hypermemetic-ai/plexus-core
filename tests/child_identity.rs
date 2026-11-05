@@ -299,12 +299,14 @@ async fn identity_only_when_chosen_drops_the_session_and_ceiling() {
     let hub = hub(&m);
     let viewer_only = ceilinged(BOB, json!(["viewer@*"]));
     let out = data(hub.route("tickets.mirror.whoami", json!({}), Some(&viewer_only)).await.unwrap()).await;
-    // The verified user id and session id are kept; the metadata — the
-    // principal stamp, the session key, the ceiling — is not.
+    // The verified user id and session id are kept, and (RETURNS-47) the
+    // principal stamp with them — it is the identity, so a `key:` caller is
+    // still named in the child; the rest of the metadata — the session key,
+    // the ceiling — is not.
     assert_eq!(out[0]["user"], json!(viewer_only.user_id));
     assert_eq!(out[0]["session"], json!("s1"));
     assert_eq!(out[0]["ceiling"], Value::Null);
-    assert_eq!(out[0]["principal"], Value::Null);
+    assert_eq!(out[0]["principal"], json!(BOB));
 }
 
 #[tokio::test]

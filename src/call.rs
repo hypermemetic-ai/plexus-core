@@ -123,10 +123,34 @@ impl CallContext {
         Self(Arc::new(Inner::with(auth.cloned(), None, Some((gate, grant)), None)))
     }
 
-    /// A call that came through the child seam: the hop, and nothing this
-    /// process admitted.
+    /// A call that came through the child seam (owner, 2026-11-04: children
+    /// receive auth): its caller is the one the hop names — `for`'s far end,
+    /// as an `AuthContext` whose session is the hop's call id; anonymous when
+    /// `for` is empty — and its reach the hop's ceiling
+    /// ([`Reach::from_hop_ceiling`]: `limit.held_on` for `limit.grant`),
+    /// never wider; nowhere when no gate decided (`limit: null`). The hop is
+    /// believed as the transport delivered it (`remote_child::serve_child_on`
+    /// takes it only from a sender it trusts).
     pub(crate) fn through_hop(hop: Hop) -> Self {
-        Self(Arc::new(Inner::with(None, None, None, Some(hop))))
+        let auth = hop.caller().and_then(|p| p.parse::<plexus_auth_core::identity::Principal>().ok()).map(|p| {
+            AuthContext::for_principal(&p, format!("hop:{}", hop.call), Vec::new(), serde_json::json!({ "hop_principal": hop.principal }))
+        });
+        let reach = match &hop.limit {
+            Some(l) => Reach::from_hop_ceiling(Grant::new(l.grant.clone()), hop.held_on()),
+            None => Reach::nowhere(),
+        };
+        Self(Arc::new(Inner::with(auth, Some(reach), None, Some(hop))))
+    }
+
+    /// The context of a call routed into an in-process child, under its
+    /// forward policy: `callee` the context the policy derived (none, or
+    /// one no longer signed in, is anonymous); the call's reach kept when
+    /// the policy keeps the caller's identity, nowhere when it does not; the
+    /// hop kept; the verified value the child's own (another caller).
+    pub(crate) fn for_child(&self, callee: Option<&AuthContext>, keeps_identity: bool) -> Self {
+        let auth = callee.filter(|a| a.is_authenticated()).cloned();
+        let reach = if keeps_identity { self.reach().cloned().unwrap_or_else(Reach::nowhere) } else { Reach::nowhere() };
+        Self(Arc::new(Inner::with(auth, Some(reach), None, self.0.hop.clone())))
     }
 
     /// This context with its identity replaced: a call routed from inside
@@ -143,14 +167,14 @@ impl CallContext {
         Self(Arc::new(inner))
     }
 
-    /// The identity the gate admitted; `None` for an anonymous call, or one
-    /// that came through a hop.
+    /// The identity the gate admitted (in a child, the one the hop names, or
+    /// the one its forward policy derived); `None` for an anonymous call.
     pub fn auth(&self) -> Option<&AuthContext> {
         self.0.auth.as_ref()
     }
 
-    /// The reach the gate answered; `None` for a call that came through a
-    /// hop (its bound is [`Hop::allows`]).
+    /// The reach the gate answered (in a child through the seam, the hop's
+    /// ceiling).
     pub fn reach(&self) -> Option<&Reach> {
         if let Some(reach) = self.0.reach.get() {
             return Some(reach);

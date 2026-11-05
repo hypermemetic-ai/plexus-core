@@ -53,7 +53,7 @@ use plexus_auth_core::grants::{GrantsGeneration, Reach};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-pub use host::{serve_child, serve_child_stdio};
+pub use host::{serve_child, serve_child_on, serve_child_stdio, ChildPeer};
 pub use link::MountTimings;
 pub use spec::{parse_duration, Backoff, ChildError, ChildOptions, ChildSpec};
 #[cfg(feature = "clap")]

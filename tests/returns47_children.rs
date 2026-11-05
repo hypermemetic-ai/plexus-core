@@ -73,7 +73,7 @@ pub struct KidActivation {
 }
 
 /// A child of plain methods.
-#[plexus_macros::activation(request = Req)]
+#[plexus_macros::activation(request = Req, auth = "mixed")]
 impl KidActivation {
     /// The `#[from_auth]` verifier's user.
     #[plexus_macros::method]

@@ -41,20 +41,38 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   each call in its hop's context, schema calls and a dynamic child's lookup
   included. Before the method runs: a call with no hop is `unauthenticated`;
   a hop no gate decided (`limit: null`, no grant) or one admitted for another
-  grant than the method called is `forbidden`. **No caller in a child:** no
-  gate of the child admits one and the hop is no credential, so `caller()` is
-  an error there; an activation whose methods need a caller (`auth =
-  "required"` on a method not `public`, or a `#[from_auth]` parameter, as its
-  schema says) is refused at start, naming them. A plugin bounds itself with
-  `hop()` (`Hop::allows`) and declares no `required`. (A trait-impl method's
-  verifier under another posture is not in the schema, so not seen at start:
-  such a method is refused call by call.) **The hop is trusted from the
-  transport** — unsigned JSON from whoever writes the child's input — so a
-  child is served only on a pipe its parent owns; anywhere else is unsafe
-  until GRAFT-1's credential scoped to the call exists.
+  grant than the method called is `forbidden`. **A child receives auth** (owner,
+  2026-11-04): through a hop `caller()` is the caller the hop names (`for`'s
+  far end; anonymous when `for` is empty), its reach the hop's ceiling
+  (`Reach::from_hop_ceiling`: `limit.held_on` for `limit.grant`), never
+  wider; `required` works in a child (an anonymous hop is refused), and a
+  `#[from_auth]` verifier is the child's own, run on that caller.
+  (The re-review's start-time refusal of an activation that needs a caller
+  is gone with the reason for it.) **Who may send a hop** (`remote_child`'s
+  `host` docs hold the trust model): a hop is unsigned, so it is believed
+  only from a sender the child trusts. On a pipe its parent owns
+  (`serve_child`, `serve_child_stdio`: `ChildPeer::Pipe`) every hop is the
+  parent's. On a proven connection (`serve_child_on` with
+  `ChildPeer::connection(proven, acts_for_others)`) a hop is taken only when
+  the proven principal is one the child trusts to act for others and the hop
+  names it as the acting service; any other is refused `forbidden`.
+  plexus-core has no WebSocket server for a Rust child: the server that
+  proves the connection hands `serve_child_on` its principal.
 
 ### Changed
 
+- **In-process children receive auth** (owner, 2026-11-04). A call routed
+  into a child (`route_to_child`: static `#[child]`, dynamic, nested) runs in
+  a context of its own, under the child's forward policy: its caller the
+  context the policy derived (`same_service`, `pass_through`: the caller
+  whole; `identity_only`: its identity, roles and metadata dropped but its
+  principal kept; `anonymous`: none), its reach the call's when the policy
+  keeps the caller's identity and nowhere when not, its verified value its
+  own. So `caller()`, `current_reach()`, `reach: Reach`, `#[from_auth]` and
+  `required` answer in a child as the policy says; before, `caller()` and
+  `reach` answered the outer call whole whatever the policy (`anonymous`
+  leaked the caller and its reach), and `identity_only` dropped a `key:`
+  caller's principal (plexus-auth-core's fix).
 - Every call a `DynamicHub` dispatches runs in its context, and the stream
   it answers carries it (each poll inside it): the gate's reach on a gated
   service; on one without a gate `Reach::everywhere`, said by the dispatch

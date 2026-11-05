@@ -10,19 +10,16 @@
 //! ```
 //!
 //! It answers `_info` (`backend`: the activation's namespace), `{ns}.call
-//! {method, params, hop}` and `{ns}.call_unsub [sid]`. Each call runs in the
-//! hop's context ([`crate::call`]): the method reads it with
-//! `plexus_core::call::hop()` — the acting service, the caller it acts for,
-//! the near side's verdict as a ceiling ([`Hop::allows`]) and the call id —
-//! and `call::caller()` there is an error: no gate of this process admitted
-//! anyone, and the hop is no credential.
+//! {method, params, hop}` and `{ns}.call_unsub [sid]`.
 //!
-//! **No caller in a child.** No gate of the child admits anyone, and the hop
-//! is no credential, so `call::caller()` is an error here: an activation
-//! whose methods need a caller (`auth = "required"` on a method not
-//! `public`, `#[from_auth]`) is refused at start, naming them. A plugin
-//! bounds itself with `plexus_core::call::hop()` (`Hop::allows`) and declares
-//! no `required`.
+//! **A child receives auth** (owner, 2026-11-04). Each call runs in the hop's
+//! context ([`crate::call`]): `call::caller()` is the caller the hop names
+//! (`for`'s far end; anonymous when `for` is empty), its reach the hop's
+//! ceiling (`limit.held_on` for `limit.grant`, [`Reach::from_hop_ceiling`]),
+//! never wider; `current_reach()` and `reach: Reach` answer that ceiling; a
+//! method under `auth = "required"` refuses an anonymous hop; a `#[from_auth]`
+//! verifier (on a parameter, or on a trait-impl method) is the child's own,
+//! run on that caller. `call::hop()` answers the hop itself.
 //!
 //! The far side decides again (spec/12 rule 2), before the method runs: a
 //! call with no hop is `unauthenticated`; a hop no gate decided (`limit:
@@ -31,12 +28,28 @@
 //! hop, in its context when it has one, as every call (a dynamic child's
 //! lookup included) runs. Nothing is written to stdout but the protocol.
 //!
-//! **The hop is trusted from the transport.** It is JSON from whoever writes
-//! to the child's input: nothing in it is signed, and the child cannot tell
-//! a service's hop from one written by anyone else on that pipe. Serve a
-//! child only on a pipe its parent owns (stdio, spawned by the service that
-//! mounts it); serving it anywhere else — a socket, a shared pipe — is
-//! unsafe until GRAFT-1's credential scoped to the call exists.
+//! # Who may send a hop — the trust model
+//!
+//! A hop is unsigned JSON: it is believed only from a sender the child
+//! trusts to act for others, and [`ChildPeer`] says who that is.
+//!
+//! - **A pipe** ([`ChildPeer::Pipe`], [`serve_child`], [`serve_child_stdio`]):
+//!   the child's stdin is the pipe of the service that spawned it — nobody
+//!   else writes it — so every hop on it is the parent's. Serve a child this
+//!   way only on a pipe its parent owns.
+//! - **A connection** ([`ChildPeer::connection`], [`serve_child_on`]): the
+//!   transport has proven who is on the other end (a WebSocket's key proof,
+//!   plexus-wire spec/00 — what `RemoteChild` dials `child-ws` with, its
+//!   `--child-key`), and the child takes a hop only when that principal is
+//!   one it trusts to act for others (a configured list) and the hop names
+//!   it as the acting service (`hop.principal`). Any other hop is refused
+//!   `forbidden`, before the method runs. plexus-core has no WebSocket
+//!   server of its own for a Rust child: the server that proves the
+//!   connection hands this its principal.
+//!
+//! What a trusted sender says is believed: the caller it names and the
+//! ceiling it gives. GRAFT-1's credential scoped to the call is what would
+//! let a child check the claim rather than the sender.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -49,14 +62,47 @@ use tokio::sync::mpsc;
 
 use super::link::{meta, write_lines};
 use crate::call::{CallContext, Hop, InCall};
+#[allow(unused_imports)]
+use plexus_auth_core::grants::Reach;
 use crate::plexus::plexus::{error_item, Activation};
 use crate::plexus::types::PlexusStreamItem;
 
 type Live = Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>;
 
+/// Who is on the other end of a child's input, and so whose hops it takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildPeer {
+    /// A pipe the parent owns (the child's stdin): every hop is the
+    /// parent's.
+    Pipe,
+    /// A connection the transport proved: `proven` is the principal it
+    /// proved (`key:<hex>`); a hop is taken only when `proven` is one of
+    /// `acts_for_others` and the hop names it as the acting service.
+    Connection { proven: String, acts_for_others: Vec<String> },
+}
+
+impl ChildPeer {
+    /// A connection proven as `proven`, the child trusting `acts_for_others`
+    /// (service principals) to act for others.
+    pub fn connection(proven: impl Into<String>, acts_for_others: impl IntoIterator<Item = String>) -> Self {
+        ChildPeer::Connection { proven: proven.into(), acts_for_others: acts_for_others.into_iter().collect() }
+    }
+
+    /// Whether a hop on this input is believed.
+    fn takes(&self, hop: &Hop) -> bool {
+        match self {
+            ChildPeer::Pipe => true,
+            ChildPeer::Connection { proven, acts_for_others } => {
+                acts_for_others.iter().any(|t| t == proven) && hop.principal == *proven
+            }
+        }
+    }
+}
+
 /// Serve `activation` as a child on this process's stdin and stdout, until
 /// the service closes stdin (spec/11: the end of input ends every call).
-/// Only for a process the service spawned: its stdin is the service's alone.
+/// Only for a process the service spawned: its stdin is the service's alone
+/// ([`ChildPeer::Pipe`]).
 pub async fn serve_child_stdio<A>(activation: A) -> std::io::Result<()>
 where
     A: Activation + Clone,
@@ -65,32 +111,27 @@ where
 }
 
 /// Serve `activation` as a child over `r` (frames from the service, one per
-/// line) and `w` (frames to it), until `r` ends. The hop on each frame is
-/// believed as written: `r` must be a pipe only the parent service writes
-/// (see the module docs).
+/// line) and `w` (frames to it), until `r` ends — a pipe its parent owns
+/// ([`ChildPeer::Pipe`]): every hop on it is believed (see the module docs).
 pub async fn serve_child<A, R, W>(activation: A, r: R, w: W) -> std::io::Result<()>
 where
     A: Activation + Clone,
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    serve_child_on(activation, r, w, ChildPeer::Pipe).await
+}
+
+/// [`serve_child`] on an input whose sender is `peer`: a hop is taken only
+/// as [`ChildPeer`] says, and refused `forbidden` otherwise.
+pub async fn serve_child_on<A, R, W>(activation: A, r: R, w: W, peer: ChildPeer) -> std::io::Result<()>
+where
+    A: Activation + Clone,
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let ns = activation.namespace().to_string();
-    // RETURNS-47: no gate of a child admits a caller (`caller()` is an error
-    // through a hop), so a method that needs one would refuse every call.
-    // Refused here, at start, naming them.
-    let needs = needs_a_caller(&activation.plugin_schema());
-    if !needs.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "`{ns}` cannot be served as a child: {} need a caller (`auth = \"required\"` on a method not \
-                 `public`, or `#[from_auth]`), and a call through the seam has none — no gate of the child \
-                 admits one. A plugin bounds itself with `plexus_core::call::hop()` (`Hop::allows`) and \
-                 declares no `required`.",
-                needs.iter().map(|m| format!("`{ns}.{m}`")).collect::<Vec<_>>().join(", ")
-            ),
-        ));
-    }
+    let peer = Arc::new(peer);
     let (call_m, unsub_m) = (format!("{ns}.call"), format!("{ns}.call_unsub"));
     let (out, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_lines(w, out_rx));
@@ -125,7 +166,7 @@ where
             next_sid += 1;
             // spec/02: the subscription id before any of its items.
             send(&out, json!({ "jsonrpc": "2.0", "id": id, "result": sid }));
-            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop));
+            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer)));
             live.lock().unwrap().insert(sid, task.abort_handle());
         } else if method == unsub_m {
             let held = params.get(0).and_then(Value::as_u64).and_then(|sid| live.lock().unwrap().remove(&sid));
@@ -158,6 +199,7 @@ async fn run<A: Activation>(
     target: String,
     params: Value,
     hop: Option<Value>,
+    peer: Arc<ChildPeer>,
 ) {
     let item = |v: Value| {
         let frame = json!({ "jsonrpc": "2.0", "method": format!("{ns}.call"), "params": { "subscription": sid, "result": v } });
@@ -172,6 +214,10 @@ async fn run<A: Activation>(
     } else if let Some(method) = target.strip_prefix(&format!("{ns}.")) {
         let hop: Option<Hop> = hop.and_then(|h| serde_json::from_value(h).ok());
         let introspection = method == "schema" || method.ends_with(".schema");
+        // Who may send a hop: one this child does not take is refused
+        // (a schema call answers without it).
+        let untrusted = hop.as_ref().is_some_and(|h| !peer.takes(h));
+        let hop = if untrusted && introspection { None } else { hop };
         // The far side decides again, before the method runs: no hop is
         // nobody; a hop no gate decided (`limit: null`, or no grant) or one
         // admitted for another grant is forbidden. A schema call answers
@@ -180,6 +226,9 @@ async fn run<A: Activation>(
             reason: DenyReason::MissingGrant { grant: target.clone(), scope: "*".into(), roles: vec![], held_on: vec![] },
         };
         let refused = match &hop {
+            _ if untrusted && !introspection => Some(RemoteError::Forbidden {
+                reason: DenyReason::MissingGrant { grant: target.clone(), scope: "*".into(), roles: vec![], held_on: vec![] },
+            }),
             _ if introspection => None,
             None => Some(RemoteError::Unauthenticated),
             Some(h) => match h.grant() {
@@ -192,8 +241,11 @@ async fn run<A: Activation>(
             (None, hop) => {
                 let routed = match hop {
                     Some(hop) => {
+                        // The hop's caller is the call's: `caller()` and a
+                        // `#[from_auth]` parameter both name it.
                         let ctx = CallContext::through_hop(hop);
-                        crate::call::scope(ctx.clone(), activation.call(method, params, None, None))
+                        let auth = ctx.auth().cloned();
+                        crate::call::scope(ctx.clone(), async { activation.call(method, params, auth.as_ref(), None).await })
                             .await
                             .map(|s| -> crate::plexus::PlexusStream { Box::pin(InCall::new(ctx, s)) })
                     }
@@ -213,30 +265,4 @@ async fn run<A: Activation>(
         refuse(RemoteError::ActivationNotFound { activation: target.split('.').next().unwrap_or_default().to_string() });
     }
     live.lock().unwrap().remove(&sid);
-}
-
-/// The methods of `schema` that need a caller the gate admitted: `auth =
-/// "required"` on a method not `public`, or a parameter the dispatch takes
-/// from the caller (`x-plexus-source: {"from": "auth"}`, `#[from_auth]`).
-/// A trait-impl method's verifier written on the method under any other
-/// posture is not in the schema, and so not seen here.
-fn needs_a_caller(schema: &crate::plexus::PluginSchema) -> Vec<String> {
-    use crate::plexus::schema::AuthPosture;
-    schema
-        .methods
-        .iter()
-        .filter(|m| m.name != "schema")
-        .filter(|m| {
-            let required = matches!(m.auth_posture, Some(AuthPosture::Required)) && !m.public;
-            let from_auth = m
-                .params
-                .as_ref()
-                .and_then(|p| serde_json::to_value(p).ok())
-                .and_then(|p| p.get("properties").cloned())
-                .and_then(|p| p.as_object().cloned())
-                .is_some_and(|props| props.values().any(|v| v["x-plexus-source"]["from"] == "auth"));
-            required || from_auth
-        })
-        .map(|m| m.name.clone())
-        .collect()
 }

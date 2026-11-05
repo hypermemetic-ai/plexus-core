@@ -282,6 +282,18 @@ impl From<&PlexusError> for RemoteError {
     }
 }
 
+/// RETURNS-47: a child's call inside its own context (when the parent's call
+/// had one), its stream carrying it.
+async fn in_child<F>(ctx: Option<crate::call::CallContext>, routed: F) -> Result<PlexusStream, PlexusError>
+where
+    F: std::future::Future<Output = Result<PlexusStream, PlexusError>>,
+{
+    match ctx {
+        Some(ctx) => in_call(ctx, routed).await,
+        None => routed.await,
+    }
+}
+
 /// RETURNS-47: run a call's routing inside its context, and hand back its
 /// stream carrying that context, so the method's stream reads its caller as
 /// its first line does ([`crate::call`]).
@@ -732,17 +744,27 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
             // consumed them via `with_callee_context`, which scopes the
             // callee to the dispatch closure (the raw constructor remains
             // pub(crate) to plexus-auth-core).
+            // RETURNS-47 (owner, 2026-11-04: children receive auth): the
+            // child's call runs in a context of its own, as the policy
+            // derived it — its caller the derived context, its reach the
+            // call's when the policy keeps the caller's identity, nowhere
+            // when not — so `caller()`, `current_reach()` and `required` in a
+            // child answer as the policy says, not as the outer call does.
+            let outer = crate::call::context().ok();
+            let keeps_identity = derivation.keep_verified_user;
             return match auth {
                 Some(caller_ctx) => {
                     caller_ctx
                         .with_callee_context(&derivation, &site.caller, |callee_ctx| async move {
-                            child
-                                .router_call(rest, params, Some(&callee_ctx), raw_ctx)
-                                .await
+                            let ctx = outer.map(|o| o.for_child(Some(&callee_ctx), keeps_identity));
+                            in_child(ctx, child.router_call(rest, params, Some(&callee_ctx), raw_ctx)).await
                         })
                         .await
                 }
-                None => child.router_call(rest, params, None, raw_ctx).await,
+                None => {
+                    let ctx = outer.map(|o| o.for_child(None, keeps_identity));
+                    in_child(ctx, child.router_call(rest, params, None, raw_ctx)).await
+                }
             };
         }
         return Err(PlexusError::ActivationNotFound(child_name.to_string()));

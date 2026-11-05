@@ -159,3 +159,19 @@ async fn verified_is_the_calls_inside_with_reach() {
     assert_eq!(r.0, Ok("first".to_string()), "the call's verified value, narrowed");
     assert_eq!(r.1, Err(call::CallError::AlreadyVerified));
 }
+
+/// A hop that names no readable caller allows nothing, whatever its
+/// ceiling: it agrees with `caller()?.reach()`, which is nowhere then.
+#[test]
+fn a_hop_with_no_readable_caller_allows_nothing() {
+    use plexus_core::plexus::ScopeRef;
+    let hop = |for_: Value| -> call::Hop {
+        serde_json::from_value(json!({ "principal": "service:svc", "for": for_, "limit": { "grant": "g.m", "held_on": ["*"] }, "call": "c" })).unwrap()
+    };
+    for for_ in [json!([]), json!(["junk"])] {
+        let h = hop(for_.clone());
+        assert!(!h.allows(&[ScopeRef::Everywhere]), "for={for_}");
+        assert!(!h.allows_scope("MENGER"), "for={for_}");
+    }
+    assert!(hop(json!([ADA])).allows_scope("MENGER"), "a readable caller within `*`");
+}

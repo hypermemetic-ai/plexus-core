@@ -1,10 +1,8 @@
 //! RETURNS-47 · the re-review's core cases.
 //!
-//! - A trait-impl activation under `auth = "required"` cannot be served as a
-//!   child (no gate of the child admits a caller: `caller()` is an error
-//!   through a hop), so `serve_child` refuses it at start, naming the
-//!   methods, rather than refusing every call at runtime. A plugin bounds
-//!   itself with `hop()` and declares no `required`.
+//! - A trait-impl activation under `auth = "required"` is served as a child
+//!   (the owner: children receive auth): `caller()` there is the caller the
+//!   hop names, and an anonymous hop is refused by `required`.
 //! - `call::verified` is set once per call: a second set (a forgery by any
 //!   code inside the call) is an error, and `verified()` still answers the
 //!   verifier's value.
@@ -61,16 +59,34 @@ impl guarded::Guarded for G {
     }
 }
 
-#[tokio::test]
-async fn serve_child_refuses_at_start_an_activation_whose_methods_need_a_caller() {
-    let (_ours, theirs) = tokio::io::duplex(1 << 16);
+/// One call to `G` served as a child, with `hop`; its first item.
+async fn child_call(target: &str, hop: Value) -> Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (mut ours, theirs) = tokio::io::duplex(1 << 16);
     let (r, w) = tokio::io::split(theirs);
-    let refused = plexus_core::plexus::remote_child::serve_child(G, r, w).await;
-    let e = refused.expect_err("refused at start, not call by call");
-    let said = e.to_string();
-    assert!(said.contains("guarded.get") && said.contains("guarded.list"), "{said}");
-    assert!(!said.contains("guarded.open"), "a public method needs no caller: {said}");
-    assert!(said.contains("hop()"), "{said}");
+    let served = tokio::spawn(plexus_core::plexus::remote_child::serve_child(G, r, w));
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "guarded.call", "params": { "method": target, "params": {}, "hop": hop } });
+    ours.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    let mut lines = BufReader::new(&mut ours).lines();
+    let _opened = lines.next_line().await.unwrap().unwrap();
+    let item: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    drop(lines);
+    drop(ours);
+    served.await.unwrap().unwrap();
+    item["params"]["result"].clone()
+}
+
+// The owner, 2026-11-04 ("I NEED children to be able to receive auth"):
+// this replaces the re-review's start-time refusal. Through a hop
+// `caller()` is the caller the hop names, so `required` works in a child.
+#[tokio::test]
+async fn a_required_trait_impl_is_served_as_a_child_and_answers_the_hops_caller() {
+    let hop = json!({ "principal": "service:svc", "for": [ADA], "limit": { "grant": "guarded.get", "held_on": ["*"] }, "call": "x" });
+    let got = child_call("guarded.get", hop).await;
+    assert_eq!(got["content"], json!("ran"), "{got}");
+    let anonymous = json!({ "principal": "service:svc", "for": [], "limit": { "grant": "guarded.get", "held_on": ["*"] }, "call": "y" });
+    let got = child_call("guarded.get", anonymous).await;
+    assert_eq!(got["error_kind"], "unauthenticated", "anonymous, refused by required: {got}");
 }
 
 mod forge {

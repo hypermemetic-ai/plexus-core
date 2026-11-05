@@ -22,6 +22,11 @@
 //! verifier (on a parameter, or on a trait-impl method) is the child's own,
 //! run on that caller. `call::hop()` answers the hop itself.
 //!
+//! A plugin bounds its reads with `call::caller()?.reach()` (or
+//! `current_reach()`): within the ceiling for the caller the hop names, and
+//! nowhere when it names none it can read. `call::hop()?.allows(…)` answers
+//! the same.
+//!
 //! The far side decides again (spec/12 rule 2), before the method runs: a
 //! call with no hop is `unauthenticated`; a hop no gate decided (`limit:
 //! null`, or no grant) and a hop admitted for another grant than the method

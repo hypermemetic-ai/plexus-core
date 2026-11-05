@@ -18,7 +18,8 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   whose signature cannot carry `#[from_auth]`, reaches its caller as an
   inherent one does. `hop()` answers, in a child reached through the seam,
   the hop the call came through (`Hop`: `principal`, `for`, `limit`, `call`;
-  `Hop::caller`, `Hop::grant`, `Hop::held_on`, `Hop::allows`). `context()`
+  `Hop::caller`, `Hop::grant`, `Hop::held_on`, `Hop::allows` — false when
+  the hop names no readable caller, agreeing with `caller()?.reach()`). `context()`
   and `scope(ctx, fut)` hand a call's context to a task it spawns, which
   otherwise has none. `InCall`: a stream polled inside a context. Each is an
   error outside a call (`CallError`, as a `PlexusError` `Unauthenticated`),

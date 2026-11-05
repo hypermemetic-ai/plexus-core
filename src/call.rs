@@ -455,9 +455,14 @@ impl Hop {
     }
 
     /// Whether a target whose scope chain is `chain` is within the ceiling:
-    /// held on `*`, or on a scope of the chain. `false` when no gate decided.
+    /// held on `*`, or on a scope of the chain. `false` when no gate decided,
+    /// and when the hop names no readable caller (`for` empty, or not a
+    /// principal) — the ceiling was the near side's verdict for a caller,
+    /// and there is none here: this agrees with `caller()?.reach()`, which
+    /// is nowhere then.
     pub fn allows(&self, chain: &[ScopeRef]) -> bool {
-        self.held_on().iter().any(|s| s.is_everywhere() || chain.contains(s))
+        let readable = self.caller().is_some_and(|p| p.parse::<plexus_auth_core::identity::Principal>().is_ok());
+        readable && self.held_on().iter().any(|s| s.is_everywhere() || chain.contains(s))
     }
 
     /// [`Hop::allows`] for one named scope.

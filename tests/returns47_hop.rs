@@ -272,6 +272,14 @@ async fn over_a_connection(proven: &str, trusted: &[&str], hop_principal: &str) 
     item["params"]["result"].clone()
 }
 
+async fn an_unreadable_caller_reaches_nowhere() {
+    // `for` names no principal it can read: anonymous, and no ceiling either.
+    let hop = json!({ "principal": "service:menger", "for": ["not a principal"], "limit": { "grant": "forge.whoami", "held_on": ["MENGER"] }, "call": "c7" });
+    let got = raw(json!({ "method": "forge.whoami", "params": {}, "hop": hop })).await;
+    assert_eq!(got["content"]["caller_principal"], Value::Null, "{got}");
+    assert_eq!(got["content"]["reach"], json!([]), "{got}");
+}
+
 const PARENT: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const MALLORY: &str = "key:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
@@ -316,6 +324,8 @@ fn main() {
         println!("test the_child_sees_no_wider_than_the_ceiling ... ok");
         a_hop_over_a_connection_is_taken_only_from_a_trusted_service().await;
         println!("test a_hop_over_a_connection_is_taken_only_from_a_trusted_service ... ok");
+        an_unreadable_caller_reaches_nowhere().await;
+        println!("test an_unreadable_caller_reaches_nowhere ... ok");
     });
-    println!("\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out");
+    println!("\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out");
 }

@@ -61,6 +61,14 @@ fn seen() -> String {
     }
 }
 
+/// `hop(for, MENGER allowed)`; `nohop` when `hop()` errors.
+fn hop_seen() -> String {
+    match call::hop() {
+        Ok(h) => format!("hop({},{})", h.caller().map(short).unwrap_or("-".into()), h.allows_scope("MENGER")),
+        Err(_) => "nohop".into(),
+    }
+}
+
 fn short(p: &str) -> String {
     if p == ADA { "ADA".into() } else { p.into() }
 }
@@ -93,6 +101,12 @@ impl KidActivation {
         held(&reach)
     }
 
+    /// The hop, as `call::hop()` answers it here.
+    #[plexus_macros::method]
+    pub async fn by_hop(&self) -> String {
+        hop_seen()
+    }
+
     /// A grandchild, the same service.
     #[plexus_macros::child]
     fn deeper(&self) -> TraitKid {
@@ -104,6 +118,7 @@ pub mod kid_t {
     #[allow(async_fn_in_trait)]
     pub trait KidT {
         async fn whom(&self) -> String;
+        async fn hop(&self) -> String;
     }
 }
 
@@ -116,6 +131,11 @@ impl kid_t::KidT for TraitKid {
     /// The call's caller, signed in.
     async fn whom(&self) -> String {
         seen()
+    }
+
+    /// The hop, as `call::hop()` answers it here.
+    async fn hop(&self) -> String {
+        hop_seen()
     }
 }
 
@@ -275,4 +295,66 @@ async fn an_anonymous_caller_is_refused_by_a_required_child() {
     })
     .await;
     assert!(matches!(got, Err(PlexusError::Unauthenticated(_))), "{got:?}");
+}
+
+// ------------------------------------------------------- the hop, per policy
+
+/// One call to the parent served as a child (`serve_child`), its hop for
+/// ADA within MENGER for `path`'s grant; the answer's text.
+async fn through_the_seam(path: &str) -> String {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (mut ours, theirs) = tokio::io::duplex(1 << 16);
+    let (r, w) = tokio::io::split(theirs);
+    let served = tokio::spawn(plexus_core::plexus::remote_child::serve_child(ParentActivation, r, w));
+    let target = format!("parent.{path}");
+    let hop = serde_json::json!({ "principal": "service:menger", "for": [ADA], "limit": { "grant": target, "held_on": ["MENGER"] }, "call": "c1" });
+    let frame = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "parent.call", "params": { "method": target, "params": {}, "hop": hop } });
+    ours.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    let mut lines = BufReader::new(&mut ours).lines();
+    let _opened = lines.next_line().await.unwrap();
+    let mut out = Vec::new();
+    while let Ok(Some(l)) = lines.next_line().await {
+        let v: serde_json::Value = serde_json::from_str(&l).unwrap();
+        let r = v["params"]["result"].clone();
+        match r["type"].as_str() {
+            Some("data") => out.push(r["content"].as_str().unwrap_or_default().to_string()),
+            Some("error") => {
+                out.push(format!("error({})", r["error_kind"].as_str().unwrap_or("?")));
+                break;
+            }
+            _ => break,
+        }
+    }
+    drop(lines);
+    drop(ours);
+    let _ = served.await;
+    out.join(";")
+}
+
+/// The `hop()` column: in process there is no hop (the call came through
+/// none); through the seam a child's hop follows its caller — kept under
+/// `same_service`, `identity_only`, `pass_through`, none under `anonymous`
+/// (`hop()` errors there, as outside a hop).
+#[tokio::test]
+async fn a_childs_hop_follows_its_forward_policy() {
+    // In process: no hop anywhere.
+    for kid in ["same", "ident", "through", "nobody", "mars"] {
+        assert_eq!(through(&format!("{kid}.by_hop")).await, "nohop", "{kid}");
+    }
+    // Through the seam: (path, hop(), caller()).
+    let rows = [
+        ("same", "hop(ADA,true)", "ADA@MENGER"),
+        ("ident", "hop(ADA,true)", "ADA@MENGER"),
+        ("through", "hop(ADA,true)", "ADA@MENGER"),
+        ("nobody", "nohop", "anonymous@"),
+        ("mars", "hop(ADA,true)", "ADA@MENGER"),
+    ];
+    for (kid, hop, caller) in rows {
+        assert_eq!(through_the_seam(&format!("{kid}.by_hop")).await, hop, "{kid}: hop()");
+        assert_eq!(through_the_seam(&format!("{kid}.by_caller")).await, caller, "{kid}: caller()");
+    }
+    // Nested under `anonymous`: a grandchild of a same-service kind sees no
+    // hop either, and the trait child under `required` refuses.
+    assert_eq!(through_the_seam("tsame.hop").await, "hop(ADA,true)");
+    assert_eq!(through_the_seam("tnobody.hop").await, "error(unauthenticated)");
 }

@@ -25,6 +25,8 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   never a default.
 - `call::verified::<T>()`: what a trait-impl method's verifier
   (`#[plexus_macros::from_auth(…)]` on the method) answered for the call.
+  Set once per call, by the dispatch before the body: a second set is
+  refused (`CallError::AlreadyVerified`) and the verifier's value stands.
 - `call::ungated(activation, method, params, auth, raw_ctx)`: one activation
   dispatched as a service with no gate dispatches it — in a context admitting
   `auth` everywhere, said by the caller of the function. The leaf path for a
@@ -37,7 +39,14 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   each call in its hop's context, schema calls and a dynamic child's lookup
   included. Before the method runs: a call with no hop is `unauthenticated`;
   a hop no gate decided (`limit: null`, no grant) or one admitted for another
-  grant than the method called is `forbidden`. **The hop is trusted from the
+  grant than the method called is `forbidden`. **No caller in a child:** no
+  gate of the child admits one and the hop is no credential, so `caller()` is
+  an error there; an activation whose methods need a caller (`auth =
+  "required"` on a method not `public`, or a `#[from_auth]` parameter, as its
+  schema says) is refused at start, naming them. A plugin bounds itself with
+  `hop()` (`Hop::allows`) and declares no `required`. (A trait-impl method's
+  verifier under another posture is not in the schema, so not seen at start:
+  such a method is refused call by call.) **The hop is trusted from the
   transport** — unsigned JSON from whoever writes the child's input — so a
   child is served only on a pipe its parent owns; anywhere else is unsafe
   until GRAFT-1's credential scoped to the call exists.

@@ -213,6 +213,9 @@ pub enum CallError {
     /// Inside a call whose method declared no verifier, or one that answered
     /// another type than the one asked for.
     NotVerified,
+    /// The call's verified value is already set: it is set once, by the
+    /// method's verifier, and never replaced.
+    AlreadyVerified,
 }
 
 impl fmt::Display for CallError {
@@ -223,6 +226,7 @@ impl fmt::Display for CallError {
             }
             CallError::ThroughHop => "no caller admitted here: this call came through a hop (read plexus_core::call::hop)",
             CallError::NoHop => "no hop: this call did not come through the child seam",
+            CallError::AlreadyVerified => "the call's verified value is set once, by its verifier, and is set",
             CallError::NotVerified => {
                 "nothing verified: the method declares no `#[plexus_macros::from_auth(…)]` answering this type"
             }
@@ -271,10 +275,17 @@ pub fn verified<T: Clone + Send + Sync + 'static>() -> Result<T, CallError> {
 }
 
 /// The macro's half of [`verified`]: keep a verifier's answer on the call.
+/// Set once per call: the dispatch sets it before the body runs, so a second
+/// set — by any code inside the call — is refused (`AlreadyVerified`) and
+/// the verifier's value stands.
 #[doc(hidden)]
 pub fn __keep_verified<T: Send + Sync + 'static>(value: T) -> Result<(), CallError> {
     let ctx = context()?;
-    *ctx.0.verified.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(value));
+    let mut held = ctx.0.verified.lock().unwrap_or_else(|p| p.into_inner());
+    if held.is_some() {
+        return Err(CallError::AlreadyVerified);
+    }
+    *held = Some(Arc::new(value));
     Ok(())
 }
 

@@ -17,6 +17,13 @@
 //! and `call::caller()` there is an error: no gate of this process admitted
 //! anyone, and the hop is no credential.
 //!
+//! **No caller in a child.** No gate of the child admits anyone, and the hop
+//! is no credential, so `call::caller()` is an error here: an activation
+//! whose methods need a caller (`auth = "required"` on a method not
+//! `public`, `#[from_auth]`) is refused at start, naming them. A plugin
+//! bounds itself with `plexus_core::call::hop()` (`Hop::allows`) and declares
+//! no `required`.
+//!
 //! The far side decides again (spec/12 rule 2), before the method runs: a
 //! call with no hop is `unauthenticated`; a hop no gate decided (`limit:
 //! null`, or no grant) and a hop admitted for another grant than the method
@@ -68,6 +75,22 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let ns = activation.namespace().to_string();
+    // RETURNS-47: no gate of a child admits a caller (`caller()` is an error
+    // through a hop), so a method that needs one would refuse every call.
+    // Refused here, at start, naming them.
+    let needs = needs_a_caller(&activation.plugin_schema());
+    if !needs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`{ns}` cannot be served as a child: {} need a caller (`auth = \"required\"` on a method not \
+                 `public`, or `#[from_auth]`), and a call through the seam has none — no gate of the child \
+                 admits one. A plugin bounds itself with `plexus_core::call::hop()` (`Hop::allows`) and \
+                 declares no `required`.",
+                needs.iter().map(|m| format!("`{ns}.{m}`")).collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
     let (call_m, unsub_m) = (format!("{ns}.call"), format!("{ns}.call_unsub"));
     let (out, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_lines(w, out_rx));
@@ -190,4 +213,30 @@ async fn run<A: Activation>(
         refuse(RemoteError::ActivationNotFound { activation: target.split('.').next().unwrap_or_default().to_string() });
     }
     live.lock().unwrap().remove(&sid);
+}
+
+/// The methods of `schema` that need a caller the gate admitted: `auth =
+/// "required"` on a method not `public`, or a parameter the dispatch takes
+/// from the caller (`x-plexus-source: {"from": "auth"}`, `#[from_auth]`).
+/// A trait-impl method's verifier written on the method under any other
+/// posture is not in the schema, and so not seen here.
+fn needs_a_caller(schema: &crate::plexus::PluginSchema) -> Vec<String> {
+    use crate::plexus::schema::AuthPosture;
+    schema
+        .methods
+        .iter()
+        .filter(|m| m.name != "schema")
+        .filter(|m| {
+            let required = matches!(m.auth_posture, Some(AuthPosture::Required)) && !m.public;
+            let from_auth = m
+                .params
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok())
+                .and_then(|p| p.get("properties").cloned())
+                .and_then(|p| p.as_object().cloned())
+                .is_some_and(|props| props.values().any(|v| v["x-plexus-source"]["from"] == "auth"));
+            required || from_auth
+        })
+        .map(|m| m.name.clone())
+        .collect()
 }

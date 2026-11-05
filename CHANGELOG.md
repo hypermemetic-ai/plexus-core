@@ -28,7 +28,8 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
 - `call::ungated(activation, method, params, auth, raw_ctx)`: one activation
   dispatched as a service with no gate dispatches it — in a context admitting
   `auth` everywhere, said by the caller of the function. The leaf path for a
-  bridge that serves a single activation.
+  bridge that serves a single activation, where there is no service and so no
+  gate; a call that passes a gate goes through the service's route instead.
 - `call::test::in_call(auth, reach, fut)` (feature `test-util`, never
   default): a test's way into a call.
 - `remote_child::serve_child` / `serve_child_stdio`: an activation served as
@@ -64,6 +65,10 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   `DynamicHub`, or `call::ungated`.
 - A `RemoteChild` forward outside a call sends nothing and answers
   `unauthenticated`.
+- `tests/remote_child.rs`'s `cancel_crosses_hop` asserts the cancel's order
+  (the child sent `call_unsub`, took it for a live call, stopped that call;
+  the service holds nothing after) within 5 s per cancel, not a 100 ms bound
+  on the slowest of twenty, which missed under a loaded run.
 
 ### Removed
 
@@ -87,13 +92,14 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
 - **plexus-ui** (`plexus-ui-service`, on 0.7.0 today): `Callers::verify`
   (`service/src/caller.rs:60`) takes `current_reach()?`, and its direct
   `verify` tests are wrapped in `in_call` the same way.
-- **plexus-transport's REST and MCP bridges** call `Activation::call`
-  straight on their leaf path (`src/http/bridge.rs:216`,
-  `src/mcp/bridge.rs:357`), so there a `reach: Reach` method is refused and
-  `caller()` errors. The fix is theirs: `plexus_core::call::ungated(&*activation,
-  method, params, None, None)` in place of `activation.call(…)`. Their
-  service (`route_fn` / router) path goes through a `DynamicHub` and is
-  unaffected.
+- **plexus-transport's REST and MCP bridges** (its RETURNS-47 entry): their
+  leaf path — one activation, no service, so no gate — runs through
+  `call::ungated` in place of `Activation::call`, so a `reach: Reach` method
+  and a `caller()` reader are answered there as on a service with no gate.
+  The REST bridge names its caller with the session validator and routes over
+  a service with it (`with_router_as`), through the gate. The legacy
+  `ActivationMcpBridge` names no caller (anonymous); the mounted MCP bridge
+  goes through the service's route as the caller its validator names.
 - **A child served with `serve_child`** under a service without a gate gets
   `limit: null` hops, and so refuses every call but its schema: gate the
   service that mounts it.

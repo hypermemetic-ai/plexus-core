@@ -110,6 +110,12 @@ required-features = ["child-ws"]
 name = "remote_child_perf"
 required-features = ["child-ws"]
 
+# RETURNS-47: no harness — the binary is the service and, run again by the
+# seam, the plugin on stdio, whose stdout carries the protocol alone.
+[[test]]
+name = "returns47_hop"
+harness = false
+
 [dev-dependencies]
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", features = ["ws-native"] }

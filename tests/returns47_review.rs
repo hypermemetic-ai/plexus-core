@@ -171,10 +171,18 @@ fn gated() -> DynamicHub {
 fn who(p: &str) -> AuthContext {
     AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], serde_json::Value::Null)
 }
+/// A stream's items: data as its content; anything else as its type and
+/// kind (metadata — provenance, time — differs between activations).
 async fn all(s: PlexusStream) -> Vec<serde_json::Value> {
-    s.map(|i| match i {
-        PlexusStreamItem::Data { content, .. } => content.into_value(),
-        other => serde_json::to_value(other).unwrap(),
+    s.filter_map(|i| async move {
+        match i {
+            PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
+            PlexusStreamItem::Done { .. } => None,
+            other => {
+                let v = serde_json::to_value(other).unwrap();
+                Some(serde_json::json!({ "type": v["type"], "error_kind": v.get("error_kind") }))
+            }
+        }
     })
     .collect()
     .await
@@ -283,7 +291,7 @@ async fn in_call_is_the_supported_way_in_for_a_test() {
 #[derive(Clone)]
 struct Leaf;
 
-#[plexus_macros::activation(namespace = "leaf", version = "1.0.0", crate_path = "plexus_core")]
+#[plexus_macros::activation(version = "1.0.0")]
 impl Leaf {
     /// Health check.
     #[plexus_macros::method]
@@ -295,7 +303,7 @@ impl Leaf {
 #[derive(Clone)]
 struct Shelf;
 
-#[plexus_macros::activation(namespace = "shelf", version = "1.0.0", crate_path = "plexus_core")]
+#[plexus_macros::activation(version = "1.0.0")]
 impl Shelf {
     /// Health check.
     #[plexus_macros::method]

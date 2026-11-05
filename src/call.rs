@@ -51,7 +51,8 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::any::Any;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
 use futures::Stream;
@@ -78,6 +79,9 @@ struct Inner {
     /// reads it (PERF-15: an introspection answer looks no role up).
     deferred: Option<(Arc<Gate>, Grant)>,
     hop: Option<Hop>,
+    /// What a trait-impl method's verifier answered for this call
+    /// (`#[plexus_macros::from_auth(…)]` on the method): [`verified`].
+    verified: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
 }
 
 impl Inner {
@@ -86,7 +90,7 @@ impl Inner {
         if let Some(r) = reach {
             let _ = cell.set(r);
         }
-        Inner { auth, reach: cell, deferred, hop }
+        Inner { auth, reach: cell, deferred, hop, verified: Mutex::new(None) }
     }
 }
 
@@ -206,6 +210,9 @@ pub enum CallError {
     ThroughHop,
     /// Inside a call that did not come through a hop: there is none to read.
     NoHop,
+    /// Inside a call whose method declared no verifier, or one that answered
+    /// another type than the one asked for.
+    NotVerified,
 }
 
 impl fmt::Display for CallError {
@@ -216,6 +223,9 @@ impl fmt::Display for CallError {
             }
             CallError::ThroughHop => "no caller admitted here: this call came through a hop (read plexus_core::call::hop)",
             CallError::NoHop => "no hop: this call did not come through the child seam",
+            CallError::NotVerified => {
+                "nothing verified: the method declares no `#[plexus_macros::from_auth(…)]` answering this type"
+            }
         })
     }
 }
@@ -246,6 +256,65 @@ pub fn hop() -> Result<Hop, CallError> {
 /// spawns, [`scope`]`(context()?, fut)`. An error outside a call.
 pub fn context() -> Result<CallContext, CallError> {
     CALL.try_with(CallContext::clone).map_err(|_| CallError::OutsideCall)
+}
+
+/// What the method's verifier answered for this call: on `impl Trait for
+/// Type`, `#[plexus_macros::from_auth(self.access.verify)]` on the method
+/// runs the verifier before the body — its error the call's refusal, out of
+/// band and typed, as a `#[from_auth]` parameter's is — and keeps its value
+/// here for the body. An error outside a call, and when the method declared
+/// no verifier of type `T`.
+pub fn verified<T: Clone + Send + Sync + 'static>() -> Result<T, CallError> {
+    let ctx = context()?;
+    let held = ctx.0.verified.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    held.and_then(|v| v.downcast_ref::<T>().cloned()).ok_or(CallError::NotVerified)
+}
+
+/// The macro's half of [`verified`]: keep a verifier's answer on the call.
+#[doc(hidden)]
+pub fn __keep_verified<T: Send + Sync + 'static>(value: T) -> Result<(), CallError> {
+    let ctx = context()?;
+    *ctx.0.verified.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(value));
+    Ok(())
+}
+
+/// Dispatch a call to one activation as a service with no gate dispatches
+/// it: in a context admitting `auth` everywhere — said here, by the caller of
+/// this function, never assumed by the method. The leaf path of a bridge that
+/// serves a single activation (plexus-transport's REST and MCP bridges call
+/// `Activation::call` straight, outside any context, where a method that
+/// needs its caller is refused). Inside a call already, that call's reach
+/// and hop are kept, with this call's identity.
+pub async fn ungated<A: crate::plexus::Activation + ?Sized>(
+    activation: &A,
+    method: &str,
+    params: serde_json::Value,
+    auth: Option<&AuthContext>,
+    raw_ctx: Option<&crate::request::RawRequestContext>,
+) -> Result<crate::plexus::PlexusStream, PlexusError> {
+    let ctx = match context() {
+        Ok(outer) => outer.with_auth(auth),
+        Err(_) => CallContext::admitted(auth, Reach::everywhere()),
+    };
+    let stream = scope(ctx.clone(), activation.call(method, params, auth, raw_ctx)).await?;
+    Ok(Box::pin(InCall::new(ctx, stream)))
+}
+
+/// A test's way into a call (feature `test-util`, never default): a
+/// verifier that reads [`caller()`] or `current_reach()`, tested without a
+/// service. Nothing but a test builds a caller by hand.
+#[cfg(feature = "test-util")]
+pub mod test {
+    use super::{scope, CallContext};
+    use crate::plexus::AuthContext;
+    use plexus_auth_core::grants::Reach;
+    use std::future::Future;
+
+    /// Run `fut` inside a call admitted for `auth` (none: anonymous) with
+    /// `reach`, as a service's dispatch would run it.
+    pub async fn in_call<F: Future>(auth: Option<&AuthContext>, reach: Reach, fut: F) -> F::Output {
+        scope(CallContext::admitted(auth, reach), fut).await
+    }
 }
 
 /// Run `fut` inside `ctx`: how a task a method spawns carries its caller.

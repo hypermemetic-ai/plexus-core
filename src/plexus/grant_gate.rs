@@ -69,15 +69,22 @@ pub fn current_reach() -> Result<Reach, PlexusError> {
     ctx.reach().cloned().ok_or_else(|| crate::call::CallError::ThroughHop.into())
 }
 
-/// Run `fut` with `reach` as the [`current_reach`]: the call's context as it
-/// stands with its reach replaced, or — outside a call — an anonymous call
-/// admitted with `reach`.
-pub async fn with_reach<F: std::future::Future>(reach: Reach, fut: F) -> F::Output {
-    let ctx = match crate::call::context() {
-        Ok(ctx) => ctx.with_reach(reach),
-        Err(_) => crate::call::CallContext::admitted(None, reach),
-    };
-    crate::call::scope(ctx, fut).await
+/// Run `fut` with `reach` as the [`current_reach`] of the call it runs in:
+/// it narrows that call's reach, never widens it and never creates a call.
+/// RETURNS-47: refused (`Unauthenticated`) outside a call, and when `reach`
+/// holds a scope the call's does not (unless the call's is everywhere) —
+/// it used to build an anonymous caller by hand. A test enters a call with
+/// `plexus_core::call::test::in_call` (feature `test-util`).
+pub async fn with_reach<F: std::future::Future>(reach: Reach, fut: F) -> Result<F::Output, PlexusError> {
+    let ctx = crate::call::context()?;
+    let current = ctx.reach().ok_or(crate::call::CallError::ThroughHop)?;
+    let within = current.is_everywhere() || reach.held_on().iter().all(|s| current.held_on().contains(s));
+    if !within {
+        return Err(PlexusError::Unauthenticated(
+            "with_reach narrows a call's reach; it holds a scope the call does not".into(),
+        ));
+    }
+    Ok(crate::call::scope(ctx.with_reach(reach), fut).await)
 }
 
 /// What the gate decided for a call that may proceed: run it under this

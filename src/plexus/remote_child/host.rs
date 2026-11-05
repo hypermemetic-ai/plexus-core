@@ -17,10 +17,19 @@
 //! and `call::caller()` there is an error: no gate of this process admitted
 //! anyone, and the hop is no credential.
 //!
-//! The far side decides again (spec/12 rule 2): a call with no hop is
-//! `unauthenticated`, and a hop admitted for another grant than the method
-//! called is `forbidden`. A schema call (`{ns}.schema`) answers whatever its
-//! hop. Nothing is written to stdout but the protocol.
+//! The far side decides again (spec/12 rule 2), before the method runs: a
+//! call with no hop is `unauthenticated`; a hop no gate decided (`limit:
+//! null`, or no grant) and a hop admitted for another grant than the method
+//! called are `forbidden`. A schema call (`{ns}.schema`) answers whatever its
+//! hop, in its context when it has one, as every call (a dynamic child's
+//! lookup included) runs. Nothing is written to stdout but the protocol.
+//!
+//! **The hop is trusted from the transport.** It is JSON from whoever writes
+//! to the child's input: nothing in it is signed, and the child cannot tell
+//! a service's hop from one written by anyone else on that pipe. Serve a
+//! child only on a pipe its parent owns (stdio, spawned by the service that
+//! mounts it); serving it anywhere else — a socket, a shared pipe — is
+//! unsafe until GRAFT-1's credential scoped to the call exists.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,6 +49,7 @@ type Live = Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>;
 
 /// Serve `activation` as a child on this process's stdin and stdout, until
 /// the service closes stdin (spec/11: the end of input ends every call).
+/// Only for a process the service spawned: its stdin is the service's alone.
 pub async fn serve_child_stdio<A>(activation: A) -> std::io::Result<()>
 where
     A: Activation + Clone,
@@ -48,7 +58,9 @@ where
 }
 
 /// Serve `activation` as a child over `r` (frames from the service, one per
-/// line) and `w` (frames to it), until `r` ends.
+/// line) and `w` (frames to it), until `r` ends. The hop on each frame is
+/// believed as written: `r` must be a pipe only the parent service writes
+/// (see the module docs).
 pub async fn serve_child<A, R, W>(activation: A, r: R, w: W) -> std::io::Result<()>
 where
     A: Activation + Clone,
@@ -137,12 +149,20 @@ async fn run<A: Activation>(
     } else if let Some(method) = target.strip_prefix(&format!("{ns}.")) {
         let hop: Option<Hop> = hop.and_then(|h| serde_json::from_value(h).ok());
         let introspection = method == "schema" || method.ends_with(".schema");
+        // The far side decides again, before the method runs: no hop is
+        // nobody; a hop no gate decided (`limit: null`, or no grant) or one
+        // admitted for another grant is forbidden. A schema call answers
+        // what the child is, whatever the hop (the mount asks it with none).
+        let forbidden = || RemoteError::Forbidden {
+            reason: DenyReason::MissingGrant { grant: target.clone(), scope: "*".into(), roles: vec![], held_on: vec![] },
+        };
         let refused = match &hop {
             _ if introspection => None,
             None => Some(RemoteError::Unauthenticated),
-            Some(h) => h.grant().filter(|g| *g != target).map(|_| RemoteError::Forbidden {
-                reason: DenyReason::MissingGrant { grant: target.clone(), scope: "*".into(), roles: vec![], held_on: vec![] },
-            }),
+            Some(h) => match h.grant() {
+                Some(g) if g == target => None,
+                _ => Some(forbidden()),
+            },
         };
         match (refused, hop) {
             (Some(error), _) => refuse(error),

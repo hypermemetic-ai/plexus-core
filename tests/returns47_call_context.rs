@@ -292,10 +292,10 @@ async fn a_service_without_a_gate_says_everywhere_and_anonymous_is_refused_close
     // Signed in: the reach is everywhere because the dispatch says so.
     let got = data(service.route("jottings.get", serde_json::json!({ "id": "OTHER-1" }), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(got, vec![serde_json::json!({ "type": "note", "id": "OTHER-1", "by": ADA, "held_on": ["*"] })]);
-    // Anonymous: the from_auth method is refused before its body; the
-    // trait method's verifier refuses in its body, in band.
-    let from_auth = service.route("notes.get", serde_json::json!({ "id": "OTHER-1" }), None).await;
-    assert!(matches!(from_auth, Err(PlexusError::Unauthenticated(_))));
-    let by_caller = data(service.route("jottings.get", serde_json::json!({ "id": "OTHER-1" }), None).await.unwrap()).await;
-    assert_eq!(by_caller[0]["type"], "error", "{by_caller:?}");
+    // Anonymous: both are refused before their bodies, out of band, alike
+    // (the review's r2: `auth = "required"` holds on a trait impl).
+    let from_auth = outcome(&service, "notes", "get", serde_json::json!({ "id": "OTHER-1" }), None).await;
+    let by_caller = outcome(&service, "jottings", "get", serde_json::json!({ "id": "OTHER-1" }), None).await;
+    assert_eq!(by_caller, from_auth);
+    assert!(from_auth.contains("unauthenticated"), "{from_auth}");
 }

@@ -23,10 +23,23 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   otherwise has none. `InCall`: a stream polled inside a context. Each is an
   error outside a call (`CallError`, as a `PlexusError` `Unauthenticated`),
   never a default.
+- `call::verified::<T>()`: what a trait-impl method's verifier
+  (`#[plexus_macros::from_auth(…)]` on the method) answered for the call.
+- `call::ungated(activation, method, params, auth, raw_ctx)`: one activation
+  dispatched as a service with no gate dispatches it — in a context admitting
+  `auth` everywhere, said by the caller of the function. The leaf path for a
+  bridge that serves a single activation.
+- `call::test::in_call(auth, reach, fut)` (feature `test-util`, never
+  default): a test's way into a call.
 - `remote_child::serve_child` / `serve_child_stdio`: an activation served as
   a child on stdio (spec/11, 12) — `_info`, `{ns}.call`, `{ns}.call_unsub` —
-  each call in its hop's context. A call with no hop is `unauthenticated`;
-  a hop admitted for another grant than the method called, `forbidden`.
+  each call in its hop's context, schema calls and a dynamic child's lookup
+  included. Before the method runs: a call with no hop is `unauthenticated`;
+  a hop no gate decided (`limit: null`, no grant) or one admitted for another
+  grant than the method called is `forbidden`. **The hop is trusted from the
+  transport** — unsigned JSON from whoever writes the child's input — so a
+  child is served only on a pipe its parent owns; anywhere else is unsafe
+  until GRAFT-1's credential scoped to the call exists.
 
 ### Changed
 
@@ -35,17 +48,22 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   service; on one without a gate `Reach::everywhere`, said by the dispatch
   (or, routed from inside another call, that call's reach and hop with this
   call's identity); an introspection call the caller's reach for the path,
-  asked of the gate only if read.
+  asked of the gate only if read. `{ns}.list_children` and
+  `{ns}.search_children` run their list and search methods in a context the
+  same way (they are not gated — a gap of its own).
 - **`current_reach()` returns `Result<Reach, PlexusError>`** (was `Reach`)
   and fails closed: outside a call it is `Unauthenticated`, never
   `Reach::everywhere` (it fell back to everywhere when no gate had set one).
-  `#[plexus_macros::method]`'s `reach: Reach` reads it with `?`: called
-  outside a dispatch (`activation.call(..)` directly), such a method is
-  refused. A `RemoteChild` forward outside a call sends nothing and answers
-  `unauthenticated`. What to do: `current_reach()?` in a function returning
-  a `PlexusError` (menger's `Access::verify`); call through a service.
-- `with_reach` sets the call's context (its reach replaced), not a reach of
-  its own.
+- **`with_reach` returns `Result<F::Output, PlexusError>`** and only narrows
+  the reach of the call it runs in: outside a call, or given a scope the
+  call does not hold, it is refused. (It built an anonymous caller by hand.)
+- **`Activation::call`, called straight** (not through a service), runs in
+  no context: a method that takes `reach: Reach`, a trait-impl method under
+  `auth = "required"`, and any body reading `caller()` are refused
+  (`Unauthenticated`, or in band where the body says so). Call through a
+  `DynamicHub`, or `call::ungated`.
+- A `RemoteChild` forward outside a call sends nothing and answers
+  `unauthenticated`.
 
 ### Removed
 
@@ -54,6 +72,31 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   `EchoActivation` and `AuthActivation` and no longer does (RETURNS-47: a
   trait only when named); and `FromClientError` for `EchoEvent` and
   `AuthEvent`, which only their clients' trait impls asked for.
+
+### Migration
+
+- **menger** (`menger-tickets-api`, on 0.7.0 today): in `Access::verify`
+  (`tickets-api/src/access/mod.rs:774`) `current_reach()` becomes
+  `current_reach()?`; its test
+  `the_frames_resolver_answers_typed_and_keeps_the_calls_reach`
+  (`tickets-api/src/access/tests.rs:616`), which calls `verify` outside any
+  call, wraps each `a.verify(..)` in
+  `plexus_core::call::test::in_call(None, Reach::everywhere(), …)` (with
+  `plexus-core = { …, features = ["test-util"] }` under
+  `[dev-dependencies]`). `docs/src/caller.rs:44` takes the same `?`.
+- **plexus-ui** (`plexus-ui-service`, on 0.7.0 today): `Callers::verify`
+  (`service/src/caller.rs:60`) takes `current_reach()?`, and its direct
+  `verify` tests are wrapped in `in_call` the same way.
+- **plexus-transport's REST and MCP bridges** call `Activation::call`
+  straight on their leaf path (`src/http/bridge.rs:216`,
+  `src/mcp/bridge.rs:357`), so there a `reach: Reach` method is refused and
+  `caller()` errors. The fix is theirs: `plexus_core::call::ungated(&*activation,
+  method, params, None, None)` in place of `activation.call(…)`. Their
+  service (`route_fn` / router) path goes through a `DynamicHub` and is
+  unaffected.
+- **A child served with `serve_child`** under a service without a gate gets
+  `limit: null` hops, and so refuses every call but its schema: gate the
+  service that mounts it.
 
 ## [0.8.0]
 

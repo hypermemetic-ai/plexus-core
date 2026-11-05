@@ -2344,10 +2344,11 @@ impl DynamicHub {
             };
         }
         // RETURNS-47: no gate — the call is admitted everywhere, said here
-        // rather than assumed by `current_reach` (which fails closed). A hub
-        // without a gate reached from inside a call (a nested hub, a method
-        // calling its parent) keeps that call's reach and hop, as the
-        // task-local reach always carried through, with this call's identity.
+        // rather than assumed by `current_reach` (which fails closed). A
+        // service without a gate reached from inside a call (a nested
+        // service, a method calling its parent) keeps that call's reach and
+        // hop, as the task-local reach always carried through, with this
+        // call's identity.
         let ctx = match crate::call::context() {
             Ok(outer) => outer.with_auth(auth),
             Err(_) => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
@@ -2674,7 +2675,7 @@ impl DynamicHub {
         // register {ns}.list_children / {ns}.search_children as subscriptions.
         // Per-activation namespaced (not top-level _list_children).
         for (ns, router) in self.inner.child_routers.iter() {
-            register_child_capability_methods(&mut module, ns, router.clone())?;
+            register_child_capability_methods(&mut module, ns, router.clone(), self.inner.gate.clone())?;
         }
 
         Ok(module)
@@ -2893,7 +2894,7 @@ impl DynamicHub {
         // CHILD-WIRE: for each registered child router with capability bits set,
         // register {ns}.list_children / {ns}.search_children as subscriptions.
         for (ns, router) in hub.inner.child_routers.iter() {
-            register_child_capability_methods(&mut module, ns, router.clone())?;
+            register_child_capability_methods(&mut module, ns, router.clone(), hub.inner.gate.clone())?;
         }
 
         Ok(module)
@@ -2913,11 +2914,33 @@ impl DynamicHub {
 /// Activations that advertise neither bit produce no registrations — calling
 /// the methods returns standard `methodNotFound`. That's the wire-level
 /// signal that the activation doesn't support enumeration / search.
+/// RETURNS-47: the context a `{ns}.list_children` / `{ns}.search_children`
+/// call runs in, so a dynamic child's list or search method reads its caller
+/// as any method does: everywhere on a service without a gate; on a gated
+/// one the caller's reach for the method's path, asked of the gate only if
+/// read (as an introspection call's). These methods are not decided by the
+/// gate (a gap of their own); the context only says who is asking.
+fn listing_context(
+    gate: Option<&Arc<plexus_auth_core::grants::Gate>>,
+    ext: &jsonrpsee::Extensions,
+    method: &str,
+) -> crate::call::CallContext {
+    let auth = ext.get::<Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
+    match gate {
+        None => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
+        Some(gate) => {
+            let (auth, _) = super::grant_gate::standing(gate, auth);
+            crate::call::CallContext::introspection(auth, Arc::clone(gate), plexus_auth_core::grants::Grant::new(method.to_string()))
+        }
+    }
+}
+
 #[allow(deprecated)] // ChildCapabilities is deprecated by IR-4 but still the wire-level signal
 fn register_child_capability_methods(
     module: &mut RpcModule<()>,
     namespace: &str,
     router: Arc<dyn ChildRouter>,
+    gate: Option<Arc<plexus_auth_core::grants::Gate>>,
 ) -> Result<(), jsonrpsee::core::RegisterMethodError> {
     let caps = router.capabilities();
     if caps.is_empty() {
@@ -2932,12 +2955,14 @@ fn register_child_capability_methods(
         let list_unsub: &'static str =
             Box::leak(format!("{}.list_children_unsub", namespace).into_boxed_str());
         let router_for_list = router.clone();
+        let gate_for_list = gate.clone();
         module.register_subscription(
             list_method,
             PLEXUS_NOTIF_METHOD,
             list_unsub,
             move |_params, pending, _ctx, ext| {
                 let router = router_for_list.clone();
+                let ctx = listing_context(gate_for_list.as_ref(), &ext, list_method);
                 Box::pin(async move {
                     // Collect names eagerly so the BoxStream's borrow on the
                     // router doesn't outlive list_children's call. For v1 this
@@ -2945,17 +2970,20 @@ fn register_child_capability_methods(
                     // Solar's eight planets). A future variant could keep the
                     // Arc-borrow alive across the stream by binding the BoxStream
                     // to the Arc directly — out of scope here.
-                    let collected: Vec<String> = match router.list_children().await {
-                        Some(mut s) => {
-                            use futures::StreamExt;
-                            let mut acc = Vec::new();
-                            while let Some(name) = s.next().await {
-                                acc.push(name);
+                    let collected: Vec<String> = crate::call::scope(ctx, async {
+                        match router.list_children().await {
+                            Some(mut s) => {
+                                use futures::StreamExt;
+                                let mut acc = Vec::new();
+                                while let Some(name) = s.next().await {
+                                    acc.push(name);
+                                }
+                                acc
                             }
-                            acc
+                            None => Vec::new(),
                         }
-                        None => Vec::new(),
-                    };
+                    })
+                    .await;
                     let stream = async_stream::stream! {
                         for name in collected {
                             yield name;
@@ -2978,25 +3006,30 @@ fn register_child_capability_methods(
         let search_unsub: &'static str =
             Box::leak(format!("{}.search_children_unsub", namespace).into_boxed_str());
         let router_for_search = router.clone();
+        let gate_for_search = gate.clone();
         module.register_subscription(
             search_method,
             PLEXUS_NOTIF_METHOD,
             search_unsub,
             move |params, pending, _ctx, ext| {
                 let router = router_for_search.clone();
+                let ctx = listing_context(gate_for_search.as_ref(), &ext, search_method);
                 Box::pin(async move {
                     let p: SearchChildrenParams = params.parse()?;
-                    let collected: Vec<String> = match router.search_children(&p.query).await {
-                        Some(mut s) => {
-                            use futures::StreamExt;
-                            let mut acc = Vec::new();
-                            while let Some(name) = s.next().await {
-                                acc.push(name);
+                    let collected: Vec<String> = crate::call::scope(ctx, async {
+                        match router.search_children(&p.query).await {
+                            Some(mut s) => {
+                                use futures::StreamExt;
+                                let mut acc = Vec::new();
+                                while let Some(name) = s.next().await {
+                                    acc.push(name);
+                                }
+                                acc
                             }
-                            acc
+                            None => Vec::new(),
                         }
-                        None => Vec::new(),
-                    };
+                    })
+                    .await;
                     let stream = async_stream::stream! {
                         for name in collected {
                             yield name;
@@ -3894,7 +3927,7 @@ mod tests {
     fn build_module_for(router: WireFixture, ns: &str) -> RpcModule<()> {
         let mut module = RpcModule::new(());
         let arc: Arc<dyn ChildRouter> = Arc::new(router);
-        register_child_capability_methods(&mut module, ns, arc).expect("register");
+        register_child_capability_methods(&mut module, ns, arc, None).expect("register");
         module
     }
 

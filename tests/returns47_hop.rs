@@ -123,8 +123,8 @@ fn gated(child: &RemoteChild) -> DynamicHub {
 
 async fn the_plugins_hop_names_the_caller_and_the_ceiling() {
     let child = mounted().await;
-    let hub = gated(&child);
-    let got = items(hub.route("forge.whoami", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let service = gated(&child);
+    let got = items(service.route("forge.whoami", json!({}), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(
         got[0],
         json!({ "principal": "service:menger", "caller": ADA, "grant": "forge.whoami", "held_on": ["MENGER"], "caller_admitted": false }),
@@ -134,43 +134,70 @@ async fn the_plugins_hop_names_the_caller_and_the_ceiling() {
 
 async fn the_plugins_reads_are_bounded_by_the_ceiling() {
     let child = mounted().await;
-    let hub = gated(&child);
-    let got = items(hub.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let service = gated(&child);
+    let got = items(service.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(got[0], json!(["menger", "menger-skills"]), "{got:?}");
     // Refused at the gate: the plugin never hears of it.
-    let refused = hub.route("forge.repos", json!({}), Some(&who(BOB))).await;
+    let refused = service.route("forge.repos", json!({}), Some(&who(BOB))).await;
     assert!(refused.is_err(), "BOB holds nothing");
 }
 
-async fn with_no_gate_deciding_the_plugin_reads_nothing() {
-    // A service without a gate sends `limit: null`: no ceiling crossed, and
-    // a read bounded by the hop is bounded to nothing (fail closed).
+async fn with_no_gate_deciding_the_plugin_refuses_before_the_method() {
+    // A service without a gate sends `limit: null`: no ceiling crossed, so
+    // the plugin refuses the call before its method runs (fail closed). Its
+    // schema, asked at the mount with no limit either, was answered.
     let child = mounted().await;
-    let hub = DynamicHub::new("menger").register(child.clone());
-    let got = items(hub.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
-    assert_eq!(got[0], json!([]), "{got:?}");
-    let seen = items(hub.route("forge.whoami", json!({}), Some(&who(ADA))).await.unwrap()).await;
-    assert_eq!(seen[0]["grant"], Value::Null, "{seen:?}");
-    assert_eq!(seen[0]["caller"], ADA, "{seen:?}");
+    let service = DynamicHub::new("menger").register(child.clone());
+    let got = items(service.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0]["type"], "error", "{got:?}");
+    assert_eq!(got[0]["error_kind"], "forbidden", "{got:?}");
 }
 
-async fn a_call_with_no_hop_is_refused_by_the_plugin() {
-    // The far side decides again (spec/12 rule 2): no hop, nobody.
+/// One raw `forge.call` to a plugin served on a pipe, its first item back.
+async fn raw(call: Value) -> Value {
     let (mut ours, theirs) = tokio::io::duplex(1 << 16);
     let (r, w) = tokio::io::split(theirs);
     let served = tokio::spawn(plexus_core::plexus::remote_child::serve_child(Plugin, r, w));
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    ours.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"forge.call\",\"params\":{\"method\":\"forge.repos\",\"params\":{}}}\n").await.unwrap();
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "forge.call", "params": call });
+    ours.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
     let mut lines = BufReader::new(&mut ours).lines();
     let opened: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert_eq!(opened["id"], 1, "{opened}");
     let item: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-    let result = &item["params"]["result"];
-    assert_eq!(result["type"], "error", "{item}");
-    assert_eq!(result["error_kind"], "unauthenticated", "{item}");
     drop(lines);
     drop(ours);
     served.await.unwrap().unwrap();
+    item["params"]["result"].clone()
+}
+
+async fn a_hop_for_another_grant_is_forbidden() {
+    let hop = json!({ "principal": "service:menger", "for": [ADA], "limit": { "grant": "forge.whoami", "held_on": ["*"] }, "call": "c1" });
+    let got = raw(json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
+    assert_eq!(got["type"], "error", "{got}");
+    assert_eq!(got["error_kind"], "forbidden", "{got}");
+    assert_eq!(got["grant"], "forge.repos", "{got}");
+}
+
+async fn a_hop_with_no_limit_is_refused_before_the_method() {
+    let hop = json!({ "principal": "service:menger", "for": [ADA], "limit": null, "call": "c2" });
+    let got = raw(json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
+    assert_eq!(got["type"], "error", "{got}");
+    assert_eq!(got["error_kind"], "forbidden", "{got}");
+}
+
+async fn a_schema_call_runs_in_the_hops_context() {
+    let hop = json!({ "principal": "service:menger", "for": [], "limit": null, "call": "c3" });
+    let got = raw(json!({ "method": "forge.schema", "params": {}, "hop": hop })).await;
+    assert_eq!(got["type"], "data", "{got}");
+}
+
+async fn a_call_with_no_hop_is_refused_by_the_plugin() {
+    // The far side decides again (spec/12 rule 2): no hop, nobody.
+    let got = raw(json!({ "method": "forge.repos", "params": {} })).await;
+    assert_eq!(got["type"], "error", "{got}");
+    assert_eq!(got["error_kind"], "unauthenticated", "{got}");
 }
 
 fn main() {
@@ -186,10 +213,16 @@ fn main() {
         println!("test the_plugins_hop_names_the_caller_and_the_ceiling ... ok");
         the_plugins_reads_are_bounded_by_the_ceiling().await;
         println!("test the_plugins_reads_are_bounded_by_the_ceiling ... ok");
-        with_no_gate_deciding_the_plugin_reads_nothing().await;
-        println!("test with_no_gate_deciding_the_plugin_reads_nothing ... ok");
+        with_no_gate_deciding_the_plugin_refuses_before_the_method().await;
+        println!("test with_no_gate_deciding_the_plugin_refuses_before_the_method ... ok");
         a_call_with_no_hop_is_refused_by_the_plugin().await;
         println!("test a_call_with_no_hop_is_refused_by_the_plugin ... ok");
+        a_hop_for_another_grant_is_forbidden().await;
+        println!("test a_hop_for_another_grant_is_forbidden ... ok");
+        a_hop_with_no_limit_is_refused_before_the_method().await;
+        println!("test a_hop_with_no_limit_is_refused_before_the_method ... ok");
+        a_schema_call_runs_in_the_hops_context().await;
+        println!("test a_schema_call_runs_in_the_hops_context ... ok");
     });
-    println!("\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out");
+    println!("\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out");
 }

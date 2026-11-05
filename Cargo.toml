@@ -101,6 +101,10 @@ clap = ["dep:clap"]
 child-ws = ["dep:tokio-tungstenite", "dep:ed25519-dalek"]
 # ... and on wss:// (TLS, webpki roots).
 child-wss = ["child-ws", "tokio-tungstenite/rustls-tls-webpki-roots"]
+# RETURNS-47: `call::test::in_call`, a test's way into a call context (a
+# verifier that reads `current_reach()`, tested without a service). Never
+# default: nothing but a test builds a caller by hand.
+test-util = []
 
 [[test]]
 name = "remote_child"
@@ -117,6 +121,8 @@ name = "returns47_hop"
 harness = false
 
 [dev-dependencies]
+# RETURNS-47: this crate's own tests use `call::test::in_call`.
+plexus-core = { path = ".", features = ["test-util"] }
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", features = ["ws-native"] }
 tempfile = "3"

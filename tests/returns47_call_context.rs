@@ -215,9 +215,9 @@ async fn data(stream: PlexusStream) -> Vec<serde_json::Value> {
 
 /// A call's outcome with the activation's own namespace taken out, so the
 /// two activations' answers compare: its data, or its typed refusal.
-async fn outcome(hub: &DynamicHub, ns: &str, method: &str, params: serde_json::Value, caller: Option<&str>) -> String {
+async fn outcome(service: &DynamicHub, ns: &str, method: &str, params: serde_json::Value, caller: Option<&str>) -> String {
     let auth = caller.map(who);
-    let out = match hub.route(&format!("{ns}.{method}"), params, auth.as_ref()).await {
+    let out = match service.route(&format!("{ns}.{method}"), params, auth.as_ref()).await {
         Ok(s) => serde_json::to_string(&data(s).await).unwrap(),
         Err(e) => serde_json::to_string(&RemoteError::from(&e)).unwrap(),
     };
@@ -236,7 +236,7 @@ fn a_menger_shaped_activation_keeps_its_activation_name() {
 
 #[tokio::test]
 async fn a_trait_method_reading_caller_is_refused_and_answered_as_the_from_auth_one() {
-    let hub = gated();
+    let service = gated();
     let cases: Vec<(serde_json::Value, Option<&str>)> = vec![
         (serde_json::json!({ "id": "MENGER-1" }), None),
         (serde_json::json!({ "id": "MENGER-1" }), Some(BOB)),
@@ -245,8 +245,8 @@ async fn a_trait_method_reading_caller_is_refused_and_answered_as_the_from_auth_
     ];
     let mut seen = Vec::new();
     for (params, caller) in cases {
-        let by_from_auth = outcome(&hub, "notes", "get", params.clone(), caller).await;
-        let by_caller = outcome(&hub, "jottings", "get", params.clone(), caller).await;
+        let by_from_auth = outcome(&service, "notes", "get", params.clone(), caller).await;
+        let by_caller = outcome(&service, "jottings", "get", params.clone(), caller).await;
         assert_eq!(by_caller, by_from_auth, "{params} as {caller:?}");
         seen.push(by_from_auth);
     }
@@ -273,29 +273,29 @@ async fn caller_and_current_reach_outside_a_call_are_errors_not_everything() {
 
 #[tokio::test]
 async fn a_spawned_task_does_not_see_the_caller_unless_handed_it() {
-    let hub = gated();
-    let got = data(hub.route("jottings.spawned", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let service = gated();
+    let got = data(service.route("jottings.spawned", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
     // [in the method, spawned bare, spawned with call::scope]
     assert_eq!(got, vec![serde_json::json!([true, false, true])]);
 }
 
 #[tokio::test]
 async fn the_calls_stream_carries_its_context() {
-    let hub = gated();
-    let got = data(hub.route("notes.lazy", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let service = gated();
+    let got = data(service.route("notes.lazy", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(got, vec![serde_json::json!({ "type": "note", "id": "lazy", "by": ADA, "held_on": ["MENGER"] })]);
 }
 
 #[tokio::test]
 async fn a_service_without_a_gate_says_everywhere_and_anonymous_is_refused_closed() {
-    let hub = plain();
+    let service = plain();
     // Signed in: the reach is everywhere because the dispatch says so.
-    let got = data(hub.route("jottings.get", serde_json::json!({ "id": "OTHER-1" }), Some(&who(ADA))).await.unwrap()).await;
+    let got = data(service.route("jottings.get", serde_json::json!({ "id": "OTHER-1" }), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(got, vec![serde_json::json!({ "type": "note", "id": "OTHER-1", "by": ADA, "held_on": ["*"] })]);
     // Anonymous: the from_auth method is refused before its body; the
     // trait method's verifier refuses in its body, in band.
-    let from_auth = hub.route("notes.get", serde_json::json!({ "id": "OTHER-1" }), None).await;
+    let from_auth = service.route("notes.get", serde_json::json!({ "id": "OTHER-1" }), None).await;
     assert!(matches!(from_auth, Err(PlexusError::Unauthenticated(_))));
-    let by_caller = data(hub.route("jottings.get", serde_json::json!({ "id": "OTHER-1" }), None).await.unwrap()).await;
+    let by_caller = data(service.route("jottings.get", serde_json::json!({ "id": "OTHER-1" }), None).await.unwrap()).await;
     assert_eq!(by_caller[0]["type"], "error", "{by_caller:?}");
 }

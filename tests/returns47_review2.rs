@@ -125,3 +125,21 @@ async fn verified_is_set_once_per_call() {
     assert_eq!(r.0, Err(call::CallError::AlreadyVerified));
     assert_eq!(r.1, Ok("first".to_string()));
 }
+
+#[tokio::test]
+async fn verified_is_the_calls_inside_with_reach() {
+    let auth = AuthContext::for_principal(&ADA.parse().unwrap(), "s1", vec![], Value::Null);
+    let r = call::test::in_call(Some(&auth), Reach::everywhere(), async {
+        call::__keep_verified(User("first".into())).unwrap();
+        plexus_core::plexus::with_reach(Reach::everywhere(), async {
+            let seen = call::verified::<User>().map(|u| u.0);
+            let second = call::__keep_verified(User("forged".into()));
+            (seen, second)
+        })
+        .await
+        .unwrap()
+    })
+    .await;
+    assert_eq!(r.0, Ok("first".to_string()), "the call's verified value, narrowed");
+    assert_eq!(r.1, Err(call::CallError::AlreadyVerified));
+}

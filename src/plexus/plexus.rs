@@ -282,6 +282,17 @@ impl From<&PlexusError> for RemoteError {
     }
 }
 
+/// RETURNS-47: run a call's routing inside its context, and hand back its
+/// stream carrying that context, so the method's stream reads its caller as
+/// its first line does ([`crate::call`]).
+async fn in_call<F>(ctx: crate::call::CallContext, routed: F) -> Result<PlexusStream, PlexusError>
+where
+    F: std::future::Future<Output = Result<PlexusStream, PlexusError>>,
+{
+    let stream = crate::call::scope(ctx.clone(), routed).await?;
+    Ok(Box::pin(crate::call::InCall::new(ctx, stream)))
+}
+
 /// Get the semantic JSON-RPC error code for a PlexusError.
 ///
 /// Codes:
@@ -2315,16 +2326,33 @@ impl DynamicHub {
             .map_err(|e| super::grant_gate::say_ended(e, ended.as_deref()))?;
             return match admit {
                 // AUTH-4: introspection answers from the caller's view.
-                super::grant_gate::Admit::Open => match self.introspect_in_view(method, &params, auth, raw_ctx).await {
-                    Some(answer) => answer,
-                    None => self.route_ungated(method, params, auth, raw_ctx).await,
-                },
+                // RETURNS-47: in a context too — the caller's reach for the
+                // path, as the gate gives a public method's — never none.
+                super::grant_gate::Admit::Open => {
+                    let grant = plexus_auth_core::grants::Grant::new(method.to_string());
+                    in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
+                        match self.introspect_in_view(method, &params, auth, raw_ctx).await {
+                            Some(answer) => answer,
+                            None => self.route_ungated(method, params, auth, raw_ctx).await,
+                        }
+                    })
+                    .await
+                }
                 super::grant_gate::Admit::Reach(reach) => {
-                    super::grant_gate::with_reach(reach, self.route_ungated(method, params, auth, raw_ctx)).await
+                    in_call(crate::call::CallContext::admitted(auth, reach), self.route_ungated(method, params, auth, raw_ctx)).await
                 }
             };
         }
-        self.route_ungated(method, params, auth, raw_ctx).await
+        // RETURNS-47: no gate — the call is admitted everywhere, said here
+        // rather than assumed by `current_reach` (which fails closed). A hub
+        // without a gate reached from inside a call (a nested hub, a method
+        // calling its parent) keeps that call's reach and hop, as the
+        // task-local reach always carried through, with this call's identity.
+        let ctx = match crate::call::context() {
+            Ok(outer) => outer.with_auth(auth),
+            Err(_) => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
+        };
+        in_call(ctx, self.route_ungated(method, params, auth, raw_ctx)).await
     }
 
     /// Everything [`DynamicHub::route_with_ctx`] does after the grant gate.

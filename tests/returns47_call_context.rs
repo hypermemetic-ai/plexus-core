@@ -253,7 +253,8 @@ async fn a_trait_method_reading_caller_is_refused_and_answered_as_the_from_auth_
     assert!(seen[0].contains("unauthenticated"), "{}", seen[0]);
     assert!(seen[1].contains("missing_grant"), "{}", seen[1]);
     assert!(seen[2].contains("missing_grant") && seen[2].contains("OTHER"), "{}", seen[2]);
-    assert_eq!(seen[3], format!(r#"[{{"type":"note","id":"MENGER-1","by":"{ADA}","held_on":["MENGER"]}}]"#));
+    let answered: serde_json::Value = serde_json::from_str(&seen[3]).unwrap();
+    assert_eq!(answered, serde_json::json!([{ "type": "note", "id": "MENGER-1", "by": ADA, "held_on": ["MENGER"] }]));
 }
 
 #[tokio::test]

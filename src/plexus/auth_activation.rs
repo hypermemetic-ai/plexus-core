@@ -300,14 +300,6 @@ impl AuthEvent {
     }
 }
 
-/// MACRO-13: `AuthClient` implements the `Auth` trait; a client failure is
-/// the in-band error, the last item of its stream.
-impl plexus_client::FromClientError for AuthEvent {
-    fn from_client_error(error: plexus_client::ClientError) -> Self {
-        Self::error(error.to_string())
-    }
-}
-
 impl From<Session> for AuthEvent {
     fn from(s: Session) -> Self {
         Self::Session {

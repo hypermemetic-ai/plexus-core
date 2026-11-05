@@ -5,6 +5,56 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+RETURNS-47: the caller from the call's context, fail closed. Breaking.
+
+### Added
+
+- `plexus_core::call`: `caller()` answers the caller of the call it runs in
+  as the service's gate admitted it — the `AuthContext` that stands (after
+  AUTH-11's liveness) and the `Reach` the gate answered (`Caller::auth`,
+  `Caller::signed_in`, `Caller::reach`) — so a method of a hand-written trait,
+  whose signature cannot carry `#[from_auth]`, reaches its caller as an
+  inherent one does. `hop()` answers, in a child reached through the seam,
+  the hop the call came through (`Hop`: `principal`, `for`, `limit`, `call`;
+  `Hop::caller`, `Hop::grant`, `Hop::held_on`, `Hop::allows`). `context()`
+  and `scope(ctx, fut)` hand a call's context to a task it spawns, which
+  otherwise has none. `InCall`: a stream polled inside a context. Each is an
+  error outside a call (`CallError`, as a `PlexusError` `Unauthenticated`),
+  never a default.
+- `remote_child::serve_child` / `serve_child_stdio`: an activation served as
+  a child on stdio (spec/11, 12) — `_info`, `{ns}.call`, `{ns}.call_unsub` —
+  each call in its hop's context. A call with no hop is `unauthenticated`;
+  a hop admitted for another grant than the method called, `forbidden`.
+
+### Changed
+
+- Every call a `DynamicHub` dispatches runs in its context, and the stream
+  it answers carries it (each poll inside it): the gate's reach on a gated
+  service; on one without a gate `Reach::everywhere`, said by the dispatch
+  (or, routed from inside another call, that call's reach and hop with this
+  call's identity); an introspection call the caller's reach for the path,
+  asked of the gate only if read.
+- **`current_reach()` returns `Result<Reach, PlexusError>`** (was `Reach`)
+  and fails closed: outside a call it is `Unauthenticated`, never
+  `Reach::everywhere` (it fell back to everywhere when no gate had set one).
+  `#[plexus_macros::method]`'s `reach: Reach` reads it with `?`: called
+  outside a dispatch (`activation.call(..)` directly), such a method is
+  refused. A `RemoteChild` forward outside a call sends nothing and answers
+  `unauthenticated`. What to do: `current_reach()?` in a function returning
+  a `PlexusError` (menger's `Access::verify`); call through a service.
+- `with_reach` sets the call's context (its reach replaced), not a reach of
+  its own.
+
+### Removed
+
+- The `Echo` and `Auth` traits (`activations::echo::Echo`,
+  `plexus::Auth`), which `#[plexus_macros::activation]` emitted for
+  `EchoActivation` and `AuthActivation` and no longer does (RETURNS-47: a
+  trait only when named); and `FromClientError` for `EchoEvent` and
+  `AuthEvent`, which only their clients' trait impls asked for.
+
 ## [0.8.0]
 
 ### Breaking (TRANSPORT-23: no rmcp in plexus-core)

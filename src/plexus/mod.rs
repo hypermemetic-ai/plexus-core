@@ -68,7 +68,7 @@ pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME
 pub use grant_gate::{current_reach, with_reach, ForbiddenItem};
 pub use view::View;
 pub use auth_activation::{
-    Auth, AuthActivation, AuthBackend, AuthClient, AuthEvent, AuthFailure, AuthSetup, LoginAnswer, LoginFlow, MembershipEntry, MembershipStore,
+    AuthActivation, AuthBackend, AuthClient, AuthEvent, AuthFailure, AuthSetup, LoginAnswer, LoginFlow, MembershipEntry, MembershipStore,
     Provider, ProviderKind, Requirement, RoleStore, Session, SignupAnswer, StoreError, Waiting, SIGNED_IN_GRANTS,
 };
 pub use auth_memory::{MemoryAuthBackend, MemoryMemberships, MemoryRoles};

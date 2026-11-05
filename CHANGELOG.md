@@ -44,8 +44,9 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   grant than the method called is `forbidden`. **A child receives auth** (owner,
   2026-11-04): through a hop `caller()` is the caller the hop names (`for`'s
   far end; anonymous when `for` is empty), its reach the hop's ceiling
-  (`Reach::from_hop_ceiling`: `limit.held_on` for `limit.grant`), never
-  wider; `required` works in a child (an anonymous hop is refused), and a
+  (`limit.held_on` for `limit.grant`, as a gate of the hop alone answers
+  it: no public constructor makes such a reach; nowhere when `for` cannot be
+  read), never wider; `required` works in a child (an anonymous hop is refused), and a
   `#[from_auth]` verifier is the child's own, run on that caller.
   (The re-review's start-time refusal of an activation that needs a caller
   is gone with the reason for it.) **Who may send a hop** (`remote_child`'s
@@ -68,8 +69,11 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   whole; `identity_only`: its identity, roles and metadata dropped but its
   principal kept; `anonymous`: none), its reach the call's when the policy
   keeps the caller's identity and nowhere when not, its verified value its
-  own. So `caller()`, `current_reach()`, `reach: Reach`, `#[from_auth]` and
-  `required` answer in a child as the policy says; before, `caller()` and
+  own, and its hop (in a child process) kept as its caller is — whole under
+  `same_service`, `identity_only`, `pass_through`, none under `anonymous`
+  (`hop()` errors there, as outside a hop). So `caller()`, `current_reach()`,
+  `reach: Reach`, `hop()`, `#[from_auth]` and `required` answer in a child as
+  the policy says; before, `caller()` and
   `reach` answered the outer call whole whatever the policy (`anonymous`
   leaked the caller and its reach), and `identity_only` dropped a `key:`
   caller's principal (plexus-auth-core's fix).

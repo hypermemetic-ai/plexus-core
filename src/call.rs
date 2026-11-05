@@ -126,18 +126,21 @@ impl CallContext {
     /// A call that came through the child seam (owner, 2026-11-04: children
     /// receive auth): its caller is the one the hop names — `for`'s far end,
     /// as an `AuthContext` whose session is the hop's call id; anonymous when
-    /// `for` is empty — and its reach the hop's ceiling
-    /// ([`Reach::from_hop_ceiling`]: `limit.held_on` for `limit.grant`),
-    /// never wider; nowhere when no gate decided (`limit: null`). The hop is
+    /// `for` is empty — and its reach the hop's ceiling (`limit.held_on` for
+    /// `limit.grant`, as a gate of the hop alone answers it), never wider;
+    /// nowhere when no gate decided (`limit: null`) or `for` cannot be read. The hop is
     /// believed as the transport delivered it (`remote_child::serve_child_on`
     /// takes it only from a sender it trusts).
     pub(crate) fn through_hop(hop: Hop) -> Self {
+        // `for` names someone this cannot read: anonymous, and no ceiling —
+        // the verdict was for a caller this child cannot name.
+        let unreadable = hop.caller().is_some_and(|p| p.parse::<plexus_auth_core::identity::Principal>().is_err());
         let auth = hop.caller().and_then(|p| p.parse::<plexus_auth_core::identity::Principal>().ok()).map(|p| {
             AuthContext::for_principal(&p, format!("hop:{}", hop.call), Vec::new(), serde_json::json!({ "hop_principal": hop.principal }))
         });
         let reach = match &hop.limit {
-            Some(l) => Reach::from_hop_ceiling(Grant::new(l.grant.clone()), hop.held_on()),
-            None => Reach::nowhere(),
+            Some(l) if !unreadable => ceiling_reach(auth.as_ref(), &l.grant, &hop.held_on()),
+            _ => Reach::nowhere(),
         };
         Self(Arc::new(Inner::with(auth, Some(reach), None, Some(hop))))
     }
@@ -146,11 +149,19 @@ impl CallContext {
     /// forward policy: `callee` the context the policy derived (none, or
     /// one no longer signed in, is anonymous); the call's reach kept when
     /// the policy keeps the caller's identity, nowhere when it does not; the
-    /// hop kept; the verified value the child's own (another caller).
+    /// hop kept as the caller is (none under `anonymous`); the verified
+    /// value the child's own (another caller).
     pub(crate) fn for_child(&self, callee: Option<&AuthContext>, keeps_identity: bool) -> Self {
         let auth = callee.filter(|a| a.is_authenticated()).cloned();
-        let reach = if keeps_identity { self.reach().cloned().unwrap_or_else(Reach::nowhere) } else { Reach::nowhere() };
-        Self(Arc::new(Inner::with(auth, Some(reach), None, self.0.hop.clone())))
+        // The reach and the hop follow the caller: kept with its identity
+        // (`same_service`, `identity_only`, `pass_through`), none under
+        // `anonymous` — `hop()` there errors, as outside a hop.
+        let (reach, hop) = if keeps_identity {
+            (self.reach().cloned().unwrap_or_else(Reach::nowhere), self.0.hop.clone())
+        } else {
+            (Reach::nowhere(), None)
+        };
+        Self(Arc::new(Inner::with(auth, Some(reach), None, hop)))
     }
 
     /// This context with its identity replaced: a call routed from inside
@@ -453,4 +464,39 @@ impl Hop {
     pub fn allows_scope(&self, scope: &str) -> bool {
         self.allows(&[ScopeRef::parse(scope)])
     }
+}
+
+/// The reach a hop's ceiling gives its caller: what a gate of the hop alone
+/// answers — the caller holds one role, listing `grant` alone, on each scope
+/// of `held_on`, and a target resolves to itself and `*` (the child cannot
+/// resolve the service's scopes) — so it names `grant`, covers exactly
+/// `held_on`, and allows a target by name only on `*`. An anonymous caller
+/// holds nothing. RETURNS-47: no public constructor makes a reach from a
+/// list of scopes; this one is the seam's, built from a hop it took.
+fn ceiling_reach(caller: Option<&AuthContext>, grant: &str, held_on: &[ScopeRef]) -> Reach {
+    use plexus_auth_core::grants::{Gate, Membership, Memberships, Resolve, RoleTable};
+    struct Held(Vec<Membership>);
+    impl Memberships for Held {
+        fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
+            self.0.iter().filter(|m| &m.principal == who).cloned().collect()
+        }
+    }
+    struct Itself;
+    impl Resolve for Itself {
+        fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::named(target), ScopeRef::Everywhere])
+        }
+    }
+    const ROLE: &str = "hop";
+    let grant = Grant::new(grant.to_string());
+    let held: Vec<Membership> = match caller.and_then(|a| a.principal()) {
+        Some(p) => held_on
+            .iter()
+            .map(|s| Membership { principal: p.clone(), role: plexus_auth_core::RoleName::new(ROLE), scope: s.clone() })
+            .collect(),
+        None => Vec::new(),
+    };
+    let roles = RoleTable::from_lists([(ROLE, [grant.as_str()])]);
+    let gate = Gate::new(std::sync::Arc::new(Held(held)), std::sync::Arc::new(roles), std::sync::Arc::new(Itself));
+    gate.reach_of_public(caller, &grant)
 }

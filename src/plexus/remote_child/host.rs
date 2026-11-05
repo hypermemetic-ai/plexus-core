@@ -15,7 +15,8 @@
 //! **A child receives auth** (owner, 2026-11-04). Each call runs in the hop's
 //! context ([`crate::call`]): `call::caller()` is the caller the hop names
 //! (`for`'s far end; anonymous when `for` is empty), its reach the hop's
-//! ceiling (`limit.held_on` for `limit.grant`, [`Reach::from_hop_ceiling`]),
+//! ceiling (`limit.held_on` for `limit.grant`, as a gate of the hop alone
+//! answers it; nowhere when `for` cannot be read),
 //! never wider; `current_reach()` and `reach: Reach` answer that ceiling; a
 //! method under `auth = "required"` refuses an anonymous hop; a `#[from_auth]`
 //! verifier (on a parameter, or on a trait-impl method) is the child's own,
@@ -62,8 +63,6 @@ use tokio::sync::mpsc;
 
 use super::link::{meta, write_lines};
 use crate::call::{CallContext, Hop, InCall};
-#[allow(unused_imports)]
-use plexus_auth_core::grants::Reach;
 use crate::plexus::plexus::{error_item, Activation};
 use crate::plexus::types::PlexusStreamItem;
 

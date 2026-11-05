@@ -28,6 +28,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod activations;
 pub mod builder;
+// RETURNS-47: the caller from the call's context — `call::caller()`,
+// `call::hop()`, `call::scope` — fail closed.
+pub mod call;
 pub mod plexus;
 pub mod plugin_system;
 pub mod request;

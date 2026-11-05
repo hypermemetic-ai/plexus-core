@@ -34,13 +34,16 @@
 //! # How a method receives its [`Reach`]
 //!
 //! The gate's answer — where the grant is held — rides into the method as
-//! [`Reach`]: the dispatch runs the routed call inside a task-local scope,
-//! and `#[plexus_macros::method]` hands a method that declares a `reach:
-//! Reach` parameter (stripped from the schema, like `auth`) the value of
-//! [`current_reach`]. Outside a gated dispatch, [`current_reach`] is
-//! [`Reach::everywhere`] — what a service without a gate has always meant. The
-//! reach is live: [`Reach::allows`] / [`Reach::current`] ask the gate again
-//! as it stands, which is how a stream checks each event (IDENTITY-37).
+//! [`Reach`]: the dispatch runs the routed call inside its context
+//! ([`crate::call`], RETURNS-47) — the stream it answers included — and
+//! `#[plexus_macros::method]` hands a method that declares a `reach: Reach`
+//! parameter (stripped from the schema, like `auth`) the value of
+//! [`current_reach`]. A service without a gate dispatches with
+//! [`Reach::everywhere`], said by its dispatch; outside a call
+//! [`current_reach`] is an error, never everything (RETURNS-47: it fell back
+//! to everywhere). The reach is live: [`Reach::allows`] / [`Reach::current`]
+//! ask the gate again as it stands, which is how a stream checks each event
+//! (IDENTITY-37).
 
 use plexus_auth_core::grants::{Gate, Grant, Reach, Refusal};
 use serde_json::Value;
@@ -49,24 +52,39 @@ use super::auth::AuthContext;
 use super::plexus::{AuthzDenyReason, PlexusError};
 use super::scope_gate::MethodGateInfo;
 
-tokio::task_local! {
-    static CURRENT_REACH: Reach;
-}
-
 /// The reach of the call being dispatched: what the gate answered for its
-/// grant. [`Reach::everywhere`] when no gate decided this call (a service
-/// without a gate, or a call that did not come through a gated dispatch).
+/// grant — [`Reach::everywhere`] on a service without a gate, which its
+/// dispatch says. RETURNS-47: **fail closed** — outside a call (code no
+/// dispatch runs, a task spawned without its context handed to it,
+/// [`crate::call::scope`]), and in a call that came through a hop (its
+/// bound is [`crate::call::Hop::allows`]), it is an error
+/// (`Unauthenticated`), never everything.
 ///
 /// `#[plexus_macros::method]` calls this for a method that declares a
-/// `reach: Reach` parameter, before the method's stream is built — read it
-/// there, not from inside a stream, which runs outside the dispatch's scope.
-pub fn current_reach() -> Reach {
-    CURRENT_REACH.try_with(Reach::clone).unwrap_or_else(|_| Reach::everywhere())
+/// `reach: Reach` parameter, before the method's stream is built; the
+/// stream runs in the call's context too, so reading it there answers the
+/// same.
+pub fn current_reach() -> Result<Reach, PlexusError> {
+    let ctx = crate::call::context()?;
+    ctx.reach().cloned().ok_or_else(|| crate::call::CallError::ThroughHop.into())
 }
 
-/// Run `fut` with `reach` as the [`current_reach`].
-pub async fn with_reach<F: std::future::Future>(reach: Reach, fut: F) -> F::Output {
-    CURRENT_REACH.scope(reach, fut).await
+/// Run `fut` with `reach` as the [`current_reach`] of the call it runs in:
+/// it narrows that call's reach, never widens it and never creates a call.
+/// RETURNS-47: refused (`Unauthenticated`) outside a call, and when `reach`
+/// holds a scope the call's does not (unless the call's is everywhere) —
+/// it used to build an anonymous caller by hand. A test enters a call with
+/// `plexus_core::call::test::in_call` (feature `test-util`).
+pub async fn with_reach<F: std::future::Future>(reach: Reach, fut: F) -> Result<F::Output, PlexusError> {
+    let ctx = crate::call::context()?;
+    let current = ctx.reach().ok_or(crate::call::CallError::ThroughHop)?;
+    let within = current.is_everywhere() || reach.held_on().iter().all(|s| current.held_on().contains(s));
+    if !within {
+        return Err(PlexusError::Unauthenticated(
+            "with_reach narrows a call's reach; it holds a scope the call does not".into(),
+        ));
+    }
+    Ok(crate::call::scope(ctx.with_reach(reach), fut).await)
 }
 
 /// What the gate decided for a call that may proceed: run it under this

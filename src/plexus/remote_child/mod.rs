@@ -20,14 +20,18 @@
 //! `hop = {principal, for, limit {grant, held_on} | null, call}`: the
 //! service acting, the caller it acts for, the gate's verdict as a ceiling
 //! and a call id — built from the verified principal and
-//! [`current_reach`](super::grant_gate::current_reach) only, never from the
-//! caller's credential. Items come back unchanged, in order; the child's
+//! [`current_reach`](super::grant_gate::current_reach) only (an error outside
+//! a call, RETURNS-47: then nothing crosses), never from the caller's
+//! credential. Items come back unchanged, in order; the child's
 //! terminal item ends the caller's stream. A caller that lets go sends
 //! `{ns}.call_unsub`. A child gone is one `child_unavailable` error — the
 //! end (spec/03: an error is terminal) — and the next call starts it again,
 //! within its [`Backoff`]. An item nobody asked for is dropped, logged and
 //! counted ([`ChildStats::unasked`]).
 
+// RETURNS-47: the far side in Rust — an activation served as a child, each
+// call in its hop's context.
+mod host;
 mod link;
 // RETURNS-36: a peer on plexus-wire's spec as main wrote it, read as 0.8.
 mod peer;
@@ -49,6 +53,7 @@ use plexus_auth_core::grants::{GrantsGeneration, Reach};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+pub use host::{serve_child, serve_child_on, serve_child_stdio, ChildPeer};
 pub use link::MountTimings;
 pub use spec::{parse_duration, Backoff, ChildError, ChildOptions, ChildSpec};
 #[cfg(feature = "clap")]
@@ -268,9 +273,14 @@ impl RemoteChild {
     }
 
     async fn forward(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> PlexusStream {
-        let reach = super::grant_gate::current_reach();
         let shared = &self.inner.shared;
         let one = |item: PlexusStreamItem| -> PlexusStream { Box::pin(futures::stream::iter([item])) };
+        // RETURNS-47: the verdict is the call's; outside one (a forward no
+        // dispatch admitted) nothing crosses — fail closed, never everywhere.
+        let reach = match super::grant_gate::current_reach() {
+            Ok(reach) => reach,
+            Err(e) => return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false)),
+        };
         let max = shared.opts.max_calls;
         if shared.counters.open.fetch_add(1, Ordering::AcqRel) >= max {
             shared.counters.open.fetch_sub(1, Ordering::AcqRel);

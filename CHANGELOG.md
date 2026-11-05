@@ -5,6 +5,139 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+RETURNS-47: the caller from the call's context, fail closed. Breaking.
+
+### Added
+
+- `plexus_core::call`: `caller()` answers the caller of the call it runs in
+  as the service's gate admitted it — the `AuthContext` that stands (after
+  AUTH-11's liveness) and the `Reach` the gate answered (`Caller::auth`,
+  `Caller::signed_in`, `Caller::reach`) — so a method of a hand-written trait,
+  whose signature cannot carry `#[from_auth]`, reaches its caller as an
+  inherent one does. `hop()` answers, in a child reached through the seam,
+  the hop the call came through (`Hop`: `principal`, `for`, `limit`, `call`;
+  `Hop::caller`, `Hop::grant`, `Hop::held_on`, `Hop::allows` — false when
+  the hop names no readable caller, agreeing with `caller()?.reach()`). `context()`
+  and `scope(ctx, fut)` hand a call's context to a task it spawns, which
+  otherwise has none. `InCall`: a stream polled inside a context. Each is an
+  error outside a call (`CallError`, as a `PlexusError` `Unauthenticated`),
+  never a default.
+- `call::verified::<T>()`: what a trait-impl method's verifier
+  (`#[plexus_macros::from_auth(…)]` on the method) answered for the call.
+  Set once per call, by the dispatch before the body: a second set is
+  refused (`CallError::AlreadyVerified`) and the verifier's value stands —
+  inside `with_reach` too, which narrows the same call (another caller's
+  context, `ungated` or a nested route, starts its own).
+- `call::ungated(activation, method, params, auth, raw_ctx)`: one activation
+  dispatched as a service with no gate dispatches it — in a context admitting
+  `auth` everywhere, said by the caller of the function. The leaf path for a
+  bridge that serves a single activation, where there is no service and so no
+  gate; a call that passes a gate goes through the service's route instead.
+- `call::test::in_call(auth, reach, fut)` (feature `test-util`, never
+  default): a test's way into a call.
+- `remote_child::serve_child` / `serve_child_stdio`: an activation served as
+  a child on stdio (spec/11, 12) — `_info`, `{ns}.call`, `{ns}.call_unsub` —
+  each call in its hop's context, schema calls and a dynamic child's lookup
+  included. Before the method runs: a call with no hop is `unauthenticated`;
+  a hop no gate decided (`limit: null`, no grant) or one admitted for another
+  grant than the method called is `forbidden`. **A child receives auth** (owner,
+  2026-11-04): through a hop `caller()` is the caller the hop names (`for`'s
+  far end; anonymous when `for` is empty), its reach the hop's ceiling
+  (`limit.held_on` for `limit.grant`, as a gate of the hop alone answers
+  it: no public constructor makes such a reach; nowhere when `for` cannot be
+  read), never wider; `required` works in a child (an anonymous hop is refused), and a
+  `#[from_auth]` verifier is the child's own, run on that caller.
+  (The re-review's start-time refusal of an activation that needs a caller
+  is gone with the reason for it.) **Who may send a hop** (`remote_child`'s
+  `host` docs hold the trust model): a hop is unsigned, so it is believed
+  only from a sender the child trusts. On a pipe its parent owns
+  (`serve_child`, `serve_child_stdio`: `ChildPeer::Pipe`) every hop is the
+  parent's. On a proven connection (`serve_child_on` with
+  `ChildPeer::connection(proven, acts_for_others)`) a hop is taken only when
+  the proven principal is one the child trusts to act for others and the hop
+  names it as the acting service; any other is refused `forbidden`.
+  plexus-core has no WebSocket server for a Rust child: the server that
+  proves the connection hands `serve_child_on` its principal.
+
+### Changed
+
+- **In-process children receive auth** (owner, 2026-11-04). A call routed
+  into a child (`route_to_child`: static `#[child]`, dynamic, nested) runs in
+  a context of its own, under the child's forward policy: its caller the
+  context the policy derived (`same_service`, `pass_through`: the caller
+  whole; `identity_only`: its identity, roles and metadata dropped but its
+  principal kept; `anonymous`: none), its reach the call's when the policy
+  keeps the caller's identity and nowhere when not, its verified value its
+  own, and its hop (in a child process) kept as its caller is — whole under
+  `same_service`, `identity_only`, `pass_through`, none under `anonymous`
+  (`hop()` errors there, as outside a hop). So `caller()`, `current_reach()`,
+  `reach: Reach`, `hop()`, `#[from_auth]` and `required` answer in a child as
+  the policy says; before, `caller()` and
+  `reach` answered the outer call whole whatever the policy (`anonymous`
+  leaked the caller and its reach), and `identity_only` dropped a `key:`
+  caller's principal (plexus-auth-core's fix).
+- Every call a `DynamicHub` dispatches runs in its context, and the stream
+  it answers carries it (each poll inside it): the gate's reach on a gated
+  service; on one without a gate `Reach::everywhere`, said by the dispatch
+  (or, routed from inside another call, that call's reach and hop with this
+  call's identity); an introspection call the caller's reach for the path,
+  asked of the gate only if read. `{ns}.list_children` and
+  `{ns}.search_children` run their list and search methods in a context the
+  same way (they are not gated — a gap of its own).
+- **`current_reach()` returns `Result<Reach, PlexusError>`** (was `Reach`)
+  and fails closed: outside a call it is `Unauthenticated`, never
+  `Reach::everywhere` (it fell back to everywhere when no gate had set one).
+- **`with_reach` returns `Result<F::Output, PlexusError>`** and only narrows
+  the reach of the call it runs in: outside a call, or given a scope the
+  call does not hold, it is refused. (It built an anonymous caller by hand.)
+- **`Activation::call`, called straight** (not through a service), runs in
+  no context: a method that takes `reach: Reach`, a trait-impl method under
+  `auth = "required"`, and any body reading `caller()` are refused
+  (`Unauthenticated`, or in band where the body says so). Call through a
+  `DynamicHub`, or `call::ungated`.
+- A `RemoteChild` forward outside a call sends nothing and answers
+  `unauthenticated`.
+- `tests/remote_child.rs`'s `cancel_crosses_hop` asserts the cancel's order
+  (the child sent `call_unsub`, took it for a live call, stopped that call;
+  the service holds nothing after) within 5 s per cancel, not a 100 ms bound
+  on the slowest of twenty, which missed under a loaded run.
+
+### Removed
+
+- The `Echo` and `Auth` traits (`activations::echo::Echo`,
+  `plexus::Auth`), which `#[plexus_macros::activation]` emitted for
+  `EchoActivation` and `AuthActivation` and no longer does (RETURNS-47: a
+  trait only when named); and `FromClientError` for `EchoEvent` and
+  `AuthEvent`, which only their clients' trait impls asked for.
+
+### Migration
+
+- **menger** (`menger-tickets-api`, on 0.7.0 today): in `Access::verify`
+  (`tickets-api/src/access/mod.rs:774`) `current_reach()` becomes
+  `current_reach()?`; its test
+  `the_frames_resolver_answers_typed_and_keeps_the_calls_reach`
+  (`tickets-api/src/access/tests.rs:616`), which calls `verify` outside any
+  call, wraps each `a.verify(..)` in
+  `plexus_core::call::test::in_call(None, Reach::everywhere(), …)` (with
+  `plexus-core = { …, features = ["test-util"] }` under
+  `[dev-dependencies]`). `docs/src/caller.rs:44` takes the same `?`.
+- **plexus-ui** (`plexus-ui-service`, on 0.7.0 today): `Callers::verify`
+  (`service/src/caller.rs:60`) takes `current_reach()?`, and its direct
+  `verify` tests are wrapped in `in_call` the same way.
+- **plexus-transport's REST and MCP bridges** (its RETURNS-47 entry): their
+  leaf path — one activation, no service, so no gate — runs through
+  `call::ungated` in place of `Activation::call`, so a `reach: Reach` method
+  and a `caller()` reader are answered there as on a service with no gate.
+  The REST bridge names its caller with the session validator and routes over
+  a service with it (`with_router_as`), through the gate. The legacy
+  `ActivationMcpBridge` names no caller (anonymous); the mounted MCP bridge
+  goes through the service's route as the caller its validator names.
+- **A child served with `serve_child`** under a service without a gate gets
+  `limit: null` hops, and so refuses every call but its schema: gate the
+  service that mounts it.
+
 ## [0.8.0]
 
 ### Breaking (TRANSPORT-23: no rmcp in plexus-core)

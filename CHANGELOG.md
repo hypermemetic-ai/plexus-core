@@ -138,6 +138,18 @@ RETURNS-47: the caller from the call's context, fail closed. Breaking.
   `limit: null` hops, and so refuses every call but its schema: gate the
   service that mounts it.
 
+## [0.8.1]
+
+### Added (V2-57)
+
+- `DynamicHub::serve_call(params, pending, ext, ns)`: one `{ns}.call` served
+  exactly as the service's own `{ns}.call` serves it — the connection's
+  caller, a method with an `Input` taking its input half (BIDIR-6), each item
+  piped. For a host that registers `{ns}.call` itself to check its own limits
+  first (menger's call layer): before it, such a host could only `route`,
+  outside the call's seam, and every `Input` method answered that the
+  transport carries none. `tests/host_call.rs`.
+
 ## [0.8.0]
 
 ### Breaking (TRANSPORT-23: no rmcp in plexus-core)

@@ -209,7 +209,7 @@ where
 
     // Spawn background task to auto-respond
     let channel_clone = channel.clone();
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         while let Some(item) = rx.recv().await {
             if let PlexusStreamItem::Request {
                 request_id,

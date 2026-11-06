@@ -109,7 +109,7 @@
 
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use crate::rt::Instant;
 
 use chrono::Utc;
 use futures::FutureExt;

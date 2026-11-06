@@ -1794,7 +1794,7 @@ impl DynamicHub {
                     schemas.insert(path, schema);
                 }
                 let service = self.inner.namespace.clone();
-                tokio::task::spawn_blocking(move || super::ir::answer(&service, &roots, &schemas))
+                crate::rt::spawn_blocking(move || super::ir::answer(&service, &roots, &schemas))
                     .await
                     .unwrap_or_else(|e| Err(super::ir::IrError::Unreadable { namespace: String::new(), message: format!("the IR's build failed: {e}") }))
             })
@@ -1973,7 +1973,7 @@ impl DynamicHub {
         self.inner.duplex_gate.get_or_init(|| match &self.inner.gate {
             Some(gate) => {
                 let (audit, drain) = plexus_auth_core::audit::AuditQueue::new(1024, self.inner.audit_sink.clone());
-                tokio::spawn(drain);
+                crate::rt::spawn(drain);
                 super::duplex_gate::DuplexGate::new((**gate).clone()).with_audit(audit)
             }
             None => super::duplex_gate::DuplexGate::ungated(),

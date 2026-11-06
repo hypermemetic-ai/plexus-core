@@ -34,6 +34,9 @@ pub mod call;
 pub mod plexus;
 pub mod plugin_system;
 pub mod request;
+// PLEXUS-45: the runtime seam — spawn, sleep, timeout, the clock — tokio and
+// std natively, the JS event loop and clock on wasm32.
+pub(crate) mod rt;
 pub mod serde_helpers;
 pub mod types;
 

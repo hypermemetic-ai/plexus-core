@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Not released: `Cargo.toml` stays at 0.8.0. The next version is the owner's
-call — V2-57 claims 0.8.1 (`serve_call`, cut from the v0.8.0 tag), and what
-is below includes RETURNS-47's breaking change.
+## [0.9.0] — 2026-11-06
+
+PLEXUS-46 (owner, 2026-11-06: "publish the core however you like"): 0.9.0,
+not 0.8.x, because what is below includes RETURNS-47's breaking change
+(`grant_gate::current_reach` is `-> Result<Reach, PlexusError>`; it was
+`-> Reach`) — a 0.8.x would break every `^0.8` consumer on `cargo update`.
+On plexus-macros and plexus-client 0.9.0, released in lockstep. The 0.8 line
+stays open: 0.8.1 is left for V2-57's `serve_call`, cut from the v0.8.0 tag.
 
 PLEXUS-45: plexus-core builds **and runs** on `wasm32-unknown-unknown`
 (owner, 2026-11-06: "can we make plexus core wasm compatible without

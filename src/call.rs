@@ -131,6 +131,8 @@ impl CallContext {
     /// nowhere when no gate decided (`limit: null`) or `for` cannot be read. The hop is
     /// believed as the transport delivered it (`remote_child::serve_child_on`
     /// takes it only from a sender it trusts).
+    // PLEXUS-45: the child seam is native-only; on wasm32 nothing takes a hop.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn through_hop(hop: Hop) -> Self {
         // `for` names someone this cannot read: anonymous, and no ceiling —
         // the verdict was for a caller this child cannot name.
@@ -478,6 +480,7 @@ impl Hop {
 /// `held_on`, and allows a target by name only on `*`. An anonymous caller
 /// holds nothing. RETURNS-47: no public constructor makes a reach from a
 /// list of scopes; this one is the seam's, built from a hop it took.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn ceiling_reach(caller: Option<&AuthContext>, grant: &str, held_on: &[ScopeRef]) -> Reach {
     use plexus_auth_core::grants::{Gate, Membership, Memberships, Resolve, RoleTable};
     struct Held(Vec<Membership>);

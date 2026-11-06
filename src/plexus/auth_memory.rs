@@ -25,7 +25,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -40,7 +39,7 @@ use super::auth_activation::{
 };
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    crate::rt::now_unix()
 }
 
 fn fresh(prefix: &str) -> String {

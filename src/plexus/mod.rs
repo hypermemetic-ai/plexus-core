@@ -37,6 +37,10 @@ pub mod middleware;
 pub mod path;
 pub mod plexus;
 // POLYGLOT-5: the child seam's second implementation — a process or a socket.
+// PLEXUS-45: native only. A browser has no processes, and a ws child waits
+// for a browser-WebSocket transport (a later ticket); on wasm32 the module
+// would compile to a child with no way to reach it.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod remote_child;
 pub mod schema;
 mod schema_sites;
@@ -59,8 +63,9 @@ pub use context::PlexusContext;
 pub use in_process::InProcessTransport;
 pub use input::{Delivered, Input, InputTable};
 pub use hub_transport::HubTransport;
+#[cfg(not(target_arch = "wasm32"))]
 pub use remote_child::{Backoff, ChildError, ChildMethods, ChildOptions, ChildSpec, ChildStats, MountTimings, RemoteChild};
-#[cfg(feature = "clap")]
+#[cfg(all(feature = "clap", not(target_arch = "wasm32")))]
 pub use remote_child::ChildArgs;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};

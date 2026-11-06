@@ -61,7 +61,7 @@ impl EchoActivation {
         stream! {
             for i in 0..count {
                 if i > 0 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    crate::rt::sleep(Duration::from_millis(500)).await;
                 }
                 yield EchoEvent::Echo {
                     message: message.clone(),

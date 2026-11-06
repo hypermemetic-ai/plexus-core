@@ -581,7 +581,7 @@ impl DuplexCall {
                 match expires {
                     Some(at) => {
                         let secs = at.saturating_sub(now).max(0) as u64;
-                        tokio::time::sleep(std::time::Duration::from_secs(secs)).await
+                        crate::rt::sleep(std::time::Duration::from_secs(secs)).await
                     }
                     None => std::future::pending().await,
                 }

@@ -8,7 +8,7 @@ use jsonrpsee::core::{server::Methods, SubscriptionResult};
 use jsonrpsee::{proc_macros::rpc, PendingSubscriptionSink};
 use serde_json::Value;
 use std::pin::Pin;
-use std::time::Instant;
+use crate::rt::Instant;
 
 /// Health RPC interface
 #[rpc(server, namespace = "health")]
@@ -76,7 +76,7 @@ impl HealthRpcServer for Health {
         let wrapped = wrap_stream(stream, "health.status", vec!["health".into()]);
 
         // Forward all items to sink
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let mut stream = wrapped;
             while let Some(item) = stream.next().await {
                 if let Ok(raw_value) = serde_json::value::to_raw_value(&item) {

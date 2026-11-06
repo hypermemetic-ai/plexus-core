@@ -24,8 +24,8 @@ bytes = { version = "1.9", features = ["serde"] }
 # PERF-7: wrap_stream's stream, the method's own inside it unboxed.
 pin-project-lite = "0.2"
 
-# Async runtime
-tokio = { version = "1.0", features = ["full"] }
+# Async runtime. PLEXUS-45: tokio is in the target tables below — `full`
+# natively, as it always was; the parts that build for wasm32 there.
 tokio-stream = "0.1"
 futures = "0.3"
 futures-core = "0.3"
@@ -57,9 +57,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # Logging
 tracing = "0.1"
 
-# JSON-RPC server
-# plexus::input reads PendingSubscriptionSink::subscription_id, new in 0.26.1.
-jsonrpsee = { version = "0.26.1", features = ["server", "macros"] }
+# JSON-RPC server: in the target tables below (PLEXUS-45). Natively
+# `server` + `macros`, as always; on wasm32 `server-core` + `macros`, which
+# hold everything this crate uses (RpcModule, Methods, the subscription
+# sinks, Params, ErrorObject, Extensions, ConnectionId) without hyper/mio.
 
 # POLYGLOT-5: the child seam. `--child NAME=stdio:CMD` is split as a shell
 # would split it (shell-words), then run without one.
@@ -68,8 +69,8 @@ shell-words = "1.1"
 clap = { version = "4", features = ["derive", "env"], optional = true }
 # A WebSocket child (feature `child-ws`): dialed with the service's key proof
 # (spec/00) — signed here, so the seam needs neither the adapters nor a
-# network client; `child-wss` adds TLS.
-tokio-tungstenite = { version = "0.30", optional = true }
+# network client; `child-wss` adds TLS. tokio-tungstenite is native-only
+# (the target table below): on wasm32 there are no children (PLEXUS-45).
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"], optional = true }
 # BIDIR-17: an `Input<Bytes>` item sent as JSON is base64.
 base64 = "0.22"
@@ -80,8 +81,8 @@ base64 = "0.22"
 plexus-macros = { path = "../plexus-macros", version = "0.8.0" }
 
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
-# Wasm-safe by construction; the dependency only runs this way, since
-# plexus-client must build for wasm32 and plexus-core cannot.
+# Wasm-safe by construction; the dependency only runs this way (plexus-client
+# carries no server). Since PLEXUS-45 plexus-core builds for wasm32 too.
 # RETURNS-6: `schema` — the error frame carries plexus-client's `RemoteError`,
 # and `PlexusStreamItem` derives `JsonSchema`.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", features = ["schema"] }
@@ -89,7 +90,33 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", fe
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.3" }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1" }
+
+# PLEXUS-45: natively, every dependency exactly as before PLEXUS-45.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.0", features = ["full"] }
+# plexus::input reads PendingSubscriptionSink::subscription_id, new in 0.26.1.
+jsonrpsee = { version = "0.26.1", features = ["server", "macros"] }
+tokio-tungstenite = { version = "0.30", optional = true }
+
+# PLEXUS-45: wasm32-unknown-unknown (a browser, or node). No processes, no
+# sockets of its own, one thread, no tokio runtime: tokio for its sync
+# primitives and macros only; the runtime seam (`crate::rt`) spawns on the
+# JS event loop (wasm-bindgen-futures), sleeps on `setTimeout` (futures-timer
+# over gloo-timers, a `Send` future) and reads the JS clock (web-time);
+# randomness and chrono's `Utc::now` come from the JS runtime. getrandom
+# 0.3's `wasm_js` also needs `--cfg getrandom_backend="wasm_js"` in the
+# target's rustflags.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.0", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
+jsonrpsee = { version = "0.26.1", default-features = false, features = ["server-core", "macros"] }
+wasm-bindgen-futures = "0.4"
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+web-time = "1"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+uuid = { version = "1.6", features = ["js"] }
+chrono = { version = "0.4", features = ["wasmbind"] }
 
 [features]
 # POLYGLOT-5: a WebSocket child is on by default (three small crates);
@@ -123,6 +150,9 @@ harness = false
 [dev-dependencies]
 # RETURNS-47: this crate's own tests use `call::test::in_call`.
 plexus-core = { path = ".", features = ["test-util"] }
+
+# PLEXUS-45: every other test dependency is the native suite's, as before.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.8.0", features = ["ws-native"] }
 tempfile = "3"
@@ -149,7 +179,13 @@ plexus-transport = { path = "../plexus-transport", default-features = false }
 # `src/plexus/credential_envelope.rs` can mint real `Credential<T>`
 # values. Added by AUTHZ-CRED-CORE-1B as part of wiring CRED-CORE-2's
 # deferred end-to-end ACs (#1, #2 full, #4 end-to-end, #5 end-to-end).
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.3", features = ["test-support", "adapters"] }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1", features = ["test-support", "adapters"] }
+
+# PLEXUS-45: tests/wasm_dispatch.rs, a DynamicHub dispatched in wasm32 under
+# Node (`scripts/wasm-test.sh`); its timers and clock are the normal
+# wasm32 dependencies above.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 # PERF-6 (PLEXUS/PERF-6): the one build perf runs and releases use, PERF-1's
 # `profiles` fork built to its recommendation. Release, with LTO across every

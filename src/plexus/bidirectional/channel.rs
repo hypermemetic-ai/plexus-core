@@ -56,7 +56,7 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use crate::rt::timeout;
 use uuid::Uuid;
 
 use super::registry::{register_pending_request, unregister_pending_request};

@@ -41,7 +41,7 @@ where
         let sink = pending.accept().await?;
         let plexus_hash = PlexusContext::hash();
 
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let mut stream = Box::pin(self);
             let mut item_count = 0u64;
             debug!(provenance = ?provenance, "SUBSCRIPTION: Stream processing started");

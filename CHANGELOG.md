@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Not released: `Cargo.toml` stays at 0.8.0. The next version is the owner's
+call — V2-57 claims 0.8.1 (`serve_call`, cut from the v0.8.0 tag), and what
+is below includes RETURNS-47's breaking change.
+
+PLEXUS-45: plexus-core builds **and runs** on `wasm32-unknown-unknown`
+(owner, 2026-11-06: "can we make plexus core wasm compatible without
+degrading anything?"). No published plexus-core ever built there. Native is
+unchanged: the host's `cargo tree -e normal` is the same with default
+features, without them and with all of them, and every native call site
+makes the same tokio/std call it made before.
+
+### Added
+
+- **wasm32 dependency tables.** Natively tokio stays `full` and jsonrpsee
+  `server` + `macros`, in a `cfg(not(target_arch = "wasm32"))` table. On
+  wasm32: tokio `sync, macros, rt, time, io-util`; jsonrpsee
+  `server-core` + `macros` (RpcModule, the subscription sinks, Params,
+  ErrorObject, Extensions — no hyper, no mio); getrandom 0.3 `wasm_js` / 0.2
+  `js`, uuid `js`, chrono `wasmbind`; wasm-bindgen-futures, futures-timer
+  (`wasm-bindgen`) and web-time for the seam. getrandom 0.3 also needs
+  `--cfg getrandom_backend="wasm_js"` in the target's rustflags.
+- **One runtime seam, `crate::rt` (crate-private):** `spawn`,
+  `spawn_blocking`, `sleep`, `timeout`, `Instant`, `now_unix`. Natively each
+  is a re-export of the tokio/std item the call site named before (or, for
+  `now_unix`, the same `SystemTime` arithmetic). On wasm32: `spawn` is
+  `wasm_bindgen_futures::spawn_local`; `spawn_blocking` runs the closure
+  inline (one thread — nowhere else to run it); `sleep` is a `setTimeout`,
+  `timeout` races it; `Instant` and `now_unix` read the JS clock. Every
+  non-test site goes through it: the health activation (its uptime clock and
+  its subscription task), the IR build (`spawn_blocking`), the duplex gate's
+  audit drain and expiry, the bidirectional channel's request timeout and
+  `auto_respond_channel`, `PlexusStream`'s subscription task, the echo
+  activation's delay, the scope gate's timing, the memory auth backend's
+  clock.
+- `tests/wasm_dispatch.rs`: a `DynamicHub` with activations dispatched in
+  wasm32 under Node — a plain call, a streaming call spaced by timers, a
+  question that times out, the health activation and the schema read.
+  `scripts/wasm-test.sh` runs it (finding or installing the matching
+  `wasm-bindgen-test-runner`).
+- `tests/wasm32_check.rs`, in the native suite:
+  `cargo check --lib --no-default-features --target wasm32-unknown-unknown`
+  is green (skipped, with a message, when the target is not installed).
+
+### Changed
+
+- **wasm32 only:** `plexus::remote_child` (and its re-exports `RemoteChild`,
+  `ChildSpec`, `ChildOptions`, …) is not built. A browser has no processes,
+  and a ws child waits for a browser-WebSocket transport (a later ticket).
+  `child-ws`'s tokio-tungstenite is native-only.
+- **wasm32 limit:** dispatch in wasm goes through `DynamicHub::route` (or
+  the in-process transport). The JSON-RPC module (`into_rpc_module`) spawns
+  each subscription with `tokio::spawn` inside jsonrpsee, which needs a
+  tokio runtime that wasm32 does not have; it is a server's path.
+- Requires plexus-auth-core 0.3.1 (wasm32 builds; natively unchanged).
+
 RETURNS-47: the caller from the call's context, fail closed. Breaking.
 
 ### Added

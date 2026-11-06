@@ -2652,6 +2652,26 @@ impl DynamicHub {
         Ok(module)
     }
 
+    /// V2-57: serve one `{ns}.call` exactly as this service's own `{ns}.call`
+    /// does: routed as the connection's caller (the `AuthContext` the upgrade
+    /// put in `ext`), a method with an `Input` taking its input half from
+    /// `pending` (BIDIR-6), each item piped, a dispatch error sent as an
+    /// item. For a host that registers `{ns}.call` itself to check its own
+    /// limits first (menger's call layer): it removes the module's
+    /// `{ns}.call`, registers its own, and hands each call it admits here.
+    /// Routing with [`route`](Self::route) instead runs outside the call's
+    /// seam, so an `Input` method answers that the transport carries none.
+    /// `ns` is the service's runtime namespace, the error items' source.
+    pub fn serve_call(
+        &self,
+        params: jsonrpsee::types::Params<'static>,
+        pending: jsonrpsee::PendingSubscriptionSink,
+        ext: http::Extensions,
+        ns: &'static str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = jsonrpsee::core::SubscriptionResult> + Send>> {
+        serve_call(self.clone(), params, pending, ext, ns, true)
+    }
+
     /// Convert Arc<DynamicHub> to RPC module while keeping the Arc alive
     ///
     /// Unlike `into_rpc_module`, this keeps the Arc<DynamicHub> reference alive,

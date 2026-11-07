@@ -166,6 +166,12 @@ harness = false
 name = "nest_spike"
 harness = false
 
+# NEST-6: dynamic children and peer slots through a mount; the host and, run
+# again by the seam, the child on stdio.
+[[test]]
+name = "nest6_dynamic"
+harness = false
+
 [dev-dependencies]
 # RETURNS-47: this crate's own tests use `call::test::in_call`.
 plexus-core = { path = ".", features = ["test-util"] }

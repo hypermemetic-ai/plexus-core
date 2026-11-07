@@ -230,3 +230,130 @@ async fn nested_child_through_the_seam() {
     std::env::remove_var("NEST_PY_VARIANT");
     assert!(gone["message"].as_str().is_some_and(|m| m.contains("schema changed; restart the service")), "{gone}");
 }
+
+// ------------------------------------------------------------------ NEST-6
+
+/// NEST-6 — a child with a typed slot and an untyped one, in another
+/// language (`tests/fixtures/slot_child.py`), mounted: every row of NEST-6's
+/// table. The walk keeps each slot and its type; a call into a slot is
+/// decided on the slot grant and forwarded with it in the child's terms, the
+/// child checking it against the slot; an unknown name is the child's own
+/// not-found; the slot's list is forwarded; an instance's schema crosses once
+/// per name, an item with another `plexus_hash` drops it, and a restart
+/// drops every name.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_children_through_the_seam() {
+    use futures::StreamExt;
+    use plexus_core::plexus::{AuthContext, Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EDITOR: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    #[derive(Default)]
+    struct Members(Mutex<Vec<Membership>>);
+    impl Memberships for Members {
+        fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
+            self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
+        }
+    }
+    struct Everywhere;
+    impl Resolve for Everywhere {
+        fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::Everywhere])
+        }
+    }
+    async fn all(r: Result<plexus_core::plexus::PlexusStream, plexus_core::plexus::PlexusError>) -> Vec<Value> {
+        match r {
+            Err(e) => vec![json!({ "route_error": format!("{e:?}") })],
+            Ok(s) => s
+                .filter_map(|i| async move {
+                    match i {
+                        plexus_core::plexus::PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
+                        plexus_core::plexus::PlexusStreamItem::Done { .. } => None,
+                        other => Some(serde_json::to_value(other).unwrap()),
+                    }
+                })
+                .collect()
+                .await,
+        }
+    }
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/slot_child.py");
+    let spec = ChildSpec::Stdio { name: "sky".into(), argv: vec!["python3".into(), "-I".into(), fixture.to_string_lossy().into_owned()] };
+    let child = RemoteChild::connect(spec, ChildOptions::for_service("host")).await.expect("a python child with slots mounts");
+    let kept: Vec<String> = plexus_core::plexus::Activation::static_child_schemas(&child).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(kept, ["belt"], "the static level; each slot stays on its parent");
+
+    let roles = DynamicHub::new("host").register(child.clone()).declared_roles();
+    for g in ["sky.{planet}.info", "sky.belt.{rock}", "sky.names"] {
+        assert!(roles["viewer"].contains(&g.to_string()), "{g}: {roles:?}");
+    }
+    assert_eq!(roles["editor"], ["sky.{planet}.rename"], "{roles:?}");
+    let members = Arc::new(Members::default());
+    for (p, r) in [(VIEWER, "viewer"), (EDITOR, "editor")] {
+        members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::parse("*") });
+    }
+    let table = RoleTable::from_lists(roles.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
+    let host = DynamicHub::new("host").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(table), Arc::new(Everywhere))));
+    let viewer = AuthContext::for_principal(&VIEWER.parse().unwrap(), "s1", vec![], Value::Null);
+    let editor = AuthContext::for_principal(&EDITOR.parse().unwrap(), "s1", vec![], Value::Null);
+    let (v, e) = (Some(&viewer), Some(&editor));
+
+    // A typed slot: the slot grant, in the child's terms.
+    let got = all(host.route("sky.earth.info", json!({}), v).await).await;
+    assert_eq!(got[0]["method"], "pys.earth.info", "{got:?}");
+    assert_eq!(got[0]["hop"]["limit"]["grant"], "pys.{planet}.info", "{got:?}");
+    assert_eq!(got[0]["hop"]["for"], json!([VIEWER]), "{got:?}");
+    let refused = all(host.route("sky.earth.rename", json!({}), v).await).await;
+    assert!(refused[0]["route_error"].as_str().is_some_and(|r| r.contains("rename")), "{refused:?}");
+    let got = all(host.route("sky.mars.rename", json!({}), e).await).await;
+    assert_eq!(got[0]["hop"]["limit"]["grant"], "pys.{planet}.rename", "{got:?}");
+    // An unknown name: the child's own not-found, unchanged.
+    let got = all(host.route("sky.pluto.info", json!({}), v).await).await;
+    assert_eq!(got[0]["message"], "Activation not found: pys.pluto.info", "{got:?}");
+    // The slot's list, forwarded.
+    assert_eq!(all(host.route("sky.names", json!({}), v).await).await, [json!("earth"), json!("mars"), json!("venus")]);
+    // An untyped slot: gated whole; every method on the name.
+    let got = all(host.route("sky.belt.ceres.info", json!({}), v).await).await;
+    assert_eq!(got[0]["hop"]["limit"]["grant"], "pys.belt.{rock}", "{got:?}");
+    let refused = all(host.route("sky.belt.ceres.info", json!({}), e).await).await;
+    assert!(refused[0]["route_error"].as_str().is_some_and(|r| r.contains("sky.belt.{rock}")), "{refused:?}");
+
+    // One schema per name: one hop for ten asks.
+    let before = child.stats();
+    for _ in 0..10 {
+        let s = all(host.route("sky.earth.schema", json!({}), v).await).await;
+        assert_eq!(s[0]["namespace"], "planet", "{s:?}");
+    }
+    let after = child.stats();
+    assert_eq!((after.name_schemas - before.name_schemas, after.name_schema_hits - before.name_schema_hits), (1, 9), "{after:?}");
+    let r = all(host.route("sky.belt.ceres.schema", json!({}), v).await).await;
+    assert_eq!(r[0]["namespace"], "rock", "{r:?}");
+    let got = all(host.route("sky.pluto.schema", json!({}), v).await).await;
+    assert_eq!(got[0]["message"], "Activation not found: pys.pluto.schema", "not kept, relayed: {got:?}");
+    assert_eq!(child.stats().names_kept, 2);
+
+    // The child changes under the mount: an item through `earth` with
+    // another plexus_hash drops earth's entry (not ceres').
+    let _ = all(host.route("sky.bump", json!({}), v).await).await;
+    let _ = all(host.route("sky.earth.info", json!({}), v).await).await;
+    assert_eq!(child.stats().names_kept, 1, "{:?}", child.stats());
+    let hops = child.stats().name_schemas;
+    let _ = all(host.route("sky.earth.schema", json!({}), v).await).await;
+    assert_eq!(child.stats().name_schemas, hops + 1, "asked again");
+
+    // A restart drops every name.
+    let pid = child.pid().unwrap();
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = all(host.route("sky.ping", json!({}), v).await).await;
+        if got.first().is_some_and(|g| g["method"] == "pys.ping") && child.pid() != Some(pid) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the child never came back: {got:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(child.stats().names_kept, 0, "{:?}", child.stats());
+}

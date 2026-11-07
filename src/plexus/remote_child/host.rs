@@ -30,7 +30,9 @@
 //! The far side decides again (spec/12 rule 2), before the method runs: a
 //! call with no hop is `unauthenticated`; a hop no gate decided (`limit:
 //! null`, or no grant) and a hop admitted for another grant than the method
-//! called are `forbidden`. A schema call (`{ns}.schema`) answers whatever its
+//! called — or than the dynamic slot it goes through (NEST-6:
+//! `{ns}.solar.{planet}.info` for `{ns}.solar.earth.info`, an untyped slot's
+//! `{ns}.belt.{rock}` for every method on a rock) — are `forbidden`. A schema call (`{ns}.schema`) answers whatever its
 //! hop, in its context when it has one, as every call (a dynamic child's
 //! lookup included) runs. Nothing is written to stdout but the protocol.
 //!
@@ -69,6 +71,7 @@ use tokio::sync::mpsc;
 use super::link::{meta, write_lines};
 use crate::call::{CallContext, Hop, InCall};
 use crate::plexus::plexus::{error_item, Activation};
+use crate::plexus::slots::Slots;
 use crate::plexus::types::PlexusStreamItem;
 
 type Live = Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>;
@@ -136,6 +139,7 @@ where
 {
     let ns = activation.namespace().to_string();
     let peer = Arc::new(peer);
+    let slots = Arc::new(slot_index(&activation));
     let (call_m, unsub_m) = (format!("{ns}.call"), format!("{ns}.call_unsub"));
     let (out, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_lines(w, out_rx));
@@ -170,7 +174,7 @@ where
             next_sid += 1;
             // spec/02: the subscription id before any of its items.
             send(&out, json!({ "jsonrpc": "2.0", "id": id, "result": sid }));
-            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer)));
+            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots)));
             live.lock().unwrap().insert(sid, task.abort_handle());
         } else if method == unsub_m {
             let held = params.get(0).and_then(Value::as_u64).and_then(|sid| live.lock().unwrap().remove(&sid));
@@ -191,6 +195,20 @@ where
     Ok(())
 }
 
+/// NEST-6: the slots of the activation served — its own schema's, its
+/// static children's and, to any depth, each typed slot's — so a hop's grant
+/// is checked against the slot a path goes through, as the mount's gate
+/// decided it ([`Slots::resolve`]).
+fn slot_index<A: Activation>(activation: &A) -> Slots {
+    let schema = activation.plugin_schema();
+    let statics = crate::plexus::children::qualified(&schema.namespace, activation.static_child_schemas());
+    let (mut typed, mut untyped) = (Vec::new(), Vec::new());
+    for s in std::iter::once(&schema).chain(statics.iter()) {
+        crate::plexus::slots::slot_schemas(s, &mut typed, &mut untyped);
+    }
+    Slots::of(std::iter::once(&schema).chain(statics.iter()).chain(typed.iter()), &untyped)
+}
+
 /// One call: its items as `{ns}.call` notifications for `sid`, in order,
 /// the last one terminal.
 #[allow(clippy::too_many_arguments)]
@@ -204,6 +222,7 @@ async fn run<A: Activation>(
     params: Value,
     hop: Option<Value>,
     peer: Arc<ChildPeer>,
+    slots: Arc<Slots>,
 ) {
     let item = |v: Value| {
         let frame = json!({ "jsonrpc": "2.0", "method": format!("{ns}.call"), "params": { "subscription": sid, "result": v } });
@@ -235,8 +254,12 @@ async fn run<A: Activation>(
             }),
             _ if introspection => None,
             None => Some(RemoteError::Unauthenticated),
+            // NEST-6: or, for a path through a dynamic slot, the slot's
+            // grant (`{ns}.a.{item}.m`; an untyped slot's `{ns}.a.{item}`),
+            // which is what a mount's gate decided it on.
             Some(h) => match h.grant() {
                 Some(g) if g == target => None,
+                Some(g) if slots.resolve(&target).as_deref() == Some(g) => None,
                 _ => Some(forbidden()),
             },
         };

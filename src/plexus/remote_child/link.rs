@@ -553,7 +553,10 @@ pub(super) fn static_children(raw: &Value) -> Vec<String> {
     // name is its method's, which may differ from the child's namespace);
     // a service's root (a DynamicHub) lists its activations in `children`.
     if methods.iter().any(|m| kind(m).is_some_and(|k| k.ends_with("_child"))) {
-        return methods.iter().filter(|m| kind(m).as_deref() == Some("static_child")).filter_map(|m| m.get("name").and_then(Value::as_str)).map(str::to_string).collect();
+        // NEST-6: a peer slot is a `static_child` marked `peer` on the
+        // wire (NEST-7) — a slot, reached by name, not a level to walk.
+        let peer = |m: &Value| m.get("role").and_then(|r| r.get("peer")).and_then(Value::as_bool).unwrap_or(false);
+        return methods.iter().filter(|m| kind(m).as_deref() == Some("static_child") && !peer(m)).filter_map(|m| m.get("name").and_then(Value::as_str)).map(str::to_string).collect();
     }
     raw.get("children").and_then(Value::as_array).map(|c| c.iter().filter_map(|c| c.get("namespace").and_then(Value::as_str)).map(str::to_string).collect()).unwrap_or_default()
 }

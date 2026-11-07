@@ -541,7 +541,7 @@ impl PeerSocket {
         };
         let timings = MountTimings { spawn_ms: 0.0, schema_ms: t0.elapsed().as_secs_f64() * 1e3, merge_ms: 0.0 };
         let methods: Vec<String> = schema.methods.iter().map(|m| m.name.clone()).collect();
-        let child = RemoteChild { inner: Arc::new(Inner { shared, schema, nodes, timings }) };
+        let child = RemoteChild { inner: Arc::new(Inner::new(shared, schema, nodes, timings)) };
         let replaced = peers.inner.table.write().unwrap().insert(name.clone(), Entry { child, principal: principal.clone(), namespace: namespace.clone(), socket: self.id, since: Instant::now() });
         *self.mount.lock().unwrap() = Some(name.clone());
         if replaced.is_some() {

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+NEST-6: **a mounted child's dynamic children are reachable through the
+mount.** The walk keeps each slot on its parent with its type (a `#[peer]`
+slot is a slot, no longer walked as a level), so the host's gate decides
+`<mount>.solar.earth.info` on the slot grant `<mount>.solar.{planet}.info`
+(an untyped slot whole, `<mount>.belt.{rock}`), and `RemoteChild` forwards it
+with `hop.limit.grant` the slot grant in the child's terms — it no longer
+refuses a call into a slot. The far side (`serve_child*`) checks a hop's
+grant against the slot a path goes through as well as the literal path. A
+slot's list and search methods are forwarded like any method, and an unknown
+name is the child's own not-found, unchanged. `<mount>.<path>.<name>.schema`
+is the one schema that crosses the hop (spec/12 rule 7's exception): once per
+name, kept under the name and the `plexus_hash` it came with, at most
+`--child-schema-cache` names (`ChildArgs::child_schema_cache`,
+`ChildOptions::schema_cache`, default 1024, least recently used out); an item
+through the name with another `plexus_hash` drops it, a restart drops every
+name. `ChildStats` counts `name_schemas`, `name_schema_hits` and
+`names_kept`. The hub answers `<activation>.<name>.schema` for a name in an
+activation's own slot by routing it (it was `method_not_found` in the
+caller's view). `ChildArgs::default()` is the flags' defaults (a derived
+`Default` said 0 for every count, so `--child-max-depth` 0).
+
 NEST-7: **the primitive — an activation returns an activation** (`plexus::peer`).
 `trait Peer` is the erased activation (`interface`, `call`, `peer`),
 blanket-implemented for every `Activation + ChildRouter` (`RemoteChild`

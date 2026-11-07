@@ -137,6 +137,10 @@ pub struct ChildOptions {
     /// NEST-4: how many levels of static children a mount walks
     /// (`--child-max-depth`); a deeper one fails the mount, naming it.
     pub max_depth: usize,
+    /// NEST-6: how many dynamic instances' schemas a mount keeps
+    /// (`--child-schema-cache`), the least recently used out first; 0
+    /// keeps none.
+    pub schema_cache: usize,
 }
 
 impl Default for ChildOptions {
@@ -151,6 +155,7 @@ impl Default for ChildOptions {
             env: Vec::new(),
             backoff: Backoff::default(),
             max_depth: 8,
+            schema_cache: 1024,
         }
     }
 }

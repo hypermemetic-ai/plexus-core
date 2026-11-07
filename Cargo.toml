@@ -141,6 +141,20 @@ required-features = ["child-ws"]
 name = "remote_child_perf"
 required-features = ["child-ws"]
 
+# VISION-5: a relay mounting the services that dial in, and a service that
+# dials out with no listening port; their test.
+[[example]]
+name = "relay"
+required-features = ["child-ws"]
+
+[[example]]
+name = "peer"
+required-features = ["child-ws"]
+
+[[test]]
+name = "dial"
+required-features = ["child-ws"]
+
 # RETURNS-47: no harness — the binary is the service and, run again by the
 # seam, the plugin on stdio, whose stdout carries the protocol alone.
 [[test]]

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **NEST-4: a remote child may have children.** `RemoteChild` no longer
+  refuses a child whose schema has a child role or lists `children`. At
+  mount it walks the static tree depth-first (`{ns}.<path>.schema` for each
+  static child; a service root's `children`), at most `--child-max-depth`
+  levels (`ChildOptions::max_depth`, default 8) and within the one
+  `--child-timeout`, keeps it and hashes it: a restart whose tree hash
+  differs is refused `schema changed; restart the service`, as a flat
+  child's is. The kept tree is the mount's `static_child_schemas`, so the
+  host gates `<mount>.a.b.m` by its full path with the child's roles renamed
+  at every level, as it does an in-process child's. `<mount>.a.b.schema` is
+  answered from the kept tree (nothing crosses the hop); `<mount>.a.b.m` is
+  forwarded as `{ns}.call {method: "{ns}.a.b.m", hop}`, its grant the full
+  path. A dynamic child's slot is kept on its parent's schema, and a call
+  into it is refused naming the slot (`<mount>.a.{item}`) until NEST-6.
+
+### Fixed
+
+- **A mounted child's method grants are requalified under the mount name**
+  (`{ns}.m` → `<mount>.m`), as its roles already were: a child whose schema
+  states each method's `grant` (every macro-built one) and is mounted under
+  another name was hidden from every caller's view and admin-only.
+
 ## [0.9.0] — 2026-11-06
 
 PLEXUS-46 (owner, 2026-11-06: "publish the core however you like"): 0.9.0,

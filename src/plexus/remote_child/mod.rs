@@ -111,6 +111,11 @@ impl MethodEnumSchema for ChildMethods {
 struct Inner {
     shared: Arc<Shared>,
     schema: PluginSchema,
+    /// NEST-4: every static child below the mount, by dotted path relative
+    /// to it (`a`, `a.b`), each schema as the child published it — its own
+    /// namespace, its grants and roles relative to it, as an in-process
+    /// child's ([`Activation::static_child_schemas`]).
+    nodes: Vec<(String, PluginSchema)>,
     timings: MountTimings,
 }
 
@@ -128,18 +133,25 @@ impl std::fmt::Debug for RemoteChild {
     }
 }
 
+/// One schema as a child published it, read into 0.8's shape.
+fn read_schema(raw: Value) -> Result<PluginSchema, String> {
+    serde_json::from_value(peer::schema(raw)?).map_err(|e| format!("its schema does not read: {e}"))
+}
+
+/// A static child's schema as the mount keeps it (NEST-4): as published,
+/// its grants relative to it — the host qualifies them by the path
+/// ([`super::children::qualified`]), as it does an in-process child's.
+fn node_schema(path: &str, raw: Value) -> Result<PluginSchema, String> {
+    read_schema(raw).map_err(|e| format!("its child `{path}`: {e}"))
+}
+
 /// The child's schema as the service keeps it: under the mount name, its
-/// roles' grants requalified (`{ns}.m` → `<mount>.m`). A child mounting
-/// children of its own is refused, naming the method.
+/// roles' grants and its methods' own grants requalified (`{ns}.m` →
+/// `<mount>.m`). Its static children are kept beside it ([`node_schema`]);
+/// a dynamic child's role stays on it, the slot a call into it is refused at
+/// until NEST-6.
 fn mount_schema(name: &str, raw: Value) -> Result<PluginSchema, String> {
-    let mut schema: PluginSchema = serde_json::from_value(peer::schema(raw)?).map_err(|e| format!("its schema does not read: {e}"))?;
-    if let Some(m) = schema.methods.iter().find(|m| m.role != MethodRole::Rpc) {
-        return Err(format!("its method `{}` is a child ({:?}): a child mounting children is not served", m.name, m.role));
-    }
-    #[allow(deprecated)] // IR-4: the side-table, still on the wire
-    if schema.children.as_ref().is_some_and(|c| !c.is_empty()) {
-        return Err("its schema lists children: a child mounting children is not served".into());
-    }
+    let mut schema = read_schema(raw)?;
     if schema.namespace != name {
         tracing::info!(target: "plexus::child", child = %name, declared = %schema.namespace, "mounted under its mount name, not the namespace it declares");
     }
@@ -149,6 +161,11 @@ fn mount_schema(name: &str, raw: Value) -> Result<PluginSchema, String> {
         None => format!("{name}.{g}"),
     };
     schema.roles = schema.roles.iter().map(|(r, gs)| (r.clone(), gs.iter().map(requalify).collect())).collect();
+    for m in schema.methods.iter_mut() {
+        if let Some(g) = m.grant.as_ref() {
+            m.grant = Some(requalify(g));
+        }
+    }
     schema.namespace = name.to_string();
     Ok(schema)
 }
@@ -166,10 +183,14 @@ impl RemoteChild {
         }
         let principal = Self::principal_for(&spec, &opts).map_err(start)?;
         let shared = Shared::new(spec, opts, principal);
-        let (conn, raw, mut timings) = shared.connect_once().await.map_err(start)?;
+        let (conn, kept, mut timings) = shared.connect_once().await.map_err(start)?;
         let t = Instant::now();
-        let hash = link::schema_hash(&raw);
-        let schema = match mount_schema(&name, raw) {
+        let hash = kept.hash();
+        let read = mount_schema(&name, kept.top).and_then(|schema| {
+            let nodes = kept.nodes.into_iter().map(|(path, raw)| node_schema(&path, raw).map(|s| (path, s))).collect::<Result<Vec<_>, _>>()?;
+            Ok((schema, nodes))
+        });
+        let (schema, nodes) = match read {
             Ok(s) => s,
             Err(why) => {
                 conn.shutdown.notify_one();
@@ -179,8 +200,8 @@ impl RemoteChild {
         let _ = shared.mounted_hash.set(hash);
         shared.install(conn);
         timings.merge_ms = t.elapsed().as_secs_f64() * 1e3;
-        tracing::info!(target: "plexus::child", child = %name, spawn_ms = timings.spawn_ms, schema_ms = timings.schema_ms, merge_ms = timings.merge_ms, methods = schema.methods.len(), "child mounted");
-        Ok(Self { inner: Arc::new(Inner { shared, schema, timings }) })
+        tracing::info!(target: "plexus::child", child = %name, spawn_ms = timings.spawn_ms, schema_ms = timings.schema_ms, merge_ms = timings.merge_ms, methods = schema.methods.len(), children = nodes.len(), "child mounted");
+        Ok(Self { inner: Arc::new(Inner { shared, schema, nodes, timings }) })
     }
 
     #[allow(unused_variables)]
@@ -249,10 +270,49 @@ impl RemoteChild {
         json!({ "principal": self.inner.shared.principal, "for": for_, "limit": limit, "call": uuid::Uuid::new_v4().to_string() })
     }
 
+    /// NEST-4: the kept static child at `path` (dotted, relative to the mount).
+    fn node(&self, path: &str) -> Option<&PluginSchema> {
+        self.inner.nodes.iter().find(|(p, _)| p == path).map(|(_, s)| s)
+    }
+
+    /// NEST-4: the dynamic slot a path below the mount passes through, if it
+    /// does: the deepest kept level it starts with, and that level's dynamic
+    /// child — `<mount>.<parent>.{<slot>}`.
+    fn slot_of(&self, path: &str) -> Option<String> {
+        let segs: Vec<&str> = path.split('.').collect();
+        let (parent, schema) = (1..segs.len())
+            .rev()
+            .find_map(|n| {
+                let parent = segs[..n].join(".");
+                self.node(&parent).map(|s| (format!("{}.{parent}", self.name()), s))
+            })
+            .unwrap_or_else(|| (self.name().to_string(), &self.inner.schema));
+        let slot = schema.methods.iter().find(|m| matches!(m.role, MethodRole::DynamicChild { .. }))?;
+        Some(format!("{parent}.{{{}}}", slot.name))
+    }
+
+    /// A path no kept level answers: in a dynamic slot, refused naming it
+    /// (NEST-6 reaches it); else not found.
+    fn unreached(&self, path: &str, method: &str) -> PlexusError {
+        match self.slot_of(path) {
+            Some(slot) => PlexusError::ExecutionError(format!(
+                "`{}.{method}` is in the dynamic slot `{slot}`, which a mount does not reach yet (NEST-6)",
+                self.name()
+            )),
+            None => PlexusError::MethodNotFound { activation: self.name().to_string(), method: method.to_string() },
+        }
+    }
+
     fn schema_stream(&self, params: &Value) -> PlexusStream {
-        let ns = self.name().to_string();
+        self.schema_stream_of(&self.inner.schema, self.name(), params)
+    }
+
+    /// `schema` answered from what the mount kept: nothing crosses the hop
+    /// (spec/12 rule 7). `label` is the content type's namespace.
+    fn schema_stream_of(&self, schema: &PluginSchema, label: &str, params: &Value) -> PlexusStream {
+        let ns = label.to_string();
         let content = match params.get("method").and_then(Value::as_str) {
-            Some(m) => match self.inner.schema.methods.iter().find(|x| x.name == m) {
+            Some(m) => match schema.methods.iter().find(|x| x.name == m) {
                 Some(ms) => serde_json::to_value(ms).unwrap_or_default(),
                 None => {
                     let error = plexus_client::RemoteError::MethodNotFound { activation: ns.clone(), method: m.to_string() };
@@ -264,7 +324,7 @@ impl RemoteChild {
                     return Box::pin(futures::stream::iter([e]));
                 }
             },
-            None => serde_json::to_value(&self.inner.schema).unwrap_or_default(),
+            None => serde_json::to_value(schema).unwrap_or_default(),
         };
         Box::pin(futures::stream::iter([
             PlexusStreamItem::Data { metadata: meta(&ns).into(), content_type: format!("{ns}.schema").into(), content: content.into() },
@@ -426,7 +486,22 @@ impl Activation for RemoteChild {
         if method == "schema" {
             return Ok(self.schema_stream(&params));
         }
-        let Some(m) = self.inner.schema.methods.iter().find(|m| m.name == method) else {
+        // NEST-4: a static child's schema, from the kept tree.
+        if let Some(path) = method.strip_suffix(".schema") {
+            return match self.node(path) {
+                Some(s) => Ok(self.schema_stream_of(s, &s.namespace, &params)),
+                None => Err(self.unreached(path, method)),
+            };
+        }
+        let found = match method.rsplit_once('.') {
+            // NEST-4: a static child's method, by its path.
+            Some((path, name)) => match self.node(path) {
+                Some(s) => s.methods.iter().find(|m| m.name == name && m.role == MethodRole::Rpc),
+                None => return Err(self.unreached(path, method)),
+            },
+            None => self.inner.schema.methods.iter().find(|m| m.name == method && m.role == MethodRole::Rpc),
+        };
+        let Some(m) = found else {
             return Err(PlexusError::MethodNotFound { activation: self.name().to_string(), method: method.to_string() });
         };
         // BIDIR-6: a hop forwards no input half yet; the far side would wait
@@ -449,6 +524,13 @@ impl Activation for RemoteChild {
     fn plugin_schema(&self) -> PluginSchema {
         self.inner.schema.clone()
     }
+
+    /// NEST-4: the kept tree — the host gates, lists and describes a mounted
+    /// child's children by their whole path, as it does an in-process
+    /// child's (MACRO-20, [`super::children`]).
+    fn static_child_schemas(&self) -> Vec<(String, PluginSchema)> {
+        self.inner.nodes.clone()
+    }
 }
 
 #[async_trait]
@@ -467,6 +549,10 @@ impl ChildRouter for RemoteChild {
 
     fn router_schema(&self) -> Option<PluginSchema> {
         Some(self.inner.schema.clone())
+    }
+
+    fn router_static_child_schemas(&self) -> Vec<(String, PluginSchema)> {
+        self.inner.nodes.clone()
     }
 }
 
@@ -500,12 +586,43 @@ mod tests {
         assert_eq!(s.roles["editor"], vec!["echo.echo".to_string(), "echo.shout".to_string()]);
     }
 
+    /// NEST-4: a child with children mounts; its child roles stay on it.
     #[test]
-    fn a_child_with_children_is_refused_naming_the_method() {
+    fn a_child_with_children_mounts_and_its_method_grants_are_requalified() {
         let mut inner = m("inner");
         inner["role"] = json!({ "kind": "static_child" });
-        let e = mount_schema("echo", raw(json!([m("echo"), inner]), json!({}))).unwrap_err();
-        assert!(e.contains("`inner`"), "{e}");
+        let mut own = m("echo");
+        own["grant"] = json!("stub.echo");
+        let s = mount_schema("echo", raw(json!([own, inner]), json!({}))).unwrap();
+        assert_eq!(s.methods[0].grant.as_deref(), Some("echo.echo"));
+        assert_eq!(s.methods[1].role, MethodRole::StaticChild);
+        let mut slot = m("item");
+        slot["role"] = json!({ "kind": "dynamic_child", "list_method": "names" });
+        let nested = raw(json!([m("echo"), s_inner(), slot]), json!({}));
+        assert_eq!(link::static_children(&nested), vec!["inner".to_string()], "a dynamic child is a slot, not walked");
+        // A service's root says its activations in `children` alone.
+        let mut root = raw(json!([m("call")]), json!({}));
+        root["children"] = json!([{ "namespace": "greeter", "description": "", "hash": "g" }]);
+        assert_eq!(link::static_children(&root), vec!["greeter".to_string()]);
+    }
+
+    fn s_inner() -> Value {
+        let mut inner = m("inner");
+        inner["role"] = json!({ "kind": "static_child" });
+        inner
+    }
+
+    /// NEST-4: the tree's hash moves with a grandchild's.
+    #[test]
+    fn the_tree_hash_covers_every_level() {
+        let top = raw(json!([m("echo")]), json!({}));
+        let flat = link::Kept { top: top.clone(), nodes: vec![] };
+        assert_eq!(flat.hash(), link::schema_hash(&top), "a flat child's hash is its schema's, as before");
+        let mut c = raw(json!([m("m")]), json!({}));
+        let one = link::Kept { top: top.clone(), nodes: vec![("a.b".into(), c.clone())] }.hash();
+        c["hash"] = json!("other");
+        let two = link::Kept { top, nodes: vec![("a.b".into(), c)] }.hash();
+        assert_ne!(one, two);
     }
 
     #[test]

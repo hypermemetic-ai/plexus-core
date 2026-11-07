@@ -147,6 +147,11 @@ required-features = ["child-ws"]
 name = "returns47_hop"
 harness = false
 
+# NEST-3/NEST-4: the host and, run again by the seam, a nested child on stdio.
+[[test]]
+name = "nest_spike"
+harness = false
+
 [dev-dependencies]
 # RETURNS-47: this crate's own tests use `call::test::in_call`.
 plexus-core = { path = ".", features = ["test-util"] }

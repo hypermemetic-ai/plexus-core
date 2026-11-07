@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+NEST-5: **slot types and slot grants, in-process.** A dynamic child's role
+carries its slot's type (`MethodRole::DynamicChild { child }`, the child
+type's schema; absent for `#[child(opaque)]` or a hand-written router), and
+the gate grants a slot once: `solar.{planet}.info` is `info` on every name in
+the slot, `solar.{planet}` an untyped slot whole (`plexus::slots`). A call to
+`solar.earth.info` matches the slot (a static child still wins) and is
+decided on the slot's grant, after a grant written as the literal path;
+`declared_roles`, `auth.requires`, `auth.role_set` and the caller's view read
+slots as they read static children. `Activation::slot_schema()` (the schema
+without an instance) is new. Breaking for a crate that builds
+`MethodRole::DynamicChild { list_method, search_method }` by hand: add
+`child: None`.
+
 ## [0.9.0] — 2026-11-06
 
 PLEXUS-46 (owner, 2026-11-06: "publish the core however you like"): 0.9.0,

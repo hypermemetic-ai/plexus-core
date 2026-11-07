@@ -461,9 +461,50 @@ impl Catalog {
         }
     }
 
-    /// The requirement of `method` (`tickets.set_status`).
+    /// NEST-5: an untyped slot (`solar.{planet}`), granted whole.
+    pub(crate) fn add_slots(&self, untyped: &[String]) {
+        let mut map = self.0.write().unwrap_or_else(|p| p.into_inner());
+        for path in untyped {
+            map.insert(path.clone(), Requirement { grant: path.clone(), target: None, public: false });
+        }
+    }
+
+    /// The requirement of `method` (`tickets.set_status`); NEST-5: through
+    /// a slot, the slot's (`solar.earth.info` → `solar.{planet}.info`).
     pub fn get(&self, method: &str) -> Option<Requirement> {
-        self.0.read().unwrap_or_else(|p| p.into_inner()).get(method).cloned()
+        let map = self.0.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = map.get(method) {
+            return Some(r.clone());
+        }
+        // A literal path's slot: the segments that name no known path are
+        // a slot's names, tried left to right (a known path wins).
+        let segs: Vec<&str> = method.split('.').collect();
+        if segs.len() < 3 {
+            return None;
+        }
+        let slots: Vec<&String> = map.keys().filter(|k| k.contains('{')).collect();
+        if slots.is_empty() {
+            return None;
+        }
+        let known = |prefix: &str| map.keys().any(|k| k.starts_with(prefix) && k.as_bytes().get(prefix.len()) == Some(&b'.'));
+        let mut cur = segs[0].to_string();
+        for (i, seg) in segs[1..segs.len() - 1].iter().enumerate() {
+            let literal = format!("{cur}.{seg}");
+            if known(&literal) {
+                cur = literal;
+                continue;
+            }
+            let slot_prefix = format!("{cur}.{{");
+            let slot = slots.iter().find(|k| k.starts_with(&slot_prefix))?;
+            let close = slot[slot_prefix.len()..].find('}')? + slot_prefix.len();
+            cur = slot[..=close].to_string();
+            if let Some(r) = map.get(&cur) {
+                // An untyped slot: granted whole, whatever lies below.
+                return Some(r.clone());
+            }
+            let _ = i;
+        }
+        map.get(&format!("{cur}.{}", segs[segs.len() - 1])).cloned()
     }
 
     /// Whether `grant` names a method of this hub.

@@ -67,8 +67,45 @@ pub enum MethodRole {
         /// Optional sibling method that searches available keys.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         search_method: Option<String>,
+        /// NEST-5: the slot's type — the schema every instance in the slot
+        /// serves (`fn item(&self, name: &str) -> Option<Item>`: `Item`'s).
+        /// Absent for an untyped slot (`#[child(opaque)]`, a hand-written
+        /// router), which the gate admits whole (`tickets.{item}`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<Box<PluginSchema>>,
     },
 }
+
+impl MethodRole {
+    /// NEST-5: whether this role names a slot — a child found by name at
+    /// call time.
+    pub fn is_slot(&self) -> bool {
+        matches!(self, MethodRole::DynamicChild { .. })
+    }
+
+    /// NEST-5: the slot's type as a schema (a typed dynamic child's
+    /// `child`); `None` for an untyped slot or a role that is no slot.
+    pub fn slot_schema(&self) -> Option<PluginSchema> {
+        match self {
+            MethodRole::DynamicChild { child, .. } => child.as_deref().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Whether this role is a child or peer of any kind (not an RPC).
+    pub fn is_child(&self) -> bool {
+        !matches!(self, MethodRole::Rpc)
+    }
+}
+
+/// NEST-5: a schema compares by what it serializes to — so a role carrying
+/// one (`DynamicChild { child }`) keeps `PartialEq`/`Eq`.
+impl PartialEq for PluginSchema {
+    fn eq(&self, other: &Self) -> bool {
+        serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
+    }
+}
+impl Eq for PluginSchema {}
 
 impl Default for MethodRole {
     fn default() -> Self {
@@ -2480,6 +2517,7 @@ mod tests {
                     MethodRole::DynamicChild {
                         list_method: Some("list_x".into()),
                         search_method: Some("search_x".into()),
+                        child: None,
                     },
                 ),
             ],
@@ -2495,6 +2533,7 @@ mod tests {
             MethodRole::DynamicChild {
                 list_method: Some("list_x".into()),
                 search_method: Some("search_x".into()),
+                child: None,
             }
         );
 
@@ -2503,6 +2542,7 @@ mod tests {
             MethodRole::DynamicChild {
                 list_method: None,
                 search_method: None,
+                child: None,
             },
         );
         let j2 = serde_json::to_string(&bare_dyn).unwrap();
@@ -2512,6 +2552,7 @@ mod tests {
             MethodRole::DynamicChild {
                 list_method: None,
                 search_method: None,
+                child: None,
             }
         );
     }
@@ -2575,6 +2616,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: None,
                     search_method: None,
+                    child: None,
                 },
             )],
         );
@@ -2782,6 +2824,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: Some("list_planets".into()),
                     search_method: None,
+                    child: None,
                 },
             ),
         ];
@@ -2856,6 +2899,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: None,
                     search_method: None,
+                    child: None,
                 },
             )],
         );
@@ -2910,6 +2954,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: Some("body_names".into()),
                     search_method: None,
+                    child: None,
                 },
             )],
             vec![ChildSummary {

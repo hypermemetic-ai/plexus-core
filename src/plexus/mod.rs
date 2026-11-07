@@ -43,6 +43,8 @@ pub mod plexus;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod remote_child;
 pub mod schema;
+/// NEST-5: slot types and slot grants.
+pub mod slots;
 mod schema_sites;
 pub(crate) mod scope_gate;
 pub mod streaming;

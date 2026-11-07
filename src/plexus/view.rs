@@ -227,7 +227,8 @@ impl Described {
     /// the service describes it — what `ir` may be asked for below an
     /// activation.
     pub(crate) fn nested(&self) -> impl Iterator<Item = &str> {
-        self.below.iter().map(|b| b.namespace.as_str())
+        // NEST-5: a slot (`tickets.{item}`) is no path `ir` is asked for.
+        self.below.iter().map(|b| b.namespace.as_str()).filter(|n| !n.contains('{'))
     }
 
     /// The envelope kept for an introspection answer (`key`: its method and params).
@@ -375,6 +376,19 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, base: &Described, at: usiz
         // navigate to what it holds.
         // A child that describes nothing (a hand-written router) is
         // decided as before, by the entry's own grant.
+        // NEST-5: a slot's entry (`solar.planet`) the same, by the slot's
+        // path (`solar.{planet}`): it stays when the caller holds a method
+        // of the slot, or the untyped slot whole.
+        if m.role.is_slot() {
+            let slot = super::slots::slot_path(ns, &m.name);
+            let reached = reaches_below(asker, &slot, &base.below).unwrap_or(false)
+                || asker.keep(&slot, false).is_some()
+                || asker.keep(&m.grant_or(ns), m.public).is_some();
+            if reached {
+                kept.push((i, None));
+            }
+            continue;
+        }
         if matches!(m.role, MethodRole::StaticChild) {
             if let Some(reached) = reaches_below(asker, &format!("{ns}.{}", m.name), &base.below) {
                 if reached {

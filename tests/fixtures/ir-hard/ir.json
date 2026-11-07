@@ -1,6 +1,6 @@
 {
   "irBackend": "xsvc",
-  "irHash": "cf2e9dd1837fb188",
+  "irHash": "2e7e96c1600fcc40",
   "irMetadata": null,
   "irMethods": {
     ".call": {
@@ -1081,24 +1081,24 @@
   },
   "irPluginHashes": {
     "": {
-      "phiChildrenHash": "cf2e9dd1837fb188",
-      "phiHash": "cf2e9dd1837fb188",
-      "phiSelfHash": "cf2e9dd1837fb188"
+      "phiChildrenHash": "2e7e96c1600fcc40",
+      "phiHash": "2e7e96c1600fcc40",
+      "phiSelfHash": "2e7e96c1600fcc40"
     },
     "alpha": {
-      "phiChildrenHash": "e1eeca55e79e4d11",
-      "phiHash": "e1eeca55e79e4d11",
-      "phiSelfHash": "e1eeca55e79e4d11"
+      "phiChildrenHash": "29cd3615a08d69ba",
+      "phiHash": "29cd3615a08d69ba",
+      "phiSelfHash": "29cd3615a08d69ba"
     },
     "alpha.inner": {
-      "phiChildrenHash": "170f75c0b21362fc",
-      "phiHash": "170f75c0b21362fc",
-      "phiSelfHash": "170f75c0b21362fc"
+      "phiChildrenHash": "02be8021ad67902c",
+      "phiHash": "02be8021ad67902c",
+      "phiSelfHash": "02be8021ad67902c"
     },
     "beta": {
-      "phiChildrenHash": "76026553cb976cb2",
-      "phiHash": "76026553cb976cb2",
-      "phiSelfHash": "76026553cb976cb2"
+      "phiChildrenHash": "0a4da2417deedfdb",
+      "phiHash": "0a4da2417deedfdb",
+      "phiSelfHash": "0a4da2417deedfdb"
     }
   },
   "irPluginRequests": null,
@@ -3058,6 +3058,22 @@
           {
             "vdDescription": "Method gates a dynamic child keyed by its argument.",
             "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "NEST-5: the slot's type — the schema every instance in the slot\nserves (`fn item(&self, name: &str) -> Option<Item>`: `Item`'s).\nAbsent for an untyped slot (`#[child(opaque)]`, a hand-written\nrouter), which the gate admits whole (`tickets.{item}`).",
+                "fdName": "child",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": {
+                      "qnLocalName": "PluginSchema",
+                      "qnNamespace": "beta"
+                    },
+                    "tag": "RefNamed"
+                  },
+                  "tag": "RefOptional"
+                }
+              },
               {
                 "fdDefault": null,
                 "fdDescription": "Optional sibling method that lists available keys.",

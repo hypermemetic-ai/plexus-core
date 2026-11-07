@@ -641,14 +641,14 @@
   },
   "irPluginHashes": {
     "alpha": {
-      "phiChildrenHash": "e1eeca55e79e4d11",
-      "phiHash": "e1eeca55e79e4d11",
-      "phiSelfHash": "e1eeca55e79e4d11"
+      "phiChildrenHash": "29cd3615a08d69ba",
+      "phiHash": "29cd3615a08d69ba",
+      "phiSelfHash": "29cd3615a08d69ba"
     },
     "alpha.inner": {
-      "phiChildrenHash": "170f75c0b21362fc",
-      "phiHash": "170f75c0b21362fc",
-      "phiSelfHash": "170f75c0b21362fc"
+      "phiChildrenHash": "02be8021ad67902c",
+      "phiHash": "02be8021ad67902c",
+      "phiSelfHash": "02be8021ad67902c"
     }
   },
   "irPluginRequests": null,
@@ -1461,6 +1461,22 @@
           {
             "vdDescription": "Method gates a dynamic child keyed by its argument.",
             "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "NEST-5: the slot's type — the schema every instance in the slot\nserves (`fn item(&self, name: &str) -> Option<Item>`: `Item`'s).\nAbsent for an untyped slot (`#[child(opaque)]`, a hand-written\nrouter), which the gate admits whole (`tickets.{item}`).",
+                "fdName": "child",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": {
+                      "qnLocalName": "PluginSchema",
+                      "qnNamespace": "alpha"
+                    },
+                    "tag": "RefNamed"
+                  },
+                  "tag": "RefOptional"
+                }
+              },
               {
                 "fdDefault": null,
                 "fdDescription": "Optional sibling method that lists available keys.",

@@ -39,8 +39,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 
-use super::link::{gone, meta, schema_hash, Conn, Shared};
-use super::{mount_schema, Backoff, ChildOptions, ChildSpec, Inner, MountTimings, RemoteChild};
+use super::link::{gone, meta, Conn, Kept, Shared};
+use super::{mount_schema, node_schema, Backoff, ChildOptions, ChildSpec, Inner, MountTimings, RemoteChild};
 use crate::plexus::auth::AuthContext;
 use crate::plexus::method_enum::MethodEnumSchema;
 use crate::plexus::plexus::{route_to_child, Activation, ChildRouter, PlexusError};
@@ -516,13 +516,23 @@ impl PeerSocket {
         let t0 = Instant::now();
         let hop = json!({ "principal": peers.inner.principal, "for": [], "limit": null, "call": uuid::Uuid::new_v4().to_string() });
         let asked = ask(&conn, &format!("{namespace}.call"), json!({ "method": format!("{namespace}.schema"), "params": {}, "hop": hop }), peers.inner.opts.timeout).await;
-        let mounted = asked.and_then(|raw| {
-            let hash = schema_hash(&raw);
-            let schema = mount_schema(&path, raw)?;
+        // NEST-4 (vision merge): a dial-in peer's static tree is walked and
+        // kept as a dialed child's is, within the same one timeout.
+        let mounted = match asked {
+            Ok(raw) => {
+                let deadline = t0 + peers.inner.opts.timeout;
+                shared.walk(&conn, &namespace, &raw, deadline).await.map(|nodes| Kept { top: raw, nodes })
+            }
+            Err(e) => Err(e),
+        };
+        let mounted = mounted.and_then(|kept| {
+            let hash = kept.hash();
+            let schema = mount_schema(&path, kept.top)?;
+            let nodes = kept.nodes.into_iter().map(|(p, raw)| node_schema(&p, raw).map(|s| (p, s))).collect::<Result<Vec<_>, _>>()?;
             let _ = shared.mounted_hash.set(hash.clone());
-            Ok((schema, hash))
+            Ok((schema, nodes, hash))
         });
-        let (schema, hash) = match mounted {
+        let (schema, nodes, hash) = match mounted {
             Ok(m) => m,
             Err(why) => {
                 self.link.lock().unwrap().take();
@@ -531,7 +541,7 @@ impl PeerSocket {
         };
         let timings = MountTimings { spawn_ms: 0.0, schema_ms: t0.elapsed().as_secs_f64() * 1e3, merge_ms: 0.0 };
         let methods: Vec<String> = schema.methods.iter().map(|m| m.name.clone()).collect();
-        let child = RemoteChild { inner: Arc::new(Inner { shared, schema, timings }) };
+        let child = RemoteChild { inner: Arc::new(Inner { shared, schema, nodes, timings }) };
         let replaced = peers.inner.table.write().unwrap().insert(name.clone(), Entry { child, principal: principal.clone(), namespace: namespace.clone(), socket: self.id, since: Instant::now() });
         *self.mount.lock().unwrap() = Some(name.clone());
         if replaced.is_some() {

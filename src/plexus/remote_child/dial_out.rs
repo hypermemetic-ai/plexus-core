@@ -210,19 +210,19 @@ impl Exposed {
             let mut failures = 0usize;
             loop {
                 let Some(inner) = weak.upgrade() else { return };
-                let _ = inner.state.send(DialState::Connecting);
+                inner.state.send_replace(DialState::Connecting);
                 let outcome = session(&inner, activation.clone()).await;
                 inner.live.lock().unwrap().take();
                 let backoff = inner.opts.backoff;
                 match outcome {
                     Outcome::Refused(why) => {
                         tracing::warn!(target: "plexus::dial", url = %inner.opts.url, "the offer was refused: {why}");
-                        let _ = inner.state.send(DialState::Refused { why });
+                        inner.state.send_replace(DialState::Refused { why });
                         return;
                     }
                     Outcome::Dropped { why, was_mounted } => {
                         tracing::warn!(target: "plexus::dial", url = %inner.opts.url, "{why}; dialing again");
-                        let _ = inner.state.send(DialState::Down { why });
+                        inner.state.send_replace(DialState::Down { why });
                         failures = if was_mounted { 0 } else { failures + 1 };
                     }
                 }
@@ -243,7 +243,7 @@ impl Exposed {
         if let Some(live) = self.inner.live.lock().unwrap().take() {
             live.conn.shutdown.notify_one();
         }
-        let _ = self.inner.state.send(DialState::Stopped);
+        self.inner.state.send_replace(DialState::Stopped);
     }
 
     /// Call `method` (a path at the relay: `peers.bob.hello`, `peers.list`)
@@ -497,7 +497,7 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     }
     *inner.live.lock().unwrap() = Some(Live { conn: Arc::clone(&conn), service: service.clone() });
     tracing::info!(target: "plexus::dial", url = %opts.url, %path, %relay, "mounted at the relay");
-    let _ = inner.state.send(DialState::Mounted { mount, path, service, relay });
+    inner.state.send_replace(DialState::Mounted { mount, path, service, relay });
 
     let why = reader.await.unwrap_or_else(|_| "the socket".into());
     ended(why, true)

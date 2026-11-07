@@ -149,7 +149,7 @@ fn read_schema(raw: Value) -> Result<PluginSchema, String> {
 /// A static child's schema as the mount keeps it (NEST-4): as published,
 /// its grants relative to it — the host qualifies them by the path
 /// ([`super::children::qualified`]), as it does an in-process child's.
-fn node_schema(path: &str, raw: Value) -> Result<PluginSchema, String> {
+pub(super) fn node_schema(path: &str, raw: Value) -> Result<PluginSchema, String> {
     read_schema(raw).map_err(|e| format!("its child `{path}`: {e}"))
 }
 

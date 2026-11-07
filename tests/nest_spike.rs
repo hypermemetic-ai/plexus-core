@@ -267,7 +267,9 @@ async fn the_mount_keeps_the_tree_and_the_host_declares_it() {
     let kept: Vec<String> = child.static_child_schemas().into_iter().map(|(p, _)| p).collect();
     assert_eq!(kept, ["a", "a.b", "a.b.c"], "depth-first, every static child");
     let roles = DynamicHub::new("host").register(child.clone()).declared_roles();
-    assert_eq!(roles["viewer"], ["mnt.ping", "mnt.a.m", "mnt.a.b.c.m"], "{roles:?}");
+    // NEST-5 (merged on `vision`): a typed slot's roles come with it, as
+    // slot grants, renamed under the mount like every other grant.
+    assert_eq!(roles["viewer"], ["mnt.ping", "mnt.a.m", "mnt.a.b.c.m", "mnt.a.{item}.m", "mnt.a.b.{opaque}.m"], "{roles:?}");
     assert_eq!(roles["editor"], ["mnt.a.b.m"], "{roles:?}");
     println!("mount timings: {:?}", child.mount_timings());
 }

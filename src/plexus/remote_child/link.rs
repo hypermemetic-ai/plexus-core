@@ -622,7 +622,7 @@ impl Shared {
     /// child's own (no caller, no verdict). A dynamic child is not walked:
     /// its role, on its parent's schema, is the slot. Past the depth, or the
     /// time, the mount fails naming the path.
-    async fn walk(&self, conn: &Conn, ns: &str, top: &Value, deadline: Instant) -> Result<Vec<(String, Value)>, String> {
+    pub(super) async fn walk(&self, conn: &Conn, ns: &str, top: &Value, deadline: Instant) -> Result<Vec<(String, Value)>, String> {
         let mut out = Vec::new();
         let mut stack: Vec<String> = static_children(top).into_iter().rev().collect();
         while let Some(path) = stack.pop() {

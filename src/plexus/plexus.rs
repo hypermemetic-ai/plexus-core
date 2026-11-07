@@ -544,6 +544,16 @@ pub trait ChildRouter: Send + Sync {
     /// Get a child activation instance by name for nested routing
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>>;
 
+    /// NEST-7: the child or peer named `name`, or why a peer could not be
+    /// returned — what routing asks, so a caller gets a typed error item
+    /// (`not_grafted`, `unavailable`, `shape_mismatch`, …), never "not
+    /// found", for a peer that failed. Default: [`Self::get_child`], which
+    /// cannot fail. `#[plexus_macros::activation]` overrides it for an
+    /// activation with a `#[plexus_macros::peer]` slot.
+    async fn peer_child(&self, name: &str) -> Result<Option<Box<dyn ChildRouter>>, super::peer::PeerError> {
+        Ok(self.get_child(name).await)
+    }
+
     /// Which optional operations (list / search) this router supports.
     ///
     /// Defaults to [`ChildCapabilities::empty()`]: a router that only
@@ -674,7 +684,14 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
 ) -> Result<PlexusStream, PlexusError> {
     // Try to split on first dot for nested routing
     if let Some((child_name, rest)) = method.split_once('.') {
-        if let Some(child) = parent.get_child(child_name).await {
+        // NEST-7: a peer that could not be returned is its typed error item.
+        let found = match parent.peer_child(child_name).await {
+            Ok(found) => found,
+            Err(e) => {
+                return Ok(e.stream(vec![parent.router_namespace().to_string(), child_name.to_string()]));
+            }
+        };
+        if let Some(child) = found {
             // ── AUTHLANG-3: forwarding-policy dispatch sequence ───────────
             // Steps 1–3, 5–6 per the pinned spike §3. Step 4 (audit
             // emission) is deferred until PRIVACY-1 lands `AuditRecord` /
@@ -807,6 +824,10 @@ impl ChildRouter for ArcChildRouter {
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
         self.0.get_child(name).await
+    }
+
+    async fn peer_child(&self, name: &str) -> Result<Option<Box<dyn ChildRouter>>, super::peer::PeerError> {
+        self.0.peer_child(name).await
     }
 
     #[allow(deprecated)]

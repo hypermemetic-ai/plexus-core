@@ -443,14 +443,17 @@ pub struct Requirement {
     pub public: bool,
 }
 
-/// Every method of the hub by grant — fed as activations register.
+/// Every method of the hub by grant — fed as activations register — and
+/// (NEST-5) the hub's slots, through which a literal path finds its slot's
+/// requirement.
 #[derive(Clone, Default)]
-pub struct Catalog(Arc<RwLock<BTreeMap<String, Requirement>>>);
+pub struct Catalog(Arc<RwLock<BTreeMap<String, Requirement>>>, Arc<RwLock<super::slots::Slots>>);
 
 impl Catalog {
     /// Add an activation's methods (not its auto-generated `schema`, which
     /// is introspection, nor its child routes).
     pub(crate) fn add(&self, schema: &PluginSchema) {
+        self.1.write().unwrap_or_else(|p| p.into_inner()).add(schema);
         let mut map = self.0.write().unwrap_or_else(|p| p.into_inner());
         for m in &schema.methods {
             if m.is_auto_schema() || !matches!(m.role, MethodRole::Rpc) {
@@ -463,8 +466,10 @@ impl Catalog {
 
     /// NEST-5: an untyped slot (`solar.{planet}`), granted whole.
     pub(crate) fn add_slots(&self, untyped: &[String]) {
+        let mut slots = self.1.write().unwrap_or_else(|p| p.into_inner());
         let mut map = self.0.write().unwrap_or_else(|p| p.into_inner());
         for path in untyped {
+            slots.add_untyped(path);
             map.insert(path.clone(), Requirement { grant: path.clone(), target: None, public: false });
         }
     }
@@ -476,35 +481,8 @@ impl Catalog {
         if let Some(r) = map.get(method) {
             return Some(r.clone());
         }
-        // A literal path's slot: the segments that name no known path are
-        // a slot's names, tried left to right (a known path wins).
-        let segs: Vec<&str> = method.split('.').collect();
-        if segs.len() < 3 {
-            return None;
-        }
-        let slots: Vec<&String> = map.keys().filter(|k| k.contains('{')).collect();
-        if slots.is_empty() {
-            return None;
-        }
-        let known = |prefix: &str| map.keys().any(|k| k.starts_with(prefix) && k.as_bytes().get(prefix.len()) == Some(&b'.'));
-        let mut cur = segs[0].to_string();
-        for (i, seg) in segs[1..segs.len() - 1].iter().enumerate() {
-            let literal = format!("{cur}.{seg}");
-            if known(&literal) {
-                cur = literal;
-                continue;
-            }
-            let slot_prefix = format!("{cur}.{{");
-            let slot = slots.iter().find(|k| k.starts_with(&slot_prefix))?;
-            let close = slot[slot_prefix.len()..].find('}')? + slot_prefix.len();
-            cur = slot[..=close].to_string();
-            if let Some(r) = map.get(&cur) {
-                // An untyped slot: granted whole, whatever lies below.
-                return Some(r.clone());
-            }
-            let _ = i;
-        }
-        map.get(&format!("{cur}.{}", segs[segs.len() - 1])).cloned()
+        let key = self.1.read().unwrap_or_else(|p| p.into_inner()).resolve(method)?;
+        map.get(&key).cloned()
     }
 
     /// Whether `grant` names a method of this hub.

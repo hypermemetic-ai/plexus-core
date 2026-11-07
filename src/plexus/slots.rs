@@ -116,8 +116,12 @@ pub fn slot_type<T: super::Activation>() -> Option<Box<PluginSchema>> {
 /// The slots of a service, for resolving a literal path to its slot's.
 #[derive(Debug, Default, Clone)]
 pub struct Slots {
-    /// A parent's path → its slot's name and whether it is typed.
+    /// A parent's dynamic child (reached as `parent.<name>`): its slot's
+    /// name and whether it is typed.
     by_parent: HashMap<String, (String, bool)>,
+    /// NEST-7: a parent's peer slots (reached as `parent.<slot>.<name>`), by
+    /// slot name: whether each is typed.
+    peers: HashMap<(String, String), bool>,
     /// Every path the service describes: activations, static children and
     /// slots (`tickets.{item}`) — a literal segment that names one wins.
     known: HashSet<String>,
@@ -129,53 +133,88 @@ impl Slots {
     pub fn of<'a>(schemas: impl IntoIterator<Item = &'a PluginSchema>, untyped: &[String]) -> Self {
         let mut s = Slots::default();
         for schema in schemas {
-            s.known.insert(schema.namespace.clone());
-            for m in &schema.methods {
-                if m.role.is_slot() {
-                    let typed = matches!(&m.role, MethodRole::DynamicChild { child: Some(_), .. }) || m.role.slot_schema().is_some();
-                    s.by_parent.entry(schema.namespace.clone()).or_insert((m.name.clone(), typed));
-                }
-            }
+            s.add(schema);
         }
         for u in untyped {
-            s.known.insert(u.clone());
+            s.add_untyped(u);
         }
         s
     }
 
+    /// Add one schema's slots (its namespace its whole path).
+    pub fn add(&mut self, schema: &PluginSchema) {
+        self.known.insert(schema.namespace.clone());
+        for m in &schema.methods {
+            let typed = m.role.slot_schema().is_some();
+            match &m.role {
+                MethodRole::Peer { .. } => {
+                    self.peers.insert((schema.namespace.clone(), m.name.clone()), typed);
+                }
+                MethodRole::DynamicChild { .. } => {
+                    self.by_parent.entry(schema.namespace.clone()).or_insert((m.name.clone(), typed));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Add an untyped slot's path (`tickets.{item}`).
+    pub fn add_untyped(&mut self, path: &str) {
+        self.known.insert(path.to_string());
+    }
+
     /// Whether no slot is known.
     pub fn is_empty(&self) -> bool {
-        self.by_parent.is_empty()
+        self.by_parent.is_empty() && self.peers.is_empty()
     }
 
     /// The slot grant's key for the literal `method` (`solar.earth.info` →
-    /// `solar.{planet}.info`; through an untyped slot, the slot itself,
-    /// `solar.{planet}`), or `None` when no slot is on its way — a static
-    /// child that names a segment wins over the slot.
+    /// `solar.{planet}.info`; a peer slot's `host.integration.github.repos`
+    /// → `host.{integration}.repos`; through an untyped slot, the slot
+    /// itself, `solar.{planet}`), or `None` when no slot is on its way — a
+    /// static child that names a segment wins over the slot.
     pub fn resolve(&self, method: &str) -> Option<String> {
-        if self.by_parent.is_empty() {
+        if self.is_empty() {
             return None;
         }
         let segs: Vec<&str> = method.split('.').collect();
         if segs.len() < 3 {
             return None;
         }
+        let last = segs.len() - 1;
         let mut cur = segs[0].to_string();
         let mut through = false;
-        for seg in &segs[1..segs.len() - 1] {
+        let mut i = 1;
+        while i < last {
+            let seg = segs[i];
             let literal = format!("{cur}.{seg}");
             if self.known.contains(&literal) {
                 cur = literal;
+                i += 1;
+                continue;
+            }
+            // NEST-7: a peer slot is named in the path, then the peer's name.
+            if let Some(typed) = self.peers.get(&(cur.clone(), seg.to_string())) {
+                if i + 1 >= last {
+                    return None;
+                }
+                cur = slot_path(&cur, seg);
+                through = true;
+                i += 2;
+                if !typed {
+                    return Some(cur);
+                }
                 continue;
             }
             let (slot, typed) = self.by_parent.get(&cur)?;
             cur = slot_path(&cur, slot);
             through = true;
+            i += 1;
             if !typed {
                 return Some(cur);
             }
         }
-        through.then(|| format!("{cur}.{}", segs[segs.len() - 1]))
+        through.then(|| format!("{cur}.{}", segs[last]))
     }
 }
 

@@ -1,6 +1,6 @@
 {
   "irBackend": "xsvc",
-  "irHash": "cf2e9dd1837fb188",
+  "irHash": "7acb47ac39d19482",
   "irMetadata": null,
   "irMethods": {
     ".call": {
@@ -1081,24 +1081,24 @@
   },
   "irPluginHashes": {
     "": {
-      "phiChildrenHash": "cf2e9dd1837fb188",
-      "phiHash": "cf2e9dd1837fb188",
-      "phiSelfHash": "cf2e9dd1837fb188"
+      "phiChildrenHash": "7acb47ac39d19482",
+      "phiHash": "7acb47ac39d19482",
+      "phiSelfHash": "7acb47ac39d19482"
     },
     "alpha": {
-      "phiChildrenHash": "e1eeca55e79e4d11",
-      "phiHash": "e1eeca55e79e4d11",
-      "phiSelfHash": "e1eeca55e79e4d11"
+      "phiChildrenHash": "3913fa017a798190",
+      "phiHash": "3913fa017a798190",
+      "phiSelfHash": "3913fa017a798190"
     },
     "alpha.inner": {
-      "phiChildrenHash": "170f75c0b21362fc",
-      "phiHash": "170f75c0b21362fc",
-      "phiSelfHash": "170f75c0b21362fc"
+      "phiChildrenHash": "13eb884ebba940e5",
+      "phiHash": "13eb884ebba940e5",
+      "phiSelfHash": "13eb884ebba940e5"
     },
     "beta": {
-      "phiChildrenHash": "76026553cb976cb2",
-      "phiHash": "76026553cb976cb2",
-      "phiSelfHash": "76026553cb976cb2"
+      "phiChildrenHash": "dbb194170303145c",
+      "phiHash": "dbb194170303145c",
+      "phiSelfHash": "dbb194170303145c"
     }
   },
   "irPluginRequests": null,
@@ -2995,6 +2995,80 @@
       "tdName": "HttpMethod",
       "tdNamespace": "beta"
     },
+    "beta.Interface": {
+      "tdDescription": "A peer's shape, named and content-addressed: what `<ns>.ir` answers for\nit, its hash, and each method's own hash. Two interfaces with one hash\nserve one shape (descriptions, grants and the name aside).",
+      "tdKind": {
+        "ksFields": [
+          {
+            "fdDefault": null,
+            "fdDescription": "The shape's hash: of every method's own hash, by name.",
+            "fdName": "hash",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The IR of the shape (IR 3.0, as `<ns>.ir` writes it).",
+            "fdName": "ir",
+            "fdRequired": true,
+            "fdType": {
+              "tag": "RefJson"
+            }
+          },
+          {
+            "fdDefault": {},
+            "fdDescription": "Each method's own hash, by name ([`Interface::method_hash`]).",
+            "fdName": "methods",
+            "fdRequired": false,
+            "fdType": {
+              "contents": {
+                "contents": [
+                  "string",
+                  null
+                ],
+                "tag": "RefPrimitive"
+              },
+              "tag": "RefMap"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The interface's name: a contract's namespace (`\"forge\"`), or the\npeer's own.",
+            "fdName": "name",
+            "fdRequired": true,
+            "fdType": {
+              "contents": [
+                "string",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
+            "fdDescription": "The schema the interface was read from: what a gate indexes for a\ntyped slot (its methods' grants, targets and roles).",
+            "fdName": "schema",
+            "fdRequired": true,
+            "fdType": {
+              "contents": {
+                "qnLocalName": "PluginSchema",
+                "qnNamespace": "beta"
+              },
+              "tag": "RefNamed"
+            }
+          }
+        ],
+        "tag": "KindStruct"
+      },
+      "tdName": "Interface",
+      "tdNamespace": "beta"
+    },
     "beta.MethodExample": {
       "tdDescription": "SYNAPSE-13: one worked call of a method — the params it sends and a note\nsaying what it does (`#[plexus_macros::method(example(note = \"…\", params\n= r#\"{…}\"#))]`).",
       "tdKind": {
@@ -3041,7 +3115,7 @@
       "tdNamespace": "beta"
     },
     "beta.MethodRole": {
-      "tdDescription": "Describes how a method participates in the activation graph.\n\nEvery method on a plugin is exactly one of three kinds:\n\n- `Rpc` — a regular RPC endpoint (the default).\n- `StaticChild` — the method returns a child activation by a static name\n  (no lookup argument). Used by `#[child]`-annotated methods on hubs.\n- `DynamicChild { .. }` — the method gates a dynamic child keyed by its\n  argument. `list_method` optionally names a sibling method that enumerates\n  available keys, and `search_method` optionally names a sibling method\n  that searches keys.\n\nThis tag is consumed by downstream tooling (synapse, synapse-cc,\nintrospection clients) to reconstruct the child graph without a separate\nside-table. Today's macros emit `MethodRole::Rpc` for every method; IR-3\npopulates child roles from `#[child]` annotations.\n\n# Wire back-compat\n\nAdded in IR-2. Serde defaults to `Rpc` for pre-IR schemas.\n`#[non_exhaustive]` reserves space for future variants without breaking\ndownstream match arms.",
+      "tdDescription": "Describes how a method participates in the activation graph: `rpc`,\n`static_child` (a child by its own name; `peer` set for a slot of peers,\nreached as `<slot>.<name>`, `interface` the slot's type), or\n`dynamic_child` (a child found by name at call time; `child` its slot's\ntype).",
       "tdKind": {
         "keDiscriminator": "kind",
         "keVariants": [
@@ -3051,13 +3125,91 @@
             "vdName": "rpc"
           },
           {
-            "vdDescription": "Method returns a child activation by static name (no lookup arg).",
-            "vdFields": [],
+            "vdDescription": "Method returns a child activation by static name (no lookup arg) —\nor, marked `peer`, a slot of peers by name.",
+            "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "NEST-7: a typed peer slot's interface.",
+                "fdName": "interface",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": {
+                      "qnLocalName": "Interface",
+                      "qnNamespace": "beta"
+                    },
+                    "tag": "RefNamed"
+                  },
+                  "tag": "RefOptional"
+                }
+              },
+              {
+                "fdDefault": null,
+                "fdDescription": "NEST-7: a peer slot's sibling method that lists its names.",
+                "fdName": "list_method",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": [
+                      "string",
+                      null
+                    ],
+                    "tag": "RefPrimitive"
+                  },
+                  "tag": "RefOptional"
+                }
+              },
+              {
+                "fdDefault": null,
+                "fdDescription": "NEST-7: the child is a slot of peers (`#[plexus_macros::peer]`).",
+                "fdName": "peer",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": [
+                    "boolean",
+                    null
+                  ],
+                  "tag": "RefPrimitive"
+                }
+              },
+              {
+                "fdDefault": null,
+                "fdDescription": "NEST-7: a peer slot's sibling method that searches its names.",
+                "fdName": "search_method",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": [
+                      "string",
+                      null
+                    ],
+                    "tag": "RefPrimitive"
+                  },
+                  "tag": "RefOptional"
+                }
+              }
+            ],
             "vdName": "static_child"
           },
           {
             "vdDescription": "Method gates a dynamic child keyed by its argument.",
             "vdFields": [
+              {
+                "fdDefault": null,
+                "fdDescription": "NEST-5: the slot's type, for a typed dynamic child.",
+                "fdName": "child",
+                "fdRequired": false,
+                "fdType": {
+                  "contents": {
+                    "contents": {
+                      "qnLocalName": "PluginSchema",
+                      "qnNamespace": "beta"
+                    },
+                    "tag": "RefNamed"
+                  },
+                  "tag": "RefOptional"
+                }
+              },
               {
                 "fdDefault": null,
                 "fdDescription": "Optional sibling method that lists available keys.",

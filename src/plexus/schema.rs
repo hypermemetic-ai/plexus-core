@@ -51,8 +51,7 @@ use super::content_hash::{canonical_json, hash16, hash16_lines};
 /// Added in IR-2. Serde defaults to `Rpc` for pre-IR schemas.
 /// `#[non_exhaustive]` reserves space for future variants without breaking
 /// downstream match arms.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MethodRole {
     /// Method is an RPC endpoint (the default for ordinary methods).
@@ -62,13 +61,163 @@ pub enum MethodRole {
     /// Method gates a dynamic child keyed by its argument.
     DynamicChild {
         /// Optional sibling method that lists available keys.
+        list_method: Option<String>,
+        /// Optional sibling method that searches available keys.
+        search_method: Option<String>,
+        /// NEST-5: the slot's type — the schema every instance in the slot
+        /// serves (`fn item(&self, name: &str) -> Option<Item>`: `Item`'s).
+        /// Absent for an untyped slot (`#[child(opaque)]`, a hand-written
+        /// router), which the gate admits whole (`tickets.{item}`).
+        child: Option<Box<PluginSchema>>,
+    },
+    /// NEST-7: a peer slot — `#[plexus_macros::peer] async fn x(&self, name:
+    /// &str) -> Result<Box<dyn I>, PeerError>`: an activation returned by
+    /// name, in this process or across the network. `interface` is the
+    /// slot's type (`None`: an untyped peer, admitted whole). It is reached
+    /// as `<parent>.<slot>.<name>`: on the wire it is a `static_child` (the
+    /// slot, whose own schema is one dynamic child — any name) marked
+    /// `peer: true` beside its `interface`, so a reader that knows only
+    /// static and dynamic children navigates it.
+    Peer {
+        /// Optional sibling method that lists available names.
+        list_method: Option<String>,
+        /// Optional sibling method that searches available names.
+        search_method: Option<String>,
+        /// The interface every peer in the slot serves; `None` for an
+        /// untyped slot.
+        interface: Option<super::peer::Interface>,
+    },
+}
+
+/// Describes how a method participates in the activation graph: `rpc`,
+/// `static_child` (a child by its own name; `peer` set for a slot of peers,
+/// reached as `<slot>.<name>`, `interface` the slot's type), or
+/// `dynamic_child` (a child found by name at call time; `child` its slot's
+/// type).
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[schemars(rename = "MethodRole")]
+enum MethodRoleWire {
+    /// Method is an RPC endpoint (the default for ordinary methods).
+    Rpc,
+    /// Method returns a child activation by static name (no lookup arg) —
+    /// or, marked `peer`, a slot of peers by name.
+    StaticChild {
+        /// NEST-7: the child is a slot of peers (`#[plexus_macros::peer]`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        peer: bool,
+        /// NEST-7: a peer slot's sibling method that lists its names.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        list_method: Option<String>,
+        /// NEST-7: a peer slot's sibling method that searches its names.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search_method: Option<String>,
+        /// NEST-7: a typed peer slot's interface.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<Box<super::peer::Interface>>,
+    },
+    /// Method gates a dynamic child keyed by its argument.
+    DynamicChild {
+        /// Optional sibling method that lists available keys.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         list_method: Option<String>,
         /// Optional sibling method that searches available keys.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         search_method: Option<String>,
+        /// NEST-5: the slot's type, for a typed dynamic child.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<Box<PluginSchema>>,
     },
 }
+
+impl From<MethodRole> for MethodRoleWire {
+    fn from(r: MethodRole) -> Self {
+        match r {
+            MethodRole::Rpc => MethodRoleWire::Rpc,
+            MethodRole::StaticChild => {
+                MethodRoleWire::StaticChild { peer: false, list_method: None, search_method: None, interface: None }
+            }
+            MethodRole::DynamicChild { list_method, search_method, child } => {
+                MethodRoleWire::DynamicChild { list_method, search_method, child }
+            }
+            MethodRole::Peer { list_method, search_method, interface } => MethodRoleWire::StaticChild {
+                peer: true,
+                list_method,
+                search_method,
+                interface: interface.map(Box::new),
+            },
+        }
+    }
+}
+
+impl From<MethodRoleWire> for MethodRole {
+    fn from(r: MethodRoleWire) -> Self {
+        match r {
+            MethodRoleWire::Rpc => MethodRole::Rpc,
+            MethodRoleWire::StaticChild { peer: true, list_method, search_method, interface } => {
+                MethodRole::Peer { list_method, search_method, interface: interface.map(|i| *i) }
+            }
+            MethodRoleWire::StaticChild { .. } => MethodRole::StaticChild,
+            MethodRoleWire::DynamicChild { list_method, search_method, child } => {
+                MethodRole::DynamicChild { list_method, search_method, child }
+            }
+        }
+    }
+}
+
+impl Serialize for MethodRole {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        MethodRoleWire::from(self.clone()).serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for MethodRole {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        MethodRoleWire::deserialize(d).map(MethodRole::from)
+    }
+}
+
+impl JsonSchema for MethodRole {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <MethodRoleWire as JsonSchema>::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <MethodRoleWire as JsonSchema>::json_schema(generator)
+    }
+}
+
+impl MethodRole {
+    /// NEST-5/NEST-7: whether this role names a slot — a child or a peer
+    /// found by name at call time.
+    pub fn is_slot(&self) -> bool {
+        matches!(self, MethodRole::DynamicChild { .. } | MethodRole::Peer { .. })
+    }
+
+    /// NEST-5: the slot's type as a schema (a typed dynamic child's
+    /// `child`); `None` for an untyped slot or a role that is no slot.
+    pub fn slot_schema(&self) -> Option<PluginSchema> {
+        match self {
+            MethodRole::DynamicChild { child, .. } => child.as_deref().cloned(),
+            MethodRole::Peer { interface, .. } => interface.as_ref().map(|i| i.schema().clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether this role is a child or peer of any kind (not an RPC).
+    pub fn is_child(&self) -> bool {
+        !matches!(self, MethodRole::Rpc)
+    }
+}
+
+/// NEST-5: a schema compares by what it serializes to — so a role carrying
+/// one (`DynamicChild { child }`) keeps `PartialEq`/`Eq`.
+impl PartialEq for PluginSchema {
+    fn eq(&self, other: &Self) -> bool {
+        serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
+    }
+}
+impl Eq for PluginSchema {}
 
 impl Default for MethodRole {
     fn default() -> Self {
@@ -1124,7 +1273,7 @@ impl PluginSchema {
                     if let Some(m) = colliding_method {
                         if matches!(
                             m.role,
-                            MethodRole::StaticChild | MethodRole::DynamicChild { .. }
+                            MethodRole::StaticChild | MethodRole::DynamicChild { .. } | MethodRole::Peer { .. }
                         ) {
                             continue;
                         }
@@ -1189,7 +1338,7 @@ impl PluginSchema {
             .filter(|m| {
                 matches!(
                     m.role,
-                    MethodRole::StaticChild | MethodRole::DynamicChild { .. }
+                    MethodRole::StaticChild | MethodRole::DynamicChild { .. } | MethodRole::Peer { .. }
                 )
             })
             .map(|m| ChildSummary {
@@ -1366,7 +1515,7 @@ impl PluginSchema {
         self.methods.iter().any(|m| {
             matches!(
                 m.role,
-                MethodRole::StaticChild | MethodRole::DynamicChild { .. }
+                MethodRole::StaticChild | MethodRole::DynamicChild { .. } | MethodRole::Peer { .. }
             )
         })
     }
@@ -2480,6 +2629,7 @@ mod tests {
                     MethodRole::DynamicChild {
                         list_method: Some("list_x".into()),
                         search_method: Some("search_x".into()),
+                        child: None,
                     },
                 ),
             ],
@@ -2495,6 +2645,7 @@ mod tests {
             MethodRole::DynamicChild {
                 list_method: Some("list_x".into()),
                 search_method: Some("search_x".into()),
+                child: None,
             }
         );
 
@@ -2503,6 +2654,7 @@ mod tests {
             MethodRole::DynamicChild {
                 list_method: None,
                 search_method: None,
+                child: None,
             },
         );
         let j2 = serde_json::to_string(&bare_dyn).unwrap();
@@ -2512,6 +2664,7 @@ mod tests {
             MethodRole::DynamicChild {
                 list_method: None,
                 search_method: None,
+                child: None,
             }
         );
     }
@@ -2575,6 +2728,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: None,
                     search_method: None,
+                    child: None,
                 },
             )],
         );
@@ -2782,6 +2936,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: Some("list_planets".into()),
                     search_method: None,
+                    child: None,
                 },
             ),
         ];
@@ -2856,6 +3011,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: None,
                     search_method: None,
+                    child: None,
                 },
             )],
         );
@@ -2910,6 +3066,7 @@ mod tests {
                 MethodRole::DynamicChild {
                     list_method: Some("body_names".into()),
                     search_method: None,
+                    child: None,
                 },
             )],
             vec![ChildSummary {

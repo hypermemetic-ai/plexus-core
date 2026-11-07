@@ -43,6 +43,10 @@ pub mod plexus;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod remote_child;
 pub mod schema;
+/// NEST-5: slot types and slot grants.
+pub mod slots;
+/// NEST-7: the primitive — an activation returns an activation.
+pub mod peer;
 mod schema_sites;
 pub(crate) mod scope_gate;
 pub mod streaming;
@@ -72,6 +76,7 @@ pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME};
 pub use grant_gate::{current_reach, with_reach, ForbiddenItem};
 pub use view::View;
+pub use peer::{Contract, FindPeer, Interface, ListPeers, Peer, PeerError, PeerRouter, PeerSlot, PeerTransport, RouterPeer, Stamp};
 pub use auth_activation::{
     AuthActivation, AuthBackend, AuthClient, AuthEvent, AuthFailure, AuthSetup, LoginAnswer, LoginFlow, MembershipEntry, MembershipStore,
     Provider, ProviderKind, Requirement, RoleStore, Session, SignupAnswer, StoreError, Waiting, SIGNED_IN_GRANTS,

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+NEST-7: **the primitive — an activation returns an activation** (`plexus::peer`).
+`trait Peer` is the erased activation (`interface`, `call`, `peer`),
+blanket-implemented for every `Activation + ChildRouter` (`RemoteChild`
+included). `Interface { name, hash, ir, methods, schema }` is a peer's shape
+(the hash of each method's shape hash; `satisfies` is the shape check).
+`PeerError` (`not_found`, `not_grafted`, `unavailable`, `shape_mismatch`,
+`timeout`, `forbidden`) is a typed error item: `ChildRouter::peer_child` is
+what routing asks, and a peer that could not be returned is its error, never
+"not found". `MethodRole::Peer { list_method, search_method, interface }` is a
+`#[plexus_macros::peer]` slot, reached as `<parent>.<slot>.<name>` (on the
+wire a `static_child` marked `peer`, so synapse navigates it); `PeerSlot`
+routes it, checking a typed peer against the slot's interface. A contract's
+client runs over a `PeerTransport`, which checks the backend against the
+client's `Stamp` (equal; `drift` once; else `ShapeMismatch`) and again when
+an item's `plexus_hash` moves. The slot grant (NEST-5) covers peer slots:
+`host.{integration}.repos`, `garden.{dendrite}`.
+
+NEST-5: **slot types and slot grants, in-process.** A dynamic child's role
+carries its slot's type (`MethodRole::DynamicChild { child }`, the child
+type's schema; absent for `#[child(opaque)]` or a hand-written router), and
+the gate grants a slot once: `solar.{planet}.info` is `info` on every name in
+the slot, `solar.{planet}` an untyped slot whole (`plexus::slots`). A call to
+`solar.earth.info` matches the slot (a static child still wins) and is
+decided on the slot's grant, after a grant written as the literal path;
+`declared_roles`, `auth.requires`, `auth.role_set` and the caller's view read
+slots as they read static children. `Activation::slot_schema()` (the schema
+without an instance) is new. Breaking for a crate that builds
+`MethodRole::DynamicChild { list_method, search_method }` by hand: add
+`child: None`.
+
 ### Added
 
 - **NEST-4: a remote child may have children.** `RemoteChild` no longer

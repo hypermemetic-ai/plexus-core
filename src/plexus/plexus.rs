@@ -428,6 +428,19 @@ pub trait Activation: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// NEST-5: this activation's schema without an instance — what a
+    /// parent's dynamic `#[child]` publishes as its slot's type
+    /// (`MethodRole::DynamicChild { child }`). `None` (the default) for an
+    /// activation the macro did not write; `#[plexus_macros::activation]`
+    /// emits it (its static namespace, version, description, methods and
+    /// roles).
+    fn slot_schema() -> Option<PluginSchema>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Return this activation's schema (methods + optional children)
     fn plugin_schema(&self) -> PluginSchema {
         // A method of an activation not built with `#[activation]` is known
@@ -530,6 +543,16 @@ pub trait ChildRouter: Send + Sync {
 
     /// Get a child activation instance by name for nested routing
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>>;
+
+    /// NEST-7: the child or peer named `name`, or why a peer could not be
+    /// returned — what routing asks, so a caller gets a typed error item
+    /// (`not_grafted`, `unavailable`, `shape_mismatch`, …), never "not
+    /// found", for a peer that failed. Default: [`Self::get_child`], which
+    /// cannot fail. `#[plexus_macros::activation]` overrides it for an
+    /// activation with a `#[plexus_macros::peer]` slot.
+    async fn peer_child(&self, name: &str) -> Result<Option<Box<dyn ChildRouter>>, super::peer::PeerError> {
+        Ok(self.get_child(name).await)
+    }
 
     /// Which optional operations (list / search) this router supports.
     ///
@@ -661,7 +684,14 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
 ) -> Result<PlexusStream, PlexusError> {
     // Try to split on first dot for nested routing
     if let Some((child_name, rest)) = method.split_once('.') {
-        if let Some(child) = parent.get_child(child_name).await {
+        // NEST-7: a peer that could not be returned is its typed error item.
+        let found = match parent.peer_child(child_name).await {
+            Ok(found) => found,
+            Err(e) => {
+                return Ok(e.stream(vec![parent.router_namespace().to_string(), child_name.to_string()]));
+            }
+        };
+        if let Some(child) = found {
             // ── AUTHLANG-3: forwarding-policy dispatch sequence ───────────
             // Steps 1–3, 5–6 per the pinned spike §3. Step 4 (audit
             // emission) is deferred until PRIVACY-1 lands `AuditRecord` /
@@ -794,6 +824,10 @@ impl ChildRouter for ArcChildRouter {
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
         self.0.get_child(name).await
+    }
+
+    async fn peer_child(&self, name: &str) -> Result<Option<Box<dyn ChildRouter>>, super::peer::PeerError> {
+        self.0.peer_child(name).await
     }
 
     #[allow(deprecated)]
@@ -1171,7 +1205,10 @@ struct DynamicHubInner {
     /// schemas on the hot path; activations registered after the first
     /// gated dispatch are not in the index (registration is builder-time,
     /// before serving, in every supported composition).
-    gate_index: std::sync::OnceLock<HashMap<String, super::scope_gate::MethodGateInfo>>,
+    /// NEST-5: and the service's slots, so a literal path through a
+    /// dynamic child (`solar.earth.info`) finds its slot's entry
+    /// (`solar.{planet}.info`).
+    gate_index: std::sync::OnceLock<GateIndex>,
     /// BIDIR-6: every method path the service knows, and whether it takes an
     /// `Input` (see [`DynamicHub::may_take_input`]). Built once, on the first
     /// call.
@@ -1208,6 +1245,14 @@ impl DynamicHubInner {
     fn nested_count(&self) -> usize {
         self.nested_count
     }
+}
+
+/// NEST-5: the gate's index — every method path to its gate facts, and the
+/// service's slots, through which a literal path finds its slot's entry.
+#[derive(Debug, Default)]
+pub(crate) struct GateIndex {
+    methods: HashMap<String, super::scope_gate::MethodGateInfo>,
+    slots: super::slots::Slots,
 }
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
@@ -1504,10 +1549,14 @@ impl DynamicHub {
         for a in self.inner.activations.values() {
             catalog.add(&a.plugin_schema());
         }
-        // MACRO-20: a static child's methods, by their whole path.
-        for child in self.static_children() {
+        // MACRO-20: a static child's methods, by their whole path; NEST-5:
+        // a typed slot's, by the slot's (`solar.{planet}.info`), and an
+        // untyped slot whole (`solar.{planet}`).
+        for child in self.described_children() {
             catalog.add(&child);
         }
+        let (_, untyped) = self.slot_children();
+        catalog.add_slots(&untyped);
         let (auth, gate) = super::auth_activation::AuthActivation::mount(setup, catalog.clone());
         {
             let inner = self.inner_mut("Cannot mount auth: DynamicHub has multiple references");
@@ -1570,7 +1619,8 @@ impl DynamicHub {
         let activations: Vec<PluginSchema> = self.inner.activations.values().map(|a| a.plugin_schema()).collect();
         // MACRO-20: a static child's entry stays in its parent's view when
         // the caller can use something below it.
-        super::view::Described::new(service, activations, self.static_children())
+        // NEST-5: and a slot's (`solar.planet`) when something in the slot.
+        super::view::Described::new(service, activations, self.described_children())
     }
 
     /// PERF-15: a gated service's view for `caller`, kept per view key and
@@ -1832,7 +1882,7 @@ impl DynamicHub {
     /// call itself would meet.
     async fn scope_answers(&self, method: &str, caller: Option<&super::auth::AuthContext>) -> bool {
         let registry = self.inner.scope_registry.as_deref().unwrap_or_else(|| super::scope_gate::empty_registry());
-        super::scope_gate::answers(registry, self.inner.default_deny, method, self.gate_index().get(method), caller).await
+        super::scope_gate::answers(registry, self.inner.default_deny, method, self.gate_info(method), caller).await
     }
 
     /// The schema at `path` as the snapshot answers it — what `<path>.schema`
@@ -1915,7 +1965,8 @@ impl DynamicHub {
         let mut out: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
         // MACRO-20: and every static child's, its grants qualified by the
         // path it is reached through (`commits.link` → `tickets.commits.link`).
-        let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
+        // NEST-5: and every typed slot's, by the slot's path.
+        let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.described_children());
         for schema in schemas {
             for (role, grants) in schema.roles {
                 let entry = out.entry(role).or_default();
@@ -1957,7 +2008,7 @@ impl DynamicHub {
         if self.inner.gate.is_none() {
             return Ok(InputTerms { grant: method.to_string(), targets: Vec::new(), recheck: false });
         }
-        let info = self.gate_index().get(method);
+        let info = self.gate_info(method);
         let grant = info.and_then(|i| i.grant.clone()).unwrap_or_else(|| method.to_string());
         let open = info.is_some_and(|i| i.public) || self.inner.signed_in_grants.contains(grant.as_str());
         let targets = match info.and_then(|i| i.target.as_deref()) {
@@ -1997,9 +2048,40 @@ impl DynamicHub {
         index.get(method).copied().unwrap_or(true)
     }
 
+    /// NEST-5: the gate's facts for `method` — its own entry, else its
+    /// slot's (`solar.earth.info` → `solar.{planet}.info`; through an
+    /// untyped slot, `solar.{planet}`). A literal entry always wins.
+    fn gate_info(&self, method: &str) -> Option<&super::scope_gate::MethodGateInfo> {
+        let index = self.gate_index();
+        index.methods.get(method).or_else(|| index.slots.resolve(method).and_then(|k| index.methods.get(&k)))
+    }
+
+    /// NEST-5: every slot of every registered activation and static child
+    /// (to any depth): each typed slot as a schema at its path
+    /// (`tickets.{item}`, grants qualified — [`super::slots`]), and each
+    /// untyped slot's path.
+    pub fn slot_children(&self) -> (Vec<PluginSchema>, Vec<String>) {
+        let (mut typed, mut untyped) = (Vec::new(), Vec::new());
+        let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
+        for schema in schemas {
+            super::slots::slot_schemas(&schema, &mut typed, &mut untyped);
+        }
+        (typed, untyped)
+    }
+
+    /// MACRO-20 and NEST-5: every static child and every typed slot, each a
+    /// schema whose namespace is its whole path and whose grants are
+    /// qualified by it — what the gate, the roles, `auth.requires` and the
+    /// caller's view read below an activation.
+    pub fn described_children(&self) -> Vec<PluginSchema> {
+        let mut out = self.static_children();
+        out.extend(self.slot_children().0);
+        out
+    }
+
     /// The gate's path→schema-facts index; built once on first gated
     /// dispatch. See the field docs on `DynamicHubInner::gate_index`.
-    fn gate_index(&self) -> &HashMap<String, super::scope_gate::MethodGateInfo> {
+    fn gate_index(&self) -> &GateIndex {
         self.inner.gate_index.get_or_init(|| {
             let mut index = HashMap::new();
             // The hub's own methods, addressable as "<hub-ns>.<method>".
@@ -2018,15 +2100,27 @@ impl DynamicHub {
             // child (an open name set) has no MethodSchema at this hub's
             // level; the gate treats its paths as schema-less (grant = the
             // dotted path; registry overlay / default_deny still apply).
-            let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
-            for schema in schemas {
+            // NEST-5: and each typed slot's, as `<parent>.{<slot>}.<method>`
+            // with its grant qualified by the slot's path; an untyped slot
+            // is one entry, `<parent>.{<slot>}`, granted whole.
+            let (typed, untyped) = self.slot_children();
+            let activations: Vec<PluginSchema> = self.inner.activations.values().map(|a| a.plugin_schema()).collect();
+            let statics = self.static_children();
+            for schema in activations.iter().chain(statics.iter()).chain(typed.iter()) {
                 for m in &schema.methods {
                     let mut info = super::scope_gate::MethodGateInfo::from_schema(m);
                     info.grant = Some(m.grant_or(&schema.namespace));
                     index.insert(format!("{}.{}", schema.namespace, m.name), info);
                 }
             }
-            index
+            for path in &untyped {
+                index.insert(
+                    path.clone(),
+                    super::scope_gate::MethodGateInfo { grant: Some(path.clone()), ..Default::default() },
+                );
+            }
+            let slots = super::slots::Slots::of(activations.iter().chain(statics.iter()).chain(typed.iter()), &untyped);
+            GateIndex { methods: index, slots }
         })
     }
 
@@ -2192,9 +2286,17 @@ impl DynamicHub {
         if let Some(catalog) = inner.auth_catalog.as_ref() {
             let schema = activation.plugin_schema();
             // MACRO-20: and its static children's methods, by their whole path.
-            for child in super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation)) {
-                catalog.add(&child);
+            let statics = super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation));
+            // NEST-5: and its slots — a typed slot's methods by the slot's
+            // path, an untyped slot whole.
+            let (mut typed, mut untyped) = (Vec::new(), Vec::new());
+            for s in std::iter::once(&schema).chain(statics.iter()) {
+                super::slots::slot_schemas(s, &mut typed, &mut untyped);
             }
+            for child in statics.iter().chain(typed.iter()) {
+                catalog.add(child);
+            }
+            catalog.add_slots(&untyped);
             catalog.add(&schema);
         }
         // RETURNS-40: the cheap bound on `ir`'s names, counted here, once
@@ -2235,9 +2337,17 @@ impl DynamicHub {
         if let Some(catalog) = inner.auth_catalog.as_ref() {
             let schema = activation.plugin_schema();
             // MACRO-20: and its static children's methods, by their whole path.
-            for child in super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation)) {
-                catalog.add(&child);
+            let statics = super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation));
+            // NEST-5: and its slots — a typed slot's methods by the slot's
+            // path, an untyped slot whole.
+            let (mut typed, mut untyped) = (Vec::new(), Vec::new());
+            for s in std::iter::once(&schema).chain(statics.iter()) {
+                super::slots::slot_schemas(s, &mut typed, &mut untyped);
             }
+            for child in statics.iter().chain(typed.iter()) {
+                catalog.add(child);
+            }
+            catalog.add_slots(&untyped);
             catalog.add(&schema);
         }
         // RETURNS-40: the cheap bound on `ir`'s names, counted here, once
@@ -2336,15 +2446,17 @@ impl DynamicHub {
         if let Some(gate) = self.inner.gate.as_ref() {
             // AUTH-11: a sign-in that ended proves no one, on every method.
             let (auth, ended) = super::grant_gate::standing(gate, auth);
-            let admit = super::grant_gate::decide(
-                gate,
-                &self.inner.namespace,
-                method,
-                self.gate_index().get(method),
-                &params,
-                auth,
-                &self.inner.signed_in_grants,
-            )
+            let decide = |info| super::grant_gate::decide(gate, &self.inner.namespace, method, info, &params, auth, &self.inner.signed_in_grants);
+            let admit = match self.gate_index().methods.get(method) {
+                Some(info) => decide(Some(info)),
+                // NEST-5: a path through a slot is decided on the slot's
+                // grant; a grant written as its literal path still decides
+                // first (the slot grant is additive).
+                None => match self.gate_info(method) {
+                    Some(slot) => decide(None).or_else(|_| decide(Some(slot))),
+                    None => decide(None),
+                },
+            }
             .map_err(|e| super::grant_gate::say_ended(e, ended.as_deref()))?;
             return match admit {
                 // AUTH-4: introspection answers from the caller's view.
@@ -2395,7 +2507,7 @@ impl DynamicHub {
                 self.inner.default_deny,
                 &self.inner.audit_sink,
                 method,
-                self.gate_index().get(method),
+                self.gate_info(method),
                 auth,
                 raw_ctx.and_then(|ctx| ctx.peer.map(|peer| peer.ip())),
             )

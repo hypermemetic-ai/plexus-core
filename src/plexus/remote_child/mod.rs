@@ -40,6 +40,11 @@ mod spec;
 mod ws;
 #[cfg(feature = "clap")]
 mod args;
+// VISION-5 (LOCAL-5): dial-in peers (the accepting side) and dial-out (the
+// side with no listening port).
+mod dial_in;
+#[cfg(feature = "child-ws")]
+mod dial_out;
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -58,6 +63,9 @@ pub use link::MountTimings;
 pub use spec::{parse_duration, Backoff, ChildError, ChildOptions, ChildSpec};
 #[cfg(feature = "clap")]
 pub use args::ChildArgs;
+pub use dial_in::{PeerEvent, PeerInfo, PeerRoles, PeerSocket, Peers, PeersMethods};
+#[cfg(feature = "child-ws")]
+pub use dial_out::{key_principal, DialOut, DialState, Exposed};
 
 use link::{meta, too_many, unavailable, Conn, Counters, Shared, SubKey};
 

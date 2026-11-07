@@ -1737,6 +1737,10 @@ impl DynamicHub {
                     // A visible nested child: its own routing answers.
                     Some(_) => return None,
                     None if name.contains('.') => return None,
+                    // NEST-6: a name in the activation's dynamic slot
+                    // (`solar.earth.schema`): the instance's own schema,
+                    // which its routing answers.
+                    None if base.activations.iter().any(|a| a.namespace == ns && a.methods.iter().any(|m| m.role.is_slot())) => return None,
                     None => {
                         return Some(Err(PlexusError::MethodNotFound {
                             activation: ns.to_string(),

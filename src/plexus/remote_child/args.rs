@@ -17,7 +17,7 @@ use super::RemoteChild;
 /// }
 /// let children = args.children.connect_all("menger").await?;   // before the service is shared
 /// ```
-#[derive(clap::Args, Debug, Clone, Default)]
+#[derive(clap::Args, Debug, Clone)]
 #[command(next_help_heading = "Children")]
 pub struct ChildArgs {
     /// An activation in another process, mounted under NAME:
@@ -51,6 +51,29 @@ pub struct ChildArgs {
     /// a deeper child fails the mount, naming its path.
     #[arg(long = "child-max-depth", value_name = "N", default_value_t = 8, hide_short_help = true)]
     pub child_max_depth: usize,
+
+    /// How many dynamic children's schemas a mount keeps, one per name,
+    /// asked of the child the first time (NEST-6); the least recently used
+    /// goes first. 0 keeps none.
+    #[arg(long = "child-schema-cache", value_name = "N", default_value_t = 1024, hide_short_help = true)]
+    pub child_schema_cache: usize,
+}
+
+/// The flags' own defaults (a derived `Default` would say 0 for each
+/// count, and a mount of depth 0 or a cache of 0 is not what no flag means).
+impl Default for ChildArgs {
+    fn default() -> Self {
+        let d = ChildOptions::default();
+        Self {
+            child: Vec::new(),
+            child_timeout: d.timeout,
+            child_max_calls: d.max_calls,
+            child_env: Vec::new(),
+            child_key: None,
+            child_max_depth: d.max_depth,
+            child_schema_cache: d.schema_cache,
+        }
+    }
 }
 
 impl ChildArgs {
@@ -62,6 +85,7 @@ impl ChildArgs {
             env: self.child_env.clone(),
             key: self.child_key.clone(),
             max_depth: self.child_max_depth,
+            schema_cache: self.child_schema_cache,
             ..ChildOptions::for_service(service)
         }
     }
@@ -98,10 +122,15 @@ mod tests {
         assert_eq!((o.timeout, o.max_calls, o.principal.as_str(), o.env.clone()), (Duration::from_millis(250), 8, "service:menger", vec!["RUST_LOG".to_string()]));
         assert_eq!(o.key.as_deref(), Some(std::path::Path::new("/k")));
         let d = Cli::try_parse_from(["svc"]).unwrap().children;
+        let o = ChildArgs::default();
+        assert_eq!((o.child_timeout, o.child_max_calls, o.child_max_depth, o.child_schema_cache), (d.child_timeout, d.child_max_calls, d.child_max_depth, d.child_schema_cache), "Default is the flags' defaults");
         assert!(d.child.is_empty());
         assert_eq!((d.child_timeout, d.child_max_calls, d.child_max_depth), (Duration::from_secs(5), 1024, 8));
         let deep = Cli::try_parse_from(["svc", "--child-max-depth", "3"]).unwrap().children;
         assert_eq!(deep.options("menger").max_depth, 3);
+        assert_eq!(d.options("menger").schema_cache, 1024);
+        let few = Cli::try_parse_from(["svc", "--child-schema-cache", "16"]).unwrap().children;
+        assert_eq!(few.options("menger").schema_cache, 16);
         let e = Cli::try_parse_from(["svc", "--child", "a.b=stdio:x"]).err().unwrap().to_string();
         assert!(e.contains("dotted"), "{e}");
     }

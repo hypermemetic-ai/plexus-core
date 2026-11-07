@@ -306,22 +306,22 @@ async fn every_method_is_gated_by_its_full_path() {
     assert_eq!(got[0], json!({ "at": "b", "grant": "nest.a.b.m", "for": EDITOR }), "{got:?}");
 }
 
-async fn a_call_into_a_dynamic_slot_is_refused_naming_the_slot() {
+async fn a_call_into_a_dynamic_slot_is_forwarded_on_the_slot_grant() {
+    // NEST-6 (was NEST-4's refusal, naming the slot): the host's gate decides
+    // a name in a slot on the slot grant (NEST-5), and the mount forwards it
+    // with that grant in the child's terms; the far side checks the slot.
     let child = mount("mnt").await;
-    // Gated: nothing grants a name in a slot yet (NEST-5), so the gate
-    // refuses it as an unknown method — admin's alone.
     let host = gated(&child);
     let got = items(host.route("mnt.a.earth.m", json!({}), Some(&who(VIEWER))).await).await;
-    assert!(got[0]["route_error"].as_str().is_some_and(|r| r.contains("mnt.a.earth.m")), "{got:?}");
-    // Past the gate (none here): the mount refuses it, naming the slot.
-    let plain = DynamicHub::new("host").register(child.clone());
-    let got = items(plain.route("mnt.a.earth.m", json!({}), Some(&who(VIEWER))).await).await;
-    let why = got[0]["route_error"].as_str().unwrap_or_default().to_string();
-    assert!(why.contains("mnt.a.{item}") && why.contains("NEST-6"), "{got:?}");
-    let got = items(plain.route("mnt.a.b.zz.m", json!({}), None).await).await;
-    assert!(got[0]["route_error"].as_str().is_some_and(|r| r.contains("mnt.a.b.{opaque}")), "{got:?}");
-    let got = items(plain.route("mnt.a.earth.schema", json!({}), None).await).await;
-    assert!(got[0]["route_error"].as_str().is_some_and(|r| r.contains("mnt.a.{item}")), "{got:?}");
+    assert_eq!(got[0], json!({ "at": "item", "grant": "nest.a.{item}.m", "for": VIEWER }), "{got:?}");
+    let got = items(host.route("mnt.a.b.zz.m", json!({}), Some(&who(VIEWER))).await).await;
+    assert_eq!(got[0], json!({ "at": "item", "grant": "nest.a.b.{opaque}.m", "for": VIEWER }), "{got:?}");
+    // An unknown name: the child's own not-found, relayed.
+    let got = items(host.route("mnt.a.pluto.m", json!({}), Some(&who(VIEWER))).await).await;
+    assert_eq!(got[0]["error"]["kind"], "activation_not_found", "{got:?}");
+    // An instance's schema: crosses once.
+    let got = items(host.route("mnt.a.earth.schema", json!({}), Some(&who(VIEWER))).await).await;
+    assert_eq!(got[0]["namespace"], "item", "{got:?}");
 }
 
 async fn past_the_depth_the_mount_fails_naming_the_path() {
@@ -463,7 +463,7 @@ fn main() {
             the_mount_keeps_the_tree_and_the_host_declares_it,
             each_level_schema_is_answered_from_the_kept_tree,
             every_method_is_gated_by_its_full_path,
-            a_call_into_a_dynamic_slot_is_refused_naming_the_slot,
+            a_call_into_a_dynamic_slot_is_forwarded_on_the_slot_grant,
             past_the_depth_the_mount_fails_naming_the_path,
             restart_with_a_changed_grandchild_is_refused
         );

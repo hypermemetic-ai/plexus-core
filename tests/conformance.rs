@@ -143,3 +143,90 @@ async fn kit_green_through_child() {
     println!("the child, as the seam saw it: {:?}", child.stats());
     assert!(ok, "the conformance kit is not green through a child (plexus-wire's echo-rs --stdio, mounted by RemoteChild):\n{out}");
 }
+
+// ------------------------------------------------------------------ NEST-4
+
+/// NEST-4 — a child with children, in another language: the mount walks its
+/// static tree (`py`, `py.a`, `py.a.b`), the host gates each method by its
+/// full path with the child's roles renamed at every level, answers each
+/// level's schema from what it kept, and forwards with the full path as the
+/// hop's grant; a restart whose grandchild changed is refused though the
+/// child's own hash did not move (`tests/fixtures/nest_child.py`).
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_child_through_the_seam() {
+    use futures::StreamExt;
+    use plexus_core::plexus::{AuthContext, Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[derive(Default)]
+    struct Members(Mutex<Vec<Membership>>);
+    impl Memberships for Members {
+        fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
+            self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
+        }
+    }
+    struct Everywhere;
+    impl Resolve for Everywhere {
+        fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::Everywhere])
+        }
+    }
+    async fn first(r: Result<plexus_core::plexus::PlexusStream, plexus_core::plexus::PlexusError>) -> Value {
+        match r {
+            Err(e) => json!({ "route_error": format!("{e:?}") }),
+            Ok(mut s) => match s.next().await.unwrap() {
+                plexus_core::plexus::PlexusStreamItem::Data { content, .. } => content.into_value(),
+                other => serde_json::to_value(other).unwrap(),
+            },
+        }
+    }
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nest_child.py");
+    let spec = ChildSpec::Stdio { name: "deep".into(), argv: vec!["python3".into(), "-I".into(), fixture.to_string_lossy().into_owned()] };
+    let mut opts = ChildOptions::for_service("host");
+    opts.env = vec!["NEST_PY_VARIANT".into()];
+    std::env::remove_var("NEST_PY_VARIANT");
+    let child = RemoteChild::connect(spec, opts).await.expect("a python child with children mounts");
+    let kept: Vec<String> = plexus_core::plexus::Activation::static_child_schemas(&child).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(kept, ["a", "a.b"]);
+
+    let roles = DynamicHub::new("host").register(child.clone()).declared_roles();
+    assert_eq!(roles["viewer"], ["deep.ping", "deep.a.m"], "{roles:?}");
+    assert_eq!(roles["editor"], ["deep.a.b.m"], "{roles:?}");
+    let members = Arc::new(Members::default());
+    members.0.lock().unwrap().push(Membership { principal: VIEWER.parse().unwrap(), role: plexus_auth_core::RoleName::new("viewer"), scope: ScopeRef::parse("*") });
+    let table = RoleTable::from_lists(roles.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
+    let host = DynamicHub::new("host").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(table), Arc::new(Everywhere))));
+    let viewer = AuthContext::for_principal(&VIEWER.parse().unwrap(), "s1", vec![], Value::Null);
+
+    let calls = child.stats().calls;
+    let a = first(host.route("deep.a.schema", json!({}), Some(&viewer)).await).await;
+    assert_eq!(a["namespace"], "a", "{a}");
+    let b = first(host.route("deep.a.b.schema", json!({}), Some(&viewer)).await).await;
+    assert_eq!(b["namespace"], "b", "{b}");
+    assert_eq!(child.stats().calls, calls, "no schema call crossed the hop");
+
+    let got = first(host.route("deep.a.m", json!({}), Some(&viewer)).await).await;
+    assert_eq!(got["method"], "py.a.m", "{got}");
+    assert_eq!(got["hop"]["limit"]["grant"], "py.a.m", "{got}");
+    assert_eq!(got["hop"]["for"], json!([VIEWER]), "{got}");
+    let refused = first(host.route("deep.a.b.m", json!({}), Some(&viewer)).await).await;
+    assert!(refused["route_error"].as_str().is_some_and(|r| r.contains("deep.a.b.m")), "{refused}");
+
+    // The grandchild changes across a restart; the child's own hash does not.
+    std::env::set_var("NEST_PY_VARIANT", "2");
+    let pid = child.pid().unwrap();
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let gone = loop {
+        let got = first(host.route("deep.a.m", json!({}), Some(&viewer)).await).await;
+        if got["message"].as_str().is_some_and(|m| m.contains("schema changed")) || Instant::now() > deadline {
+            break got;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    std::env::remove_var("NEST_PY_VARIANT");
+    assert!(gone["message"].as_str().is_some_and(|m| m.contains("schema changed; restart the service")), "{gone}");
+}

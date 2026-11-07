@@ -46,6 +46,11 @@ pub struct ChildArgs {
     /// principal the hop's. A path, never the key.
     #[arg(long = "child-key", value_name = "PATH", hide_short_help = true)]
     pub child_key: Option<PathBuf>,
+
+    /// How many levels of a child's static children its mount walks (NEST-4);
+    /// a deeper child fails the mount, naming its path.
+    #[arg(long = "child-max-depth", value_name = "N", default_value_t = 8, hide_short_help = true)]
+    pub child_max_depth: usize,
 }
 
 impl ChildArgs {
@@ -56,6 +61,7 @@ impl ChildArgs {
             max_calls: self.child_max_calls,
             env: self.child_env.clone(),
             key: self.child_key.clone(),
+            max_depth: self.child_max_depth,
             ..ChildOptions::for_service(service)
         }
     }
@@ -93,7 +99,9 @@ mod tests {
         assert_eq!(o.key.as_deref(), Some(std::path::Path::new("/k")));
         let d = Cli::try_parse_from(["svc"]).unwrap().children;
         assert!(d.child.is_empty());
-        assert_eq!((d.child_timeout, d.child_max_calls), (Duration::from_secs(5), 1024));
+        assert_eq!((d.child_timeout, d.child_max_calls, d.child_max_depth), (Duration::from_secs(5), 1024, 8));
+        let deep = Cli::try_parse_from(["svc", "--child-max-depth", "3"]).unwrap().children;
+        assert_eq!(deep.options("menger").max_depth, 3);
         let e = Cli::try_parse_from(["svc", "--child", "a.b=stdio:x"]).err().unwrap().to_string();
         assert!(e.contains("dotted"), "{e}");
     }

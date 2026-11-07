@@ -134,6 +134,9 @@ pub struct ChildOptions {
     pub env: Vec<String>,
     /// Restarting (or redialing) a child that died.
     pub backoff: Backoff,
+    /// NEST-4: how many levels of static children a mount walks
+    /// (`--child-max-depth`); a deeper one fails the mount, naming it.
+    pub max_depth: usize,
 }
 
 impl Default for ChildOptions {
@@ -147,6 +150,7 @@ impl Default for ChildOptions {
             buffer: 1024,
             env: Vec::new(),
             backoff: Backoff::default(),
+            max_depth: 8,
         }
     }
 }

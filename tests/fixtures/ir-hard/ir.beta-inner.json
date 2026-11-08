@@ -4,9 +4,7 @@
   "irMetadata": null,
   "irMethods": {
     "alpha.inner.leaves": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "leaf page in inner",
       "mdError": {
@@ -34,9 +32,7 @@
       }
     },
     "alpha.inner.note": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note b in inner",
       "mdError": {
@@ -64,9 +60,7 @@
       }
     },
     "alpha.inner.schema": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -107,9 +101,7 @@
       }
     },
     "alpha.inner.tree": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "tree in inner",
       "mdError": {
@@ -137,9 +129,7 @@
       }
     },
     "beta.dotted": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "dotted",
       "mdError": {
@@ -183,9 +173,7 @@
       }
     },
     "beta.ext": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "ext",
       "mdError": {
@@ -221,9 +209,7 @@
       }
     },
     "beta.nest": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "nest again",
       "mdError": {
@@ -251,9 +237,7 @@
       }
     },
     "beta.note": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note b",
       "mdError": {
@@ -281,9 +265,7 @@
       }
     },
     "beta.schema": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -324,9 +306,7 @@
       }
     },
     "beta.tree": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "tree twice",
       "mdError": {
@@ -354,9 +334,7 @@
       }
     },
     "beta.trees": {
-      "mdBidirResponseSchema": null,
-      "mdBidirResponseType": null,
-      "mdBidirType": null,
+      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "trees again",
       "mdError": {
@@ -386,14 +364,14 @@
   },
   "irPluginHashes": {
     "alpha.inner": {
-      "phiChildrenHash": "13eb884ebba940e5",
-      "phiHash": "13eb884ebba940e5",
-      "phiSelfHash": "13eb884ebba940e5"
+      "phiChildrenHash": "778a16d3c17c5f85",
+      "phiHash": "778a16d3c17c5f85",
+      "phiSelfHash": "778a16d3c17c5f85"
     },
     "beta": {
-      "phiChildrenHash": "dbb194170303145c",
-      "phiHash": "dbb194170303145c",
-      "phiSelfHash": "dbb194170303145c"
+      "phiChildrenHash": "60d210dfc8a73707",
+      "phiHash": "60d210dfc8a73707",
+      "phiSelfHash": "60d210dfc8a73707"
     }
   },
   "irPluginRequests": null,
@@ -1343,6 +1321,19 @@
           },
           {
             "fdDefault": null,
+            "fdDescription": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
+            "fdName": "asks",
+            "fdRequired": false,
+            "fdType": {
+              "contents": [
+                "boolean",
+                null
+              ],
+              "tag": "RefPrimitive"
+            }
+          },
+          {
+            "fdDefault": null,
             "fdDescription": "Declared auth posture of the activation this method belongs to.\n\nPopulated by `#[plexus_macros::activation(auth = \"...\")]` (R-1) —\nstamped onto every RPC method of the activation. `None` means the\nactivation never declared a posture (pre-R-1 emissions and\nposture-silent activations are byte-identical on the wire).\n\nAdded in R-2 (joint AP-1). Defaults to `None` via `#[serde(default)]`\nso pre-R IRs decode cleanly; `skip_serializing_if` keeps the wire\nshape unchanged when unset.",
             "fdName": "auth_posture",
             "fdRequired": false,
@@ -1355,19 +1346,6 @@
                 "tag": "RefNamed"
               },
               "tag": "RefOptional"
-            }
-          },
-          {
-            "fdDefault": false,
-            "fdDescription": "Whether this method supports bidirectional communication\n\nWhen true, the server can send requests to the client during method execution\nand wait for responses (e.g., confirmations, prompts, selections).",
-            "fdName": "bidirectional",
-            "fdRequired": false,
-            "fdType": {
-              "contents": [
-                "boolean",
-                null
-              ],
-              "tag": "RefPrimitive"
             }
           },
           {
@@ -1617,15 +1595,6 @@
           },
           {
             "fdDefault": null,
-            "fdDescription": "JSON Schema for the request type sent from server to client\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nrequests the server may send during method execution.",
-            "fdName": "request_type",
-            "fdRequired": false,
-            "fdType": {
-              "tag": "RefJson"
-            }
-          },
-          {
-            "fdDefault": null,
             "fdDescription": "What credential this method requires on input (if any).\n\nDerived implicitly from the method's scope tagging and the\ncredential-graph linkage at schema-build time (per\n`AUTHZ-CRED-CORE-3` §\"Implicit derivation\"):\n\n- `scope = \"...\"` → `RequiredCredential::from_method_scope(scope)`.\n- `public` method → `None` (the absence of this field).\n- target of `refresh_via`/`revoke_via` of another credential →\n  `RequiredCredential::from_refresh_revoke_target(kind, scopes)`.\n\nAdded in `AUTHZ-CRED-CORE-3`. Defaults to `None` via\n`#[serde(default)]` so pre-IR schemas deserialize cleanly. The\n`skip_serializing_if = \"Option::is_none\"` clause keeps the wire JSON\nshape unchanged for public methods and methods with no scope-derived\nrequirement.",
             "fdName": "requires_credential",
             "fdRequired": false,
@@ -1638,15 +1607,6 @@
                 "tag": "RefNamed"
               },
               "tag": "RefOptional"
-            }
-          },
-          {
-            "fdDefault": null,
-            "fdDescription": "JSON Schema for the response type sent from client to server\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nresponses the client should send in reply to server requests.",
-            "fdName": "response_type",
-            "fdRequired": false,
-            "fdType": {
-              "tag": "RefJson"
             }
           },
           {
@@ -2608,5 +2568,5 @@
       "tdNamespace": "beta"
     }
   },
-  "irVersion": "3.0"
+  "irVersion": "3.1"
 }

@@ -109,7 +109,6 @@
         }
       },
       "cardinality": "one",
-      "bidirectional": false,
       "http_method": "POST",
       "role": {
         "kind": "rpc"
@@ -230,7 +229,6 @@
         }
       },
       "cardinality": "one",
-      "bidirectional": false,
       "http_method": "POST",
       "role": {
         "kind": "rpc"
@@ -242,7 +240,6 @@
       "hash": "auto_schema",
       "returns": {},
       "cardinality": "one",
-      "bidirectional": false,
       "http_method": "POST",
       "role": {
         "kind": "rpc"
@@ -254,7 +251,6 @@
       "hash": "",
       "returns": {},
       "cardinality": "one",
-      "bidirectional": false,
       "http_method": "POST",
       "role": {
         "kind": "dynamic_child",

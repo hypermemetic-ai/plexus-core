@@ -22,7 +22,6 @@ use plexus_auth_core::{
 /// resolves, per Z2H-2).
 pub use plexus_auth_core::Scope;
 
-use super::bidirectional::{StandardRequest, StandardResponse};
 use super::content_hash::{canonical_json, hash16, hash16_lines};
 
 // =============================================================================
@@ -789,12 +788,15 @@ pub struct MethodSchema {
     /// field exists to end.
     pub cardinality: Cardinality,
 
-    /// Whether this method supports bidirectional communication
-    ///
-    /// When true, the server can send requests to the client during method execution
-    /// and wait for responses (e.g., confirmations, prompts, selections).
-    #[serde(default)]
-    pub bidirectional: bool,
+    // ASK-2 (plexus-wire spec/08): `super::ask`'s `NeedsInput` and
+    // `ConfirmToken`. An older schema's `bidirectional` (the in-call
+    // question this replaced) is not read: such a method does not ask. The
+    // doc comment below is this field's description on the wire.
+    /// Whether this method may answer a call with a proposal (a
+    /// `needs_input` item saying what it would do) and act when called again
+    /// with the proposal's token in its `confirm` parameter. Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub asks: bool,
 
     /// HTTP method for REST endpoints (GET, POST, PUT, DELETE, PATCH)
     ///
@@ -809,22 +811,6 @@ pub struct MethodSchema {
     /// - PATCH: Partial update operations
     #[serde(default)]
     pub http_method: HttpMethod,
-
-    /// JSON Schema for the request type sent from server to client
-    ///
-    /// Only relevant when `bidirectional: true`. Describes the structure of
-    /// requests the server may send during method execution.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<serde_json::Value>")] // a JSON Schema document: the JSON type
-    pub request_type: Option<schemars::Schema>,
-
-    /// JSON Schema for the response type sent from client to server
-    ///
-    /// Only relevant when `bidirectional: true`. Describes the structure of
-    /// responses the client should send in reply to server requests.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<serde_json::Value>")] // a JSON Schema document: the JSON type
-    pub response_type: Option<schemars::Schema>,
 
     /// How this method participates in the activation graph.
     ///
@@ -1624,10 +1610,8 @@ impl MethodSchema {
             error: None,
             progress: None,
             cardinality: Cardinality::One,
-            bidirectional: false,
+            asks: false,
             http_method: HttpMethod::default(),
-            request_type: None,
-            response_type: None,
             role: MethodRole::Rpc,
             deprecation: None,
             params_meta: Vec::new(),
@@ -1794,44 +1778,12 @@ impl MethodSchema {
         self
     }
 
-    /// Set whether this method supports bidirectional communication
-    ///
-    /// When true, the server can send requests to the client during method
-    /// execution and wait for responses.
-    pub fn with_bidirectional(mut self, bidirectional: bool) -> Self {
-        self.bidirectional = bidirectional;
+    /// ASK-2: mark this method as one that may answer with a proposal
+    /// (`needs_input`) and take its token back in `confirm`. Emitted by
+    /// `#[plexus_macros::method(asks)]`.
+    pub fn with_asks(mut self, asks: bool) -> Self {
+        self.asks = asks;
         self
-    }
-
-    /// Set the JSON Schema for server-to-client request types
-    ///
-    /// Only relevant when `bidirectional: true`. Use `schema_for!(YourRequestType)`
-    /// to generate the schema.
-    pub fn with_request_type(mut self, mut schema: schemars::Schema) -> Self {
-        spell_json_values(&mut schema);
-        self.request_type = Some(schema);
-        self
-    }
-
-    /// Set the JSON Schema for client-to-server response types
-    ///
-    /// Only relevant when `bidirectional: true`. Use `schema_for!(YourResponseType)`
-    /// to generate the schema.
-    pub fn with_response_type(mut self, mut schema: schemars::Schema) -> Self {
-        spell_json_values(&mut schema);
-        self.response_type = Some(schema);
-        self
-    }
-
-    /// Configure method for standard bidirectional communication
-    ///
-    /// Sets `bidirectional: true` and configures request/response types to use
-    /// `StandardRequest` and `StandardResponse`, which support common UI patterns
-    /// like confirmations, prompts, and selections.
-    pub fn with_standard_bidirectional(self) -> Self {
-        self.with_bidirectional(true)
-            .with_request_type(schema_for!(StandardRequest).into())
-            .with_response_type(schema_for!(StandardResponse).into())
     }
 
     /// Set this method's role in the activation graph.
@@ -2876,14 +2828,16 @@ mod tests {
     }
 
     /// The fields sit where `returns` / the old flag sat: after `params`,
-    /// before `bidirectional` — every other field keeps its place on the wire.
+    /// before `asks` (ASK-2: where `bidirectional` sat) — every other field
+    /// keeps its place on the wire.
     #[test]
     fn returns_5_field_order_on_the_wire() {
         let method = returns_5_full_method()
-            .with_params(schemars::json_schema!({ "type": "object" }));
+            .with_params(schemars::json_schema!({ "type": "object" }))
+            .with_asks(true);
         let text = serde_json::to_string(&method).unwrap();
         let pos = |k: &str| text.find(&format!("\"{k}\":")).unwrap_or_else(|| panic!("{k} missing in {text}"));
-        let order = ["name", "description", "hash", "params", "returns", "error", "progress", "cardinality", "bidirectional", "http_method", "role"];
+        let order = ["name", "description", "hash", "params", "returns", "error", "progress", "cardinality", "asks", "http_method", "role"];
         for pair in order.windows(2) {
             assert!(pos(pair[0]) < pos(pair[1]), "{} must precede {} in {text}", pair[0], pair[1]);
         }

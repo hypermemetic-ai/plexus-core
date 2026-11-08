@@ -360,10 +360,7 @@ fn method_def(r: &mut Reader, shared: &Doc<'_>, namespace: &str, m: &MethodIn<'_
         error: error_ref,
         progress: progress_ref,
         cardinality: m.cardinality,
-        // StandardBidirChannel's T = serde_json::Value
-        bidir_type: m.bidirectional.then_some(TypeRef::Json),
-        bidir_response_type: None,
-        bidir_response_schema: m.response_type.cloned(),
+        asks: m.asks,
         role: m.role.clone(),
         grant: m.grant.clone(),
         target: m.target.clone(),
@@ -494,14 +491,13 @@ fn deduplicate(mut ir: Ir) -> Ir {
         md.returns = update(std::mem::replace(&mut md.returns, TypeRef::Unknown));
         md.error = md.error.take().map(update);
         md.progress = md.progress.take().map(update);
-        md.bidir_type = md.bidir_type.take().map(update);
         md.input = md.input.take().map(update);
     }
     ir
 }
 
 /// How often each contested type is named, by (namespace, name): in every
-/// method's params, returns, error, progress, input and bidirectional type,
+/// method's params, returns, error, progress and input,
 /// and every type's fields, before deduplication.
 fn ref_counts(contested: &HashSet<(String, String)>, ir: &Ir, groups: &[((String, TypeKind), Vec<(String, TypeDef)>)]) -> HashMap<(String, String), usize> {
     let mut counts = HashMap::new();
@@ -520,7 +516,7 @@ fn ref_counts(contested: &HashSet<(String, String)>, ir: &Ir, groups: &[((String
             keys(&p.ty, &mut names);
         }
         keys(&md.returns, &mut names);
-        for t in [&md.error, &md.progress, &md.input, &md.bidir_type].into_iter().flatten() {
+        for t in [&md.error, &md.progress, &md.input].into_iter().flatten() {
             keys(t, &mut names);
         }
     }

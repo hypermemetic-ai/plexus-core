@@ -5,7 +5,28 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 0.10.0
+
+ASK-2 (breaking): **a method proposes; the server no longer asks its caller
+mid-call.** The `bidirectional` module goes — `BidirChannel`,
+`StandardBidirChannel`, `StandardRequest` / `StandardResponse`,
+`SelectOption`, `BidirError`, the pending-request registry,
+`create_bidir_stream` / `wrap_stream_with_bidir` — with
+`PlexusStreamItem::Request`, `{ns}.respond`, and `MethodSchema`'s
+`bidirectional`, `request_type` and `response_type` (and their builders). In
+their place, `plexus::ask` (plexus-wire spec/08): `NeedsInput` (the
+`needs_input` item: `summary`, `effects`, `fields`, `token`, `expires`),
+`Field`, `Proposal`, `ConfirmToken` (`v1.<expiry>.<base64url
+HMAC-SHA256(key, caller · method path · plan · expiry)>`), `ConfirmKey`
+(random per process; `DynamicHub::with_confirm_key` for replicas), and the
+two helpers `ask::propose(plan, proposal)` and `ask::check(confirm, plan)`.
+`MethodSchema.asks` (`with_asks`), absent while false; an older schema's
+`bidirectional` reads as `asks: false`. The IR is 3.1: each method's
+`mdAsks` in place of `mdBidirType`, `mdBidirResponseType`,
+`mdBidirResponseSchema`. `tests/question_matrix.rs` is the proposal's
+matrix. The input half (`Input<T>`, `{ns}.input`, `DuplexGate`) is
+unchanged. Every schema hash moves (goldens regenerated).
+
 
 NEST-6: **a mounted child's dynamic children are reachable through the
 mount.** The walk keeps each slot on its parent with its type (a `#[peer]`

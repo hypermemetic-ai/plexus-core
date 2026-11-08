@@ -102,7 +102,6 @@ fn every_frame() -> Vec<ServerItem> {
             json!({"type": "chunk", "done": 0, "of": 10}),
         ),
         ServerItem::error(meta(), RemoteError::Unauthenticated, true),
-        ServerItem::request("r-1".into(), json!({"prompt": "continue?"}), 30_000),
         ServerItem::done(meta()),
     ];
     frames.extend(
@@ -209,23 +208,6 @@ fn error_variant_survives_the_crossing() {
 }
 
 #[test]
-fn request_variant_survives_the_crossing() {
-    let server = ServerItem::request("r-1".into(), json!({"prompt": "continue?"}), 30_000);
-    match cross(&server) {
-        ClientItem::Request {
-            request_id,
-            request_data,
-            timeout_ms,
-        } => {
-            assert_eq!(request_id, "r-1");
-            assert_eq!(request_data["prompt"], "continue?");
-            assert_eq!(timeout_ms, 30_000);
-        }
-        other => panic!("expected request, got {other:?}"),
-    }
-}
-
-#[test]
 fn done_variant_survives_the_crossing() {
     let server = ServerItem::done(meta());
     match cross(&server) {
@@ -279,7 +261,6 @@ fn every_server_variant_tag_is_readable_by_the_client() {
         ("data", ServerItem::data(meta(), "t".into(), json!({}))),
         ("progress", ServerItem::progress(meta(), "t".into(), json!({"message": "m"}))),
         ("error", ServerItem::error(meta(), RemoteError::Unauthenticated, false)),
-        ("request", ServerItem::request("r".into(), json!({}), 0)),
         ("done", ServerItem::done(meta())),
     ];
 

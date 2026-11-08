@@ -4,7 +4,7 @@
 //!
 //! **Native: exactly what was called before.** Every item is a re-export of
 //! the tokio or std item each call site named (`tokio::spawn`,
-//! `tokio::task::spawn_blocking`, `tokio::time::{sleep, timeout}`,
+//! `tokio::task::spawn_blocking`, `tokio::time::sleep`,
 //! `std::time::Instant`), or, for [`now_unix`], the same `SystemTime`
 //! arithmetic inlined — no wrapper, no new behaviour.
 //!
@@ -17,7 +17,7 @@
 //!   is no other thread to move it to, and deferring it with `spawn_local`
 //!   would only run the same work later on the same thread;
 //! - [`sleep`] is a `setTimeout` (`futures-timer` over `gloo-timers`, so
-//!   the future is `Send`), [`timeout`] races it;
+//!   the future is `Send`);
 //! - [`Instant`] and [`now_unix`] read the JS clock (`web-time`).
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,7 +25,7 @@ mod imp {
     pub(crate) use std::time::Instant;
     pub(crate) use tokio::spawn;
     pub(crate) use tokio::task::spawn_blocking;
-    pub(crate) use tokio::time::{sleep, timeout};
+    pub(crate) use tokio::time::sleep;
 
     /// Seconds since the Unix epoch, 0 before it.
     #[inline]
@@ -68,28 +68,6 @@ mod imp {
     pub(crate) fn sleep(duration: Duration) -> futures_timer::Delay {
         futures_timer::Delay::new(duration)
     }
-
-    /// `future`'s output, or [`Elapsed`] once `duration` has passed first.
-    pub(crate) async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, Elapsed> {
-        use futures::future::{select, Either};
-        let future = std::pin::pin!(future);
-        match select(future, sleep(duration)).await {
-            Either::Left((output, _)) => Ok(output),
-            Either::Right(((), _)) => Err(Elapsed(())),
-        }
-    }
-
-    /// A [`timeout`] that ran out, as tokio's `Elapsed` is natively.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct Elapsed(());
-
-    impl std::fmt::Display for Elapsed {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("deadline has elapsed")
-        }
-    }
-
-    impl std::error::Error for Elapsed {}
 
     /// Seconds since the Unix epoch, from the JS clock; 0 before it.
     pub(crate) fn now_unix() -> i64 {

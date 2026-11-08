@@ -3,25 +3,24 @@
     "children": [
       {
         "description": "alpha",
-        "hash": "3913fa017a798190",
+        "hash": "a87c4d187042b31c",
         "namespace": "alpha"
       },
       {
         "description": "beta",
-        "hash": "dbb194170303145c",
+        "hash": "60d210dfc8a73707",
         "namespace": "beta"
       }
     ],
-    "children_hash": "339259fcde4b5232",
+    "children_hash": "c7bac7357650eb90",
     "description": "Central routing and introspection",
-    "hash": "7acb47ac39d19482",
+    "hash": "16231e0fb310ff65",
     "methods": [
       {
-        "bidirectional": false,
         "cardinality": "many",
         "description": "Route a call to a registered activation",
         "grant": "xsvc.call",
-        "hash": "2ea6cd03ff1041dd",
+        "hash": "6faf6004876e2252",
         "http_method": "POST",
         "name": "call",
         "params": {
@@ -526,43 +525,6 @@
               "type": "object"
             },
             {
-              "description": "Bidirectional request from server to client\n\nServer can ask client for input during stream execution.\nClient must respond via transport-specific mechanism\n(MCP: _plexus_respond tool, WebSocket: plexus.respond RPC).",
-              "properties": {
-                "requestData": {
-                  "description": "Serialized request data (generic Req type)",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
-                },
-                "requestId": {
-                  "description": "Unique identifier for correlating response",
-                  "type": "string"
-                },
-                "timeoutMs": {
-                  "description": "Maximum time to wait for response (milliseconds)",
-                  "format": "uint64",
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "type": {
-                  "const": "request",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "type",
-                "requestId",
-                "requestData",
-                "timeoutMs"
-              ],
-              "type": "object"
-            },
-            {
               "description": "Stream completed successfully",
               "properties": {
                 "metadata": {
@@ -588,11 +550,10 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "many",
         "description": "Get plexus configuration hash (from the recursive schema)\n\n This hash changes whenever any method or child plugin changes.\n It's computed from the method hashes rolled up through the schema tree.",
         "grant": "xsvc.hash",
-        "hash": "463b1a18b6d7592f",
+        "hash": "c73f5d7e7ae67552",
         "http_method": "POST",
         "long_description": "Get Plexus RPC server configuration hash (from the recursive schema)\n\nThis hash changes whenever any method or child activation changes.\nIt's computed from the method hashes rolled up through the schema tree.",
         "name": "hash",
@@ -623,11 +584,10 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "many",
         "description": "Get plugin hashes for cache validation",
         "grant": "xsvc.hashes",
-        "hash": "f6d98e90ebcdd1c5",
+        "hash": "e9c5646c1d21b984",
         "http_method": "POST",
         "long_description": "(lightweight alternative to full schema)",
         "name": "hashes",
@@ -692,7 +652,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "The service's IR (3.0): every type once, each method referring to them — of the namespaces asked, or the whole service",
         "error": {
@@ -745,7 +704,7 @@
           "title": "IrError"
         },
         "grant": "xsvc.ir",
-        "hash": "3b76885436ff0440",
+        "hash": "96971ac22998e154",
         "http_method": "POST",
         "long_description": "RETURNS-40: the service's IR — IR 3.0, every type once and each\nmethod referring to them — of the namespaces asked (none: the whole\nservice), as the caller sees the service. The one way to ask for\nseveral schemas; `<ns>.schema` answers one. Equal to what synapse\nbuilds from the same raw schemas.",
         "name": "ir",
@@ -767,7 +726,7 @@
         },
         "returns": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "description": "The service's IR 3.0: every type once (irTypes), each method referring to them (irMethods) — as synapse's buildIRFromSchemas builds it from the same schemas",
+          "description": "The service's IR 3.1: every type once (irTypes), each method referring to them (irMethods) — as synapse's buildIRFromSchemas builds it from the same schemas",
           "title": "ServiceIr",
           "type": [
             "null",
@@ -783,11 +742,10 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "xsvc.schema",
-        "hash": "57435bb758a06b57",
+        "hash": "ca61e1c90b82e182",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -1437,6 +1395,10 @@
                     "null"
                   ]
                 },
+                "asks": {
+                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
+                  "type": "boolean"
+                },
                 "auth_posture": {
                   "anyOf": [
                     {
@@ -1447,11 +1409,6 @@
                     }
                   ],
                   "description": "Declared auth posture of the activation this method belongs to.\n\nPopulated by `#[plexus_macros::activation(auth = \"...\")]` (R-1) —\nstamped onto every RPC method of the activation. `None` means the\nactivation never declared a posture (pre-R-1 emissions and\nposture-silent activations are byte-identical on the wire).\n\nAdded in R-2 (joint AP-1). Defaults to `None` via `#[serde(default)]`\nso pre-R IRs decode cleanly; `skip_serializing_if` keeps the wire\nshape unchanged when unset."
-                },
-                "bidirectional": {
-                  "default": false,
-                  "description": "Whether this method supports bidirectional communication\n\nWhen true, the server can send requests to the client during method execution\nand wait for responses (e.g., confirmations, prompts, selections).",
-                  "type": "boolean"
                 },
                 "cardinality": {
                   "$ref": "#/$defs/Cardinality",
@@ -1585,17 +1542,6 @@
                   "description": "Whether this method is explicitly public — exempt from the\ndefault-deny gate (AUTHZ-CORE-2's `#[plexus::method(public)]`).\n\n`public` and a populated `requires_credential` are mutually exclusive\nby construction: the macro rejects `public` + `scope = \"...\"` at\ncompile time.\n\nAdded in R-2. Defaults to `false` via `#[serde(default)]` so pre-R\nIRs decode cleanly; `skip_serializing_if` keeps the wire shape\nunchanged for non-public methods (i.e., every pre-R method).",
                   "type": "boolean"
                 },
-                "request_type": {
-                  "description": "JSON Schema for the request type sent from server to client\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nrequests the server may send during method execution.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
-                },
                 "requires_credential": {
                   "anyOf": [
                     {
@@ -1606,17 +1552,6 @@
                     }
                   ],
                   "description": "What credential this method requires on input (if any).\n\nDerived implicitly from the method's scope tagging and the\ncredential-graph linkage at schema-build time (per\n`AUTHZ-CRED-CORE-3` §\"Implicit derivation\"):\n\n- `scope = \"...\"` → `RequiredCredential::from_method_scope(scope)`.\n- `public` method → `None` (the absence of this field).\n- target of `refresh_via`/`revoke_via` of another credential →\n  `RequiredCredential::from_refresh_revoke_target(kind, scopes)`.\n\nAdded in `AUTHZ-CRED-CORE-3`. Defaults to `None` via\n`#[serde(default)]` so pre-IR schemas deserialize cleanly. The\n`skip_serializing_if = \"Option::is_none\"` clause keeps the wire JSON\nshape unchanged for public methods and methods with no scope-derived\nrequirement."
-                },
-                "response_type": {
-                  "description": "JSON Schema for the response type sent from client to server\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nresponses the client should send in reply to server requests.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
                 },
                 "returns": {
                   "description": "JSON Schema for the method's item type `T` — what one success carries.\n\nAlways present: every method has a return type. For a `Result<T, E>`\nor `Progress<T, P>` item it is `T` alone — `E` and `P` have fields of\ntheir own. [`MethodSchema::new`] starts it at the empty schema `{}`\n(any value) until [`MethodSchema::with_returns`] sets it.",
@@ -1869,23 +1804,22 @@
       }
     ],
     "namespace": "xsvc",
-    "self_hash": "377983c65f471a4c",
+    "self_hash": "5060a87ffba4772c",
     "version": "1.0.0"
   },
   "alpha": {
     "children": [
       {
         "description": "child",
-        "hash": "13eb884ebba940e5",
+        "hash": "778a16d3c17c5f85",
         "namespace": "inner"
       }
     ],
-    "children_hash": "6bf903456be5f059",
+    "children_hash": "08eb6b44231a0f99",
     "description": "alpha",
-    "hash": "3913fa017a798190",
+    "hash": "a87c4d187042b31c",
     "methods": [
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "generic page of leaves",
         "error": {
@@ -1911,7 +1845,7 @@
           "title": "Oops"
         },
         "grant": "alpha.leaves",
-        "hash": "a4beaf04d3aa8dcb",
+        "hash": "03a4e7b8b449ded4",
         "http_method": "POST",
         "name": "leaves",
         "params": {
@@ -2249,7 +2183,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "mutual",
         "error": {
@@ -2275,7 +2208,7 @@
           "title": "Oops"
         },
         "grant": "alpha.ping",
-        "hash": "c6028582b7a37c7c",
+        "hash": "ded09ad35b9ab2d7",
         "http_method": "POST",
         "name": "ping",
         "returns": {
@@ -2325,7 +2258,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "enums",
         "error": {
@@ -2351,7 +2283,7 @@
           "title": "Oops"
         },
         "grant": "alpha.enums",
-        "hash": "854a74f06290c50b",
+        "hash": "23e9f69e333d1713",
         "http_method": "POST",
         "name": "enums",
         "params": {
@@ -2717,7 +2649,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "shout",
         "error": {
@@ -2743,7 +2674,7 @@
           "title": "Oops"
         },
         "grant": "alpha.shout",
-        "hash": "166403cda7056f8d",
+        "hash": "0bc0614951c24e29",
         "http_method": "POST",
         "name": "shout",
         "params": {
@@ -3098,7 +3029,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "nest",
         "error": {
@@ -3124,7 +3054,7 @@
           "title": "Oops"
         },
         "grant": "alpha.nest",
-        "hash": "f640d000c6e4fd39",
+        "hash": "46b26c531465739c",
         "http_method": "POST",
         "name": "nest",
         "returns": {
@@ -3451,7 +3381,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "nums",
         "error": {
@@ -3477,7 +3406,7 @@
           "title": "Oops"
         },
         "grant": "alpha.nums",
-        "hash": "f153aa88562e31fa",
+        "hash": "c340b7b03899904c",
         "http_method": "POST",
         "name": "nums",
         "params": {
@@ -3838,7 +3767,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "note a",
         "error": {
@@ -3864,7 +3792,7 @@
           "title": "Oops"
         },
         "grant": "alpha.note",
-        "hash": "6a69aa056b063b0a",
+        "hash": "fad4222dd2fc05c9",
         "http_method": "POST",
         "name": "note",
         "returns": {
@@ -3887,11 +3815,10 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "many",
         "description": "stream of trees",
         "grant": "alpha.stream_trees",
-        "hash": "45e22e778c4c1a98",
+        "hash": "406731be155e4ca7",
         "http_method": "POST",
         "name": "stream_trees",
         "returns": {
@@ -3930,7 +3857,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "dotted",
         "error": {
@@ -3956,7 +3882,7 @@
           "title": "Oops"
         },
         "grant": "alpha.dotted",
-        "hash": "a796fa2254dac118",
+        "hash": "dc5e79e3310e50d7",
         "http_method": "POST",
         "name": "dotted",
         "params": {
@@ -4272,11 +4198,10 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "alpha.schema",
-        "hash": "5c50f29a3e7200c8",
+        "hash": "70ccf33840075d0d",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -4926,6 +4851,10 @@
                     "null"
                   ]
                 },
+                "asks": {
+                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
+                  "type": "boolean"
+                },
                 "auth_posture": {
                   "anyOf": [
                     {
@@ -4936,11 +4865,6 @@
                     }
                   ],
                   "description": "Declared auth posture of the activation this method belongs to.\n\nPopulated by `#[plexus_macros::activation(auth = \"...\")]` (R-1) —\nstamped onto every RPC method of the activation. `None` means the\nactivation never declared a posture (pre-R-1 emissions and\nposture-silent activations are byte-identical on the wire).\n\nAdded in R-2 (joint AP-1). Defaults to `None` via `#[serde(default)]`\nso pre-R IRs decode cleanly; `skip_serializing_if` keeps the wire\nshape unchanged when unset."
-                },
-                "bidirectional": {
-                  "default": false,
-                  "description": "Whether this method supports bidirectional communication\n\nWhen true, the server can send requests to the client during method execution\nand wait for responses (e.g., confirmations, prompts, selections).",
-                  "type": "boolean"
                 },
                 "cardinality": {
                   "$ref": "#/$defs/Cardinality",
@@ -5074,17 +4998,6 @@
                   "description": "Whether this method is explicitly public — exempt from the\ndefault-deny gate (AUTHZ-CORE-2's `#[plexus::method(public)]`).\n\n`public` and a populated `requires_credential` are mutually exclusive\nby construction: the macro rejects `public` + `scope = \"...\"` at\ncompile time.\n\nAdded in R-2. Defaults to `false` via `#[serde(default)]` so pre-R\nIRs decode cleanly; `skip_serializing_if` keeps the wire shape\nunchanged for non-public methods (i.e., every pre-R method).",
                   "type": "boolean"
                 },
-                "request_type": {
-                  "description": "JSON Schema for the request type sent from server to client\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nrequests the server may send during method execution.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
-                },
                 "requires_credential": {
                   "anyOf": [
                     {
@@ -5095,17 +5008,6 @@
                     }
                   ],
                   "description": "What credential this method requires on input (if any).\n\nDerived implicitly from the method's scope tagging and the\ncredential-graph linkage at schema-build time (per\n`AUTHZ-CRED-CORE-3` §\"Implicit derivation\"):\n\n- `scope = \"...\"` → `RequiredCredential::from_method_scope(scope)`.\n- `public` method → `None` (the absence of this field).\n- target of `refresh_via`/`revoke_via` of another credential →\n  `RequiredCredential::from_refresh_revoke_target(kind, scopes)`.\n\nAdded in `AUTHZ-CRED-CORE-3`. Defaults to `None` via\n`#[serde(default)]` so pre-IR schemas deserialize cleanly. The\n`skip_serializing_if = \"Option::is_none\"` clause keeps the wire JSON\nshape unchanged for public methods and methods with no scope-derived\nrequirement."
-                },
-                "response_type": {
-                  "description": "JSON Schema for the response type sent from client to server\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nresponses the client should send in reply to server requests.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
                 },
                 "returns": {
                   "description": "JSON Schema for the method's item type `T` — what one success carries.\n\nAlways present: every method has a return type. For a `Result<T, E>`\nor `Progress<T, P>` item it is `T` alone — `E` and `P` have fields of\ntheir own. [`MethodSchema::new`] starts it at the empty schema `{}`\n(any value) until [`MethodSchema::with_returns`] sets it.",
@@ -5357,10 +5259,9 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "child",
-        "hash": "942058bfd802a009",
+        "hash": "b1d6323ce344dba5",
         "http_method": "POST",
         "name": "inner",
         "returns": {},
@@ -5370,15 +5271,14 @@
       }
     ],
     "namespace": "alpha",
-    "self_hash": "aaba1e98d82233e0",
+    "self_hash": "5994d87632477216",
     "version": "1.0.0"
   },
   "alpha.inner": {
     "description": "inner",
-    "hash": "13eb884ebba940e5",
+    "hash": "778a16d3c17c5f85",
     "methods": [
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "tree in inner",
         "error": {
@@ -5404,7 +5304,7 @@
           "title": "Oops"
         },
         "grant": "inner.tree",
-        "hash": "883c12780e4af161",
+        "hash": "146a76922f42f696",
         "http_method": "POST",
         "name": "tree",
         "returns": {
@@ -5443,7 +5343,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "leaf page in inner",
         "error": {
@@ -5469,7 +5368,7 @@
           "title": "Oops"
         },
         "grant": "inner.leaves",
-        "hash": "43bb0c76ccf2984d",
+        "hash": "945ebe6c3481760f",
         "http_method": "POST",
         "name": "leaves",
         "returns": {
@@ -5515,7 +5414,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "note b in inner",
         "error": {
@@ -5541,7 +5439,7 @@
           "title": "Oops"
         },
         "grant": "inner.note",
-        "hash": "f19be38dfd6c9e16",
+        "hash": "04bb97590602f7c2",
         "http_method": "POST",
         "name": "note",
         "returns": {
@@ -5564,11 +5462,10 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "inner.schema",
-        "hash": "8cd4740f9093a15c",
+        "hash": "8348802cc68f5fb8",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -6218,6 +6115,10 @@
                     "null"
                   ]
                 },
+                "asks": {
+                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
+                  "type": "boolean"
+                },
                 "auth_posture": {
                   "anyOf": [
                     {
@@ -6228,11 +6129,6 @@
                     }
                   ],
                   "description": "Declared auth posture of the activation this method belongs to.\n\nPopulated by `#[plexus_macros::activation(auth = \"...\")]` (R-1) —\nstamped onto every RPC method of the activation. `None` means the\nactivation never declared a posture (pre-R-1 emissions and\nposture-silent activations are byte-identical on the wire).\n\nAdded in R-2 (joint AP-1). Defaults to `None` via `#[serde(default)]`\nso pre-R IRs decode cleanly; `skip_serializing_if` keeps the wire\nshape unchanged when unset."
-                },
-                "bidirectional": {
-                  "default": false,
-                  "description": "Whether this method supports bidirectional communication\n\nWhen true, the server can send requests to the client during method execution\nand wait for responses (e.g., confirmations, prompts, selections).",
-                  "type": "boolean"
                 },
                 "cardinality": {
                   "$ref": "#/$defs/Cardinality",
@@ -6366,17 +6262,6 @@
                   "description": "Whether this method is explicitly public — exempt from the\ndefault-deny gate (AUTHZ-CORE-2's `#[plexus::method(public)]`).\n\n`public` and a populated `requires_credential` are mutually exclusive\nby construction: the macro rejects `public` + `scope = \"...\"` at\ncompile time.\n\nAdded in R-2. Defaults to `false` via `#[serde(default)]` so pre-R\nIRs decode cleanly; `skip_serializing_if` keeps the wire shape\nunchanged for non-public methods (i.e., every pre-R method).",
                   "type": "boolean"
                 },
-                "request_type": {
-                  "description": "JSON Schema for the request type sent from server to client\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nrequests the server may send during method execution.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
-                },
                 "requires_credential": {
                   "anyOf": [
                     {
@@ -6387,17 +6272,6 @@
                     }
                   ],
                   "description": "What credential this method requires on input (if any).\n\nDerived implicitly from the method's scope tagging and the\ncredential-graph linkage at schema-build time (per\n`AUTHZ-CRED-CORE-3` §\"Implicit derivation\"):\n\n- `scope = \"...\"` → `RequiredCredential::from_method_scope(scope)`.\n- `public` method → `None` (the absence of this field).\n- target of `refresh_via`/`revoke_via` of another credential →\n  `RequiredCredential::from_refresh_revoke_target(kind, scopes)`.\n\nAdded in `AUTHZ-CRED-CORE-3`. Defaults to `None` via\n`#[serde(default)]` so pre-IR schemas deserialize cleanly. The\n`skip_serializing_if = \"Option::is_none\"` clause keeps the wire JSON\nshape unchanged for public methods and methods with no scope-derived\nrequirement."
-                },
-                "response_type": {
-                  "description": "JSON Schema for the response type sent from client to server\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nresponses the client should send in reply to server requests.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
                 },
                 "returns": {
                   "description": "JSON Schema for the method's item type `T` — what one success carries.\n\nAlways present: every method has a return type. For a `Result<T, E>`\nor `Progress<T, P>` item it is `T` alone — `E` and `P` have fields of\ntheir own. [`MethodSchema::new`] starts it at the empty schema `{}`\n(any value) until [`MethodSchema::with_returns`] sets it.",
@@ -6650,15 +6524,14 @@
       }
     ],
     "namespace": "inner",
-    "self_hash": "f0317324cdf43c08",
+    "self_hash": "3918fc6b68b0b67f",
     "version": "1.0.0"
   },
   "beta": {
     "description": "beta",
-    "hash": "dbb194170303145c",
+    "hash": "60d210dfc8a73707",
     "methods": [
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "note b",
         "error": {
@@ -6684,7 +6557,7 @@
           "title": "Oops"
         },
         "grant": "beta.note",
-        "hash": "4b2eb9761db1d68a",
+        "hash": "1bbc79cc042bfc47",
         "http_method": "POST",
         "name": "note",
         "returns": {
@@ -6707,7 +6580,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "trees again",
         "error": {
@@ -6733,7 +6605,7 @@
           "title": "Oops"
         },
         "grant": "beta.trees",
-        "hash": "42ac3bcf150cb36e",
+        "hash": "ae2ff3eace20b22a",
         "http_method": "POST",
         "name": "trees",
         "returns": {
@@ -6795,7 +6667,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "tree twice",
         "error": {
@@ -6821,7 +6692,7 @@
           "title": "Oops"
         },
         "grant": "beta.tree",
-        "hash": "75075bfc317342d6",
+        "hash": "ac95af65ed811d39",
         "http_method": "POST",
         "name": "tree",
         "returns": {
@@ -6860,7 +6731,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "ext",
         "error": {
@@ -6886,7 +6756,7 @@
           "title": "Oops"
         },
         "grant": "beta.ext",
-        "hash": "9657d5797335b13b",
+        "hash": "92c2e4caf997e57e",
         "http_method": "POST",
         "name": "ext",
         "params": {
@@ -7101,7 +6971,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "nest again",
         "error": {
@@ -7127,7 +6996,7 @@
           "title": "Oops"
         },
         "grant": "beta.nest",
-        "hash": "8adad82dca4555ce",
+        "hash": "e07ff0bb52ee952c",
         "http_method": "POST",
         "name": "nest",
         "returns": {
@@ -7454,7 +7323,6 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "dotted",
         "error": {
@@ -7480,7 +7348,7 @@
           "title": "Oops"
         },
         "grant": "beta.dotted",
-        "hash": "edacbd2f49dba046",
+        "hash": "fd77be64fa26a8f4",
         "http_method": "POST",
         "name": "dotted",
         "params": {
@@ -7621,11 +7489,10 @@
         }
       },
       {
-        "bidirectional": false,
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "beta.schema",
-        "hash": "0d25eecdf50bc7f4",
+        "hash": "db73d0fa48cb0bdb",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -8275,6 +8142,10 @@
                     "null"
                   ]
                 },
+                "asks": {
+                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
+                  "type": "boolean"
+                },
                 "auth_posture": {
                   "anyOf": [
                     {
@@ -8285,11 +8156,6 @@
                     }
                   ],
                   "description": "Declared auth posture of the activation this method belongs to.\n\nPopulated by `#[plexus_macros::activation(auth = \"...\")]` (R-1) —\nstamped onto every RPC method of the activation. `None` means the\nactivation never declared a posture (pre-R-1 emissions and\nposture-silent activations are byte-identical on the wire).\n\nAdded in R-2 (joint AP-1). Defaults to `None` via `#[serde(default)]`\nso pre-R IRs decode cleanly; `skip_serializing_if` keeps the wire\nshape unchanged when unset."
-                },
-                "bidirectional": {
-                  "default": false,
-                  "description": "Whether this method supports bidirectional communication\n\nWhen true, the server can send requests to the client during method execution\nand wait for responses (e.g., confirmations, prompts, selections).",
-                  "type": "boolean"
                 },
                 "cardinality": {
                   "$ref": "#/$defs/Cardinality",
@@ -8423,17 +8289,6 @@
                   "description": "Whether this method is explicitly public — exempt from the\ndefault-deny gate (AUTHZ-CORE-2's `#[plexus::method(public)]`).\n\n`public` and a populated `requires_credential` are mutually exclusive\nby construction: the macro rejects `public` + `scope = \"...\"` at\ncompile time.\n\nAdded in R-2. Defaults to `false` via `#[serde(default)]` so pre-R\nIRs decode cleanly; `skip_serializing_if` keeps the wire shape\nunchanged for non-public methods (i.e., every pre-R method).",
                   "type": "boolean"
                 },
-                "request_type": {
-                  "description": "JSON Schema for the request type sent from server to client\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nrequests the server may send during method execution.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
-                },
                 "requires_credential": {
                   "anyOf": [
                     {
@@ -8444,17 +8299,6 @@
                     }
                   ],
                   "description": "What credential this method requires on input (if any).\n\nDerived implicitly from the method's scope tagging and the\ncredential-graph linkage at schema-build time (per\n`AUTHZ-CRED-CORE-3` §\"Implicit derivation\"):\n\n- `scope = \"...\"` → `RequiredCredential::from_method_scope(scope)`.\n- `public` method → `None` (the absence of this field).\n- target of `refresh_via`/`revoke_via` of another credential →\n  `RequiredCredential::from_refresh_revoke_target(kind, scopes)`.\n\nAdded in `AUTHZ-CRED-CORE-3`. Defaults to `None` via\n`#[serde(default)]` so pre-IR schemas deserialize cleanly. The\n`skip_serializing_if = \"Option::is_none\"` clause keeps the wire JSON\nshape unchanged for public methods and methods with no scope-derived\nrequirement."
-                },
-                "response_type": {
-                  "description": "JSON Schema for the response type sent from client to server\n\nOnly relevant when `bidirectional: true`. Describes the structure of\nresponses the client should send in reply to server requests.",
-                  "type": [
-                    "null",
-                    "boolean",
-                    "number",
-                    "string",
-                    "array",
-                    "object"
-                  ]
                 },
                 "returns": {
                   "description": "JSON Schema for the method's item type `T` — what one success carries.\n\nAlways present: every method has a return type. For a `Result<T, E>`\nor `Progress<T, P>` item it is `T` alone — `E` and `P` have fields of\ntheir own. [`MethodSchema::new`] starts it at the empty schema `{}`\n(any value) until [`MethodSchema::with_returns`] sets it.",
@@ -8707,7 +8551,7 @@
       }
     ],
     "namespace": "beta",
-    "self_hash": "323e3429e143585b",
+    "self_hash": "2e2c9583437a6f1d",
     "version": "1.0.0"
   }
 }

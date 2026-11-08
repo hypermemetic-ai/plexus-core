@@ -211,10 +211,7 @@ fn every_frame_is_a_plexus_stream_item() {
             let v = value(&line);
             let item: PlexusStreamItem = exact(&v, &what);
             let _: StreamItem = exact(&v, &what);
-            let metadata = match &item {
-                PlexusStreamItem::Request { .. } => panic!("{what}: the fixture sends no requests"),
-                other => other.metadata().expect("every other item carries metadata"),
-            };
+            let metadata = item.metadata().expect("every item carries metadata");
             assert_eq!(
                 metadata.provenance,
                 vec![NS.to_string()],

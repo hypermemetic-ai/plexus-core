@@ -234,7 +234,7 @@ impl Interface {
     }
 
     /// A method's own hash: of its shape — its name, params, item, error,
-    /// progress, cardinality, input and role — not its description, grant
+    /// progress, cardinality, whether it asks (ASK-2), input and role — not its description, grant
     /// or hash, which say nothing of what crosses the wire.
     pub fn method_hash(m: &MethodSchema) -> String {
         let shape = serde_json::json!({
@@ -244,9 +244,7 @@ impl Interface {
             "error": m.error,
             "progress": m.progress,
             "cardinality": m.cardinality,
-            "bidirectional": m.bidirectional,
-            "request_type": m.request_type,
-            "response_type": m.response_type,
+            "asks": m.asks,
             "input": m.input,
             "role": m.role,
         });

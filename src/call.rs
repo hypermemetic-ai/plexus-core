@@ -84,6 +84,9 @@ struct Inner {
     /// by a context narrowed from this one (`with_reach`: the same call);
     /// another caller's context (`with_auth`, `ungated`) starts its own.
     verified: Verified,
+    /// ASK-2: the key the service seals proposals with
+    /// ([`crate::plexus::ask`]); none: the process's.
+    confirm_key: Option<Arc<crate::plexus::ask::ConfirmKey>>,
 }
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
@@ -94,7 +97,7 @@ impl Inner {
         if let Some(r) = reach {
             let _ = cell.set(r);
         }
-        Inner { auth, reach: cell, deferred, hop, verified: Verified::default() }
+        Inner { auth, reach: cell, deferred, hop, verified: Verified::default(), confirm_key: None }
     }
 }
 
@@ -163,13 +166,37 @@ impl CallContext {
         } else {
             (Reach::nowhere(), None)
         };
-        Self(Arc::new(Inner::with(auth, Some(reach), None, hop)))
+        let mut inner = Inner::with(auth, Some(reach), None, hop);
+        inner.confirm_key = self.0.confirm_key.clone();
+        Self(Arc::new(inner))
     }
 
     /// This context with its identity replaced: a call routed from inside
     /// another, through a service with no gate of its own.
     pub(crate) fn with_auth(&self, auth: Option<&AuthContext>) -> Self {
-        Self(Arc::new(Inner::with(auth.cloned(), self.0.reach.get().cloned(), self.0.deferred.clone(), self.0.hop.clone())))
+        let mut inner = Inner::with(auth.cloned(), self.0.reach.get().cloned(), self.0.deferred.clone(), self.0.hop.clone());
+        inner.confirm_key = self.0.confirm_key.clone();
+        Self(Arc::new(inner))
+    }
+
+    /// ASK-2: this context sealing proposals with `key` — the service's
+    /// own, set by its dispatch; none keeps the context's (an outer
+    /// service's, else the process's).
+    pub(crate) fn with_confirm_key(self, key: Option<Arc<crate::plexus::ask::ConfirmKey>>) -> Self {
+        if key.is_none() {
+            return self;
+        }
+        let i = &self.0;
+        let mut inner = Inner::with(i.auth.clone(), i.reach.get().cloned(), i.deferred.clone(), i.hop.clone());
+        inner.verified = Arc::clone(&i.verified);
+        inner.confirm_key = key;
+        Self(Arc::new(inner))
+    }
+
+    /// ASK-2: the key the call's service seals proposals with, when it was
+    /// given one.
+    pub fn confirm_key(&self) -> Option<&Arc<crate::plexus::ask::ConfirmKey>> {
+        self.0.confirm_key.as_ref()
     }
 
     /// This context with its reach replaced: the same call, so the same
@@ -177,6 +204,7 @@ impl CallContext {
     pub(crate) fn with_reach(&self, reach: Reach) -> Self {
         let mut inner = Inner::with(self.0.auth.clone(), Some(reach), None, self.0.hop.clone());
         inner.verified = Arc::clone(&self.0.verified);
+        inner.confirm_key = self.0.confirm_key.clone();
         Self(Arc::new(inner))
     }
 

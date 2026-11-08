@@ -131,15 +131,6 @@ pub(crate) fn to_client_item(item: PlexusStreamItem) -> StreamItem {
             error,
             fields,
         },
-        PlexusStreamItem::Request {
-            request_id,
-            request_data,
-            timeout_ms,
-        } => StreamItem::Request {
-            request_id,
-            request_data,
-            timeout_ms,
-        },
         PlexusStreamItem::Done { metadata } => StreamItem::Done {
             metadata: meta(metadata),
         },

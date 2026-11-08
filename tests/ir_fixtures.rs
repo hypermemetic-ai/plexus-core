@@ -109,3 +109,24 @@ fn canonical_is_synapses_form() {
         "{\n  \"a\": \"x\\u0001\\n\\\"\",\n  \"b\": [\n    1,\n    {\n      \"c\": {},\n      \"d\": []\n    }\n  ],\n  \"k\": 1.8446744073709551615e19,\n  \"m\": 1.5,\n  \"n\": 5.0e-2,\n  \"z\": 1000.0\n}\n"
     );
 }
+
+/// ASK-2: IR 3.1 says `mdAsks` for every method; an older schema's
+/// `bidirectional` (the in-call question, gone) reads as a method that does
+/// not ask, and its request and response types are not carried.
+#[test]
+fn an_older_bidirectional_reads_as_not_asking() {
+    let mut schema = json("conformance/expected/schema.json");
+    for m in schema["methods"].as_array_mut().unwrap() {
+        m["bidirectional"] = serde_json::json!(true);
+        m["response_type"] = serde_json::json!({"type": "string"});
+    }
+    schema["methods"][0]["asks"] = serde_json::json!(true);
+    let built = ir::build_one("conformance", &["conformance".to_string()], &schema).expect("the fixture's IR");
+    let v = built.to_json();
+    assert_eq!(v["irVersion"], "3.1");
+    for (path, m) in v["irMethods"].as_object().unwrap() {
+        let asks = path == "conformance.ping";
+        assert_eq!(m["mdAsks"], serde_json::json!(asks), "{path}: {m}");
+        assert!(m.get("mdBidirType").is_none() && m.get("mdBidirResponseSchema").is_none(), "{path}: {m}");
+    }
+}

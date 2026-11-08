@@ -34,8 +34,9 @@ pub(crate) struct MethodIn<'a> {
     pub(crate) progress: Option<&'a Value>,
     pub(crate) input: Option<&'a Value>,
     pub(crate) cardinality: Cardinality,
-    pub(crate) bidirectional: bool,
-    pub(crate) response_type: Option<&'a Value>,
+    /// ASK-2: `asks` (absent: false). An older schema's `bidirectional`
+    /// is not read — such a method does not ask.
+    pub(crate) asks: bool,
     pub(crate) param_schemas: Option<Vec<ParamIn>>,
     pub(crate) role: MethodRole,
     pub(crate) long_description: Option<String>,
@@ -167,8 +168,7 @@ fn method(v: &Value) -> Result<MethodIn<'_>, String> {
         progress: opt(o, "progress"),
         input: opt(o, "input"),
         cardinality,
-        bidirectional: opt_bool(o, "bidirectional")?,
-        response_type: opt(o, "response_type"),
+        asks: opt_bool(o, "asks")?,
         param_schemas,
         role: role(opt(o, "role"))?,
         long_description: opt_str(o, "long_description")?,

@@ -14,8 +14,6 @@ fn full() -> MethodSchema {
         .with_returns(schema_for!(u64))
         .with_cardinality(Cardinality::Many)
         .with_http_method(HttpMethod::Get)
-        .with_request_type(schema_for!(bool))
-        .with_response_type(schema_for!(i32))
         .with_role(MethodRole::Rpc)
         .with_grant("tickets.set_status")
         .with_target("id")
@@ -24,13 +22,18 @@ fn full() -> MethodSchema {
         .with_example(MethodExample::with_note(serde_json::json!({"id": "A-1"}), "note"))
 }
 
-/// 0.6.1's bytes as 0.8 writes the same schema: RETURNS-5's two changes and
-/// nothing else — `streaming: b` is `cardinality` (`many` / `one`), and
-/// `returns` is always present (`{}`, the empty schema, when none is set).
+/// 0.6.1's bytes as 0.10 writes the same schema: RETURNS-5's two changes and
+/// ASK-2's, nothing else — `streaming: b` is `cardinality` (`many` / `one`),
+/// `returns` is always present (`{}`, the empty schema, when none is set),
+/// and the in-call question's `bidirectional`, `request_type` and
+/// `response_type` are gone (`asks` is absent while false).
 fn fixture_as_0_8() -> serde_json::Value {
     let mut v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
     for m in v.as_object_mut().unwrap().values_mut() {
         let m = m.as_object_mut().unwrap();
+        for gone in ["bidirectional", "request_type", "response_type"] {
+            m.remove(gone);
+        }
         let many = m.remove("streaming").and_then(|s| s.as_bool()).unwrap_or(false);
         m.insert("cardinality".into(), serde_json::json!(if many { "many" } else { "one" }));
         m.entry("returns").or_insert(serde_json::json!({}));
@@ -57,4 +60,21 @@ fn with_input_it_round_trips() {
     let back: MethodSchema = serde_json::from_str(&text).unwrap();
     assert_eq!(serde_json::to_value(&back).unwrap(), serde_json::to_value(&m).unwrap());
     assert_eq!(back.input, Some(schema_for!(String)));
+}
+
+/// ASK-2: an older schema's `bidirectional` (and its request and response
+/// types) read as a method that does not ask.
+#[test]
+fn an_older_bidirectional_reads_as_not_asking() {
+    let mut old: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    old["full"]["bidirectional"] = serde_json::json!(true);
+    old["full"]["cardinality"] = serde_json::json!("many");
+    let m: MethodSchema = serde_json::from_value(old["full"].clone()).unwrap();
+    assert!(!m.asks);
+    let text = serde_json::to_string(&m).unwrap();
+    assert!(!text.contains("bidirectional") && !text.contains("request_type") && !text.contains("\"asks\""), "{text}");
+    let asking = MethodSchema::new("archive", "d", "h").with_asks(true);
+    let v = serde_json::to_value(&asking).unwrap();
+    assert_eq!(v["asks"], true);
+    assert!(serde_json::from_value::<MethodSchema>(v).unwrap().asks);
 }

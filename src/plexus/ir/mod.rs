@@ -1,6 +1,6 @@
 //! RETURNS-40 — **the service writes its IR.** A service answers its
 //! self-description as one document: every type once (`irTypes`), each
-//! method referring to them (`irMethods`) — IR 3.0 exactly as synapse
+//! method referring to them (`irMethods`) — IR 3.1 (ASK-2; 3.0 with `mdAsks`) as synapse
 //! defines it (`Synapse.IR.Types`, `Read`, `Builder`) and builds it from the
 //! raw schemas today, so the two are held equal: `tests/ir_fixtures.rs`
 //! compares this module's output with the goldens synapse's `ir3-test`

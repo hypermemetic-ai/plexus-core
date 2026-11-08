@@ -1217,6 +1217,9 @@ struct DynamicHubInner {
     /// before routing (default deny). `None` (the default): dispatch exactly
     /// as before it existed. See [`super::grant_gate`].
     gate: Option<Arc<plexus_auth_core::grants::Gate>>,
+    /// ASK-2: the key this service seals proposals with
+    /// ([`super::ask`]); none: the process's, random.
+    confirm_key: Option<Arc<super::ask::ConfirmKey>>,
     /// AUTH-4/AUTH-5: grants every signed-in caller reaches whatever its
     /// roles or ceiling (the auth activation's `whoami`, `logout`,
     /// `requires`). Empty unless [`DynamicHub::with_auth`] mounted it.
@@ -1381,6 +1384,7 @@ impl DynamicHub {
                 gate_index: std::sync::OnceLock::new(),
                 input_index: std::sync::OnceLock::new(),
                 gate: None,
+                confirm_key: None,
                 signed_in_grants: std::collections::BTreeSet::new(),
                 resource_metadata: None,
                 auth_catalog: None,
@@ -1493,6 +1497,15 @@ impl DynamicHub {
     pub fn with_gate(mut self, gate: Arc<plexus_auth_core::grants::Gate>) -> Self {
         let inner = self.inner_mut("Cannot set gate: DynamicHub has multiple references");
         inner.gate = Some(gate);
+        self
+    }
+
+    /// ASK-2: seal this service's proposals (`needs_input` tokens) with
+    /// `key` rather than the process's random one — so a token one replica
+    /// sealed is confirmed by another, or survives a restart.
+    pub fn with_confirm_key(mut self, key: super::ask::ConfirmKey) -> Self {
+        let inner = self.inner_mut("Cannot set confirm_key: DynamicHub has multiple references");
+        inner.confirm_key = Some(Arc::new(key));
         self
     }
 
@@ -2468,7 +2481,7 @@ impl DynamicHub {
                 // path, as the gate gives a public method's — never none.
                 super::grant_gate::Admit::Open => {
                     let grant = plexus_auth_core::grants::Grant::new(method.to_string());
-                    in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
+                    in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant).with_confirm_key(self.inner.confirm_key.clone()), async {
                         match self.introspect_in_view(method, &params, auth, raw_ctx).await {
                             Some(answer) => answer,
                             None => self.route_ungated(method, params, auth, raw_ctx).await,
@@ -2477,7 +2490,7 @@ impl DynamicHub {
                     .await
                 }
                 super::grant_gate::Admit::Reach(reach) => {
-                    in_call(crate::call::CallContext::admitted(auth, reach), self.route_ungated(method, params, auth, raw_ctx)).await
+                    in_call(crate::call::CallContext::admitted(auth, reach).with_confirm_key(self.inner.confirm_key.clone()), self.route_ungated(method, params, auth, raw_ctx)).await
                 }
             };
         }
@@ -2491,7 +2504,7 @@ impl DynamicHub {
             Ok(outer) => outer.with_auth(auth),
             Err(_) => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
         };
-        in_call(ctx, self.route_ungated(method, params, auth, raw_ctx)).await
+        in_call(ctx.with_confirm_key(self.inner.confirm_key.clone()), self.route_ungated(method, params, auth, raw_ctx)).await
     }
 
     /// Everything [`DynamicHub::route_with_ctx`] does after the grant gate.
@@ -2975,63 +2988,6 @@ impl DynamicHub {
             }
         )?;
 
-        // Register {ns}.respond method for WebSocket bidirectional responses
-        // This allows clients to respond to server-initiated requests (like confirmations/prompts)
-        let respond_method: &'static str = Box::leak(format!("{}.respond", ns).into_boxed_str());
-        // BIDIR-13: only the connection that was asked answers — the pipe
-        // bound each pending question to it as its `Request` item went out;
-        // another connection's answer is `not_this_call` and the question
-        // stays. BIDIR-9 retires this method for answers on the call itself.
-        module.register_async_method(respond_method, |params, _ctx, ext| async move {
-            use super::bidirectional::{answer_pending, BidirError};
-
-            let p: RespondParams = params.parse()?;
-            let from = ext.get::<jsonrpsee::ConnectionId>().map(|c| c.0);
-
-            tracing::debug!(
-                request_id = %p.request_id,
-                connection = ?from,
-                "Handling {}.respond via WebSocket",
-                "plexus"
-            );
-
-            match answer_pending(&p.request_id, from, p.response_data) {
-                Ok(()) => Ok(serde_json::json!({"success": true})),
-                Err(BidirError::NotThisCall) => {
-                    tracing::warn!(request_id = %p.request_id, connection = ?from, "respond from a connection that was not asked");
-                    Err(jsonrpsee::types::ErrorObject::owned(
-                        -32003,
-                        format!("not_this_call: request {} was asked on another connection", p.request_id),
-                        Some(serde_json::json!({"error_kind": "not_this_call", "request_id": p.request_id})),
-                    ))
-                }
-                Err(BidirError::UnknownRequest) => {
-                    tracing::warn!(request_id = %p.request_id, "Unknown request ID in respond");
-                    Err(jsonrpsee::types::ErrorObject::owned(
-                        -32602,
-                        format!("Unknown request ID: {}. The request may have timed out or been cancelled.", p.request_id),
-                        None::<()>,
-                    ))
-                }
-                Err(BidirError::ChannelClosed) => {
-                    tracing::warn!(request_id = %p.request_id, "Channel closed in respond");
-                    Err(jsonrpsee::types::ErrorObject::owned(
-                        -32000,
-                        "Response channel was closed (request may have timed out)",
-                        None::<()>,
-                    ))
-                }
-                Err(e) => {
-                    tracing::error!(request_id = %p.request_id, error = ?e, "Error in respond");
-                    Err(jsonrpsee::types::ErrorObject::owned(
-                        -32000,
-                        format!("Failed to deliver response: {}", e),
-                        None::<()>,
-                    ))
-                }
-            }
-        })?;
-
         // Register pending RPC methods from activations
         // AUTH-2: not under a grant gate — see `into_rpc_module`.
         let mut pending = std::mem::take(&mut *hub.inner.pending_rpc.lock().unwrap());
@@ -3231,13 +3187,6 @@ pub(crate) struct InputTerms {
 /// Params for {ns}.schema (SYNAPSE-CC-9: the published type)
 use super::schema::SchemaParams;
 
-/// Params for {ns}.respond (WebSocket bidirectional response)
-#[derive(Debug, serde::Deserialize)]
-struct RespondParams {
-    request_id: String,
-    response_data: Value,
-}
-
 /// `{ns}.call`: route the call, then pipe what it answers.
 ///
 /// The call's future is boxed here, and is its one allocation of that size,
@@ -3394,12 +3343,8 @@ fn register_input_methods(module: &mut RpcModule<()>, ns: &'static str) -> Resul
 /// Notifications are sent with the `notif_method_name` each
 /// `register_subscription` call set.
 ///
-/// BIDIR-13: a `Request` item (an in-call question) is bound to this
-/// subscription's connection before it is sent, so `{ns}.respond` takes its
-/// answer from that connection alone; and the pipe watches the sink's close
-/// (an unsubscribe, a lost socket), dropping the stream at once — a call
-/// waiting on a question is dropped with its pending entry, not left until
-/// the question's timeout.
+/// The pipe watches the sink's close (an unsubscribe, a lost socket),
+/// dropping the stream at once.
 async fn pipe_stream_to_subscription(
     pending: jsonrpsee::PendingSubscriptionSink,
     stream: PlexusStream,

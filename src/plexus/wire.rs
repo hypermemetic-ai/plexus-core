@@ -761,8 +761,7 @@ impl Frames {
 /// With a [`FrameSink`] in the call's extensions (plexus-transport's socket
 /// loop) each frame goes to the socket's writer as it is, the first fenced
 /// behind the subscription's answer; without one, each item goes to
-/// jsonrpsee's sink as one raw value. A `Request` item (an in-call
-/// question) is bound to this connection first (BIDIR-13). The pipe ends
+/// jsonrpsee's sink as one raw value. The pipe ends
 /// when the stream does, or when the caller lets go (an unsubscribe, a lost
 /// socket), dropping the stream at once.
 pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::PlexusStream, ext: &http::Extensions) -> jsonrpsee::core::SubscriptionResult {
@@ -779,7 +778,6 @@ pub async fn pipe(sink: jsonrpsee::SubscriptionSink, stream: super::streaming::P
 
 async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::PlexusStream, frames: Option<FrameSink>) -> jsonrpsee::core::SubscriptionResult {
     use futures::StreamExt;
-    let connection = sink.connection_id().0;
     let mut notification = match &frames {
         Some(_) => Frames::new(sink.method_name(), &sink.subscription_id()),
         None => Frames::default(),
@@ -795,9 +793,6 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
                 item = stream.next() => item,
             };
             let Some(item) = item else { return Ok(()) };
-            if let PlexusStreamItem::Request { request_id, .. } = &item {
-                super::bidirectional::bind_asker(request_id, connection);
-            }
             match &frames {
                 Some(to) => {
                     // PERF-8: what else the stream has ready now goes with it,
@@ -806,14 +801,14 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
                     let mut ended = false;
                     let mut held = if to.batch > 1 { size(&item) } else { BATCH_BYTES };
                     let more = held < BATCH_BYTES;
-                    let bytes = match more.then(|| ready_now(&mut stream, &mut ended, connection)).flatten() {
+                    let bytes = match more.then(|| ready_now(&mut stream, &mut ended)).flatten() {
                         None => WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item)),
                         Some(next) => {
                             held += size(&next);
                             ready.push(item);
                             ready.push(next);
                             while ready.len() < to.batch && held < BATCH_BYTES && !ended {
-                                match ready_now(&mut stream, &mut ended, connection) {
+                                match ready_now(&mut stream, &mut ended) {
                                     Some(more) => {
                                         held += size(&more);
                                         ready.push(more);
@@ -874,15 +869,10 @@ fn same_metadata(a: &Arc<StreamMetadata>, b: &Arc<StreamMetadata>) -> bool {
 
 /// The stream's next item if it is ready now: no waiting, so a batch never
 /// holds an item back for one that has not come. `ended` once the stream is.
-fn ready_now(stream: &mut super::streaming::PlexusStream, ended: &mut bool, connection: usize) -> Option<PlexusStreamItem> {
+fn ready_now(stream: &mut super::streaming::PlexusStream, ended: &mut bool) -> Option<PlexusStreamItem> {
     use futures::StreamExt;
     match futures::FutureExt::now_or_never(stream.next()) {
-        Some(Some(item)) => {
-            if let PlexusStreamItem::Request { request_id, .. } = &item {
-                super::bidirectional::bind_asker(request_id, connection);
-            }
-            Some(item)
-        }
+        Some(Some(item)) => Some(item),
         Some(None) => {
             *ended = true;
             None
@@ -961,7 +951,6 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
     let mut inbox = Some(inbox);
     let mut slot = Some(slot);
     let mut notification = Frames::new(sink.method_name(), &sink.subscription_id());
-    let connection = sink.connection_id().0;
     let mut acked = 0u64;
     let out: Result<(), ()> = async {
         // Fenced behind the subscription's answer (the client holds nothing
@@ -1025,9 +1014,6 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
             let Some(item) = item else { continue };
             let Some(item) = item else { return Ok(()) };
             match &item {
-                PlexusStreamItem::Request { request_id, .. } => {
-                    super::bidirectional::bind_asker(request_id, connection);
-                }
                 // After `done` there is no channel to tell anything on.
                 PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. } => {
                     inbox = None;

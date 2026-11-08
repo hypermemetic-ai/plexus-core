@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use super::build::{build, IrBuildError};
 
-/// A service's IR, as `<service>.ir` answers it: IR 3.0 — the document
+/// A service's IR, as `<service>.ir` answers it: IR 3.1 — the document
 /// synapse's `buildIRFromSchemas` builds from the same schemas (its
 /// `irBackend` the service's namespace, its `irMetadata` `null`). Kept as
 /// its JSON, written once.
@@ -50,7 +50,7 @@ impl JsonSchema for ServiceIr {
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "The service's IR 3.0: every type once (irTypes), each method referring to them (irMethods) — as synapse's buildIRFromSchemas builds it from the same schemas"
+            "description": "The service's IR 3.1: every type once (irTypes), each method referring to them (irMethods) — as synapse's buildIRFromSchemas builds it from the same schemas"
         })
     }
 }

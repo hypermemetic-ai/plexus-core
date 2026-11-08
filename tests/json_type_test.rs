@@ -157,7 +157,8 @@ fn the_stream_items_carriers_are_the_json_type() {
     let v = serde_json::to_value(&m.returns).unwrap();
     let variant = |tag: &str| v["oneOf"].as_array().unwrap().iter().find(|x| x["properties"]["type"]["const"] == json!(tag)).cloned().unwrap();
     assert_eq!(variant("data")["properties"]["content"]["type"], json!(JSON_TYPES));
-    assert_eq!(variant("request")["properties"]["requestData"]["type"], json!(JSON_TYPES));
+    // ASK-2: the in-call question's `request` item is gone.
+    assert!(v["oneOf"].as_array().unwrap().iter().all(|x| x["properties"]["type"]["const"] != json!("request")), "{v}");
     assert!(!v.to_string().contains("x-plexus-opaque"));
 }
 
@@ -166,8 +167,7 @@ fn schema_results_json_schema_fields_are_the_json_type() {
     let m = MethodSchema::new("schema", "d", "h").with_returns(schema_for!(SchemaResult));
     let v = serde_json::to_value(&m.returns).unwrap();
     for (ty, field) in [
-        ("MethodSchema", "params"), ("MethodSchema", "returns"), ("MethodSchema", "request_type"),
-        ("MethodSchema", "response_type"), ("MethodSchema", "input"), ("MethodSchema", "answer_by"),
+        ("MethodSchema", "params"), ("MethodSchema", "returns"), ("MethodSchema", "input"), ("MethodSchema", "answer_by"),
         ("MethodExample", "params"), ("PluginSchema", "request"),
     ] {
         let prop = &v["$defs"][ty]["properties"][field];

@@ -7,8 +7,6 @@ pub mod auth_activation;
 pub mod auth_params;
 /// AUTH-5: a reference in-memory backend and stores for the `auth` activation.
 pub mod auth_memory;
-/// ASK-2: a method that proposes — `needs_input`, `ConfirmToken`, the seal.
-pub mod ask;
 pub mod test_validator;
 /// MACRO-20: a hub sees through its activations' static children.
 pub mod children;
@@ -63,7 +61,6 @@ pub mod wire;
 // plexus::auth. New code should import directly from plexus_auth_core.
 pub use auth::{AuthContext, Principal, ServiceIdentity, SessionValidator, VerifiedUser, Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly, MethodPath, MethodPathError, PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME};
 pub use test_validator::TestSessionValidator;
-pub use ask::{ConfirmKey, ConfirmToken, Field, NeedsInput, Proposal, Stale};
 pub use context::PlexusContext;
 pub use in_process::InProcessTransport;
 pub use input::{Delivered, Input, InputTable};

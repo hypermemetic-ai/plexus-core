@@ -360,7 +360,6 @@ fn method_def(r: &mut Reader, shared: &Doc<'_>, namespace: &str, m: &MethodIn<'_
         error: error_ref,
         progress: progress_ref,
         cardinality: m.cardinality,
-        asks: m.asks,
         role: m.role.clone(),
         grant: m.grant.clone(),
         target: m.target.clone(),

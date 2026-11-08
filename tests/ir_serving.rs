@@ -428,7 +428,7 @@ async fn eq_the_hard_shapes_are_synapses() {
         ("ir.beta-inner.json", json!({"namespaces": ["beta", "alpha.inner"]})),
     ] {
         let served = ir_of(&service, params, None).await.expect("the IR");
-        // ASK-2: the IR too (plexus-core's is held equal to synapse's:
+        // The IR too (plexus-core's is held equal to synapse's:
         // regenerate synapse's goldens from the same schemas).
         if accept {
             std::fs::write(hard(file), ir::canonical(&served)).unwrap();

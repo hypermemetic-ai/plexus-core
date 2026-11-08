@@ -1217,9 +1217,6 @@ struct DynamicHubInner {
     /// before routing (default deny). `None` (the default): dispatch exactly
     /// as before it existed. See [`super::grant_gate`].
     gate: Option<Arc<plexus_auth_core::grants::Gate>>,
-    /// ASK-2: the key this service seals proposals with
-    /// ([`super::ask`]); none: the process's, random.
-    confirm_key: Option<Arc<super::ask::ConfirmKey>>,
     /// AUTH-4/AUTH-5: grants every signed-in caller reaches whatever its
     /// roles or ceiling (the auth activation's `whoami`, `logout`,
     /// `requires`). Empty unless [`DynamicHub::with_auth`] mounted it.
@@ -1384,7 +1381,6 @@ impl DynamicHub {
                 gate_index: std::sync::OnceLock::new(),
                 input_index: std::sync::OnceLock::new(),
                 gate: None,
-                confirm_key: None,
                 signed_in_grants: std::collections::BTreeSet::new(),
                 resource_metadata: None,
                 auth_catalog: None,
@@ -1497,15 +1493,6 @@ impl DynamicHub {
     pub fn with_gate(mut self, gate: Arc<plexus_auth_core::grants::Gate>) -> Self {
         let inner = self.inner_mut("Cannot set gate: DynamicHub has multiple references");
         inner.gate = Some(gate);
-        self
-    }
-
-    /// ASK-2: seal this service's proposals (`needs_input` tokens) with
-    /// `key` rather than the process's random one — so a token one replica
-    /// sealed is confirmed by another, or survives a restart.
-    pub fn with_confirm_key(mut self, key: super::ask::ConfirmKey) -> Self {
-        let inner = self.inner_mut("Cannot set confirm_key: DynamicHub has multiple references");
-        inner.confirm_key = Some(Arc::new(key));
         self
     }
 
@@ -2481,7 +2468,7 @@ impl DynamicHub {
                 // path, as the gate gives a public method's — never none.
                 super::grant_gate::Admit::Open => {
                     let grant = plexus_auth_core::grants::Grant::new(method.to_string());
-                    in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant).with_confirm_key(self.inner.confirm_key.clone()), async {
+                    in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
                         match self.introspect_in_view(method, &params, auth, raw_ctx).await {
                             Some(answer) => answer,
                             None => self.route_ungated(method, params, auth, raw_ctx).await,
@@ -2490,7 +2477,7 @@ impl DynamicHub {
                     .await
                 }
                 super::grant_gate::Admit::Reach(reach) => {
-                    in_call(crate::call::CallContext::admitted(auth, reach).with_confirm_key(self.inner.confirm_key.clone()), self.route_ungated(method, params, auth, raw_ctx)).await
+                    in_call(crate::call::CallContext::admitted(auth, reach), self.route_ungated(method, params, auth, raw_ctx)).await
                 }
             };
         }
@@ -2504,7 +2491,7 @@ impl DynamicHub {
             Ok(outer) => outer.with_auth(auth),
             Err(_) => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
         };
-        in_call(ctx.with_confirm_key(self.inner.confirm_key.clone()), self.route_ungated(method, params, auth, raw_ctx)).await
+        in_call(ctx, self.route_ungated(method, params, auth, raw_ctx)).await
     }
 
     /// Everything [`DynamicHub::route_with_ctx`] does after the grant gate.

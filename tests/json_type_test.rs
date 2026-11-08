@@ -157,7 +157,7 @@ fn the_stream_items_carriers_are_the_json_type() {
     let v = serde_json::to_value(&m.returns).unwrap();
     let variant = |tag: &str| v["oneOf"].as_array().unwrap().iter().find(|x| x["properties"]["type"]["const"] == json!(tag)).cloned().unwrap();
     assert_eq!(variant("data")["properties"]["content"]["type"], json!(JSON_TYPES));
-    // ASK-2: the in-call question's `request` item is gone.
+    // ASK-1: the in-call question's `request` item is gone.
     assert!(v["oneOf"].as_array().unwrap().iter().all(|x| x["properties"]["type"]["const"] != json!("request")), "{v}");
     assert!(!v.to_string().contains("x-plexus-opaque"));
 }

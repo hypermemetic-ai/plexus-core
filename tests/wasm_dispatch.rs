@@ -1,11 +1,9 @@
 //! PLEXUS-45 — plexus-core runs on `wasm32-unknown-unknown`, not only
 //! compiles: a `DynamicHub` with activations, dispatched in wasm.
 //!
-//! A plain call, a streaming call whose items are spaced by a timer, a
-//! proposal and its answer (ASK-2: the process's key from the JS runtime's
-//! randomness, the expiry from its clock), the health activation (its
-//! `Instant`) and the schema read, all on the JS event loop with no tokio
-//! runtime.
+//! A plain call, a streaming call whose items are spaced by a timer, the
+//! health activation (its `Instant`) and the schema read, all on the JS
+//! event loop with no tokio runtime.
 //!
 //! Run under Node (no browser needed: everything here is JS's timers and
 //! clock, which Node has, and Node is what plexus-client's wasm tests use):
@@ -18,7 +16,6 @@ use std::time::Duration;
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
-use plexus_core::plexus::ask::{self, ConfirmToken, NeedsInput, Proposal};
 use plexus_core::plexus::{DynamicHub, PlexusStreamItem};
 use plexus_core::activations::health::Health;
 use serde::{Deserialize, Serialize};
@@ -30,8 +27,6 @@ use wasm_bindgen_test::wasm_bindgen_test;
 pub enum ClockEvent {
     Pong { msg: String },
     Tick { i: u64, after_ms: u64 },
-    NeedsInput(NeedsInput),
-    Answer { answer: String },
     Error { message: String },
 }
 
@@ -60,18 +55,6 @@ impl Clock {
             for i in 0..n {
                 futures_timer::Delay::new(Duration::from_millis(gap_ms)).await;
                 yield ClockEvent::Tick { i, after_ms: start.elapsed().as_millis() as u64 };
-            }
-        }
-    }
-
-    /// Proposes; called again with the token, answers.
-    #[plexus_macros::method(asks)]
-    pub async fn ask(&self, what: String, confirm: Option<ConfirmToken>) -> impl Stream<Item = ClockEvent> + Send + 'static {
-        let plan = json!({ "what": what });
-        stream! {
-            match ask::check(confirm.as_ref(), &plan) {
-                Ok(()) => yield ClockEvent::Answer { answer: format!("confirmed {what}") },
-                Err(_) => yield ClockEvent::NeedsInput(ask::propose(&plan, Proposal::new(format!("do {what}")))),
             }
         }
     }
@@ -108,19 +91,6 @@ async fn a_streaming_call_on_the_event_loop() {
         assert_eq!(t["i"], i as u64);
     }
     assert!(ticks[2]["after_ms"].as_u64().unwrap() >= 55, "timers really waited: {ticks:?}");
-}
-
-#[wasm_bindgen_test]
-async fn a_proposal_and_its_answer() {
-    let hub = hub();
-    let items = call(&hub, "clock.ask", json!({"what": "it"})).await;
-    let d = data(&items);
-    assert_eq!(d.len(), 1, "{items:?}");
-    assert_eq!(d[0]["type"], "needs_input", "{d:?}");
-    assert!(d[0]["token"].as_str().unwrap().starts_with("v1."), "{d:?}");
-    assert!(d[0]["expires"].as_str().unwrap().starts_with("20"), "the JS clock: {d:?}");
-    let items = call(&hub, "clock.ask", json!({"what": "it", "confirm": d[0]["token"]})).await;
-    assert_eq!(data(&items), vec![json!({"type": "answer", "answer": "confirmed it"})], "{items:?}");
 }
 
 #[wasm_bindgen_test]

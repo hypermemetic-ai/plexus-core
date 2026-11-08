@@ -19,10 +19,6 @@
 mod echo;
 #[path = "../../plexus-wire/reference/echo-rs/src/service.rs"]
 mod service;
-// ASK-2: the proposal's reference (spec/08), mounted beside the echo so the
-// kit's `ask.*` tests run against plexus-core.
-#[path = "../../plexus-wire/reference/echo-rs/src/ledger.rs"]
-mod ledger;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -104,8 +100,7 @@ async fn kit_against(port: u16, serving: tokio::task::JoinHandle<anyhow::Result<
 async fn kit_green_on_service() {
     let (dir, admin, viewer) = keygen();
     let port = free_port();
-    let plain = DynamicHub::new(service::NS).register(echo::EchoActivation).register(ledger::LedgerActivation::default());
-    let serving = tokio::spawn(service::serve_over(plain, serve_opts(port, &admin, &viewer)));
+    let serving = tokio::spawn(service::serve(serve_opts(port, &admin, &viewer)));
     let (ok, out) = kit_against(port, serving, dir.path(), "plexus-core.txt").await;
     println!("{out}");
     assert!(ok, "the conformance kit is not green on plexus-core's DynamicHub:\n{out}");

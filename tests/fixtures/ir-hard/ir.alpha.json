@@ -4,7 +4,6 @@
   "irMetadata": null,
   "irMethods": {
     "alpha.dotted": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "dotted",
       "mdError": {
@@ -48,7 +47,6 @@
       }
     },
     "alpha.enums": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "enums",
       "mdError": {
@@ -118,7 +116,6 @@
       }
     },
     "alpha.inner": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "child",
       "mdError": null,
@@ -136,7 +133,6 @@
       }
     },
     "alpha.inner.leaves": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "leaf page in inner",
       "mdError": {
@@ -164,7 +160,6 @@
       }
     },
     "alpha.inner.note": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note b in inner",
       "mdError": {
@@ -192,7 +187,6 @@
       }
     },
     "alpha.inner.schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -233,7 +227,6 @@
       }
     },
     "alpha.inner.tree": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "tree in inner",
       "mdError": {
@@ -261,7 +254,6 @@
       }
     },
     "alpha.leaves": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "generic page of leaves",
       "mdError": {
@@ -308,7 +300,6 @@
       }
     },
     "alpha.nest": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "nest",
       "mdError": {
@@ -336,7 +327,6 @@
       }
     },
     "alpha.note": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note a",
       "mdError": {
@@ -364,7 +354,6 @@
       }
     },
     "alpha.nums": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "nums",
       "mdError": {
@@ -426,7 +415,6 @@
       }
     },
     "alpha.ping": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "mutual",
       "mdError": {
@@ -454,7 +442,6 @@
       }
     },
     "alpha.schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -495,7 +482,6 @@
       }
     },
     "alpha.shout": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "shout",
       "mdError": {
@@ -587,7 +573,6 @@
       }
     },
     "alpha.stream_trees": {
-      "mdAsks": false,
       "mdCardinality": "many",
       "mdDescription": "stream of trees",
       "mdError": null,
@@ -611,14 +596,14 @@
   },
   "irPluginHashes": {
     "alpha": {
-      "phiChildrenHash": "a87c4d187042b31c",
-      "phiHash": "a87c4d187042b31c",
-      "phiSelfHash": "a87c4d187042b31c"
+      "phiChildrenHash": "d0de5d77f5024e94",
+      "phiHash": "d0de5d77f5024e94",
+      "phiSelfHash": "d0de5d77f5024e94"
     },
     "alpha.inner": {
-      "phiChildrenHash": "778a16d3c17c5f85",
-      "phiHash": "778a16d3c17c5f85",
-      "phiSelfHash": "778a16d3c17c5f85"
+      "phiChildrenHash": "ac822f6aa29450a1",
+      "phiHash": "ac822f6aa29450a1",
+      "phiSelfHash": "ac822f6aa29450a1"
     }
   },
   "irPluginRequests": null,
@@ -1642,19 +1627,6 @@
                 "tag": "RefPrimitive"
               },
               "tag": "RefOptional"
-            }
-          },
-          {
-            "fdDefault": null,
-            "fdDescription": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
-            "fdName": "asks",
-            "fdRequired": false,
-            "fdType": {
-              "contents": [
-                "boolean",
-                null
-              ],
-              "tag": "RefPrimitive"
             }
           },
           {

@@ -34,9 +34,6 @@ pub(crate) struct MethodIn<'a> {
     pub(crate) progress: Option<&'a Value>,
     pub(crate) input: Option<&'a Value>,
     pub(crate) cardinality: Cardinality,
-    /// ASK-2: `asks` (absent: false). An older schema's `bidirectional`
-    /// is not read — such a method does not ask.
-    pub(crate) asks: bool,
     pub(crate) param_schemas: Option<Vec<ParamIn>>,
     pub(crate) role: MethodRole,
     pub(crate) long_description: Option<String>,
@@ -79,14 +76,6 @@ fn opt_str(o: &Map<String, Value>, k: &str) -> Result<Option<String>, String> {
         None => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(format!("`{k}` is not a string")),
-    }
-}
-
-fn opt_bool(o: &Map<String, Value>, k: &str) -> Result<bool, String> {
-    match opt(o, k) {
-        None => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
-        Some(_) => Err(format!("`{k}` is not a boolean")),
     }
 }
 
@@ -168,7 +157,6 @@ fn method(v: &Value) -> Result<MethodIn<'_>, String> {
         progress: opt(o, "progress"),
         input: opt(o, "input"),
         cardinality,
-        asks: opt_bool(o, "asks")?,
         param_schemas,
         role: role(opt(o, "role"))?,
         long_description: opt_str(o, "long_description")?,

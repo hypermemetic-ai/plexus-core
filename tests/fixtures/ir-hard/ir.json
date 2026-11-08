@@ -1,10 +1,9 @@
 {
   "irBackend": "xsvc",
-  "irHash": "16231e0fb310ff65",
+  "irHash": "bd84446c78f3ca10",
   "irMetadata": null,
   "irMethods": {
     ".call": {
-      "mdAsks": false,
       "mdCardinality": "many",
       "mdDescription": "Route a call to a registered activation",
       "mdError": null,
@@ -53,7 +52,6 @@
       }
     },
     ".hash": {
-      "mdAsks": false,
       "mdCardinality": "many",
       "mdDescription": "Get plexus configuration hash (from the recursive schema)\n\n This hash changes whenever any method or child plugin changes.\n It's computed from the method hashes rolled up through the schema tree.",
       "mdError": null,
@@ -76,7 +74,6 @@
       }
     },
     ".hashes": {
-      "mdAsks": false,
       "mdCardinality": "many",
       "mdDescription": "Get plugin hashes for cache validation",
       "mdError": null,
@@ -99,7 +96,6 @@
       }
     },
     ".ir": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "The service's IR (3.0): every type once, each method referring to them — of the namespaces asked, or the whole service",
       "mdError": {
@@ -146,7 +142,6 @@
       }
     },
     ".schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -187,7 +182,6 @@
       }
     },
     "alpha.dotted": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "dotted",
       "mdError": {
@@ -231,7 +225,6 @@
       }
     },
     "alpha.enums": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "enums",
       "mdError": {
@@ -301,7 +294,6 @@
       }
     },
     "alpha.inner": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "child",
       "mdError": null,
@@ -319,7 +311,6 @@
       }
     },
     "alpha.inner.leaves": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "leaf page in inner",
       "mdError": {
@@ -347,7 +338,6 @@
       }
     },
     "alpha.inner.note": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note b in inner",
       "mdError": {
@@ -375,7 +365,6 @@
       }
     },
     "alpha.inner.schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -416,7 +405,6 @@
       }
     },
     "alpha.inner.tree": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "tree in inner",
       "mdError": {
@@ -444,7 +432,6 @@
       }
     },
     "alpha.leaves": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "generic page of leaves",
       "mdError": {
@@ -491,7 +478,6 @@
       }
     },
     "alpha.nest": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "nest",
       "mdError": {
@@ -519,7 +505,6 @@
       }
     },
     "alpha.note": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note a",
       "mdError": {
@@ -547,7 +532,6 @@
       }
     },
     "alpha.nums": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "nums",
       "mdError": {
@@ -609,7 +593,6 @@
       }
     },
     "alpha.ping": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "mutual",
       "mdError": {
@@ -637,7 +620,6 @@
       }
     },
     "alpha.schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -678,7 +660,6 @@
       }
     },
     "alpha.shout": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "shout",
       "mdError": {
@@ -770,7 +751,6 @@
       }
     },
     "alpha.stream_trees": {
-      "mdAsks": false,
       "mdCardinality": "many",
       "mdDescription": "stream of trees",
       "mdError": null,
@@ -792,7 +772,6 @@
       }
     },
     "beta.dotted": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "dotted",
       "mdError": {
@@ -836,7 +815,6 @@
       }
     },
     "beta.ext": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "ext",
       "mdError": {
@@ -872,7 +850,6 @@
       }
     },
     "beta.nest": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "nest again",
       "mdError": {
@@ -900,7 +877,6 @@
       }
     },
     "beta.note": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note b",
       "mdError": {
@@ -928,7 +904,6 @@
       }
     },
     "beta.schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -969,7 +944,6 @@
       }
     },
     "beta.tree": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "tree twice",
       "mdError": {
@@ -997,7 +971,6 @@
       }
     },
     "beta.trees": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "trees again",
       "mdError": {
@@ -1027,24 +1000,24 @@
   },
   "irPluginHashes": {
     "": {
-      "phiChildrenHash": "16231e0fb310ff65",
-      "phiHash": "16231e0fb310ff65",
-      "phiSelfHash": "16231e0fb310ff65"
+      "phiChildrenHash": "bd84446c78f3ca10",
+      "phiHash": "bd84446c78f3ca10",
+      "phiSelfHash": "bd84446c78f3ca10"
     },
     "alpha": {
-      "phiChildrenHash": "a87c4d187042b31c",
-      "phiHash": "a87c4d187042b31c",
-      "phiSelfHash": "a87c4d187042b31c"
+      "phiChildrenHash": "d0de5d77f5024e94",
+      "phiHash": "d0de5d77f5024e94",
+      "phiSelfHash": "d0de5d77f5024e94"
     },
     "alpha.inner": {
-      "phiChildrenHash": "778a16d3c17c5f85",
-      "phiHash": "778a16d3c17c5f85",
-      "phiSelfHash": "778a16d3c17c5f85"
+      "phiChildrenHash": "ac822f6aa29450a1",
+      "phiHash": "ac822f6aa29450a1",
+      "phiSelfHash": "ac822f6aa29450a1"
     },
     "beta": {
-      "phiChildrenHash": "60d210dfc8a73707",
-      "phiHash": "60d210dfc8a73707",
-      "phiSelfHash": "60d210dfc8a73707"
+      "phiChildrenHash": "c51cdb1c865808fc",
+      "phiHash": "c51cdb1c865808fc",
+      "phiSelfHash": "c51cdb1c865808fc"
     }
   },
   "irPluginRequests": null,
@@ -3174,19 +3147,6 @@
                 "tag": "RefPrimitive"
               },
               "tag": "RefOptional"
-            }
-          },
-          {
-            "fdDefault": null,
-            "fdDescription": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
-            "fdName": "asks",
-            "fdRequired": false,
-            "fdType": {
-              "contents": [
-                "boolean",
-                null
-              ],
-              "tag": "RefPrimitive"
             }
           },
           {

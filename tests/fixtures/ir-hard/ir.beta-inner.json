@@ -4,7 +4,6 @@
   "irMetadata": null,
   "irMethods": {
     "alpha.inner.leaves": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "leaf page in inner",
       "mdError": {
@@ -32,7 +31,6 @@
       }
     },
     "alpha.inner.note": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note b in inner",
       "mdError": {
@@ -60,7 +58,6 @@
       }
     },
     "alpha.inner.schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -101,7 +98,6 @@
       }
     },
     "alpha.inner.tree": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "tree in inner",
       "mdError": {
@@ -129,7 +125,6 @@
       }
     },
     "beta.dotted": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "dotted",
       "mdError": {
@@ -173,7 +168,6 @@
       }
     },
     "beta.ext": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "ext",
       "mdError": {
@@ -209,7 +203,6 @@
       }
     },
     "beta.nest": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "nest again",
       "mdError": {
@@ -237,7 +230,6 @@
       }
     },
     "beta.note": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "note b",
       "mdError": {
@@ -265,7 +257,6 @@
       }
     },
     "beta.schema": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
       "mdError": null,
@@ -306,7 +297,6 @@
       }
     },
     "beta.tree": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "tree twice",
       "mdError": {
@@ -334,7 +324,6 @@
       }
     },
     "beta.trees": {
-      "mdAsks": false,
       "mdCardinality": "one",
       "mdDescription": "trees again",
       "mdError": {
@@ -364,14 +353,14 @@
   },
   "irPluginHashes": {
     "alpha.inner": {
-      "phiChildrenHash": "778a16d3c17c5f85",
-      "phiHash": "778a16d3c17c5f85",
-      "phiSelfHash": "778a16d3c17c5f85"
+      "phiChildrenHash": "ac822f6aa29450a1",
+      "phiHash": "ac822f6aa29450a1",
+      "phiSelfHash": "ac822f6aa29450a1"
     },
     "beta": {
-      "phiChildrenHash": "60d210dfc8a73707",
-      "phiHash": "60d210dfc8a73707",
-      "phiSelfHash": "60d210dfc8a73707"
+      "phiChildrenHash": "c51cdb1c865808fc",
+      "phiHash": "c51cdb1c865808fc",
+      "phiSelfHash": "c51cdb1c865808fc"
     }
   },
   "irPluginRequests": null,
@@ -1317,19 +1306,6 @@
                 "tag": "RefPrimitive"
               },
               "tag": "RefOptional"
-            }
-          },
-          {
-            "fdDefault": null,
-            "fdDescription": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
-            "fdName": "asks",
-            "fdRequired": false,
-            "fdType": {
-              "contents": [
-                "boolean",
-                null
-              ],
-              "tag": "RefPrimitive"
             }
           },
           {

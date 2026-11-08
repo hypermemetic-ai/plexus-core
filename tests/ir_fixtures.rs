@@ -110,23 +110,26 @@ fn canonical_is_synapses_form() {
     );
 }
 
-/// ASK-2: IR 3.1 says `mdAsks` for every method; an older schema's
-/// `bidirectional` (the in-call question, gone) reads as a method that does
-/// not ask, and its request and response types are not carried.
+/// ASK-1: IR 3.1 is 3.0 without the bidir keys and nothing in their place;
+/// an older schema's `bidirectional` (the in-call question, gone) and its
+/// request and response types are read and ignored.
 #[test]
-fn an_older_bidirectional_reads_as_not_asking() {
-    let mut schema = json("conformance/expected/schema.json");
+fn an_older_bidirectional_is_ignored() {
+    let plain = json("conformance/expected/schema.json");
+    let mut schema = plain.clone();
     for m in schema["methods"].as_array_mut().unwrap() {
         m["bidirectional"] = serde_json::json!(true);
+        m["request_type"] = serde_json::json!({"type": "string"});
         m["response_type"] = serde_json::json!({"type": "string"});
     }
-    schema["methods"][0]["asks"] = serde_json::json!(true);
-    let built = ir::build_one("conformance", &["conformance".to_string()], &schema).expect("the fixture's IR");
-    let v = built.to_json();
-    assert_eq!(v["irVersion"], "3.1");
-    for (path, m) in v["irMethods"].as_object().unwrap() {
-        let asks = path == "conformance.ping";
-        assert_eq!(m["mdAsks"], serde_json::json!(asks), "{path}: {m}");
-        assert!(m.get("mdBidirType").is_none() && m.get("mdBidirResponseSchema").is_none(), "{path}: {m}");
+    let ns = &["conformance".to_string()];
+    let built = ir::build_one("conformance", ns, &schema).expect("the fixture's IR").to_json();
+    let want = ir::build_one("conformance", ns, &plain).expect("the fixture's IR").to_json();
+    assert_eq!(built, want, "an older schema's bidir keys change nothing");
+    assert_eq!(built["irVersion"], "3.1");
+    for (path, m) in built["irMethods"].as_object().unwrap() {
+        for gone in ["mdBidirType", "mdBidirResponseType", "mdBidirResponseSchema", "mdAsks"] {
+            assert!(m.get(gone).is_none(), "{path}: {gone} in {m}");
+        }
     }
 }

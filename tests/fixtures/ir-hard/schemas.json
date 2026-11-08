@@ -3,18 +3,18 @@
     "children": [
       {
         "description": "alpha",
-        "hash": "a87c4d187042b31c",
+        "hash": "d0de5d77f5024e94",
         "namespace": "alpha"
       },
       {
         "description": "beta",
-        "hash": "60d210dfc8a73707",
+        "hash": "c51cdb1c865808fc",
         "namespace": "beta"
       }
     ],
-    "children_hash": "c7bac7357650eb90",
+    "children_hash": "7e82d4e1bf4d6d62",
     "description": "Central routing and introspection",
-    "hash": "16231e0fb310ff65",
+    "hash": "bd84446c78f3ca10",
     "methods": [
       {
         "cardinality": "many",
@@ -745,7 +745,7 @@
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "xsvc.schema",
-        "hash": "ca61e1c90b82e182",
+        "hash": "51d857cec73e4ae7",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -1395,10 +1395,6 @@
                     "null"
                   ]
                 },
-                "asks": {
-                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
-                  "type": "boolean"
-                },
                 "auth_posture": {
                   "anyOf": [
                     {
@@ -1804,20 +1800,20 @@
       }
     ],
     "namespace": "xsvc",
-    "self_hash": "5060a87ffba4772c",
+    "self_hash": "31d1af23907006d8",
     "version": "1.0.0"
   },
   "alpha": {
     "children": [
       {
         "description": "child",
-        "hash": "778a16d3c17c5f85",
+        "hash": "ac822f6aa29450a1",
         "namespace": "inner"
       }
     ],
-    "children_hash": "08eb6b44231a0f99",
+    "children_hash": "c048f2ac9f790c7f",
     "description": "alpha",
-    "hash": "a87c4d187042b31c",
+    "hash": "d0de5d77f5024e94",
     "methods": [
       {
         "cardinality": "one",
@@ -4201,7 +4197,7 @@
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "alpha.schema",
-        "hash": "70ccf33840075d0d",
+        "hash": "0fe8e27aee77480c",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -4850,10 +4846,6 @@
                     "string",
                     "null"
                   ]
-                },
-                "asks": {
-                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
-                  "type": "boolean"
                 },
                 "auth_posture": {
                   "anyOf": [
@@ -5271,12 +5263,12 @@
       }
     ],
     "namespace": "alpha",
-    "self_hash": "5994d87632477216",
+    "self_hash": "de3cb5f316147edd",
     "version": "1.0.0"
   },
   "alpha.inner": {
     "description": "inner",
-    "hash": "778a16d3c17c5f85",
+    "hash": "ac822f6aa29450a1",
     "methods": [
       {
         "cardinality": "one",
@@ -5465,7 +5457,7 @@
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "inner.schema",
-        "hash": "8348802cc68f5fb8",
+        "hash": "4d16b26eae7e3706",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -6115,10 +6107,6 @@
                     "null"
                   ]
                 },
-                "asks": {
-                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
-                  "type": "boolean"
-                },
                 "auth_posture": {
                   "anyOf": [
                     {
@@ -6524,12 +6512,12 @@
       }
     ],
     "namespace": "inner",
-    "self_hash": "3918fc6b68b0b67f",
+    "self_hash": "dead0c15fe4744ef",
     "version": "1.0.0"
   },
   "beta": {
     "description": "beta",
-    "hash": "60d210dfc8a73707",
+    "hash": "c51cdb1c865808fc",
     "methods": [
       {
         "cardinality": "one",
@@ -7492,7 +7480,7 @@
         "cardinality": "one",
         "description": "Get plugin or method schema. Pass {\"method\": \"name\"} for a specific method.",
         "grant": "beta.schema",
-        "hash": "db73d0fa48cb0bdb",
+        "hash": "25bf57f9b34a8927",
         "http_method": "POST",
         "name": "schema",
         "params": {
@@ -8142,10 +8130,6 @@
                     "null"
                   ]
                 },
-                "asks": {
-                  "description": "Whether this method may answer a call with a proposal (a\n`needs_input` item saying what it would do) and act when called again\nwith the proposal's token in its `confirm` parameter. Absent when false.",
-                  "type": "boolean"
-                },
                 "auth_posture": {
                   "anyOf": [
                     {
@@ -8551,7 +8535,7 @@
       }
     ],
     "namespace": "beta",
-    "self_hash": "2e2c9583437a6f1d",
+    "self_hash": "a9bf4806d2afd092",
     "version": "1.0.0"
   }
 }

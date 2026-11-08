@@ -7,11 +7,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Number, Value};
 
-/// The IR format written: 3.1 (ASK-2) — 3.0 (RETURNS-13) with each method's
-/// `mdAsks` (whether it may answer with a `needs_input` proposal) in place
-/// of `mdBidirType`, `mdBidirResponseType` and `mdBidirResponseSchema`,
-/// the in-call question it replaced. A reader of 3.1 takes a 3.0 document
-/// as it is, its `mdAsks` absent: false.
+/// The IR format written: 3.1 (ASK-1) — 3.0 (RETURNS-13) without each
+/// method's `mdBidirType`, `mdBidirResponseType` and `mdBidirResponseSchema`
+/// (the in-call question, removed) and nothing in their place. A reader of
+/// 3.1 takes a 3.0 document as it is, ignoring those keys.
 pub const IR_VERSION: &str = "3.1";
 
 /// A type's name: its namespace (`""` for the service's root) and its name
@@ -369,9 +368,6 @@ pub struct MethodDef {
     pub error: Option<TypeRef>,
     pub progress: Option<TypeRef>,
     pub cardinality: Cardinality,
-    /// ASK-2: the method may answer with a `needs_input` proposal and take
-    /// its token back in `confirm`.
-    pub asks: bool,
     pub role: MethodRole,
     pub grant: Option<String>,
     pub target: Option<String>,
@@ -393,7 +389,6 @@ impl MethodDef {
             "mdError": r(&self.error),
             "mdProgress": r(&self.progress),
             "mdCardinality": match self.cardinality { Cardinality::One => "one", Cardinality::Many => "many" },
-            "mdAsks": self.asks,
             "mdRole": self.role.to_json(),
         });
         if let Some(g) = &self.grant {

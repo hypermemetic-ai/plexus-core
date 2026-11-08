@@ -788,15 +788,8 @@ pub struct MethodSchema {
     /// field exists to end.
     pub cardinality: Cardinality,
 
-    // ASK-2 (plexus-wire spec/08): `super::ask`'s `NeedsInput` and
-    // `ConfirmToken`. An older schema's `bidirectional` (the in-call
-    // question this replaced) is not read: such a method does not ask. The
-    // doc comment below is this field's description on the wire.
-    /// Whether this method may answer a call with a proposal (a
-    /// `needs_input` item saying what it would do) and act when called again
-    /// with the proposal's token in its `confirm` parameter. Absent when false.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub asks: bool,
+    // ASK-1: an older schema's `bidirectional`, `request_type` and
+    // `response_type` (the in-call question, removed) are read and ignored.
 
     /// HTTP method for REST endpoints (GET, POST, PUT, DELETE, PATCH)
     ///
@@ -1610,7 +1603,6 @@ impl MethodSchema {
             error: None,
             progress: None,
             cardinality: Cardinality::One,
-            asks: false,
             http_method: HttpMethod::default(),
             role: MethodRole::Rpc,
             deprecation: None,
@@ -1775,14 +1767,6 @@ impl MethodSchema {
     /// - PATCH: Partial update operations
     pub fn with_http_method(mut self, http_method: HttpMethod) -> Self {
         self.http_method = http_method;
-        self
-    }
-
-    /// ASK-2: mark this method as one that may answer with a proposal
-    /// (`needs_input`) and take its token back in `confirm`. Emitted by
-    /// `#[plexus_macros::method(asks)]`.
-    pub fn with_asks(mut self, asks: bool) -> Self {
-        self.asks = asks;
         self
     }
 
@@ -2828,16 +2812,15 @@ mod tests {
     }
 
     /// The fields sit where `returns` / the old flag sat: after `params`,
-    /// before `asks` (ASK-2: where `bidirectional` sat) — every other field
-    /// keeps its place on the wire.
+    /// before `http_method` (where `bidirectional` sat until ASK-1) — every
+    /// other field keeps its place on the wire.
     #[test]
     fn returns_5_field_order_on_the_wire() {
         let method = returns_5_full_method()
-            .with_params(schemars::json_schema!({ "type": "object" }))
-            .with_asks(true);
+            .with_params(schemars::json_schema!({ "type": "object" }));
         let text = serde_json::to_string(&method).unwrap();
         let pos = |k: &str| text.find(&format!("\"{k}\":")).unwrap_or_else(|| panic!("{k} missing in {text}"));
-        let order = ["name", "description", "hash", "params", "returns", "error", "progress", "cardinality", "asks", "http_method", "role"];
+        let order = ["name", "description", "hash", "params", "returns", "error", "progress", "cardinality", "http_method", "role"];
         for pair in order.windows(2) {
             assert!(pos(pair[0]) < pos(pair[1]), "{} must precede {} in {text}", pair[0], pair[1]);
         }

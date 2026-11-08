@@ -46,9 +46,6 @@ schemars = { version = "1.1", features = ["derive", "uuid1", "bytes1"] }
 # RETURNS-10: schema content hashes — SHA-256 of a method's canonical schema
 # JSON, truncated to 16 hex (`plexus::content_hash`). RustCrypto, pure Rust.
 sha2 = "0.10"
-# ASK-2: the process's random key a proposal's token is sealed with (on
-# wasm32 through `wasm_js`, in the target table below).
-getrandom = "0.3"
 
 # HTTP types for RawRequestContext
 http = "1"
@@ -164,12 +161,6 @@ required-features = ["child-ws"]
 name = "returns47_hop"
 harness = false
 
-# ASK-2: the proposal's matrix — in process, over the module, and through a
-# hop to this binary run again by the seam as a child on stdio.
-[[test]]
-name = "question_matrix"
-harness = false
-
 # NEST-3/NEST-4: the host and, run again by the seam, a nested child on stdio.
 [[test]]
 name = "nest_spike"
@@ -195,7 +186,7 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 base64 = "0.22"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
-# BIDIR-13: tests that drive a service's module over a real WebSocket.
+# Tests that drive a service's module over a real WebSocket.
 jsonrpsee = { version = "0.26", features = ["server", "macros", "ws-client"] }
 # PERF-15: tests/describe_golden.rs pins each self-description answer by the
 # sha256 of its bytes (already in the lock, through jsonrpsee and ring's users).

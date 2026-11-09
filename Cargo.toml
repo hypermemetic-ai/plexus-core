@@ -200,6 +200,9 @@ plexus-core = { path = ".", features = ["test-util"] }
 
 # PLEXUS-45: every other test dependency is the native suite's, as before.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# KEEL-9: the test kit (testkit/, unpublished): a world, a host with its
+# gate and roles, callers by name. No version: cargo strips it on publish.
+plexus-testkit = { path = "testkit" }
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
 plexus-client = { path = "../plexus-macros/plexus-client", version = "0.11.0", features = ["ws-native"] }
 tempfile = "3"

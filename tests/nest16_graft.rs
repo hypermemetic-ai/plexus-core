@@ -21,20 +21,14 @@
 //! No test harness: this binary is the host and, run again by the seam
 //! (`PLEXUS_CHILD_NAME` set), the child on stdio.
 
-use std::sync::{Arc, Mutex};
-
 use futures::StreamExt;
 use plexus_client::{MethodRef, StreamItem, Transport};
 use plexus_core::plexus::remote_child::host;
-use plexus_core::plexus::{
-    AuthContext, ChildOptions, ChildSpec, Gate, Membership, Memberships, Need, Parent, ParentTransport, PlexusStream,
-    PlexusStreamItem, RemoteChild, Resolve, RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{ChildOptions, ChildSpec, Need, Parent, ParentTransport, RemoteChild};
 use plexus_core::DynamicHub;
+use plexus_testkit::parts::who;
+use plexus_testkit::{HostBuilder, World, EDITOR, VIEWER};
 use serde_json::{json, Value};
-
-const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const EDITOR: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 // ------------------------------------------------------------------ the parent
 
@@ -171,58 +165,18 @@ async fn first(t: &impl Transport, m: MethodRef) -> Value {
 
 // ------------------------------------------------------------------ the host
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
-/// VIEWER: the grafts and `shop.items`; EDITOR: everything, `shop.secret` too.
-fn gate() -> Arc<Gate> {
-    let members = Arc::new(Members::default());
-    for (p, r) in [(VIEWER, "viewer"), (EDITOR, "editor")] {
-        members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::parse("*") });
-    }
+/// `svc`, serving the shop. VIEWER: the grafts and `shop.items`; EDITOR:
+/// everything, `shop.secret` too.
+fn shop_host() -> HostBuilder {
     let grafts = ["restock.low", "restock.who", "restock.sneak", "plain.up"];
     let viewer: Vec<&str> = grafts.iter().copied().chain(["shop.items"]).collect();
     let editor: Vec<&str> = viewer.iter().copied().chain(["shop.secret"]).collect();
-    let roles = RoleTable::from_lists([("viewer", viewer), ("editor", editor)]);
-    Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere)))
-}
-
-async fn items(r: Result<PlexusStream, plexus_core::plexus::PlexusError>) -> Vec<Value> {
-    match r {
-        Err(e) => vec![json!({ "route_error": format!("{e:?}") })],
-        Ok(stream) => stream
-            .map(|i| match i {
-                PlexusStreamItem::Data { content, .. } => content.into_value(),
-                other => serde_json::to_value(other).unwrap(),
-            })
-            .filter(|v| futures::future::ready(v["type"] != "done"))
-            .collect()
-            .await,
-    }
+    World::new().host().named("svc").with(shop::Shop).roles([("viewer", viewer), ("editor", editor)])
 }
 
 async fn mount(name: &str, service: &DynamicHub, legacy: bool) -> RemoteChild {
     let spec: ChildSpec = format!("{name}=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap();
     RemoteChild::connect(spec, ChildOptions::for_service("svc").with_host(service).with_legacy_upcalls(legacy)).await.expect("the child mounts")
-}
-
-fn shop_service() -> Arc<DynamicHub> {
-    Arc::new(DynamicHub::new("svc").register(shop::Shop).with_gate(gate()))
 }
 
 // ------------------------------------------------------------------ the rows
@@ -242,13 +196,14 @@ async fn restock_needs_shop_items_inferred() {
 
 /// Grafted behind a mount: `low` calls `shop.items` inward as the caller.
 async fn grafted_it_calls_items_as_the_caller() {
-    let service = shop_service();
-    let child = mount("restock", &service, false).await;
+    let host = shop_host().await;
+    let service = host.service();
+    let child = mount("restock", service, false).await;
     assert_eq!(child.needs().unwrap(), [Need::new("shop.items", child.needs().unwrap()[0].hash.clone())]);
     service.root().insert(child).expect("shop serves what restock needs");
-    let got = items(service.route("restock.low", json!({}), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("restock.low", json!({})).await;
     assert_eq!(got[0]["low"], json!({ "items": ["flour", "salt"], "caller": VIEWER }), "{got:?}");
-    let got = items(service.route("restock.who", json!({}), Some(&who(EDITOR))).await).await;
+    let got = host.as_(EDITOR).call("restock.who", json!({})).await;
     assert_eq!(got[0]["who"]["for"], EDITOR, "{got:?}");
     assert_eq!(got[0]["who"]["child"], "restock", "{got:?}");
 }
@@ -256,23 +211,24 @@ async fn grafted_it_calls_items_as_the_caller() {
 /// Its call to anything else of the shop is refused by the host — even for
 /// a caller who holds it.
 async fn its_call_past_its_needs_is_refused_by_the_host() {
-    let service = shop_service();
-    let child = mount("restock", &service, false).await;
+    let host = shop_host().await;
+    let service = host.service();
+    let child = mount("restock", service, false).await;
     service.root().insert(child).unwrap();
-    let got = items(service.route("restock.sneak", json!({}), Some(&who(EDITOR))).await).await;
+    let got = host.as_(EDITOR).call("restock.sneak", json!({})).await;
     assert_eq!(got[0]["refused"]["kind"], "forbidden", "{got:?}");
     assert_eq!(got[0]["refused"]["reason"], "not_needed", "{got:?}");
     assert_eq!(got[0]["refused"]["method"], "shop.secret", "{got:?}");
     // The editor does hold it, straight.
-    let straight = items(service.route("shop.secret", json!({}), Some(&who(EDITOR))).await).await;
+    let straight = host.as_(EDITOR).call("shop.secret", json!({})).await;
     assert_eq!(straight[0], json!({ "till": 42 }));
 }
 
 /// Onto a service without `items`: refused, naming it — at runtime and at a
 /// static start; and onto a `shop` whose `items` moved, named as changed.
 async fn refused_onto_a_service_without_items() {
-    let host = shop_service();
-    let child = mount("restock", &host, false).await;
+    let host = shop_host().await;
+    let child = mount("restock", host.service(), false).await;
     let bare = DynamicHub::new("svc").register(bare::BareActivation);
     match bare.root().insert(child.clone()) {
         Err(plexus_core::plexus::service_root::RootError::Needs(miss)) => {
@@ -301,11 +257,12 @@ async fn refused_onto_a_service_without_items() {
 
 /// Registered in the same process: the parent is the service's own routing.
 async fn in_process_it_calls_items_as_the_caller() {
-    let service = Arc::new(DynamicHub::new("svc").register(shop::Shop).register(Restock).with_gate(gate()));
+    let host = shop_host().with(Restock).await;
+    let service = host.service();
     service.check_grafts().unwrap();
-    let got = items(service.route("restock.low", json!({}), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("restock.low", json!({})).await;
     assert_eq!(got[0]["low"]["caller"], VIEWER, "{got:?}");
-    let got = items(service.route("restock.who", json!({}), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("restock.who", json!({})).await;
     assert_eq!(got[0]["who"]["for"], VIEWER, "{got:?}");
     // The transport holds to the needs before sending anything.
     let t = ParentTransport::local(service.clone(), Some(who(EDITOR)), "restock", Restock::__plexus_parent_needs());
@@ -318,14 +275,15 @@ async fn in_process_it_calls_items_as_the_caller() {
 /// A child with no needs: the standard four, nothing else — unless the host
 /// keeps NEST-11's rule for it.
 async fn a_child_with_no_needs_calls_the_standard_four_only() {
-    let service = shop_service();
+    let host = shop_host().await;
+    let service = host.service();
     let mut heard = service.notices();
-    let child = mount("plain", &service, false).await;
+    let child = mount("plain", service, false).await;
     assert_eq!(child.needs(), None);
     service.root().insert(child).unwrap();
     let up = |m: &'static str| {
-        let service = service.clone();
-        async move { items(service.route("plain.up", json!({ "method": m }), Some(&who(EDITOR))).await).await.remove(0) }
+        let host = host.clone();
+        async move { host.as_(EDITOR).call("plain.up", json!({ "method": m })).await.remove(0) }
     };
     assert_eq!(up("host.whoami").await["for"], EDITOR);
     assert_eq!(up("host.log").await, json!({ "logged": true }));
@@ -336,10 +294,10 @@ async fn a_child_with_no_needs_calls_the_standard_four_only() {
     let refused = up("shop.items").await;
     assert_eq!((refused["refused"]["reason"].as_str(), refused["refused"]["method"].as_str()), (Some("not_needed"), Some("shop.items")), "{refused:?}");
     // Under the legacy option, NEST-11's rule.
-    let legacy = shop_service();
-    let child = mount("plain", &legacy, true).await;
-    legacy.root().insert(child).unwrap();
-    let got = items(legacy.route("plain.up", json!({ "method": "shop.items" }), Some(&who(EDITOR))).await).await;
+    let legacy = shop_host().await;
+    let child = mount("plain", legacy.service(), true).await;
+    legacy.service().root().insert(child).unwrap();
+    let got = legacy.as_(EDITOR).call("plain.up", json!({ "method": "shop.items" })).await;
     assert_eq!(got[0]["caller"], EDITOR, "{got:?}");
 }
 

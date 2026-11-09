@@ -18,19 +18,13 @@ mod echo;
 #[path = "../../plexus-wire/reference/echo-rs/src/service.rs"]
 mod service;
 
-use futures::StreamExt;
 use plexus_core::plexus::peer::{Peer, PeerError};
-use plexus_core::plexus::{
-    Activation, AuthContext, ChildOptions, ChildSpec, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem,
-    RemoteChild, Resolve, RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{Activation, AuthContext, ChildOptions, ChildSpec, RemoteChild};
 use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
+use plexus_testkit::parts::items;
+use plexus_testkit::{Host, World, EDITOR, VIEWER};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
-
-const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const EDITOR: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 #[derive(PlexusRequest)]
 pub struct Req {
@@ -164,49 +158,10 @@ impl SkyActivation {
 
 // ------------------------------------------------------------------ the host
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
-async fn items(r: Result<PlexusStream, plexus_core::plexus::PlexusError>) -> Vec<Value> {
-    match r {
-        Err(e) => vec![json!({ "route_error": format!("{e:?}") })],
-        Ok(stream) => stream
-            .map(|i| match i {
-                PlexusStreamItem::Data { content, .. } => content.into_value(),
-                other => serde_json::to_value(other).unwrap(),
-            })
-            .filter(|v| futures::future::ready(v["type"] != "done"))
-            .collect()
-            .await,
-    }
-}
-
 /// VIEWER holds viewer, EDITOR editor, both on `*`; the roles the host
 /// declares are the mount's, renamed at every level.
-fn gated(child: &RemoteChild) -> DynamicHub {
-    let plain = DynamicHub::new("host").register(child.clone());
-    let members = Arc::new(Members::default());
-    for (p, r) in [(VIEWER, "viewer"), (EDITOR, "editor")] {
-        members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::parse("*") });
-    }
-    let declared = plain.declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    DynamicHub::new("host").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere))))
+async fn gated(child: &RemoteChild) -> Host {
+    World::new().host().with(child.clone()).await
 }
 
 fn spec(name: &str) -> ChildSpec {
@@ -248,27 +203,26 @@ async fn the_walk_keeps_each_slot_and_its_type() {
 /// it, in the child's terms; the far side checks it against the slot.
 async fn a_typed_slot_is_gated_by_its_slot_grant_and_forwarded() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let (v, e) = (Some(who(VIEWER)), Some(who(EDITOR)));
-    let got = items(host.route("mnt.solar.earth.info", json!({}), v.as_ref()).await).await;
+    let host = gated(&child).await;
+    let got = host.as_(VIEWER).call("mnt.solar.earth.info", json!({})).await;
     assert_eq!(got[0], json!({ "at": "planet earth", "grant": "sky.solar.{planet}.info", "for": VIEWER }), "{got:?}");
-    let got = items(host.route("mnt.solar.mars.info", json!({}), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.solar.mars.info", json!({})).await;
     assert_eq!(got[0]["at"], "planet mars", "every name in the slot, one grant: {got:?}");
-    let refused = items(host.route("mnt.solar.earth.rename", json!({ "to": "terra" }), v.as_ref()).await).await;
+    let refused = host.as_(VIEWER).call("mnt.solar.earth.rename", json!({ "to": "terra" })).await;
     let why = refused[0]["route_error"].as_str().unwrap_or_default();
     assert!(why.contains("rename") && why.contains("editor"), "a viewer holding solar.{{planet}}.info is refused rename: {refused:?}");
-    let got = items(host.route("mnt.solar.earth.rename", json!({ "to": "terra" }), e.as_ref()).await).await;
+    let got = host.as_(EDITOR).call("mnt.solar.earth.rename", json!({ "to": "terra" })).await;
     assert_eq!(got[0], json!({ "at": "earth -> terra", "grant": "sky.solar.{planet}.rename", "for": EDITOR }), "{got:?}");
 }
 
 /// An unknown name is the child's own not-found, relayed unchanged.
 async fn an_unknown_name_is_the_childs_own_not_found() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let got = items(host.route("mnt.solar.pluto.info", json!({}), Some(&who(VIEWER))).await).await;
+    let host = gated(&child).await;
+    let got = host.as_(VIEWER).call("mnt.solar.pluto.info", json!({})).await;
     assert_eq!(got[0]["type"], "error", "{got:?}");
     assert_eq!(got[0]["error"]["kind"], "activation_not_found", "{got:?}");
-    let got = items(host.route("mnt.dendrite.ghost.hello", json!({ "name": "x" }), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("mnt.dendrite.ghost.hello", json!({ "name": "x" })).await;
     assert_eq!(got[0]["error_kind"], "not_found", "a peer slot's PeerError, relayed: {got:?}");
     assert_eq!(got[0]["name"], "ghost");
 }
@@ -277,13 +231,12 @@ async fn an_unknown_name_is_the_childs_own_not_found() {
 /// names stream back unchanged.
 async fn names_are_listed_and_searched_live() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let v = Some(who(VIEWER));
-    let got = items(host.route("mnt.solar.names", json!({}), v.as_ref()).await).await;
+    let host = gated(&child).await;
+    let got = host.as_(VIEWER).call("mnt.solar.names", json!({})).await;
     assert_eq!(got, [json!("earth"), json!("mars"), json!("venus")]);
-    let got = items(host.route("mnt.solar.search", json!({ "query": "ar" }), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.solar.search", json!({ "query": "ar" })).await;
     assert_eq!(got, [json!("earth"), json!("mars")]);
-    let got = items(host.route("mnt.dendrites", json!({}), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.dendrites", json!({})).await;
     assert_eq!(got, [json!("greeter")]);
 }
 
@@ -291,17 +244,16 @@ async fn names_are_listed_and_searched_live() {
 /// an untyped peer slot the same.
 async fn an_untyped_slot_is_gated_whole() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let (v, e) = (Some(who(VIEWER)), Some(who(EDITOR)));
-    let got = items(host.route("mnt.belt.ceres.info", json!({}), v.as_ref()).await).await;
+    let host = gated(&child).await;
+    let got = host.as_(VIEWER).call("mnt.belt.ceres.info", json!({})).await;
     assert_eq!(got[0], json!({ "at": "planet ceres", "grant": "sky.belt.{rock}", "for": VIEWER }), "{got:?}");
-    let got = items(host.route("mnt.belt.ceres.rename", json!({ "to": "x" }), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.belt.ceres.rename", json!({ "to": "x" })).await;
     assert_eq!(got[0]["grant"], "sky.belt.{rock}", "the whole slot, every method: {got:?}");
-    let refused = items(host.route("mnt.belt.ceres.info", json!({}), e.as_ref()).await).await;
+    let refused = host.as_(EDITOR).call("mnt.belt.ceres.info", json!({})).await;
     assert!(refused[0]["route_error"].as_str().is_some_and(|r| r.contains("mnt.belt.{rock}")), "the editor holds no rock: {refused:?}");
-    let got = items(host.route("mnt.belt.dust1.info", json!({}), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.belt.dust1.info", json!({})).await;
     assert_eq!(got[0]["error"]["kind"], "activation_not_found", "{got:?}");
-    let got = items(host.route("mnt.dendrite.greeter.hello", json!({ "name": "world" }), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.dendrite.greeter.hello", json!({ "name": "world" })).await;
     assert_eq!(got[0], json!({ "at": "greeter", "grant": "sky.{dendrite}", "for": VIEWER, "text": "hello, world" }), "{got:?}");
 }
 
@@ -310,16 +262,15 @@ async fn an_untyped_slot_is_gated_whole() {
 /// static level never crosses.
 async fn one_schema_per_name_crosses_once() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let v = Some(who(VIEWER));
+    let host = gated(&child).await;
     let before = child.stats();
     for _ in 0..10 {
-        let s = items(host.route("mnt.solar.earth.schema", json!({}), v.as_ref()).await).await;
+        let s = host.as_(VIEWER).call("mnt.solar.earth.schema", json!({})).await;
         assert_eq!(s[0]["namespace"], "planet", "{s:?}");
         let names: Vec<&str> = s[0]["methods"].as_array().unwrap().iter().filter_map(|m| m["name"].as_str()).collect();
         assert!(names.contains(&"info") && names.contains(&"rename"), "{names:?}");
     }
-    let one = items(host.route("mnt.solar.earth.schema", json!({ "method": "info" }), v.as_ref()).await).await;
+    let one = host.as_(VIEWER).call("mnt.solar.earth.schema", json!({ "method": "info" })).await;
     assert_eq!(one[0]["name"], "info", "{one:?}");
     let after = child.stats();
     assert_eq!((after.name_schemas - before.name_schemas, after.name_schema_hits - before.name_schema_hits), (1, 10), "{after:?}");
@@ -327,17 +278,17 @@ async fn one_schema_per_name_crosses_once() {
     assert_eq!(after.names_kept, 1);
     println!("measure: `mnt.solar.earth.schema` asked 11 times: {} hop, {} from the cache ({after:?})", after.name_schemas, after.name_schema_hits);
     // An unknown name: the child's not-found, relayed, not kept.
-    let got = items(host.route("mnt.solar.pluto.schema", json!({}), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.solar.pluto.schema", json!({})).await;
     assert_eq!(got[0]["error"]["kind"], "activation_not_found", "{got:?}");
     assert_eq!(child.stats().names_kept, 1);
     // A peer, and an untyped slot's name.
-    let g = items(host.route("mnt.dendrite.greeter.schema", json!({}), v.as_ref()).await).await;
+    let g = host.as_(VIEWER).call("mnt.dendrite.greeter.schema", json!({})).await;
     assert_eq!(g[0]["namespace"], "greeter", "{g:?}");
-    let r = items(host.route("mnt.belt.ceres.schema", json!({}), v.as_ref()).await).await;
+    let r = host.as_(VIEWER).call("mnt.belt.ceres.schema", json!({})).await;
     assert_eq!(r[0]["namespace"], "planet", "{r:?}");
     // The static levels: from the kept tree, nothing crosses.
     let calls = child.stats().calls;
-    let s = items(host.route("mnt.solar.schema", json!({}), v.as_ref()).await).await;
+    let s = host.as_(VIEWER).call("mnt.solar.schema", json!({})).await;
     assert_eq!(s[0]["namespace"], "solar", "{s:?}");
     assert_eq!(child.stats().calls, calls, "a static path never crosses for its schema");
 }
@@ -358,16 +309,15 @@ async fn the_cache_is_bounded() {
 /// The child restarts: every kept name is dropped.
 async fn a_restart_drops_every_name() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let v = Some(who(VIEWER));
-    let _ = items(host.route("mnt.solar.earth.schema", json!({}), v.as_ref()).await).await;
-    let _ = items(host.route("mnt.solar.mars.schema", json!({}), v.as_ref()).await).await;
+    let host = gated(&child).await;
+    let _ = host.as_(VIEWER).call("mnt.solar.earth.schema", json!({})).await;
+    let _ = host.as_(VIEWER).call("mnt.solar.mars.schema", json!({})).await;
     assert_eq!(child.stats().names_kept, 2);
     let pid = child.pid().expect("a stdio child has a pid");
     let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let got = items(host.route("mnt.solar.names", json!({}), v.as_ref()).await).await;
+        let got = host.as_(VIEWER).call("mnt.solar.names", json!({})).await;
         if got.first() == Some(&json!("earth")) && child.pid() != Some(pid) {
             break;
         }
@@ -375,7 +325,7 @@ async fn a_restart_drops_every_name() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let hops = child.stats().name_schemas;
-    let s = items(host.route("mnt.solar.earth.schema", json!({}), v.as_ref()).await).await;
+    let s = host.as_(VIEWER).call("mnt.solar.earth.schema", json!({})).await;
     assert_eq!(s[0]["namespace"], "planet", "{s:?}");
     let st = child.stats();
     assert!(st.restarts >= 1);

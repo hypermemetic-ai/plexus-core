@@ -20,21 +20,17 @@
 //! (`PLEXUS_CHILD_NAME` set), the child on stdio.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures::StreamExt;
 use plexus_client::{MethodRef, StreamItem, Transport};
 use plexus_core::plexus::remote_child::{host, HostTransport};
-use plexus_core::plexus::{
-    AuthContext, ChildOptions, ChildSpec, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem, RemoteChild,
-    Resolve, RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{ChildOptions, ChildSpec, PlexusStreamItem, RemoteChild};
 use plexus_core::DynamicHub;
+use plexus_testkit::{Host, World, EDITOR, VIEWER};
 use serde_json::{json, Value};
 
-const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const EDITOR: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const RELAY_ONLY: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 // ------------------------------------------------------------------ the sibling
@@ -184,58 +180,21 @@ async fn child() {
 
 // ------------------------------------------------------------------ the host
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
-async fn items(r: Result<PlexusStream, plexus_core::plexus::PlexusError>) -> Vec<Value> {
-    match r {
-        Err(e) => vec![json!({ "route_error": format!("{e:?}") })],
-        Ok(stream) => stream
-            .map(|i| match i {
-                PlexusStreamItem::Data { content, .. } => content.into_value(),
-                other => serde_json::to_value(other).unwrap(),
-            })
-            .filter(|v| futures::future::ready(v["type"] != "done"))
-            .collect()
-            .await,
-    }
-}
-
 /// VIEWER: relay.* and sibling.get/ticks; EDITOR: all; RELAY_ONLY: relay.* alone.
-async fn host_and_child() -> (Arc<DynamicHub>, RemoteChild) {
+async fn host_and_child() -> (Host, RemoteChild) {
     // A child mounted at a service's start asks, at its own start, before
     // that service exists: it is told the service it will be in. (A child
     // connected inside a call — plexus-dyn's `grow` — learns it from the call.)
-    let before = Arc::new(DynamicHub::new("host").register(SiblingActivation));
+    let before = std::sync::Arc::new(DynamicHub::new("host").register(SiblingActivation));
     let spec: ChildSpec = format!("relay=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap();
     let child = RemoteChild::connect(spec, ChildOptions::for_service("host").with_host(&before).with_legacy_upcalls(true)).await.expect("the child mounts");
     std::mem::forget(before);
-    let members = Arc::new(Members::default());
-    for (p, r) in [(VIEWER, "viewer"), (EDITOR, "editor"), (RELAY_ONLY, "relayer")] {
-        members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::parse("*") });
-    }
     let relay = ["relay.ask", "relay.keep", "relay.later", "relay.follow", "relay.started"];
     let viewer: Vec<&str> = relay.iter().copied().chain(["sibling.get", "sibling.ticks"]).collect();
     let editor: Vec<&str> = viewer.iter().copied().chain(["sibling.secret"]).collect();
-    let roles = RoleTable::from_lists([("viewer", viewer), ("editor", editor), ("relayer", relay.to_vec())]);
-    let gate = Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere)));
-    let service = Arc::new(DynamicHub::new("host").register(SiblingActivation).register(child.clone()).with_gate(gate));
-    (service, child)
+    let host = World::new().host().with(SiblingActivation).with(child.clone());
+    let host = host.roles([("viewer", viewer), ("editor", editor), ("relayer", relay.to_vec())]).member(RELAY_ONLY, "relayer").await;
+    (host, child)
 }
 
 // ------------------------------------------------------------------ the rows
@@ -243,11 +202,11 @@ async fn host_and_child() -> (Arc<DynamicHub>, RemoteChild) {
 /// The call back is routed as the forwarded call's caller: the sibling
 /// names the viewer.
 async fn the_child_calls_a_sibling_as_the_original_caller() {
-    let (service, child) = host_and_child().await;
+    let (host, child) = host_and_child().await;
     let at_start = child.stats().calls_back;
-    let got = items(service.route("relay.ask", json!({ "to": "get" }), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("relay.ask", json!({ "to": "get" })).await;
     assert_eq!(got[0], json!({ "sibling": "get", "caller": VIEWER }), "{got:?}");
-    let got = items(service.route("relay.ask", json!({ "to": "get" }), Some(&who(EDITOR))).await).await;
+    let got = host.as_(EDITOR).call("relay.ask", json!({ "to": "get" })).await;
     assert_eq!(got[0]["caller"], EDITOR, "{got:?}");
     assert_eq!(child.stats().calls_back - at_start, 2, "the schema at its start, then one a call");
     assert_eq!(child.calls_open_back(), 0, "each forwarded call ended, and its standing with it");
@@ -256,23 +215,23 @@ async fn the_child_calls_a_sibling_as_the_original_caller() {
 /// The gate applies as the original caller: one without the sibling's
 /// grant is refused, though the child is the service's own.
 async fn a_caller_without_the_siblings_grant_is_refused() {
-    let (service, _child) = host_and_child().await;
-    let got = items(service.route("relay.ask", json!({ "to": "get" }), Some(&who(RELAY_ONLY))).await).await;
+    let (host, _child) = host_and_child().await;
+    let got = host.as_(RELAY_ONLY).call("relay.ask", json!({ "to": "get" })).await;
     assert_eq!(got[0]["refused"]["kind"], "forbidden", "{got:?}");
     assert!(got[0]["message"].as_str().unwrap().contains("sibling.get"), "{got:?}");
-    let got = items(service.route("relay.ask", json!({ "to": "secret" }), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("relay.ask", json!({ "to": "secret" })).await;
     assert_eq!(got[0]["refused"]["kind"], "forbidden", "a viewer holds no sibling.secret: {got:?}");
-    let got = items(service.route("relay.ask", json!({ "to": "secret" }), Some(&who(EDITOR))).await).await;
+    let got = host.as_(EDITOR).call("relay.ask", json!({ "to": "secret" })).await;
     assert_eq!(got[0], json!({ "sibling": "secret" }), "{got:?}");
 }
 
 /// Outside a live forwarded call, a call back is refused `unauthenticated`,
 /// naming why.
 async fn a_call_back_after_its_call_ended_is_refused() {
-    let (service, _child) = host_and_child().await;
-    let kept = items(service.route("relay.keep", json!({}), Some(&who(VIEWER))).await).await;
+    let (host, _child) = host_and_child().await;
+    let kept = host.as_(VIEWER).call("relay.keep", json!({})).await;
     assert_eq!(kept[0], "kept");
-    let got = items(service.route("relay.later", json!({}), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("relay.later", json!({})).await;
     assert_eq!(got[0]["refused"]["kind"], "unauthenticated", "{got:?}");
     assert!(got[0]["message"].as_str().unwrap().contains("no call"), "{got:?}");
 }
@@ -280,10 +239,10 @@ async fn a_call_back_after_its_call_ended_is_refused() {
 /// The forwarded call ends (its caller lets go): the stream the child was
 /// following through the service is dropped at the sibling.
 async fn the_forwarded_call_ending_ends_what_was_made_under_it() {
-    let (service, child) = host_and_child().await;
+    let (host, child) = host_and_child().await;
     let before = TICKING.load(Ordering::SeqCst);
     {
-        let mut s = service.route("relay.follow", json!({}), Some(&who(VIEWER))).await.unwrap();
+        let mut s = host.as_(VIEWER).route("relay.follow", json!({})).await.unwrap();
         let mut seen = vec![];
         while seen.len() < 3 {
             if let Some(PlexusStreamItem::Data { content, .. }) = s.next().await {
@@ -304,8 +263,8 @@ async fn the_forwarded_call_ending_ends_what_was_made_under_it() {
 /// At its start, outside any call: a schema is answered (the service's
 /// whole description), anything else refused `unauthenticated`.
 async fn outside_a_call_only_a_schema_is_answered() {
-    let (service, _child) = host_and_child().await;
-    let got = items(service.route("relay.started", json!({}), Some(&who(VIEWER))).await).await;
+    let (host, _child) = host_and_child().await;
+    let got = host.as_(VIEWER).call("relay.started", json!({})).await;
     assert_eq!(got[0]["schema_namespace"], "sibling", "{got:?}");
     assert_eq!(got[0]["plain"]["code"], -32001, "{got:?}");
     assert!(got[0]["plain"]["message"].as_str().unwrap().contains("only for a schema"), "{got:?}");

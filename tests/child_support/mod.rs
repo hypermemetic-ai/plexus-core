@@ -8,13 +8,16 @@ use async_stream::stream;
 use base64::Engine;
 use futures::stream::{Stream, StreamExt};
 use plexus_client::{MethodRef, StreamItem, Transport};
-use plexus_core::plexus::{AuthContext, ChildOptions, ChildSpec, Gate, HubTransport, Membership, Memberships, RemoteChild, Resolve, RoleTable, ScopeRef};
+use plexus_core::plexus::{ChildOptions, ChildSpec, Gate, HubTransport, RemoteChild};
 use plexus_core::DynamicHub;
+#[allow(unused_imports)]
+pub use plexus_testkit::parts::{who_carrying_secrets as who, Members, KEY_SECRET, SESSION_SECRET};
+use plexus_testkit::World;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -70,30 +73,12 @@ impl EchoActivation {
     }
 }
 
-pub const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-pub const NOBODY: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-pub const SESSION_SECRET: &str = "mgs_SESSIONSECRET0123456789";
-pub const KEY_SECRET: &str = "plexus-key.PROOFSECRET0123456789";
-
-#[derive(Default)]
-pub struct Members(pub Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-pub struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-/// A caller whose context carries a planted session id and key proof: what
-/// must never reach a child.
-pub fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), SESSION_SECRET, vec![], json!({ "session_key": KEY_SECRET, "token": KEY_SECRET }))
-}
+/// The viewer (the kit's `VIEWER`); NOBODY holds nothing. A caller here
+/// (`who`) carries a planted session id and key proof: what must never
+/// reach a child.
+pub const ADA: &str = plexus_testkit::VIEWER;
+#[allow(unused_imports)]
+pub use plexus_testkit::NOBODY;
 
 pub fn stub() -> PathBuf {
     std::env::var_os("PLEXUS_STUB_CHILD").map(PathBuf::from).unwrap_or_else(|| {
@@ -194,13 +179,9 @@ pub async fn rig_with(via: Via, opts: ChildOptions, extra: &str) -> Rig {
         }
     };
     let child = RemoteChild::connect(spec, opts).await.expect("the stub mounts");
-    let plain = || DynamicHub::new("service").register(RsechoActivation).register(child.clone());
-    let members = Arc::new(Members::default());
-    members.0.lock().unwrap().push(Membership { principal: ADA.parse().unwrap(), role: plexus_auth_core::RoleName::new("viewer"), scope: ScopeRef::parse("*") });
-    let declared = plain().declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let gate = Gate::new(members.clone(), Arc::new(roles), Arc::new(Everywhere));
-    Rig { service: Arc::new(plain().with_gate(Arc::new(gate.clone()))), child, log, members, gate, key, ws, dir }
+    let host = World::new().host().named("service").with(RsechoActivation).with(child.clone()).await;
+    let (members, gate) = (host.members().clone(), Gate::clone(host.gate()));
+    Rig { service: host.service().clone(), child, log, members, gate, key, ws, dir }
 }
 
 pub async fn rig(via: Via) -> Rig {

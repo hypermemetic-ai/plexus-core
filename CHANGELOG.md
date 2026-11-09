@@ -30,6 +30,19 @@ forwarded call's), `ChildStats::calls_back`, `RemoteChild::calls_open_back`.
 `DynamicHub::route_with_ctx` now runs knowing its service (the outermost
 one a call entered). Test: `tests/nest11_calls_back.rs`.
 
+NEST-12 (additive): **what a runtime peer set needs of a mount** (plexus-dyn).
+`ChildOptions::ping`: a WebSocket child is pinged at that period and marked
+down — every open call `child_unavailable`, the next one redialing — when
+nothing has come from it for twice as long; a dial whose upgrade never
+answers is given the mount's timeout. `RemoteChild::is_up`, `why_down`,
+`dead` (why a mount will never take its child back: "schema changed;
+restart the service" — a fresh `connect` mounts the new one), `up()` (bring
+it up now, within its backoff), `mounted_hash`; `ChildStats::up`. A mount
+reached through a slot of its service (a peer in `dyn.{peer}`) tells its
+child the method it was admitted for in the child's terms
+(`hop.limit.grant` = `{ns}.<method>`) rather than the service's slot grant,
+which the child could not read.
+
 ## [0.10.0]
 
 ASK-2 / ASK-1 (breaking): **the server no longer asks its caller

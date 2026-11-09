@@ -146,6 +146,10 @@ pub struct ChildOptions {
     /// service a call was routed in when the child was connected (inside a
     /// call), else the service of the first call forwarded to it.
     pub host: Option<crate::plexus::service_scope::WeakService>,
+    /// NEST-12: a WebSocket child is pinged this often, and marked down —
+    /// every open call `child_unavailable`, the next one redialing — when
+    /// nothing has come from it for twice as long. `None`: never pinged.
+    pub ping: Option<Duration>,
 }
 
 impl Default for ChildOptions {
@@ -162,6 +166,7 @@ impl Default for ChildOptions {
             max_depth: 8,
             schema_cache: 1024,
             host: None,
+            ping: None,
         }
     }
 }

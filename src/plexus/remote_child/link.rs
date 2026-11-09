@@ -791,6 +791,31 @@ impl Shared {
         }
     }
 
+    /// Why the child will never be mounted again, if it will not (a restart
+    /// published another schema).
+    pub(super) fn dead(&self) -> Option<String> {
+        self.state.lock().unwrap().dead.clone()
+    }
+
+    /// Why the child is down, when it is: the last connection's end, or the
+    /// last start that failed.
+    pub(super) fn why_down(&self) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        if st.dead.is_some() {
+            return st.dead.clone();
+        }
+        match &st.conn {
+            Some(c) if c.alive() => None,
+            _ => Some(if st.why.is_empty() { "not connected".to_string() } else { st.why.clone() }),
+        }
+    }
+
+    /// Whether a live connection is up now.
+    pub(super) fn is_up(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.dead.is_none() && st.conn.as_ref().is_some_and(|c| c.alive())
+    }
+
     fn live(&self) -> Result<Option<Arc<Conn>>, PlexusStreamItem> {
         let st = self.state.lock().unwrap();
         if let Some(why) = &st.dead {

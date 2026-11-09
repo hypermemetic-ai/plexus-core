@@ -1,0 +1,27 @@
+[package]
+name = "plexus-testkit"
+version = "0.1.0"
+edition = "2021"
+description = "A test kit for Plexus RPC services: a world, a host with its gate and roles, callers by name"
+license = "AGPL-3.0-only"
+repository = "https://github.com/hypermemetic-ai/plexus-core"
+# KEEL-9: unpublished. plexus-core's tests take it by path; a sibling
+# (plexus-dyn) by a git-ignored [patch.crates-io] onto this directory.
+publish = false
+
+[dependencies]
+plexus-core = { path = ".." }
+plexus-auth-core = { path = "../../plexus-auth-core" }
+serde_json = "1"
+futures = "0.3"
+async-trait = "0.1"
+
+[dev-dependencies]
+async-stream = "0.3"
+plexus-macros = { path = "../../plexus-macros" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# What #[plexus_macros::activation] expands to names these crates.
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+schemars = "1"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }

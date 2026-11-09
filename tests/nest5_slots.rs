@@ -10,13 +10,13 @@
 //! whole).
 
 use async_stream::stream;
-use futures::stream::{Stream, StreamExt};
-use plexus_core::plexus::{
-    Activation, AuthContext, AuthSetup, MemoryAuthBackend, MemoryMemberships, MemoryRoles, MethodRole, PlexusStream,
-    PlexusStreamItem, Resolve, ScopeRef,
-};
+use futures::stream::Stream;
+use plexus_core::plexus::{Activation, MethodRole};
 use plexus_core::{DynamicHub, PlexusError};
+use plexus_testkit::parts::{items, who};
+use plexus_testkit::{World, VIEWER};
 use serde_json::{json, Value};
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 // ------------------------------------------------------------------ the kids
@@ -106,52 +106,22 @@ impl BeltActivation {
 
 // ------------------------------------------------------------------ the world
 
-const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const LITERAL: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
+/// `space`, logged in: VIEWER holds viewer; LITERAL holds `literal`, a
+/// grant written as a literal path, which still decides (the slot grant is
+/// additive).
 fn hub() -> Arc<DynamicHub> {
-    let roles = Arc::new(MemoryRoles::default());
-    let members = MemoryMemberships::new().with(VIEWER, "viewer", "*").with(LITERAL, "literal", "*");
-    let hub = DynamicHub::new("space")
-        .register(SolarActivation)
-        .register(BeltActivation)
-        .with_auth(AuthSetup::new(Arc::new(MemoryAuthBackend::new("http://x/login")), roles.clone(), Arc::new(members), Arc::new(Everywhere)));
-    let mut declared = hub.declared_roles();
-    // A grant written as a literal path still decides (the slot grant is additive).
-    declared.insert("literal".into(), vec!["solar.mars.rename".into()]);
-    roles.seed(&declared);
-    Arc::new(hub)
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], json!({}))
-}
-
-async fn items(stream: PlexusStream) -> Vec<Value> {
-    stream
-        .filter_map(|i| async move {
-            match i {
-                PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
-                PlexusStreamItem::Error { message, fields, .. } => Some(json!({ "error": message, "fields": fields })),
-                _ => None,
-            }
-        })
-        .collect()
-        .await
+    let host = World::new().host().named("space").with(SolarActivation).with(BeltActivation).with_auth();
+    let host = futures::executor::block_on(host.role("literal", ["solar.mars.rename"]).member(LITERAL, "literal").into_future());
+    host.service().clone()
 }
 
 /// `ok:<first item>` or `refused:<grant>`.
 async fn call(hub: &DynamicHub, method: &str, params: Value, p: &str) -> String {
     match hub.route(method, params, Some(&who(p))).await {
         Ok(s) => {
-            let got = items(s).await;
+            let got = items(Ok(s)).await;
             match got.first() {
                 Some(Value::String(s)) => format!("ok:{s}"),
                 other => format!("other:{other:?}"),
@@ -252,7 +222,7 @@ async fn auth_requires_answers_the_slot_grant() {
         let hub = hub.clone();
         async move {
             let s = hub.route("auth.requires", json!({ "method": m }), Some(&who(VIEWER))).await.expect("requires");
-            items(s).await.into_iter().next().unwrap()
+            items(Ok(s)).await.into_iter().next().unwrap()
         }
     };
     let r = ask("solar.earth.info").await;

@@ -8,17 +8,16 @@
 //! it goes again. Beside it: the builder is unchanged, a plain `Peer` is
 //! served under a name of its own, and the root refuses what it must.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
 use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
-use plexus_core::plexus::{
-    AuthContext, Gate, Membership, Memberships, Peer, PeerError, PlexusStream, PlexusStreamItem, Resolve, RoleTable,
-    RootError, ScopeRef,
-};
+use plexus_core::plexus::{AuthContext, Peer, PeerError, PlexusStream, PlexusStreamItem, RootError};
 use plexus_core::{DynamicHub, PlexusError};
+use plexus_testkit::parts::who;
+use plexus_testkit::{World, NOBODY, VIEWER};
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -231,40 +230,12 @@ async fn a_client_reaches_it_through_the_module_built_before_it_came() {
 
 // ── the gate admits it by role ──────────────────────────────────────────────
 
-const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const NOBODY: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
 #[tokio::test]
 async fn the_gate_admits_a_grown_peer_by_role() {
-    let members = Arc::new(Members::default());
-    members.0.lock().unwrap().push(Membership {
-        principal: VIEWER.parse().unwrap(),
-        role: plexus_auth_core::RoleName::new("viewer"),
-        scope: ScopeRef::Everywhere,
-    });
-    // The role names the grant before the peer exists: a grant is a path.
-    let roles = RoleTable::from_lists([("viewer", ["weather.forecast"].into_iter())]);
-    let gate = Gate::new(members, Arc::new(roles), Arc::new(Everywhere));
-    let hub = DynamicHub::new("svc").with_gate(Arc::new(gate));
+    // VIEWER holds viewer; NOBODY nothing. The role names the grant before
+    // the peer exists: a grant is a path.
+    let host = World::new().host().named("svc").role("viewer", ["weather.forecast"]).await;
+    let hub = host.service().clone();
     let (viewer, nobody) = (who(VIEWER), who(NOBODY));
 
     // Before: nothing to admit, and nothing in the viewer's schema.

@@ -44,7 +44,7 @@ use super::link::meta;
 use crate::plexus::auth::AuthContext;
 use crate::plexus::service_scope::{self, WeakService};
 use crate::plexus::types::PlexusStreamItem;
-use crate::plexus::{plexus_error_to_jsonrpc, PlexusError};
+use crate::plexus::{parent, plexus_error_to_jsonrpc, PlexusError};
 
 /// The method a child opens a call into its service with.
 pub const HOST_CALL: &str = "_host.call";
@@ -68,11 +68,39 @@ pub(super) struct Upcalls {
     under: Mutex<HashMap<String, Arc<Under>>>,
     /// Calls the child made back, in all.
     pub made: AtomicU64,
+    /// NEST-16: the methods the child's schema says it needs (`None`: it
+    /// declares none), set when it is mounted.
+    needs: Mutex<Option<Arc<[String]>>>,
+    /// NEST-16: NEST-11's broad rule for a child that declares no needs —
+    /// anything its caller could reach ([`ChildOptions::legacy_upcalls`]).
+    ///
+    /// [`ChildOptions::legacy_upcalls`]: super::ChildOptions::legacy_upcalls
+    legacy: bool,
 }
 
 impl Upcalls {
-    pub(super) fn new(host: Option<WeakService>) -> Arc<Self> {
-        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0) })
+    pub(super) fn new(host: Option<WeakService>, legacy: bool) -> Arc<Self> {
+        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), needs: Mutex::default(), legacy })
+    }
+
+    /// NEST-16: what the mounted child's schema says it needs.
+    pub(super) fn set_needs(&self, needs: Option<&[crate::plexus::schema::Need]>) {
+        *self.needs.lock().unwrap() = needs.map(|n| n.iter().map(|n| n.method.clone()).collect::<Vec<_>>().into());
+    }
+
+    /// NEST-16: may the child call `method` up — the standard interface, a
+    /// need, or anything under the legacy rule for a child that declares
+    /// none. `Some(true)` when it is a need (routed under its own grant).
+    fn allows(&self, method: &str) -> Option<bool> {
+        if parent::is_standard(method) {
+            return Some(false);
+        }
+        match self.needs.lock().unwrap().as_ref() {
+            Some(needs) if needs.iter().any(|n| n == method) => Some(true),
+            Some(_) => None,
+            None if self.legacy => Some(false),
+            None => None,
+        }
     }
 
     /// The service the child is in: the one given, else the one a call was
@@ -134,9 +162,11 @@ impl Drop for UnderGuard {
 
 /// `auth`, its reach narrowed to `reach`'s scopes: one more ceiling layer,
 /// `admin@<scope>` each (any grant, only there) — none when `reach` holds
-/// everywhere.
-fn narrowed(auth: &AuthContext, reach: &Reach) -> AuthContext {
-    if reach.is_everywhere() {
+/// everywhere. NEST-16 (TM-1): for a need, the layer is its own grant on
+/// each of those scopes (`shop.items@*` when everywhere), so the call back
+/// reaches that method and nothing else, whatever the caller holds.
+fn narrowed(auth: &AuthContext, reach: &Reach, grant: Option<&str>) -> AuthContext {
+    if reach.is_everywhere() && grant.is_none() {
         return auth.clone();
     }
     let mut ctx = auth.clone();
@@ -146,7 +176,9 @@ fn narrowed(auth: &AuthContext, reach: &Reach) -> AuthContext {
         Some(other) => vec![other.clone()],
         None => Vec::new(),
     };
-    layers.push(Value::Array(reach.held_on().iter().map(|s| json!(format!("{}@{s}", plexus_auth_core::grants::ADMIN))).collect()));
+    let what = grant.unwrap_or(plexus_auth_core::grants::ADMIN);
+    let scopes: Vec<String> = if reach.is_everywhere() { vec!["*".into()] } else { reach.held_on().iter().map(|s| s.to_string()).collect() };
+    layers.push(Value::Array(scopes.iter().map(|s| json!(format!("{what}@{s}"))).collect()));
     if !ctx.metadata.is_object() {
         ctx.metadata = json!({});
     }
@@ -191,14 +223,26 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
         let stopped = held.map(|h| h.abort()).is_some();
         return send(json!({ "jsonrpc": "2.0", "id": id, "result": stopped }));
     }
-    let Some(target) = params.get("method").and_then(Value::as_str).map(str::to_string) else {
+    let Some(mut target) = params.get("method").and_then(Value::as_str).map(str::to_string) else {
         return send(refusal(&id, &PlexusError::invalid_params("`_host.call` names the `method` it calls")));
     };
     let args = params.get("params").cloned().unwrap_or_else(|| json!({}));
     let under_id = params.get("under").and_then(Value::as_str).map(str::to_string);
+    // NEST-16: the standard upward interface, the child's needs, or (a
+    // child that declares none, under the legacy option) NEST-11's rule.
+    let Some(need) = up.allows(&target) else {
+        return send(refusal(&id, &parent::not_needed(&target)));
+    };
+    let standard = matches!(target.as_str(), parent::HOST_WHOAMI | parent::HOST_LOG | parent::HOST_NOTIFY);
+    if target == parent::HOST_SCHEMA {
+        if let Some(svc) = up.host().and_then(|h| h.upgrade()) {
+            target = format!("{}.schema", svc.runtime_namespace());
+        }
+    }
     let route = match &under_id {
         Some(u) => match up.under.lock().unwrap().get(u) {
-            Some(under) => Route::Under(Arc::clone(under)),
+            Some(under) if standard => Route::Standard(under.service.clone(), under.auth.clone()),
+            Some(under) => Route::Under(Arc::clone(under), need),
             None => {
                 return send(refusal(&id, &PlexusError::Unauthenticated(format!(
                     "no call `{u}` is open into this child: a child calls its service only under a call it is serving, while it is open"
@@ -207,7 +251,8 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
         },
         None => {
             let schema = target.ends_with(".schema");
-            match (schema, up.host()) {
+            match (schema || standard, up.host()) {
+                (true, Some(host)) if standard => Route::Standard(host, None),
                 (true, Some(host)) => Route::Schema(host),
                 (true, None) => {
                     return send(refusal(&id, &PlexusError::Unauthenticated(
@@ -216,7 +261,7 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
                 }
                 (false, _) => {
                     return send(refusal(&id, &PlexusError::Unauthenticated(format!(
-                        "`{target}` names no call it acts under (`under`): a child calls its service only under a call it is serving; outside one it may ask only for a schema"
+                        "`{target}` names no call it acts under (`under`): a child calls its service only under a call it is serving; outside one it may ask only for a schema, or call `host.log` and `host.notify`"
                     ))))
                 }
             }
@@ -237,8 +282,12 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
 }
 
 enum Route {
-    Under(Arc<Under>),
+    /// A call under a forwarded call; `true`: one of the child's needs.
+    Under(Arc<Under>, bool),
     Schema(WeakService),
+    /// NEST-16: `host.whoami`, `host.log` or `host.notify`, answered by the
+    /// service itself, for the caller of the call it is made under.
+    Standard(WeakService, Option<AuthContext>),
 }
 
 /// One call the child made: routed, its items written back under `sid`
@@ -257,8 +306,8 @@ async fn pump(route: Route, out: &mpsc::UnboundedSender<Vec<u8>>, sid: u64, name
         e
     };
     let (under, service) = match &route {
-        Route::Under(u) => (Some(Arc::clone(u)), u.service.upgrade()),
-        Route::Schema(s) => (None, s.upgrade()),
+        Route::Under(u, _) => (Some(Arc::clone(u)), u.service.upgrade()),
+        Route::Schema(s) | Route::Standard(s, _) => (None, s.upgrade()),
     };
     let Some(service) = service else {
         let mut e = gone();
@@ -267,9 +316,18 @@ async fn pump(route: Route, out: &mpsc::UnboundedSender<Vec<u8>>, sid: u64, name
         }
         return item(&e);
     };
+    if let Route::Standard(_, caller) = &route {
+        for i in parent::standard_answer(&service, name, target, &args, caller.as_ref()).unwrap_or_default() {
+            item(&i);
+        }
+        return;
+    }
+    let need = matches!(route, Route::Under(_, true));
     let routed = match &under {
         Some(u) => {
-            let auth = u.auth.as_ref().map(|a| narrowed(a, &u.reach));
+            // TM-1: a need is routed under its own grant as one more ceiling.
+            let grant = if need { service.grant_at(target) } else { None };
+            let auth = u.auth.as_ref().map(|a| narrowed(a, &u.reach, grant.as_deref()));
             service.route_with_ctx(target, args, auth.as_ref(), None).await
         }
         None => service.schema_for_child(target, args).await,
@@ -346,7 +404,7 @@ mod tests {
         let gate = Gate::new(Arc::new(Held), Arc::new(roles), Arc::new(Chain));
         let who = AuthContext::for_principal(&"key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(), "s", vec![], Value::Null);
         let wide = gate.check(Some(&who), &plexus_auth_core::grants::Grant::new("a.get"), None).unwrap();
-        assert_eq!(narrowed(&who, &wide).metadata, who.metadata, "held everywhere: nothing added");
+        assert_eq!(narrowed(&who, &wide, None).metadata, who.metadata, "held everywhere: nothing added");
         // A reach held on `X` alone: the call back reaches `b.get` on X, not on Y.
         let mut n = who.clone();
         n.metadata[CEILING_KEY] = json!([["admin@X"]]);
@@ -354,7 +412,7 @@ mod tests {
         let g = plexus_auth_core::grants::Grant::new("b.get");
         assert!(gate.check(Some(&narrow), &g, Some("X")).is_ok());
         assert!(gate.check(Some(&narrow), &g, Some("Y")).is_err());
-        let layered = narrowed(&n, &gate.check(Some(&n), &plexus_auth_core::grants::Grant::new("a.get"), None).unwrap());
+        let layered = narrowed(&n, &gate.check(Some(&n), &plexus_auth_core::grants::Grant::new("a.get"), None).unwrap(), None);
         assert_eq!(layered.metadata[CEILING_KEY].as_array().unwrap().len(), 2, "{:?}", layered.metadata);
         assert!(gate.check(Some(&layered), &g, Some("Y")).is_err());
     }

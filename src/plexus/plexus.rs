@@ -105,6 +105,12 @@ pub enum AuthzDenyReason {
         /// Where the caller holds it.
         held_on: Vec<plexus_auth_core::grants::ScopeRef>,
     },
+    /// NEST-16: a child called its service for `method`, which is neither
+    /// the standard upward interface nor one of the methods it `needs`.
+    NotNeeded {
+        /// The method the child called, by its path from the service.
+        method: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +200,9 @@ impl std::fmt::Display for PlexusError {
                 AuthzDenyReason::MissingGrant { grant, scope, .. } => {
                     write!(f, "needs {} on {}", grant, scope)
                 }
+                AuthzDenyReason::NotNeeded { method } => {
+                    write!(f, "`{method}` is not among the methods this child needs (its schema's `needs`)")
+                }
             },
         }
     }
@@ -266,6 +275,7 @@ impl From<&PlexusError> for RemoteError {
                     },
                     AuthzDenyReason::TenantBoundary => DenyReason::TenantBoundary,
                     AuthzDenyReason::NotAccepted => DenyReason::NotAccepted,
+                    AuthzDenyReason::NotNeeded { method } => DenyReason::NotNeeded { method: method.clone() },
                     // AUTH-2's refusal, whole: what was needed, where, the
                     // roles listing it and where the caller holds it.
                     AuthzDenyReason::MissingGrant { grant, scope, roles, held_on } => {
@@ -438,6 +448,14 @@ pub trait Activation: Send + Sync + 'static {
     where
         Self: Sized,
     {
+        None
+    }
+
+    /// NEST-16: what this activation calls of the service it is grafted
+    /// onto — its schema's `needs`, answered without building the schema
+    /// (`#[plexus_macros::activation(parent = …)]` emits it). `None`: it
+    /// declares nothing.
+    fn needs(&self) -> Option<Vec<super::schema::Need>> {
         None
     }
 
@@ -885,6 +903,10 @@ pub(crate) trait ActivationObject: Send + Sync + 'static {
     fn plugin_schema(&self) -> PluginSchema;
     fn static_child_schemas(&self) -> Vec<(String, PluginSchema)>;
     fn schema(&self) -> Schema;
+    /// NEST-16: [`Activation::needs`].
+    fn needs(&self) -> Option<Vec<super::schema::Need>> {
+        None
+    }
 }
 
 struct ActivationWrapper<A: Activation> {
@@ -912,6 +934,8 @@ impl<A: Activation> ActivationObject for ActivationWrapper<A> {
     fn plugin_schema(&self) -> PluginSchema { self.inner.plugin_schema() }
 
     fn static_child_schemas(&self) -> Vec<(String, PluginSchema)> { self.inner.static_child_schemas() }
+
+    fn needs(&self) -> Option<Vec<super::schema::Need>> { self.inner.needs() }
 
     fn schema(&self) -> Schema {
         let schema = schemars::schema_for!(A::Methods);
@@ -1244,6 +1268,9 @@ pub(crate) struct DynamicHubInner {
     /// RETURNS-40: the `ir` answers kept, by the hash the caller sees and
     /// the namespaces asked. See [`DynamicHub::service_ir`].
     ir_cache: super::ir::IrCache,
+    /// NEST-16: what children said through `host.notify`, to whoever in the
+    /// service listens ([`DynamicHub::notices`]).
+    notices: tokio::sync::broadcast::Sender<super::parent::Notice>,
 }
 
 /// NEST-5: the gate's index — every method path to its gate facts, and the
@@ -1399,6 +1426,7 @@ impl DynamicHub {
                 auth_catalog: None,
                 describe: Default::default(),
                 ir_cache: Default::default(),
+                notices: tokio::sync::broadcast::Sender::new(64),
             }),
         }
     }
@@ -2393,6 +2421,10 @@ impl DynamicHub {
         if name == self.inner.namespace {
             return Err(super::service_root::RootError::Shadows { name });
         }
+        // NEST-16: a graft is checked against the service it joins.
+        if let Some(needs) = entry.object.needs() {
+            self.check_needs(&name, &needs).map_err(super::service_root::RootError::Needs)?;
+        }
         let before = self.compute_hash();
         let replaced = self.change_table(|table| {
             if !replace && table.entries.contains_key(&name) {
@@ -2409,6 +2441,71 @@ impl DynamicHub {
         Self::index_entry(&mut self.inner.registry.write().unwrap_or_else(|p| p.into_inner()), self.inner.auth_catalog.as_ref(), &name, &entry);
         self.table_moved(before);
         Ok(replaced)
+    }
+
+    /// NEST-16: what children say through `host.notify` from now on (the
+    /// last 64 kept for a slow listener; older ones dropped for it).
+    pub fn notices(&self) -> tokio::sync::broadcast::Receiver<super::parent::Notice> {
+        self.inner.notices.subscribe()
+    }
+
+    /// NEST-16: say `notice` to whoever listens; answers how many do.
+    pub fn notify(&self, notice: super::parent::Notice) -> u64 {
+        self.inner.notices.send(notice).map(|n| n as u64).unwrap_or(0)
+    }
+
+    /// NEST-16: the method this service serves at `path` (`shop.items`,
+    /// `shop.ui.slots.list`, `<service>.schema`): its shape hash
+    /// ([`super::peer::Interface::method_hash`]) and its grant. Every
+    /// registered activation, mounted child, static child and typed slot's
+    /// method; `None` for anything else.
+    pub fn method_at(&self, path: &str) -> Option<(String, String)> {
+        let own = Activation::plugin_schema(self);
+        if let Some(m) = path.strip_prefix(&format!("{}.", self.inner.namespace)).and_then(|m| own.methods.iter().find(|x| x.name == m)) {
+            return Some((super::peer::Interface::method_hash(m), path.to_string()));
+        }
+        let (at, name) = path.rsplit_once('.')?;
+        let activations: Vec<PluginSchema> = self.table().entries.values().map(|e| e.object.plugin_schema()).collect();
+        let statics = self.static_children();
+        let typed = self.slot_children().0;
+        activations
+            .iter()
+            .chain(statics.iter())
+            .chain(typed.iter())
+            .filter(|s| s.namespace == at)
+            .flat_map(|s| s.methods.iter().map(move |m| (s, m)))
+            .find(|(_, m)| m.name == name && matches!(m.role, super::schema::MethodRole::Rpc))
+            .map(|(s, m)| (super::peer::Interface::method_hash(m), m.grant_or(&s.namespace)))
+    }
+
+    /// NEST-16: the grant the gate holds a call to `path` to (its index's,
+    /// kept until the service changes).
+    pub(crate) fn grant_at(&self, path: &str) -> Option<String> {
+        self.gate_index().info(path).and_then(|i| i.grant.clone())
+    }
+
+    /// NEST-16: check a graft's `needs` against what this service serves,
+    /// each by its shape hash.
+    pub fn check_needs(&self, child: &str, needs: &[super::schema::Need]) -> Result<(), super::parent::NeedsMiss> {
+        // A need below an untyped slot (`dyn.peer.w.weather.forecast`) is
+        // reachable when the slot is; its shape is the peer's, unknown here.
+        super::parent::check_needs(child, &self.inner.namespace, needs, |p| {
+            self.method_at(p).map(|(h, _)| h).or_else(|| self.gate_index().slots.resolve(p).map(|_| String::new()))
+        })
+    }
+
+    /// NEST-16: check every entry that declares `needs` against the rest of
+    /// the service — what serving a service does first (a static graft whose
+    /// parent is not there is refused before anything is served).
+    pub fn check_grafts(&self) -> Result<(), Vec<super::parent::NeedsMiss>> {
+        let misses: Vec<_> = self
+            .table()
+            .entries
+            .iter()
+            .filter_map(|(name, e)| e.object.needs().map(|n| (name.clone(), n)))
+            .filter_map(|(name, needs)| self.check_needs(&name, &needs).err())
+            .collect();
+        if misses.is_empty() { Ok(()) } else { Err(misses) }
     }
 
     /// NEST-15: stop serving `name`; answers whether it was served.
@@ -2800,6 +2897,11 @@ impl DynamicHub {
     pub fn into_rpc_module(self) -> Result<RpcModule<()>, jsonrpsee::core::RegisterMethodError> {
         let mut module = RpcModule::new(());
 
+        // NEST-16: a static graft whose parent's methods are not served
+        // here, or moved, is refused before anything is served.
+        if let Err(misses) = self.check_grafts() {
+            panic!("{}", misses.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "));
+        }
         PlexusContext::init(self.compute_hash());
 
         // Register hub methods with runtime namespace using dot notation (e.g., "plexus.call" or "hub.call")
@@ -2978,6 +3080,11 @@ impl DynamicHub {
     pub fn arc_into_rpc_module(hub: Arc<Self>) -> Result<RpcModule<()>, jsonrpsee::core::RegisterMethodError> {
         let mut module = RpcModule::new(());
 
+        // NEST-16: a static graft whose parent's methods are not served
+        // here, or moved, is refused before anything is served.
+        if let Err(misses) = hub.check_grafts() {
+            panic!("{}", misses.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "));
+        }
         PlexusContext::init(hub.compute_hash());
 
         // Register hub methods with runtime namespace using dot notation (e.g., "plexus.call" or "hub.call")

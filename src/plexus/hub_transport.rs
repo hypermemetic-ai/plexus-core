@@ -70,6 +70,11 @@ impl HubTransport {
         Self { hub, auth: Some(caller) }
     }
 
+    /// NEST-16: `hub` as `caller`, or as no one.
+    pub(crate) fn with(hub: Arc<DynamicHub>, caller: Option<AuthContext>) -> Self {
+        Self { hub, auth: caller }
+    }
+
     /// Call `hub` with no identity: what a gated hub admits anonymously,
     /// and nothing else.
     pub fn anonymous(hub: Arc<DynamicHub>) -> Self {

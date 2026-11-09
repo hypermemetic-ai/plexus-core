@@ -150,6 +150,13 @@ pub struct ChildOptions {
     /// every open call `child_unavailable`, the next one redialing — when
     /// nothing has come from it for twice as long. `None`: never pinged.
     pub ping: Option<Duration>,
+    /// NEST-16: a child whose schema declares no `needs` may call up, under
+    /// a call it serves, anything that call's caller could (NEST-11's rule,
+    /// `--child-legacy-upcalls`). Off: such a child has the standard upward
+    /// interface alone (`host.schema`, `host.whoami`, `host.log`,
+    /// `host.notify`). Kept for one release, for dendrites built before
+    /// `needs`; a child that declares needs is held to them either way.
+    pub legacy_upcalls: bool,
 }
 
 impl Default for ChildOptions {
@@ -167,6 +174,7 @@ impl Default for ChildOptions {
             schema_cache: 1024,
             host: None,
             ping: None,
+            legacy_upcalls: false,
         }
     }
 }
@@ -180,6 +188,13 @@ impl ChildOptions {
 
     /// NEST-11: these options, the child mounted in `service` (see
     /// [`ChildOptions::host`]).
+    /// NEST-16: NEST-11's broad rule for a child that declares no `needs`
+    /// ([`ChildOptions::legacy_upcalls`]).
+    pub fn with_legacy_upcalls(mut self, on: bool) -> Self {
+        self.legacy_upcalls = on;
+        self
+    }
+
     pub fn with_host(mut self, service: &crate::plexus::DynamicHub) -> Self {
         self.host = Some(service.downgrade());
         self

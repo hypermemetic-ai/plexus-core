@@ -586,7 +586,7 @@ pub(super) fn static_children(raw: &Value) -> Vec<String> {
 
 impl Shared {
     pub(super) fn new(spec: ChildSpec, opts: ChildOptions, principal: String) -> Arc<Self> {
-        let upcalls = Upcalls::new(opts.host.clone().or_else(crate::plexus::service_scope::current));
+        let upcalls = Upcalls::new(opts.host.clone().or_else(crate::plexus::service_scope::current), opts.legacy_upcalls);
         Arc::new(Self {
             upcalls,
             name: spec.name().to_string(),

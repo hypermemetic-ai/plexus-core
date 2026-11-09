@@ -5,7 +5,37 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.10.2
+## [Unreleased] — 0.11.0
+
+NEST-16 (breaking: a child's calls back are narrowed; `PluginSchema` and
+`ChildOptions` gain a field; plexus-macros and plexus-client 0.11): **a graft
+that knows its parent.** `#[plexus_macros::activation(parent = ShopClient)]`
+injects the parent's client into a method as `parent: Parent<ShopClient>`
+(`plexus::Parent`, over a `ParentTransport`: the mount's connection back
+when the child runs behind one, the service's own routing in process; every
+call as the original caller). `PluginSchema.needs: Option<Vec<Need>>` — each
+method the activation calls of its parent, by path (`shop.items`) and shape
+hash (`Interface::method_hash`); absent on the wire when `None`, and kept out
+of `PluginSchema`'s own JSON Schema, so no service's hash moves.
+`Activation::needs()` (default `None`) answers it without building the
+schema. **A graft is checked**: `ServiceRoot::insert`/`replace`/`insert_peer`
+refuse an entry whose needs are not served (`RootError::Needs(NeedsMiss)`,
+every missing and changed method named); `DynamicHub::check_needs`,
+`check_grafts`, `method_at`; serving a service (`into_rpc_module`) refuses a
+static graft whose parent is not there. A need below an untyped slot counts
+as served (its shape is the peer's). **The calls back**: beyond the standard
+upward interface — `host.schema` (and any `<path>.schema`), `host.whoami`,
+`host.log`, `host.notify` (answered by the service: `DynamicHub::notices()`
+/ `notify`) — a child calls only what its schema's `needs` names; anything
+else is refused `forbidden`, reason `not_needed` (new `AuthzDenyReason` /
+`DenyReason` variant, kept out of the JSON Schema), and a need is routed
+under one more ceiling layer, its own grant on the forwarded call's scopes
+(TM-1, DYNAUTH-4). A child that declares no needs has the standard interface
+alone, unless the service keeps NEST-11's rule for it for this release:
+`ChildOptions::legacy_upcalls` / `with_legacy_upcalls`,
+`--child-legacy-upcalls`. `RemoteChild::needs()` (its whole tree's).
+
+## 0.10.2 (unreleased; folded into 0.11.0)
 
 NEST-15 (additive): **the service root is the primitive — a table of peers
 answered by `peer(name)`, and it can change while the service serves.**

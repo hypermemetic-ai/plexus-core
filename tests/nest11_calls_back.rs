@@ -223,7 +223,7 @@ async fn host_and_child() -> (Arc<DynamicHub>, RemoteChild) {
     // connected inside a call — plexus-dyn's `grow` — learns it from the call.)
     let before = Arc::new(DynamicHub::new("host").register(SiblingActivation));
     let spec: ChildSpec = format!("relay=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap();
-    let child = RemoteChild::connect(spec, ChildOptions::for_service("host").with_host(&before)).await.expect("the child mounts");
+    let child = RemoteChild::connect(spec, ChildOptions::for_service("host").with_host(&before).with_legacy_upcalls(true)).await.expect("the child mounts");
     std::mem::forget(before);
     let members = Arc::new(Members::default());
     for (p, r) in [(VIEWER, "viewer"), (EDITOR, "editor"), (RELAY_ONLY, "relayer")] {

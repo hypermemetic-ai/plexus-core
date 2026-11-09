@@ -208,6 +208,22 @@ impl Upcalls {
             .collect()
     }
 
+    /// DYNAUTH-7: every forwarded call open now ends for the child's calls
+    /// back — each made under one ends with one error item, saying `why`.
+    pub(super) fn end_all(&self, why: &str) {
+        let open: Vec<Arc<Under>> = self.under.lock().unwrap().drain().map(|(_, u)| u).collect();
+        for u in open {
+            u.ended.send_if_modified(|e| {
+                if e.is_none() {
+                    *e = Some(why.to_string());
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
     /// How many forwarded calls the child may call back under now.
     pub(super) fn open_now(&self) -> usize {
         self.under.lock().unwrap().len()
@@ -638,5 +654,20 @@ mod tests {
         // A pipe's token: bound to no key, no proof asked.
         let (token, claims) = issuer.mint(req(None)).unwrap();
         assert_eq!(presented_ok(&up, &Minted { token, claims }, &json!({}), "shop.items", "u1"), Ok(()));
+    }
+
+    /// DYNAUTH-7: a revoked child's calls back end, each saying why.
+    #[tokio::test]
+    async fn revoking_ends_every_call_back() {
+        let up = Upcalls::new(None, false);
+        let svc = crate::plexus::DynamicHub::new("svc");
+        let reach = plexus_auth_core::grants::Reach::everywhere();
+        let guard = crate::plexus::service_scope::scope(svc.downgrade(), async { up.open("c1", None, &reach, None) }).await.expect("opened");
+        let mut ended = guard.under.ended.subscribe();
+        assert_eq!(up.open_now(), 1);
+        up.end_all("revoked: compromised");
+        assert_eq!(up.open_now(), 0);
+        ended.changed().await.unwrap();
+        assert_eq!(ended.borrow().as_deref(), Some("revoked: compromised"));
     }
 }

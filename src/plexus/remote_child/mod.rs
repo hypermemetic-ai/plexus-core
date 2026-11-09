@@ -365,6 +365,21 @@ impl RemoteChild {
         self.inner.shared.upcalls.consent().map(|c| c.to_vec())
     }
 
+    /// DYNAUTH-7: revoke the child: from now no call is forwarded to it (so
+    /// no token is minted for it), and every call it is making back ends
+    /// with one error item saying `why`. A token already in its hand lives
+    /// out its `exp` (≤ 60 s) at a peer that verifies without asking.
+    pub fn revoke(&self, why: &str) {
+        *self.inner.shared.revoked.lock().unwrap() = Some(why.to_string());
+        self.inner.shared.upcalls.end_all(&format!("revoked: {why}"));
+        tracing::warn!(target: "plexus::audit", child = %self.name(), %why, "child revoked");
+    }
+
+    /// DYNAUTH-7: why the child is revoked, if it is.
+    pub fn revoked(&self) -> Option<String> {
+        self.inner.shared.revoked.lock().unwrap().clone()
+    }
+
     /// DYNAUTH-5: the Ed25519 key the child proved at its mount
     /// (`key:<hex>`), if it proved one; pinned with [`Self::identity`].
     pub fn peer_key(&self) -> Option<&str> {
@@ -598,6 +613,11 @@ impl RemoteChild {
     async fn forward(&self, method: &str, params: Value, auth: Option<&AuthContext>, instance: Option<String>) -> PlexusStream {
         let shared = &self.inner.shared;
         let one = |item: PlexusStreamItem| -> PlexusStream { Box::pin(futures::stream::iter([item])) };
+        // DYNAUTH-7: a revoked child is forwarded nothing.
+        if let Some(why) = shared.revoked.lock().unwrap().clone() {
+            let e = PlexusError::Unauthenticated(format!("`{}` is revoked ({why}): no call is forwarded to it", self.name()));
+            return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false));
+        }
         // RETURNS-47: the verdict is the call's; outside one (a forward no
         // dispatch admitted) nothing crosses — fail closed, never everywhere.
         let reach = match super::grant_gate::current_reach() {

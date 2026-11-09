@@ -150,6 +150,11 @@ pub struct ChildOptions {
     /// every open call `child_unavailable`, the next one redialing — when
     /// nothing has come from it for twice as long. `None`: never pinged.
     pub ping: Option<Duration>,
+    /// DYNAUTH-8: a PEM file of certificate authorities a `wss://` child's
+    /// certificate may chain to, beside the webpki roots (a private CA, a
+    /// test network's). Certificates are always validated; nothing turns
+    /// that off.
+    pub tls_roots: Option<PathBuf>,
 }
 
 impl Default for ChildOptions {
@@ -167,6 +172,7 @@ impl Default for ChildOptions {
             schema_cache: 1024,
             host: None,
             ping: None,
+            tls_roots: None,
         }
     }
 }

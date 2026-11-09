@@ -5,7 +5,20 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.10.1
+## [Unreleased]
+
+DYNAUTH-8 (additive): **transport hardening.** `plexus::redact` — one
+redactor for frame logs (`redact_str`, `redact_value`, `CREDENTIAL_KEYS`):
+a credential key keeps its name and loses its value. A stdio child's stderr,
+relayed into the service's log, goes through it. `child-wss` builds its own
+rustls client (ring; the webpki roots plus the new
+`ChildOptions::tls_roots`, a PEM file of more CAs) and every mount pins its
+child's identity — `RemoteChild::identity()`, a `PeerIdentity` of its
+`_info` backend and, on `wss://`, the sha256 of its certificate's public
+key; a restart or redial that proves another is refused for good
+(`dead()`), as one publishing another schema is.
+
+## 0.10.1
 
 NEST-11 (additive): **a child calls its service back, under a call it
 serves.** A child mounted by `RemoteChild` (spawned on stdio or dialed on a

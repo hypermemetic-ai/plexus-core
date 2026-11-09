@@ -98,6 +98,12 @@ tokio = { version = "1.0", features = ["full"] }
 # plexus::input reads PendingSubscriptionSink::subscription_id, new in 0.26.1.
 jsonrpsee = { version = "0.26.1", features = ["server", "macros"] }
 tokio-tungstenite = { version = "0.30", optional = true }
+# DYNAUTH-8: `child-wss` builds its own rustls client (ring, the webpki roots
+# plus `ChildOptions::tls_roots`) and pins the far side's certificate key —
+# the rustls 0.23 / ring / webpki that tokio-tungstenite's TLS already brings.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "std"], optional = true }
 
 # PLEXUS-45: wasm32-unknown-unknown (a browser, or node). No processes, no
 # sockets of its own, one thread, no tokio runtime: tokio for its sync
@@ -127,7 +133,7 @@ clap = ["dep:clap"]
 # POLYGLOT-5: a child on a WebSocket (ws://), dialed with a key proof.
 child-ws = ["dep:tokio-tungstenite", "dep:ed25519-dalek"]
 # ... and on wss:// (TLS, webpki roots).
-child-wss = ["child-ws", "tokio-tungstenite/rustls-tls-webpki-roots"]
+child-wss = ["child-ws", "tokio-tungstenite/rustls-tls-webpki-roots", "dep:rustls", "dep:webpki-roots", "dep:rustls-webpki"]
 # RETURNS-47: `call::test::in_call`, a test's way into a call context (a
 # verifier that reads `current_reach()`, tested without a service). Never
 # default: nothing but a test builds a caller by hand.

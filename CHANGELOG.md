@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 0.11.0
 
+NEST-21 (additive; `DynamicHubInner` gains a field, `redact` two
+functions): **configuration at runtime.** `plexus::config`: a subsystem
+declares each knob once as a typed `Setting<T>` (`setting!("key", default =
+…, reload = Live | Restart, sensitivity = Public | Secret, scope = Service |
+Process, remote = false, critical = true, doc = "…")`), its schema its
+type's `JsonSchema`. `Config` is the library and a capability handle (every
+clone the same store; `DynamicHub::config()` / `with_config`): `get`, `set`
+(→ `Previous`), `reset`, `seed` (the file and flag layers), `watch`,
+`on_change`, `changes`, `list` (`KeyInfo`), `schema`. Sources, lowest first:
+default < file < flag/env < runtime; `Config::with_file` keeps runtime sets
+(JSON, 0600) and reads them back as the file layer. A `Restart` setting's
+runtime value waits as `pending`; a `Secret` is never read back (set or not
+and a salted hash). Every set, reset, confirm, revert and refusal is a
+`ConfigRecord` (actor chain, key, old/new value hashes, never a value) on
+`plexus::audit` and to every `ConfigAudit` sink. **The `config`
+activation** (`DynamicHub::with_config_service`, `ConfigActivation`):
+`config.list`, `config.watch { key? }`, `config.names`, and each key a path
+of dynamic children — `config.{key}.get | set { value, confirm_within? } |
+reset | confirm` — admin's unless a role lists a key's literal path;
+`remote = false` refused (`not_remote`); `critical` needs the grant
+`config.critical` and a `confirm_within` (SIGN-1's seam); an unconfirmed set
+reverts at its deadline. plexus-core's settings: `transport.insecure_ws`
+(critical), `transport.tls_roots` (remote = false), `child.legacy_upcalls`
+(critical), `child.timeout`, `child.max_calls`, `child.backoff`,
+`log.redact.keys` (process-wide: the redactor's extra keys,
+`redact::set_extra_keys`). `ChildOptions::configured` / `seed`,
+`ChildArgs::connect_all_in`.
+
 NEST-16 (breaking: a child's calls back are narrowed; `PluginSchema` and
 `ChildOptions` gain a field; plexus-macros and plexus-client 0.11): **a graft
 that knows its parent.** `#[plexus_macros::activation(parent = ShopClient)]`

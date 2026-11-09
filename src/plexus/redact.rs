@@ -49,10 +49,30 @@ pub const CREDENTIAL_KEYS: &[&str] = &[
     "set_cookie",
 ];
 
+/// NEST-21: keys redacted beside [`CREDENTIAL_KEYS`] — the setting
+/// `log.redact.keys` ([`crate::plexus::config::settings::LOG_REDACT_KEYS`]),
+/// process-wide as the log is. Written lower case, `-` as `_`; it adds to
+/// the fixed list and never takes one of them away.
+static EXTRA_KEYS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// NEST-21: set the keys redacted beside [`CREDENTIAL_KEYS`] (replacing the
+/// ones set before). The config library calls it when `log.redact.keys`
+/// changes.
+pub fn set_extra_keys(keys: &[String]) {
+    let keys: Vec<String> = keys.iter().map(|k| k.trim().bytes().map(|b| norm(b) as char).collect()).filter(|k: &String| !k.is_empty()).collect();
+    *EXTRA_KEYS.write().unwrap_or_else(|p| p.into_inner()) = keys;
+}
+
+/// NEST-21: the keys redacted beside [`CREDENTIAL_KEYS`].
+pub fn extra_keys() -> Vec<String> {
+    EXTRA_KEYS.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
 /// Whether `key` names a credential.
 pub fn is_credential_key(key: &str) -> bool {
     let k = key.trim();
-    CREDENTIAL_KEYS.iter().any(|c| c.len() == k.len() && c.bytes().zip(k.bytes()).all(|(a, b)| a == norm(b)))
+    let same = |c: &str| c.len() == k.len() && c.bytes().zip(k.bytes()).all(|(a, b)| a == norm(b));
+    CREDENTIAL_KEYS.iter().any(|c| same(c)) || EXTRA_KEYS.read().map(|x| x.iter().any(|c| same(c))).unwrap_or(false)
 }
 
 fn norm(b: u8) -> u8 {

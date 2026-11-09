@@ -97,6 +97,20 @@ impl ChildArgs {
         }
     }
 
+    /// NEST-21: [`ChildArgs::connect_all`] on the service's configuration:
+    /// the flags put in as its flag layer (`config.list` shows them; a
+    /// runtime set goes over them), each mount's options read from it.
+    pub async fn connect_all_in(&self, service: &str, config: &crate::plexus::config::Config) -> Result<Vec<RemoteChild>, ChildError> {
+        let given = self.options(service);
+        given.seed(config);
+        let opts = given.configured(config);
+        let mut out = Vec::with_capacity(self.child.len());
+        for spec in &self.child {
+            out.push(RemoteChild::connect(spec.clone(), opts.clone()).await?);
+        }
+        Ok(out)
+    }
+
     /// Every `--child`, connected in order: the first that fails stops the
     /// start, naming it and why.
     pub async fn connect_all(&self, service: &str) -> Result<Vec<RemoteChild>, ChildError> {

@@ -11,6 +11,9 @@ pub mod test_validator;
 /// MACRO-20: a hub sees through its activations' static children.
 pub mod children;
 pub mod context;
+/// NEST-21: a service's configuration at runtime — settings, the library,
+/// the `config` activation.
+pub mod config;
 // RETURNS-10: canonical schema JSON and the SHA-256/16 hash every schema hash is.
 pub mod content_hash;
 pub mod credential_envelope;

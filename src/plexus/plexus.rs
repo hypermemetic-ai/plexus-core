@@ -1271,6 +1271,8 @@ pub(crate) struct DynamicHubInner {
     /// NEST-16: what children said through `host.notify`, to whoever in the
     /// service listens ([`DynamicHub::notices`]).
     notices: tokio::sync::broadcast::Sender<super::parent::Notice>,
+    /// NEST-21: the service's configuration, made at its first use.
+    config: std::sync::OnceLock<super::config::Config>,
 }
 
 /// NEST-5: the gate's index — every method path to its gate facts, and the
@@ -1427,6 +1429,7 @@ impl DynamicHub {
                 describe: Default::default(),
                 ir_cache: Default::default(),
                 notices: tokio::sync::broadcast::Sender::new(64),
+                config: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -2441,6 +2444,30 @@ impl DynamicHub {
         Self::index_entry(&mut self.inner.registry.write().unwrap_or_else(|p| p.into_inner()), self.inner.auth_catalog.as_ref(), &name, &entry);
         self.table_moved(before);
         Ok(replaced)
+    }
+
+    /// NEST-21: the service's configuration — a capability handle (every
+    /// clone the same store), made in memory at its first use unless
+    /// [`DynamicHub::with_config`] gave one. Hand it to what reads or sets
+    /// a setting; serve it with [`DynamicHub::with_config_service`].
+    pub fn config(&self) -> super::config::Config {
+        self.inner.config.get_or_init(super::config::Config::new).clone()
+    }
+
+    /// NEST-21: keep the configuration in `config` (one with a file, or one
+    /// a host built before the service). Before the service is shared.
+    pub fn with_config(mut self, config: super::config::Config) -> Self {
+        let inner = self.inner_mut("Cannot set config: DynamicHub has multiple references");
+        inner.config = std::sync::OnceLock::from(config);
+        self
+    }
+
+    /// NEST-21: serve the service's configuration as the `config`
+    /// activation ([`super::config::ConfigActivation`]): admin's, each key
+    /// on its own grant.
+    pub fn with_config_service(self) -> Self {
+        let config = self.config();
+        self.register(super::config::ConfigActivation::new(config))
     }
 
     /// NEST-16: what children say through `host.notify` from now on (the

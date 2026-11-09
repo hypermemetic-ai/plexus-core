@@ -141,6 +141,11 @@ pub struct ChildOptions {
     /// (`--child-schema-cache`), the least recently used out first; 0
     /// keeps none.
     pub schema_cache: usize,
+    /// NEST-11: the service the child is mounted in, whose routing and gate
+    /// take the calls the child makes back (`_host.call`). `None`: the
+    /// service a call was routed in when the child was connected (inside a
+    /// call), else the service of the first call forwarded to it.
+    pub host: Option<crate::plexus::service_scope::WeakService>,
 }
 
 impl Default for ChildOptions {
@@ -156,6 +161,7 @@ impl Default for ChildOptions {
             backoff: Backoff::default(),
             max_depth: 8,
             schema_cache: 1024,
+            host: None,
         }
     }
 }
@@ -165,6 +171,13 @@ impl ChildOptions {
     /// `service:<service>`, its proof's agent id `service`.
     pub fn for_service(service: &str) -> Self {
         Self { principal: format!("service:{service}"), agent: service.to_string(), ..Self::default() }
+    }
+
+    /// NEST-11: these options, the child mounted in `service` (see
+    /// [`ChildOptions::host`]).
+    pub fn with_host(mut self, service: &crate::plexus::DynamicHub) -> Self {
+        self.host = Some(service.downgrade());
+        self
     }
 }
 

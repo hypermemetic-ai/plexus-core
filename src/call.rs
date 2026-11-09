@@ -84,6 +84,9 @@ struct Inner {
     /// by a context narrowed from this one (`with_reach`: the same call);
     /// another caller's context (`with_auth`, `ungated`) starts its own.
     verified: Verified,
+    /// NEST-11: in a child, its link back to the service that forwarded the
+    /// call (`remote_child::host`).
+    host: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
@@ -94,7 +97,7 @@ impl Inner {
         if let Some(r) = reach {
             let _ = cell.set(r);
         }
-        Inner { auth, reach: cell, deferred, hop, verified: Verified::default() }
+        Inner { auth, reach: cell, deferred, hop, verified: Verified::default(), host: None }
     }
 }
 
@@ -147,6 +150,24 @@ impl CallContext {
         Self(Arc::new(Inner::with(auth, Some(reach), None, Some(hop))))
     }
 
+    /// NEST-11: [`CallContext::through_hop`], with the link back to the
+    /// service that forwarded the call.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn through_hop_with(hop: Hop, host: Arc<dyn Any + Send + Sync>) -> Self {
+        let mut ctx = Self::through_hop(hop);
+        if let Some(inner) = Arc::get_mut(&mut ctx.0) {
+            inner.host = Some(host);
+        }
+        ctx
+    }
+
+    /// NEST-11: the link back to the service that forwarded this call, in a
+    /// child.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn host_link(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        self.0.host.as_ref()
+    }
+
     /// The context of a call routed into an in-process child, under its
     /// forward policy: `callee` the context the policy derived (none, or
     /// one no longer signed in, is anonymous); the call's reach kept when
@@ -163,13 +184,17 @@ impl CallContext {
         } else {
             (Reach::nowhere(), None)
         };
-        Self(Arc::new(Inner::with(auth, Some(reach), None, hop)))
+        let mut inner = Inner::with(auth, Some(reach), None, hop);
+        inner.host = self.0.host.clone().filter(|_| keeps_identity);
+        Self(Arc::new(inner))
     }
 
     /// This context with its identity replaced: a call routed from inside
     /// another, through a service with no gate of its own.
     pub(crate) fn with_auth(&self, auth: Option<&AuthContext>) -> Self {
-        Self(Arc::new(Inner::with(auth.cloned(), self.0.reach.get().cloned(), self.0.deferred.clone(), self.0.hop.clone())))
+        let mut inner = Inner::with(auth.cloned(), self.0.reach.get().cloned(), self.0.deferred.clone(), self.0.hop.clone());
+        inner.host = self.0.host.clone();
+        Self(Arc::new(inner))
     }
 
     /// This context with its reach replaced: the same call, so the same
@@ -177,6 +202,7 @@ impl CallContext {
     pub(crate) fn with_reach(&self, reach: Reach) -> Self {
         let mut inner = Inner::with(self.0.auth.clone(), Some(reach), None, self.0.hop.clone());
         inner.verified = Arc::clone(&self.0.verified);
+        inner.host = self.0.host.clone();
         Self(Arc::new(inner))
     }
 

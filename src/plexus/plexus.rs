@@ -1139,7 +1139,7 @@ fn fill_site_hints_in_schema_stream(
     }))
 }
 
-struct DynamicHubInner {
+pub(crate) struct DynamicHubInner {
     /// Custom namespace for this hub instance (defaults to "plexus")
     namespace: String,
     /// The registered activations, by namespace. PERF-21: ordered, so every
@@ -1339,6 +1339,11 @@ impl IrView {
 // ============================================================================
 
 impl DynamicHub {
+    /// NEST-11: the service a [`super::service_scope::WeakService`] upgrades to.
+    pub(crate) fn from_inner(inner: Arc<DynamicHubInner>) -> Self {
+        Self { inner }
+    }
+
     /// Create a new DynamicHub with explicit namespace
     ///
     /// Unlike single activations which have fixed namespaces, DynamicHub is a
@@ -2444,7 +2449,43 @@ impl DynamicHub {
     }
 
     /// Route a call to the appropriate activation, with optional raw HTTP request context.
+    ///
+    /// NEST-11: the call is routed knowing its service — the outermost
+    /// service a call entered — so a child mounted below it
+    /// ([`RemoteChild`](super::RemoteChild)) can take the calls its far side
+    /// makes back under a forwarded call through this service's own routing
+    /// and gate ([`super::service_scope`]).
     pub async fn route_with_ctx(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        if super::service_scope::entered() {
+            return self.route_entered(method, params, auth, raw_ctx).await;
+        }
+        super::service_scope::scope(self.downgrade(), self.route_entered(method, params, auth, raw_ctx)).await
+    }
+
+    /// NEST-11: a weak handle to this service — what a child mounted below
+    /// it keeps, so a child never keeps its service alive.
+    pub fn downgrade(&self) -> super::service_scope::WeakService {
+        super::service_scope::WeakService::new(Arc::downgrade(&self.inner))
+    }
+
+    /// NEST-11: a schema the service answers for one of its own children
+    /// outside any call (a child asking, at its start, for the shape of what
+    /// it will call): the service's whole description at `method` (a
+    /// `….schema` path), as the service itself sees it — no caller's view.
+    pub(crate) async fn schema_for_child(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
+        let (_, name) = self.parse_method(method)?;
+        if !Self::is_schema_query(name) {
+            return Err(PlexusError::Unauthenticated(format!(
+                "`{method}` is not a schema: outside a call, a child asks its service only for a schema"
+            )));
+        }
+        let ctx = crate::call::CallContext::admitted(None, plexus_auth_core::grants::Reach::everywhere());
+        let routed = self.route_ungated(method, params, None, None);
+        super::service_scope::scope(self.downgrade(), in_call(ctx, routed)).await
+    }
+
+    /// [`DynamicHub::route_with_ctx`], inside its service's scope.
+    async fn route_entered(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
         // AUTH-2 grant gate: only when configured — a hub without one pays
         // this one branch and dispatches as before.
         if let Some(gate) = self.inner.gate.as_ref() {

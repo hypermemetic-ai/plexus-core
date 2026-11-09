@@ -101,6 +101,7 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     let (mut sink, mut stream) = socket.split();
     let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let conn = Conn::new(&shared.name, None, out, shared.opts.buffer, Arc::clone(&shared.counters));
+    let _ = conn.up.set(Arc::clone(&shared.upcalls));
     let writer = Arc::clone(&conn);
     tokio::spawn(async move {
         loop {

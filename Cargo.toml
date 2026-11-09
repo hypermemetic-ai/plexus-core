@@ -1,6 +1,6 @@
 [package]
 name = "plexus-core"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
 license = "AGPL-3.0-only"
@@ -170,6 +170,12 @@ harness = false
 # again by the seam, the child on stdio.
 [[test]]
 name = "nest6_dynamic"
+harness = false
+
+# NEST-11: a child calls its service back, under a call it serves; the host
+# and, run again by the seam, the child on stdio.
+[[test]]
+name = "nest11_calls_back"
 harness = false
 
 [dev-dependencies]

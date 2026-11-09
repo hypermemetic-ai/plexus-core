@@ -49,6 +49,16 @@
 //! through the name with another `plexus_hash` drops it, and a restart drops
 //! every name.
 
+//! # A child calls its service back (NEST-11)
+//!
+//! While a call is open into the child, the child may call the service back
+//! on the same connection — `_host.call {method, params, under}`, `under`
+//! the forwarded call's `hop.call` (plexus-wire spec/14). The service routes
+//! it through its own routing and gate as that call's caller, within that
+//! call's reach, and ends it when that call ends; outside a live call it
+//! answers a schema only (`upcall.rs`). The far side in Rust calls back
+//! through [`host()`], a `Transport` a generated client takes.
+
 // RETURNS-47: the far side in Rust — an activation served as a child, each
 // call in its hop's context.
 mod host;
@@ -58,6 +68,8 @@ mod names;
 // RETURNS-36: a peer on plexus-wire's spec as main wrote it, read as 0.8.
 mod peer;
 mod spec;
+// NEST-11: a child calls its service back, under a call it serves.
+mod upcall;
 #[cfg(feature = "child-ws")]
 mod ws;
 #[cfg(feature = "clap")]
@@ -80,7 +92,8 @@ use plexus_auth_core::grants::{GrantsGeneration, Reach};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-pub use host::{serve_child, serve_child_on, serve_child_stdio, ChildPeer};
+pub use host::{host, serve_child, serve_child_on, serve_child_stdio, ChildPeer, HostTransport};
+pub use upcall::{HOST_CALL, HOST_CALL_UNSUB};
 pub use link::MountTimings;
 pub use spec::{parse_duration, Backoff, ChildError, ChildOptions, ChildSpec};
 #[cfg(feature = "clap")]
@@ -117,6 +130,8 @@ pub struct ChildStats {
     /// NEST-6: dynamic instances whose schema is kept now
     /// (at most `--child-schema-cache`).
     pub names_kept: usize,
+    /// NEST-11: calls the child made back into its service, in all.
+    pub calls_back: u64,
 }
 
 /// A child's methods are data — its schema, asked at mount — not a Rust
@@ -271,7 +286,13 @@ impl RemoteChild {
             name_schemas: self.inner.names.hops.load(Ordering::Relaxed),
             name_schema_hits: self.inner.names.hits.load(Ordering::Relaxed),
             names_kept: self.inner.names.len(c.restarts.load(Ordering::Relaxed)),
+            calls_back: self.inner.shared.upcalls.made.load(Ordering::Relaxed),
         }
+    }
+
+    /// NEST-11: forwarded calls open now that the child may call back under.
+    pub fn calls_open_back(&self) -> usize {
+        self.inner.shared.upcalls.open_now()
     }
 
     /// The process now serving (a stdio child), if one is up.
@@ -307,7 +328,7 @@ impl RemoteChild {
     /// The hop (spec/12) for a call by `auth`, decided as `reach`: the
     /// service acts, the caller is named `for`, the verdict is the limit.
     /// Nothing of the caller's credential.
-    fn hop(&self, conn: &Conn, auth: Option<&AuthContext>, reach: &Reach) -> Value {
+    fn hop(&self, conn: &Conn, auth: Option<&AuthContext>, reach: &Reach) -> (Value, String) {
         let for_: Vec<String> = auth.and_then(|a| a.principal()).map(|p| p.to_string()).into_iter().collect();
         let limit = reach.grant().map(|g| {
             let grant = match g.as_str().strip_prefix(&format!("{}.", self.name())) {
@@ -317,7 +338,8 @@ impl RemoteChild {
             let held_on: Vec<String> = reach.held_on().iter().map(|s| s.to_string()).collect();
             json!({ "grant": grant, "held_on": held_on })
         });
-        json!({ "principal": self.inner.shared.principal, "for": for_, "limit": limit, "call": uuid::Uuid::new_v4().to_string() })
+        let call = uuid::Uuid::new_v4().to_string();
+        (json!({ "principal": self.inner.shared.principal, "for": for_, "limit": limit, "call": call }), call)
     }
 
     /// NEST-4: the kept static child at `path` (dotted, relative to the mount).
@@ -433,7 +455,9 @@ impl RemoteChild {
             Err(item) => return one(item),
         };
         shared.counters.calls.fetch_add(1, Ordering::Relaxed);
-        let hop = self.hop(&conn, auth, &reach);
+        let (hop, call_id) = self.hop(&conn, auth, &reach);
+        // NEST-11: the child may call back under this call while it is open.
+        let under = shared.upcalls.open(&call_id, auth, &reach);
         let path = format!("{}.{method}", conn.ns());
         let call = json!({ "method": path, "params": params, "hop": hop });
         match conn.open(&format!("{}.call", conn.ns()), call, shared.opts.timeout).await {
@@ -441,7 +465,7 @@ impl RemoteChild {
                 let generation = reach.generation().cloned();
                 let seen = generation.as_ref().map_or(0, GrantsGeneration::current);
                 let instance = instance.map(|path| (Arc::clone(&self.inner), path));
-                Box::pin(CallStream { rx, sid, conn, over: false, _guard: guard, reach, generation, seen, name: self.name().to_string(), instance })
+                Box::pin(CallStream { rx, sid, conn, over: false, _guard: guard, reach, generation, seen, name: self.name().to_string(), instance, under })
             }
             Err(item) => one(item),
         }
@@ -474,9 +498,20 @@ struct CallStream {
     /// NEST-6: the dynamic instance the call goes through, and the mount
     /// whose kept schema of it an item with another `plexus_hash` drops.
     instance: Option<(Arc<Inner>, String)>,
+    /// NEST-11: the child's standing to call back under this call; ended
+    /// with it.
+    under: Option<upcall::UnderGuard>,
 }
 
 impl CallStream {
+    /// The call is over: what the child made under it ends too.
+    fn finish(&mut self, why: &str) {
+        self.over = true;
+        if let Some(u) = self.under.take() {
+            u.end(why);
+        }
+    }
+
     /// The grant revoked mid-stream: the caller's last item.
     fn revoked(&self) -> PlexusStreamItem {
         let grant = self.reach.grant().map(|g| g.as_str().to_string()).unwrap_or_default();
@@ -515,18 +550,18 @@ impl Stream for CallStream {
                     if self.reach.current().is_none() {
                         let sid = self.sid.clone();
                         self.conn.unsubscribe(&sid);
-                        self.over = true;
+                        self.finish("its grant was revoked");
                         return Poll::Ready(Some(self.revoked()));
                     }
                 }
                 if terminal {
-                    self.over = true;
+                    self.finish("it ended");
                 }
                 Poll::Ready(Some(item))
             }
             Poll::Ready(None) => {
                 // The channel closed with no terminal item: the link went.
-                self.over = true;
+                self.finish("the connection closed");
                 Poll::Ready(Some(unavailable(&self.name, "the connection closed")))
             }
             Poll::Pending => Poll::Pending,

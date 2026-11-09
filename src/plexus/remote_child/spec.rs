@@ -83,6 +83,71 @@ impl FromStr for ChildSpec {
     }
 }
 
+/// KEEL-7: the reason a dial refused for its transport gives, as plexus-dyn's
+/// `refused` says it.
+pub const INSECURE_TRANSPORT: &str = "insecure_transport";
+
+/// KEEL-7 (DYNAUTH-8, TM-3): whether the service may dial `url` — `wss://`
+/// anywhere, `ws://` only to loopback ([`is_loopback_host`]) unless
+/// `insecure_ws` (`transport.insecure_ws`) allows it. Every dial the
+/// service makes asks it before a socket opens: a `ws://` child's, a
+/// dial-out's, plexus-dyn's. `Err`: why, said (the reason is
+/// [`INSECURE_TRANSPORT`]).
+pub fn check_ws_url(url: &str, insecure_ws: bool) -> Result<(), String> {
+    let rest = if let Some(r) = url.strip_prefix("wss://") {
+        return match url_host(r) {
+            Some(_) => Ok(()),
+            None => Err(format!("`{url}` names no host")),
+        };
+    } else if let Some(r) = url.strip_prefix("ws://") {
+        r
+    } else {
+        return Err(format!("`{url}`: a peer is reached by ws:// or wss://"));
+    };
+    let Some(host) = url_host(rest) else { return Err(format!("`{url}` names no host")) };
+    if is_loopback_host(&host) || insecure_ws {
+        return Ok(());
+    }
+    Err(format!(
+        "`{url}`: plain ws:// only to loopback (127.0.0.0/8, ::1, localhost); a peer beyond it is reached by wss://, its hop (who calls, under what ceiling) never in clear (`transport.insecure_ws` allows it, a test network's)"
+    ))
+}
+
+/// KEEL-7: whether `url` is plain `ws://` beyond loopback — a dial
+/// [`check_ws_url`] admits only under `transport.insecure_ws`, and which
+/// says so where its mount is listed.
+pub fn is_insecure_ws(url: &str) -> bool {
+    url.starts_with("ws://") && check_ws_url(url, false).is_err() && check_ws_url(url, true).is_ok()
+}
+
+/// The host of `authority[/path]`: no user info, no port, an IPv6
+/// literal without its brackets, lower case.
+fn url_host(rest: &str) -> Option<String> {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split_once(']')?.0
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// KEEL-7: loopback as every dial reads it — `127.0.0.0/8`, `::1`, an
+/// IPv4-mapped `127.x`, and `localhost` (a trailing dot allowed); a name
+/// that only begins so (`localhost.example.com`) is not.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => a.is_loopback(),
+        Ok(std::net::IpAddr::V6(a)) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        Err(_) => false,
+    }
+}
+
 /// How fast a child that died is started (or dialed) again: the n-th restart
 /// within a minute waits `initial · 2ⁿ`, at most `max`, after the death; past
 /// `per_minute` restarts in the last minute a call is answered
@@ -162,6 +227,11 @@ pub struct ChildOptions {
     /// test network's). Certificates are always validated; nothing turns
     /// that off.
     pub tls_roots: Option<PathBuf>,
+    /// KEEL-7: dial plain `ws://` beyond loopback (`transport.insecure_ws`,
+    /// a test network's). Off: such a child is refused before a socket
+    /// opens ([`check_ws_url`]); on: dialed, and its mount says
+    /// [`insecure`](crate::plexus::RemoteChild::insecure).
+    pub insecure_ws: bool,
     /// DYNAUTH-12: the service's peer-token issuer. With one, every call
     /// forwarded for a signed-in caller carries a token minted for it
     /// (`hop.token`): `aud` the child's proved key (bound to it), or
@@ -189,6 +259,7 @@ impl Default for ChildOptions {
             ping: None,
             legacy_upcalls: false,
             tls_roots: None,
+            insecure_ws: false,
             tokens: None,
         }
     }

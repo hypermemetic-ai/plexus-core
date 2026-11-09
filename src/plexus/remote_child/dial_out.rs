@@ -36,6 +36,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::host::{serve_child_on, ChildPeer};
 use super::link::{unavailable, Conn, Counters, SubKey};
+use super::spec::{check_ws_url, is_insecure_ws, INSECURE_TRANSPORT};
 use super::ws::{key_proof, principal_of, read_seed};
 use super::Backoff;
 use crate::plexus::plexus::Activation;
@@ -65,6 +66,11 @@ pub struct DialOut {
     pub backoff: Backoff,
     /// `_info`, the offer's answer, and each of this side's calls' opens.
     pub timeout: Duration,
+    /// KEEL-7: dial plain `ws://` beyond loopback (`transport.insecure_ws`,
+    /// a test network's). Off: such a relay is refused before a socket opens
+    /// ([`check_ws_url`]); on: dialed, and [`DialState::Mounted`] says
+    /// `insecure`.
+    pub insecure_ws: bool,
 }
 
 impl DialOut {
@@ -78,6 +84,7 @@ impl DialOut {
             trust: None,
             backoff: Backoff { initial: Duration::from_millis(250), max: Duration::from_secs(10), per_minute: usize::MAX },
             timeout: Duration::from_secs(10),
+            insecure_ws: false,
         }
     }
 
@@ -98,6 +105,23 @@ impl DialOut {
         self.agent = agent.into();
         self
     }
+
+    /// KEEL-7: allow plain `ws://` beyond loopback ([`DialOut::insecure_ws`]).
+    pub fn insecure_ws(mut self, on: bool) -> Self {
+        self.insecure_ws = on;
+        self
+    }
+
+    /// KEEL-7: [`DialOut::insecure_ws`] as `transport.insecure_ws` in `c`
+    /// says, when it says more than its default.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn configured(mut self, c: &crate::plexus::config::Config) -> Self {
+        use crate::plexus::config::{settings::TRANSPORT_INSECURE_WS, Source};
+        if c.source(&TRANSPORT_INSECURE_WS) != Source::Default {
+            self.insecure_ws = c.get(&TRANSPORT_INSECURE_WS);
+        }
+        self
+    }
 }
 
 /// Where a dialed-out service stands.
@@ -106,8 +130,17 @@ impl DialOut {
 pub enum DialState {
     /// Not yet dialed, or dialing.
     Connecting,
-    /// Mounted at the relay as `path` (`peers.<mount>`).
-    Mounted { mount: String, path: String, service: String, relay: String },
+    /// Mounted at the relay as `path` (`peers.<mount>`). `insecure`
+    /// (KEEL-7): over plain `ws://` beyond loopback, as
+    /// [`DialOut::insecure_ws`] allowed.
+    Mounted {
+        mount: String,
+        path: String,
+        service: String,
+        relay: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        insecure: bool,
+    },
     /// The socket dropped or could not open; dialing again.
     Down { why: String },
     /// The relay refused the offer; not dialing again.
@@ -319,6 +352,11 @@ const OFFER_ID: &str = "offer";
 async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A) -> Outcome {
     let opts = &inner.opts;
     let dropped = |why: String| Outcome::Dropped { why, was_mounted: false };
+    // KEEL-7: the transport decided before any socket opens or the key is
+    // read — `ws://` beyond loopback only under `transport.insecure_ws`.
+    if let Err(why) = check_ws_url(&opts.url, opts.insecure_ws) {
+        return Outcome::Refused(format!("{INSECURE_TRANSPORT}: {why}"));
+    }
     if opts.url.starts_with("wss://") && !cfg!(feature = "child-wss") {
         return Outcome::Refused("a wss:// relay needs plexus-core's `child-wss` feature (TLS)".into());
     }
@@ -496,8 +534,12 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
         }
     }
     *inner.live.lock().unwrap() = Some(Live { conn: Arc::clone(&conn), service: service.clone() });
-    tracing::info!(target: "plexus::dial", url = %opts.url, %path, %relay, "mounted at the relay");
-    inner.state.send_replace(DialState::Mounted { mount, path, service, relay });
+    let insecure = is_insecure_ws(&opts.url);
+    if insecure {
+        tracing::warn!(target: "plexus::dial", url = %opts.url, "insecure: dialed out over plain ws:// beyond loopback (transport.insecure_ws); the key proof and every hop cross in clear");
+    }
+    tracing::info!(target: "plexus::dial", url = %opts.url, %path, %relay, insecure, "mounted at the relay");
+    inner.state.send_replace(DialState::Mounted { mount, path, service, relay, insecure });
 
     let why = reader.await.unwrap_or_else(|_| "the socket".into());
     ended(why, true)

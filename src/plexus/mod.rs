@@ -79,7 +79,7 @@ pub use in_process::InProcessTransport;
 pub use input::{Delivered, Input, InputTable};
 pub use hub_transport::HubTransport;
 #[cfg(not(target_arch = "wasm32"))]
-pub use remote_child::{Backoff, ChildError, ChildMethods, ChildOptions, ChildSpec, ChildStats, Consented, MountTimings, PeerIdentity, RemoteChild};
+pub use remote_child::{check_ws_url, is_loopback_host, Backoff, ChildError, ChildMethods, ChildOptions, ChildSpec, ChildStats, Consented, MountTimings, PeerIdentity, RemoteChild};
 #[cfg(all(feature = "clap", not(target_arch = "wasm32")))]
 pub use remote_child::ChildArgs;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]

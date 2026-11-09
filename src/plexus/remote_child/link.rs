@@ -154,6 +154,9 @@ pub(super) struct Conn {
     /// DYNAUTH-8: on `wss://`, the sha256 (hex) of the key the far side's
     /// certificate holds (its SubjectPublicKeyInfo).
     pub tls_key: OnceLock<String>,
+    /// DYNAUTH-5: the Ed25519 key the far side proved at `_info`
+    /// (`key:<hex>`), if it proved one.
+    pub peer_key: OnceLock<String>,
 }
 
 /// One message, read in one pass: a notification's item stays raw until
@@ -212,6 +215,7 @@ impl Conn {
             up: OnceLock::new(),
             served: Arc::default(),
             tls_key: OnceLock::new(),
+            peer_key: OnceLock::new(),
         })
     }
 
@@ -631,8 +635,18 @@ impl Shared {
             ChildSpec::Ws { url, .. } => self.dial_ws(url).await?,
         };
         let asked = async {
-            let info = ask(&conn, "_info", Value::Null, self.opts.timeout).await.map_err(|e| format!("`_info`: {e}"))?;
+            // DYNAUTH-5: `_info` carries a nonce; a far side with a key of
+            // its own answers it signed (`key`, `proof`), and that key is
+            // registered and pinned with the mount. One that answers a key
+            // it cannot prove is refused; one that names none has none.
+            let nonce = crate::plexus::peer_token::random_nonce();
+            let info = ask(&conn, "_info", json!({ "nonce": nonce }), self.opts.timeout).await.map_err(|e| format!("`_info`: {e}"))?;
             let ns = info.get("backend").and_then(Value::as_str).ok_or("its `_info` names no backend")?.to_string();
+            if let Some(key) = info.get("key").and_then(Value::as_str) {
+                let proof = info.get("proof").and_then(Value::as_str).unwrap_or_default();
+                crate::plexus::peer_token::check_key_proof(key, proof, &nonce, &ns).map_err(|e| format!("its `_info` names the key {key} without proving it: {e}"))?;
+                let _ = conn.peer_key.set(key.to_string());
+            }
             let _ = conn.ns.set(ns.clone());
             let t1 = Instant::now();
             let deadline = t1 + self.opts.timeout;

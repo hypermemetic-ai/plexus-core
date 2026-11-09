@@ -71,7 +71,6 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 # (spec/00) — signed here, so the seam needs neither the adapters nor a
 # network client; `child-wss` adds TLS. tokio-tungstenite is native-only
 # (the target table below): on wasm32 there are no children (PLEXUS-45).
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"], optional = true }
 # BIDIR-17: an `Input<Bytes>` item sent as JSON is base64.
 base64 = "0.22"
 
@@ -98,6 +97,13 @@ tokio = { version = "1.0", features = ["full"] }
 # plexus::input reads PendingSubscriptionSink::subscription_id, new in 0.26.1.
 jsonrpsee = { version = "0.26.1", features = ["server", "macros"] }
 tokio-tungstenite = { version = "0.30", optional = true }
+# A WebSocket child's key proof (spec/00) and, DYNAUTH-12, the peer tokens
+# (`plexus::peer_token`: EdDSA compact JWS, a peer's key proved at `_info`,
+# the proof of possession): ed25519-dalek, always natively — `verify_strict`
+# for every signature a peer or a host checks. A key is made from the OS's
+# randomness (getrandom, already in every build's lock through uuid).
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+getrandom_02 = { package = "getrandom", version = "0.2" }
 # DYNAUTH-8: `child-wss` builds its own rustls client (ring, the webpki roots
 # plus `ChildOptions::tls_roots`) and pins the far side's certificate key —
 # the rustls 0.23 / ring / webpki that tokio-tungstenite's TLS already brings.
@@ -131,7 +137,7 @@ default = ["child-ws"]
 # POLYGLOT-5: `ChildArgs`, the child seam's flags, as clap arguments.
 clap = ["dep:clap"]
 # POLYGLOT-5: a child on a WebSocket (ws://), dialed with a key proof.
-child-ws = ["dep:tokio-tungstenite", "dep:ed25519-dalek"]
+child-ws = ["dep:tokio-tungstenite"]
 # ... and on wss:// (TLS, webpki roots).
 child-wss = ["child-ws", "tokio-tungstenite/rustls-tls-webpki-roots", "dep:rustls", "dep:webpki-roots", "dep:rustls-webpki"]
 # RETURNS-47: `call::test::in_call`, a test's way into a call context (a

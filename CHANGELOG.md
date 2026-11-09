@@ -35,6 +35,20 @@ alone, unless the service keeps NEST-11's rule for it for this release:
 `ChildOptions::legacy_upcalls` / `with_legacy_upcalls`,
 `--child-legacy-upcalls`. `RemoteChild::needs()` (its whole tree's).
 
+DYNAUTH-5 (additive): **a peer proves its key; its needs held to consent.**
+A mount asks `_info {nonce}`; a far side with a key (`ServeChild::key`,
+`serve_child_with`) answers `{backend, key, proof}` — the nonce and backend
+signed Ed25519 over `plexus-peer-key/v1` — and the mount registers and pins
+it (`PeerIdentity::key`, `RemoteChild::peer_key`): a restart proving another
+key is refused as another certificate key is. A key named and not proved
+refuses the mount. `RemoteChild::set_consent(Some(Vec<Consented>))` holds a
+child's calls back to the needs an admin consented to, each on its scopes
+(a `grant@scope` ceiling layer); a declared need not consented is refused
+`forbidden` (`not_needed`), saying so. `None` (the default) keeps NEST-16's
+rule. New module `plexus::peer_token` (DYNAUTH-12's tokens; here its keys:
+`PeerKey`, `check_key_proof`, `random_nonce`); ed25519-dalek is now a
+native dependency (it was `child-ws`'s), with getrandom 0.2 for keys.
+
 DYNAUTH-8 (additive): **transport hardening.** `plexus::redact` — one
 redactor for frame logs (`redact_str`, `redact_value`, `CREDENTIAL_KEYS`):
 a credential key keeps its name and loses its value. A stdio child's stderr,

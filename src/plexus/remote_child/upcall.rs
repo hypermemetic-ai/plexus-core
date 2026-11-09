@@ -51,6 +51,16 @@ pub const HOST_CALL: &str = "_host.call";
 /// The method a child lets go of such a call with (`[sid]`).
 pub const HOST_CALL_UNSUB: &str = "_host.call_unsub";
 
+/// DYNAUTH-5: one of a child's needs an admin consented to, and where:
+/// `scopes` `["*"]` anywhere its caller reaches, else only on those.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Consented {
+    /// The need, by its path from the service (`shop.items`).
+    pub method: String,
+    /// The scopes it may be called on (`["*"]`, `["MENGER"]`).
+    pub scopes: Vec<String>,
+}
+
 /// One forwarded call open into the child: whom it acts for, within what,
 /// and in which service.
 pub(super) struct Under {
@@ -71,6 +81,10 @@ pub(super) struct Upcalls {
     /// NEST-16: the methods the child's schema says it needs (`None`: it
     /// declares none), set when it is mounted.
     needs: Mutex<Option<Arc<[String]>>>,
+    /// DYNAUTH-5: what an admin consented to of those needs, each on the
+    /// scopes it may be called on (`None`: no consent is kept for this
+    /// mount — a declared need is enough, as NEST-16 has it).
+    consent: Mutex<Option<Arc<[Consented]>>>,
     /// NEST-16: NEST-11's broad rule for a child that declares no needs —
     /// anything its caller could reach ([`ChildOptions::legacy_upcalls`]).
     ///
@@ -80,7 +94,7 @@ pub(super) struct Upcalls {
 
 impl Upcalls {
     pub(super) fn new(host: Option<WeakService>, legacy: bool) -> Arc<Self> {
-        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), needs: Mutex::default(), legacy })
+        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), needs: Mutex::default(), consent: Mutex::default(), legacy })
     }
 
     /// NEST-16: what the mounted child's schema says it needs.
@@ -88,18 +102,45 @@ impl Upcalls {
         *self.needs.lock().unwrap() = needs.map(|n| n.iter().map(|n| n.method.clone()).collect::<Vec<_>>().into());
     }
 
+    /// DYNAUTH-5: what an admin consented to (`None`: no consent kept).
+    pub(super) fn set_consent(&self, consent: Option<Vec<Consented>>) {
+        *self.consent.lock().unwrap() = consent.map(Into::into);
+    }
+
+    /// DYNAUTH-5: the consent kept now.
+    pub(super) fn consent(&self) -> Option<Arc<[Consented]>> {
+        self.consent.lock().unwrap().clone()
+    }
+
     /// NEST-16: may the child call `method` up — the standard interface, a
     /// need, or anything under the legacy rule for a child that declares
-    /// none. `Some(true)` when it is a need (routed under its own grant).
-    fn allows(&self, method: &str) -> Option<bool> {
+    /// none. DYNAUTH-5: a need must also be consented, when consent is
+    /// kept. `Ok(Some(scopes))` for a need (routed under its own grant,
+    /// only on `scopes` — `["*"]` anywhere), `Ok(None)` for the rest;
+    /// `Err` the refusal, said.
+    fn allows(&self, method: &str) -> Result<Option<Vec<String>>, (PlexusError, String)> {
         if parent::is_standard(method) {
-            return Some(false);
+            return Ok(None);
         }
-        match self.needs.lock().unwrap().as_ref() {
-            Some(needs) if needs.iter().any(|n| n == method) => Some(true),
-            Some(_) => None,
-            None if self.legacy => Some(false),
-            None => None,
+        let declared = match self.needs.lock().unwrap().as_ref() {
+            Some(needs) => needs.iter().any(|n| n == method),
+            None if self.legacy => return Ok(None),
+            None => false,
+        };
+        if !declared {
+            let e = parent::not_needed(method);
+            let said = e.to_string();
+            return Err((e, said));
+        }
+        match self.consent.lock().unwrap().as_ref() {
+            None => Ok(Some(vec!["*".into()])),
+            Some(c) => match c.iter().find(|c| c.method == method) {
+                Some(c) => Ok(Some(c.scopes.clone())),
+                None => Err((
+                    parent::not_needed(method),
+                    format!("`{method}` is among this child's needs, but no admin has consented to it (dyn.consent): a declared need is a request, not a grant"),
+                )),
+            },
         }
     }
 
@@ -186,6 +227,31 @@ fn narrowed(auth: &AuthContext, reach: &Reach, grant: Option<&str>) -> AuthConte
     ctx
 }
 
+/// DYNAUTH-5: `auth` with one more ceiling layer, `grant@<scope>` for each
+/// consented scope — a need consented on `MENGER` reaches only there.
+fn consented(auth: &AuthContext, grant: &str, scopes: &[String]) -> AuthContext {
+    let mut ctx = auth.clone();
+    let mut layers: Vec<Value> = match ctx.metadata.get(CEILING_KEY) {
+        Some(Value::Array(items)) if items.iter().all(Value::is_string) => vec![Value::Array(items.clone())],
+        Some(Value::Array(items)) => items.clone(),
+        Some(other) => vec![other.clone()],
+        None => Vec::new(),
+    };
+    layers.push(Value::Array(scopes.iter().map(|s| json!(format!("{grant}@{s}"))).collect()));
+    if !ctx.metadata.is_object() {
+        ctx.metadata = json!({});
+    }
+    ctx.metadata[CEILING_KEY] = Value::Array(layers);
+    ctx
+}
+
+/// A refusal at the JSON-RPC layer, typed, said in its own words.
+fn refusal_said(id: &Value, e: &PlexusError, said: &str) -> Value {
+    let mut r = refusal(id, e);
+    r["error"]["message"] = json!(said);
+    r
+}
+
 /// A refusal at the JSON-RPC layer, typed.
 fn refusal(id: &Value, e: &PlexusError) -> Value {
     let mut error = serde_json::to_value(plexus_error_to_jsonrpc(e)).unwrap_or_default();
@@ -230,8 +296,9 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
     let under_id = params.get("under").and_then(Value::as_str).map(str::to_string);
     // NEST-16: the standard upward interface, the child's needs, or (a
     // child that declares none, under the legacy option) NEST-11's rule.
-    let Some(need) = up.allows(&target) else {
-        return send(refusal(&id, &parent::not_needed(&target)));
+    let need = match up.allows(&target) {
+        Ok(need) => need,
+        Err((e, said)) => return send(refusal_said(&id, &e, &said)),
     };
     let standard = matches!(target.as_str(), parent::HOST_WHOAMI | parent::HOST_LOG | parent::HOST_NOTIFY);
     if target == parent::HOST_SCHEMA {
@@ -282,8 +349,9 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
 }
 
 enum Route {
-    /// A call under a forwarded call; `true`: one of the child's needs.
-    Under(Arc<Under>, bool),
+    /// A call under a forwarded call; `Some(scopes)`: one of the child's
+    /// needs, consented on those scopes (DYNAUTH-5).
+    Under(Arc<Under>, Option<Vec<String>>),
     Schema(WeakService),
     /// NEST-16: `host.whoami`, `host.log` or `host.notify`, answered by the
     /// service itself, for the caller of the call it is made under.
@@ -322,12 +390,20 @@ async fn pump(route: Route, out: &mpsc::UnboundedSender<Vec<u8>>, sid: u64, name
         }
         return;
     }
-    let need = matches!(route, Route::Under(_, true));
+    let need = match &route {
+        Route::Under(_, n) => n.clone(),
+        _ => None,
+    };
     let routed = match &under {
         Some(u) => {
-            // TM-1: a need is routed under its own grant as one more ceiling.
-            let grant = if need { service.grant_at(target) } else { None };
+            // TM-1: a need is routed under its own grant as one more ceiling;
+            // DYNAUTH-5: and only on the scopes it was consented on.
+            let grant = need.as_ref().and_then(|_| service.grant_at(target));
             let auth = u.auth.as_ref().map(|a| narrowed(a, &u.reach, grant.as_deref()));
+            let auth = match (auth, &grant, &need) {
+                (Some(a), Some(g), Some(scopes)) if !scopes.iter().any(|s| s == "*") => Some(consented(&a, g, scopes)),
+                (a, _, _) => a,
+            };
             service.route_with_ctx(target, args, auth.as_ref(), None).await
         }
         None => service.schema_for_child(target, args).await,
@@ -415,5 +491,28 @@ mod tests {
         let layered = narrowed(&n, &gate.check(Some(&n), &plexus_auth_core::grants::Grant::new("a.get"), None).unwrap(), None);
         assert_eq!(layered.metadata[CEILING_KEY].as_array().unwrap().len(), 2, "{:?}", layered.metadata);
         assert!(gate.check(Some(&layered), &g, Some("Y")).is_err());
+    }
+
+    /// DYNAUTH-5: a declared need is called only once consented, and only
+    /// on its consented scopes; without consent kept, NEST-16's rule.
+    #[test]
+    fn a_need_is_held_to_its_consent() {
+        let up = Upcalls::new(None, false);
+        let need = |m: &str| crate::plexus::schema::Need { method: m.into(), hash: String::new() };
+        up.set_needs(Some(&[need("shop.items"), need("shop.orders")]));
+        assert_eq!(up.allows("shop.items").unwrap(), Some(vec!["*".to_string()]), "no consent kept: declared is enough");
+        assert!(up.allows("shop.secret").is_err(), "undeclared");
+        assert_eq!(up.allows(parent::HOST_WHOAMI).unwrap(), None, "the standard four need nothing");
+        up.set_consent(Some(vec![Consented { method: "shop.items".into(), scopes: vec!["MENGER".into()] }]));
+        assert_eq!(up.allows("shop.items").unwrap(), Some(vec!["MENGER".to_string()]));
+        let (e, said) = up.allows("shop.orders").unwrap_err();
+        assert!(said.contains("consented"), "{said}");
+        assert!(e.to_string().contains("shop.orders"));
+        up.set_consent(Some(vec![]));
+        assert!(up.allows("shop.items").is_err(), "an empty consent: nothing upward");
+        // The consented scope is one more ceiling layer.
+        let who = AuthContext::for_principal(&"key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(), "s", vec![], Value::Null);
+        let c = consented(&who, "shop.items", &["MENGER".to_string()]);
+        assert_eq!(c.metadata[CEILING_KEY], json!([["shop.items@MENGER"]]));
     }
 }

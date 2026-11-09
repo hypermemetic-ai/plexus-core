@@ -872,7 +872,7 @@ impl ChildRouter for ArcChildRouter {
 
 #[async_trait]
 #[allow(dead_code)] // Methods exist for completeness but some aren't called post-erasure yet
-trait ActivationObject: Send + Sync + 'static {
+pub(crate) trait ActivationObject: Send + Sync + 'static {
     fn namespace(&self) -> &str;
     fn version(&self) -> &str;
     fn description(&self) -> &str;
@@ -1055,6 +1055,16 @@ impl PluginRegistry {
         self.by_path.insert(path, id);
     }
 
+    /// NEST-15: forget the activation `id` (an entry the service no longer
+    /// serves).
+    pub(crate) fn remove(&mut self, id: uuid::Uuid) {
+        if let Some(entry) = self.by_id.remove(&id) {
+            if self.by_path.get(&entry.path) == Some(&id) {
+                self.by_path.remove(&entry.path);
+            }
+        }
+    }
+
     /// List all registered activations
     pub fn list(&self) -> impl Iterator<Item = &PluginEntry> {
         self.by_id.values()
@@ -1142,18 +1152,17 @@ fn fill_site_hints_in_schema_stream(
 pub(crate) struct DynamicHubInner {
     /// Custom namespace for this hub instance (defaults to "plexus")
     namespace: String,
-    /// The registered activations, by namespace. PERF-21: ordered, so every
-    /// list of them — the service schema's `children`
-    /// ([`DynamicHub::plugin_children`]), what the self-description cache
-    /// keeps, the static children, the declared roles — is in namespace
-    /// order: a function of what the service serves, the same at every
-    /// start. A `HashMap` listed them in the process's own order, and every
-    /// hash over the service (its own, the `plexus_hash` its items carry,
-    /// each caller's view hash) moved with it.
-    activations: BTreeMap<String, Arc<dyn ActivationObject>>,
-    /// Child routers for direct nested routing (e.g.
-    /// `service.solar.mercury.info`), by namespace as `activations` are.
-    child_routers: BTreeMap<String, Arc<dyn ChildRouter>>,
+    /// NEST-15: the service root — its table of peers, by name: each
+    /// registered activation, each mounted child, each peer served while the
+    /// service serves ([`DynamicHub::root`]). Read as a snapshot (an `Arc`),
+    /// changed by swapping one in. PERF-21: ordered, so every list of them —
+    /// the service schema's `children` ([`DynamicHub::plugin_children`]),
+    /// what the self-description cache keeps, the static children, the
+    /// declared roles — is in name order: a function of what the service
+    /// serves, the same at every start.
+    root: std::sync::RwLock<Arc<super::service_root::Table>>,
+    /// NEST-15: told the service's hash each time the root's table changes.
+    root_watch: tokio::sync::watch::Sender<String>,
     /// Activation registry mapping UUIDs to paths
     registry: std::sync::RwLock<PluginRegistry>,
     pending_rpc: std::sync::Mutex<Vec<Box<dyn FnOnce() -> Methods + Send>>>,
@@ -1200,19 +1209,19 @@ pub(crate) struct DynamicHubInner {
     duplex_gate: std::sync::OnceLock<super::duplex_gate::DuplexGate>,
     /// Lazily-built index from full dotted method path
     /// (`<activation>.<method>`, hub-own methods under
-    /// `<hub-ns>.<method>`) to the gate-relevant schema facts. Built once
-    /// on the first gated dispatch so the gate never re-walks plugin
-    /// schemas on the hot path; activations registered after the first
-    /// gated dispatch are not in the index (registration is builder-time,
-    /// before serving, in every supported composition).
+    /// `<hub-ns>.<method>`) to the gate-relevant schema facts. Built on the
+    /// first gated dispatch so the gate never re-walks plugin schemas on the
+    /// hot path, and NEST-15: dropped when the root's table changes (an
+    /// entry added or removed while the service serves), built again at the
+    /// next dispatch.
     /// NEST-5: and the service's slots, so a literal path through a
     /// dynamic child (`solar.earth.info`) finds its slot's entry
     /// (`solar.{planet}.info`).
-    gate_index: std::sync::OnceLock<GateIndex>,
+    gate_index: std::sync::RwLock<Option<Arc<GateIndex>>>,
     /// BIDIR-6: every method path the service knows, and whether it takes an
     /// `Input` (see [`DynamicHub::may_take_input`]). Built once, on the first
-    /// call.
-    input_index: std::sync::OnceLock<HashMap<String, bool>>,
+    /// call (NEST-15: and again after the root's table changes).
+    input_index: std::sync::RwLock<Option<Arc<HashMap<String, bool>>>>,
     /// AUTH-2 — the grant gate: when set, every call is decided by it
     /// before routing (default deny). `None` (the default): dispatch exactly
     /// as before it existed. See [`super::grant_gate`].
@@ -1235,16 +1244,6 @@ pub(crate) struct DynamicHubInner {
     /// RETURNS-40: the `ir` answers kept, by the hash the caller sees and
     /// the namespaces asked. See [`DynamicHub::service_ir`].
     ir_cache: super::ir::IrCache,
-    /// RETURNS-40: how many static children the registered activations
-    /// have (and theirs), counted as each registers — the cheap bound on
-    /// `ir`'s names, read with no schema built.
-    nested_count: usize,
-}
-
-impl DynamicHubInner {
-    fn nested_count(&self) -> usize {
-        self.nested_count
-    }
 }
 
 /// NEST-5: the gate's index — every method path to its gate facts, and the
@@ -1254,6 +1253,15 @@ pub(crate) struct GateIndex {
     methods: HashMap<String, super::scope_gate::MethodGateInfo>,
     slots: super::slots::Slots,
 }
+
+impl GateIndex {
+    /// NEST-5: the gate's facts for `method` — its own entry, else its
+    /// slot's (`solar.earth.info` → `solar.{planet}.info`).
+    fn info(&self, method: &str) -> Option<&super::scope_gate::MethodGateInfo> {
+        self.methods.get(method).or_else(|| self.slots.resolve(method).and_then(|k| self.methods.get(&k)))
+    }
+}
+
 
 /// DynamicHub - an activation that routes to dynamically registered child activations
 ///
@@ -1373,8 +1381,8 @@ impl DynamicHub {
         Self {
             inner: Arc::new(DynamicHubInner {
                 namespace: namespace.into(),
-                activations: BTreeMap::new(),
-                child_routers: BTreeMap::new(),
+                root: Default::default(),
+                root_watch: tokio::sync::watch::Sender::new(String::new()),
                 registry: std::sync::RwLock::new(PluginRegistry::new()),
                 pending_rpc: std::sync::Mutex::new(Vec::new()),
                 auth_capabilities: None,
@@ -1383,15 +1391,14 @@ impl DynamicHub {
                 default_deny: false,
                 audit_sink: Arc::new(plexus_auth_core::TracingAuditSink),
                 duplex_gate: std::sync::OnceLock::new(),
-                gate_index: std::sync::OnceLock::new(),
-                input_index: std::sync::OnceLock::new(),
+                gate_index: Default::default(),
+                input_index: Default::default(),
                 gate: None,
                 signed_in_grants: std::collections::BTreeSet::new(),
                 resource_metadata: None,
                 auth_catalog: None,
                 describe: Default::default(),
                 ir_cache: Default::default(),
-                nested_count: Default::default(),
             }),
         }
     }
@@ -1403,8 +1410,11 @@ impl DynamicHub {
     fn inner_mut(&mut self, refused: &str) -> &mut DynamicHubInner {
         let inner = Arc::get_mut(&mut self.inner).expect(refused);
         inner.describe.reset();
+        *inner.gate_index.get_mut().unwrap_or_else(|p| p.into_inner()) = None;
+        *inner.input_index.get_mut().unwrap_or_else(|p| p.into_inner()) = None;
         inner
     }
+
 
     /// Configure the deployment's [`ScopeRegistry`] — the scope gate's
     /// source of truth for role→scope expansion, public-method
@@ -1551,8 +1561,8 @@ impl DynamicHub {
     pub fn with_auth(mut self, setup: super::auth_activation::AuthSetup) -> Self {
         let catalog = super::auth_activation::Catalog::default();
         catalog.add(&Activation::plugin_schema(&self));
-        for a in self.inner.activations.values() {
-            catalog.add(&a.plugin_schema());
+        for e in self.table().entries.values() {
+            catalog.add(&e.object.plugin_schema());
         }
         // MACRO-20: a static child's methods, by their whole path; NEST-5:
         // a typed slot's, by the slot's (`solar.{planet}.info`), and an
@@ -1621,7 +1631,7 @@ impl DynamicHub {
 
     fn describe_now(&self) -> super::view::Described {
         let service = Activation::plugin_schema(self);
-        let activations: Vec<PluginSchema> = self.inner.activations.values().map(|a| a.plugin_schema()).collect();
+        let activations: Vec<PluginSchema> = self.table().entries.values().map(|e| e.object.plugin_schema()).collect();
         // MACRO-20: a static child's entry stays in its parent's view when
         // the caller can use something below it.
         // NEST-5: and a slot's (`solar.planet`) when something in the slot.
@@ -1891,7 +1901,7 @@ impl DynamicHub {
     /// call itself would meet.
     async fn scope_answers(&self, method: &str, caller: Option<&super::auth::AuthContext>) -> bool {
         let registry = self.inner.scope_registry.as_deref().unwrap_or_else(|| super::scope_gate::empty_registry());
-        super::scope_gate::answers(registry, self.inner.default_deny, method, self.gate_info(method), caller).await
+        super::scope_gate::answers(registry, self.inner.default_deny, method, self.gate_index().info(method), caller).await
     }
 
     /// The schema at `path` as the snapshot answers it — what `<path>.schema`
@@ -1906,7 +1916,7 @@ impl DynamicHub {
             [top, below @ ..] => {
                 // asked of its activation as the route asks it past both
                 // gates — the scope gate decided this name already, silently
-                let activation = self.inner.activations.get(top.as_str())?;
+                let activation = self.table().entries.get(top.as_str())?.object.clone();
                 let mut stream = activation.call(&format!("{}.schema", below.join(".")), Value::Null, caller, None).await.ok()?;
                 if let Some(site) = self.derived_site_hint() {
                     stream = fill_site_hints_in_schema_stream(stream, site);
@@ -1939,7 +1949,10 @@ impl DynamicHub {
         // the cheap bound first, read with no schema built: no view shows
         // more than the service has — said without the service's size
         // (re-review #3), which the caller's view may not show
-        let most = 1 + self.inner.activations.len() + self.inner.nested_count();
+        let most = {
+            let table = self.table();
+            1 + table.entries.len() + table.nested
+        };
         if asked.len() > most {
             return Err(PlexusError::malformed_param(
                 "namespaces",
@@ -1975,7 +1988,7 @@ impl DynamicHub {
         // MACRO-20: and every static child's, its grants qualified by the
         // path it is reached through (`commits.link` → `tickets.commits.link`).
         // NEST-5: and every typed slot's, by the slot's path.
-        let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.described_children());
+        let schemas = self.table().entries.values().map(|e| e.object.plugin_schema()).chain(self.described_children()).collect::<Vec<_>>();
         for schema in schemas {
             for (role, grants) in schema.roles {
                 let entry = out.entry(role).or_default();
@@ -1995,10 +2008,10 @@ impl DynamicHub {
     /// see [`super::children`]. Empty for a hub whose activations have no
     /// static `#[plexus_macros::child]`.
     pub fn static_children(&self) -> Vec<PluginSchema> {
-        self.inner
-            .activations
+        self.table()
+            .entries
             .values()
-            .flat_map(|a| super::children::qualified(&a.plugin_schema().namespace, a.static_child_schemas()))
+            .flat_map(|e| super::children::qualified(&e.object.plugin_schema().namespace, e.object.static_child_schemas()))
             .collect()
     }
 
@@ -2017,7 +2030,8 @@ impl DynamicHub {
         if self.inner.gate.is_none() {
             return Ok(InputTerms { grant: method.to_string(), targets: Vec::new(), recheck: false });
         }
-        let info = self.gate_info(method);
+        let index = self.gate_index();
+        let info = index.info(method);
         let grant = info.and_then(|i| i.grant.clone()).unwrap_or_else(|| method.to_string());
         let open = info.is_some_and(|i| i.public) || self.inner.signed_in_grants.contains(grant.as_str());
         let targets = match info.and_then(|i| i.target.as_deref()) {
@@ -2045,24 +2059,22 @@ impl DynamicHub {
     /// none — its own, each activation's, each static child's. A path they do
     /// not show (a dynamic child's) may.
     pub(crate) fn may_take_input(&self, method: &str) -> bool {
-        let index = self.inner.input_index.get_or_init(|| {
-            let own = Activation::plugin_schema(self).methods.into_iter().map(|m| (format!("{}.{}", self.inner.namespace, m.name), m.input.is_some()));
-            let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
-            let theirs = schemas.flat_map(|schema| {
-                let ns = schema.namespace;
-                schema.methods.into_iter().map(move |m| (format!("{ns}.{}", m.name), m.input.is_some()))
-            });
-            own.chain(theirs).collect()
-        });
+        let kept = self.inner.input_index.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let index = match kept {
+            Some(index) => index,
+            None => {
+                let own = Activation::plugin_schema(self).methods.into_iter().map(|m| (format!("{}.{}", self.inner.namespace, m.name), m.input.is_some()));
+                let schemas: Vec<PluginSchema> = self.table().entries.values().map(|e| e.object.plugin_schema()).chain(self.static_children()).collect();
+                let theirs = schemas.into_iter().flat_map(|schema| {
+                    let ns = schema.namespace;
+                    schema.methods.into_iter().map(move |m| (format!("{ns}.{}", m.name), m.input.is_some()))
+                });
+                let index: Arc<HashMap<String, bool>> = Arc::new(own.chain(theirs).collect());
+                *self.inner.input_index.write().unwrap_or_else(|p| p.into_inner()) = Some(index.clone());
+                index
+            }
+        };
         index.get(method).copied().unwrap_or(true)
-    }
-
-    /// NEST-5: the gate's facts for `method` — its own entry, else its
-    /// slot's (`solar.earth.info` → `solar.{planet}.info`; through an
-    /// untyped slot, `solar.{planet}`). A literal entry always wins.
-    fn gate_info(&self, method: &str) -> Option<&super::scope_gate::MethodGateInfo> {
-        let index = self.gate_index();
-        index.methods.get(method).or_else(|| index.slots.resolve(method).and_then(|k| index.methods.get(&k)))
     }
 
     /// NEST-5: every slot of every registered activation and static child
@@ -2071,7 +2083,7 @@ impl DynamicHub {
     /// untyped slot's path.
     pub fn slot_children(&self) -> (Vec<PluginSchema>, Vec<String>) {
         let (mut typed, mut untyped) = (Vec::new(), Vec::new());
-        let schemas = self.inner.activations.values().map(|a| a.plugin_schema()).chain(self.static_children());
+        let schemas = self.table().entries.values().map(|e| e.object.plugin_schema()).chain(self.static_children()).collect::<Vec<_>>();
         for schema in schemas {
             super::slots::slot_schemas(&schema, &mut typed, &mut untyped);
         }
@@ -2090,8 +2102,17 @@ impl DynamicHub {
 
     /// The gate's path→schema-facts index; built once on first gated
     /// dispatch. See the field docs on `DynamicHubInner::gate_index`.
-    fn gate_index(&self) -> &GateIndex {
-        self.inner.gate_index.get_or_init(|| {
+    fn gate_index(&self) -> Arc<GateIndex> {
+        if let Some(index) = self.inner.gate_index.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            return index.clone();
+        }
+        let index = Arc::new(self.build_gate_index());
+        *self.inner.gate_index.write().unwrap_or_else(|p| p.into_inner()) = Some(index.clone());
+        index
+    }
+
+    fn build_gate_index(&self) -> GateIndex {
+        {
             let mut index = HashMap::new();
             // The hub's own methods, addressable as "<hub-ns>.<method>".
             for m in &Activation::plugin_schema(self).methods {
@@ -2113,7 +2134,8 @@ impl DynamicHub {
             // with its grant qualified by the slot's path; an untyped slot
             // is one entry, `<parent>.{<slot>}`, granted whole.
             let (typed, untyped) = self.slot_children();
-            let activations: Vec<PluginSchema> = self.inner.activations.values().map(|a| a.plugin_schema()).collect();
+            let activations: Vec<PluginSchema> = self.table().entries.values().map(|e| e.object.plugin_schema()).collect();
+
             let statics = self.static_children();
             for schema in activations.iter().chain(statics.iter()).chain(typed.iter()) {
                 for m in &schema.methods {
@@ -2130,7 +2152,7 @@ impl DynamicHub {
             }
             let slots = super::slots::Slots::of(activations.iter().chain(statics.iter()).chain(typed.iter()), &untyped);
             GateIndex { methods: index, slots }
-        })
+        }
     }
 
     /// Register a [`plexus_auth_core::ForwardPolicy`] for a callee
@@ -2274,47 +2296,8 @@ impl DynamicHub {
     /// such a child would be unreachable at call time (Z2H-8 / HOSTLESS-3,
     /// see [`Self::new`]). Also panics if the hub has already been shared
     /// (multiple `Arc` references).
-    pub fn register<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
-        let namespace = activation.namespace().to_string();
-        self.assert_no_root_shadow(&namespace);
-        let plugin_id = activation.plugin_id();
-        let activation_for_rpc = activation.clone();
-        let activation_for_router = activation.clone();
-
-        let inner = self.inner_mut("Cannot register: DynamicHub has multiple references");
-
-        // Register in the activation registry
-        inner.registry.write().unwrap().register(
-            plugin_id,
-            namespace.clone(),
-            namespace.clone(), // Use namespace as plugin_type for now
-        );
-
-        // AUTH-5: `auth.requires` knows every method, registered before
-        // the auth activation was mounted or after.
-        if let Some(catalog) = inner.auth_catalog.as_ref() {
-            let schema = activation.plugin_schema();
-            // MACRO-20: and its static children's methods, by their whole path.
-            let statics = super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation));
-            // NEST-5: and its slots — a typed slot's methods by the slot's
-            // path, an untyped slot whole.
-            let (mut typed, mut untyped) = (Vec::new(), Vec::new());
-            for s in std::iter::once(&schema).chain(statics.iter()) {
-                super::slots::slot_schemas(s, &mut typed, &mut untyped);
-            }
-            for child in statics.iter().chain(typed.iter()) {
-                catalog.add(child);
-            }
-            catalog.add_slots(&untyped);
-            catalog.add(&schema);
-        }
-        // RETURNS-40: the cheap bound on `ir`'s names, counted here, once
-        inner.nested_count += Activation::static_child_schemas(&activation).len();
-        inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
-        inner.child_routers.insert(namespace.clone(), Arc::new(activation_for_router));
-        inner.pending_rpc.lock().unwrap()
-            .push(Box::new(move || activation_for_rpc.into_rpc_methods()));
-        self
+    pub fn register<A: Activation + ChildRouter + Clone + 'static>(self, activation: A) -> Self {
+        self.register_entry(activation)
     }
 
     /// Register a hub activation that supports nested routing
@@ -2327,26 +2310,51 @@ impl DynamicHub {
     /// Same contract as [`Self::register`]: panics on a root/activation
     /// namespace collision (Z2H-8 / HOSTLESS-3).
     #[deprecated(since = "0.5.0", note = "Use register() — it now handles both leaf and hub activations")]
-    pub fn register_hub<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
+    pub fn register_hub<A: Activation + ChildRouter + Clone + 'static>(self, activation: A) -> Self {
+        self.register_entry(activation)
+    }
+
+    /// NEST-15: `activation` as an entry of the root's table.
+    pub(crate) fn entry_of<A: Activation + ChildRouter + Clone + 'static>(activation: A) -> super::service_root::Entry {
+        let router = Arc::new(activation.clone());
+        super::service_root::Entry { object: Arc::new(ActivationWrapper { inner: activation }), router }
+    }
+
+    /// [`register`](Self::register): an entry of the root's table, at build,
+    /// with its direct RPC methods (a service without a grant gate serves
+    /// `<ns>.<method>` beside `<ns>.call`).
+    fn register_entry<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
         let namespace = activation.namespace().to_string();
         self.assert_no_root_shadow(&namespace);
-        let plugin_id = activation.plugin_id();
         let activation_for_rpc = activation.clone();
-        let activation_for_router = activation.clone();
-
+        let entry = Self::entry_of(activation);
         let inner = self.inner_mut("Cannot register: DynamicHub has multiple references");
+        Self::index_entry(inner.registry.get_mut().unwrap_or_else(|p| p.into_inner()), inner.auth_catalog.as_ref(), &namespace, &entry);
+        let table = Arc::make_mut(inner.root.get_mut().unwrap_or_else(|p| p.into_inner()));
+        if let Some(old) = table.entries.insert(namespace, entry.clone()) {
+            table.nested -= old.object.static_child_schemas().len();
+        }
+        // RETURNS-40: the cheap bound on `ir`'s names, counted here, once
+        table.nested += entry.object.static_child_schemas().len();
+        inner.pending_rpc.lock().unwrap()
+            .push(Box::new(move || activation_for_rpc.into_rpc_methods()));
+        self
+    }
 
-        // Register in the activation registry
-        inner.registry.write().unwrap().register(
-            plugin_id,
-            namespace.clone(),
-            namespace.clone(), // Use namespace as plugin_type for now
-        );
-
-        if let Some(catalog) = inner.auth_catalog.as_ref() {
-            let schema = activation.plugin_schema();
+    /// What every entry is known by besides the table: its id in the
+    /// activation registry, and — AUTH-5 — its methods in `auth.requires`
+    /// (registered before the auth activation was mounted or after).
+    fn index_entry(
+        registry: &mut PluginRegistry,
+        catalog: Option<&super::auth_activation::Catalog>,
+        namespace: &str,
+        entry: &super::service_root::Entry,
+    ) {
+        registry.register(entry.object.plugin_id(), namespace.to_string(), namespace.to_string());
+        if let Some(catalog) = catalog {
+            let schema = entry.object.plugin_schema();
             // MACRO-20: and its static children's methods, by their whole path.
-            let statics = super::children::qualified(&schema.namespace, Activation::static_child_schemas(&activation));
+            let statics = super::children::qualified(&schema.namespace, entry.object.static_child_schemas());
             // NEST-5: and its slots — a typed slot's methods by the slot's
             // path, an untyped slot whole.
             let (mut typed, mut untyped) = (Vec::new(), Vec::new());
@@ -2359,13 +2367,89 @@ impl DynamicHub {
             catalog.add_slots(&untyped);
             catalog.add(&schema);
         }
-        // RETURNS-40: the cheap bound on `ir`'s names, counted here, once
-        inner.nested_count += Activation::static_child_schemas(&activation).len();
-        inner.activations.insert(namespace.clone(), Arc::new(ActivationWrapper { inner: activation }));
-        inner.child_routers.insert(namespace, Arc::new(activation_for_router));
-        inner.pending_rpc.lock().unwrap()
-            .push(Box::new(move || activation_for_rpc.into_rpc_methods()));
-        self
+    }
+
+    /// NEST-15: the service root — its table of peers, read and changed
+    /// while the service serves.
+    pub fn root(&self) -> super::service_root::ServiceRoot {
+        super::service_root::ServiceRoot { hub: self.clone() }
+    }
+
+    /// NEST-15: the root's table now (a snapshot).
+    pub(crate) fn table(&self) -> Arc<super::service_root::Table> {
+        self.inner.root.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// NEST-15: told the service's hash each time the root's table changes.
+    pub(crate) fn watch_root(&self) -> tokio::sync::watch::Receiver<String> {
+        self.inner.root_watch.subscribe()
+    }
+
+    /// NEST-15: serve `entry` as `name` while the service serves — refused
+    /// for the service's own name, a name not one segment, or (unless
+    /// `replace`) a name taken. Answers whether an entry was replaced.
+    pub(crate) fn insert_entry(&self, name: String, entry: super::service_root::Entry, replace: bool) -> Result<bool, super::service_root::RootError> {
+        super::service_root::check_name(&name)?;
+        if name == self.inner.namespace {
+            return Err(super::service_root::RootError::Shadows { name });
+        }
+        let before = self.compute_hash();
+        let replaced = self.change_table(|table| {
+            if !replace && table.entries.contains_key(&name) {
+                return Err(super::service_root::RootError::Taken { name: name.clone() });
+            }
+            let nested = entry.object.static_child_schemas().len();
+            let old = table.entries.insert(name.clone(), entry.clone());
+            if let Some(old) = old.as_ref() {
+                table.nested -= old.object.static_child_schemas().len();
+            }
+            table.nested += nested;
+            Ok(old.is_some())
+        })?;
+        Self::index_entry(&mut self.inner.registry.write().unwrap_or_else(|p| p.into_inner()), self.inner.auth_catalog.as_ref(), &name, &entry);
+        self.table_moved(before);
+        Ok(replaced)
+    }
+
+    /// NEST-15: stop serving `name`; answers whether it was served.
+    pub(crate) fn remove_entry(&self, name: &str) -> bool {
+        let before = self.compute_hash();
+        let gone = self.change_table(|table| {
+            let old = table.entries.remove(name);
+            if let Some(old) = old.as_ref() {
+                table.nested -= old.object.static_child_schemas().len();
+            }
+            old
+        });
+        let Some(old) = gone else { return false };
+        self.inner.registry.write().unwrap_or_else(|p| p.into_inner()).remove(old.object.plugin_id());
+        if let Some(catalog) = self.inner.auth_catalog.as_ref() {
+            catalog.remove_under(name);
+        }
+        self.table_moved(before);
+        true
+    }
+
+    /// One change of the root's table, made on a copy and swapped in.
+    fn change_table<R>(&self, change: impl FnOnce(&mut super::service_root::Table) -> R) -> R {
+        let mut root = self.inner.root.write().unwrap_or_else(|p| p.into_inner());
+        let mut table = (**root).clone();
+        let out = change(&mut table);
+        *root = Arc::new(table);
+        out
+    }
+
+    /// NEST-15: the root's table changed while the service serves: what was
+    /// described and indexed is dropped, the service's hash moves — in the
+    /// `plexus_hash` items carry when it was this service's — and watchers
+    /// are told.
+    fn table_moved(&self, before: String) {
+        *self.inner.gate_index.write().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.inner.input_index.write().unwrap_or_else(|p| p.into_inner()) = None;
+        self.inner.describe.schema_moved();
+        let after = self.compute_hash();
+        PlexusContext::moved(&before, &after);
+        self.inner.root_watch.send_replace(after);
     }
 
     /// List all methods across all activations
@@ -2378,7 +2462,8 @@ impl DynamicHub {
         }
 
         // Include registered activation methods
-        for (ns, act) in &self.inner.activations {
+        for (ns, e) in &self.table().entries {
+            let act = &e.object;
             for m in act.methods() {
                 methods.push(format!("{}.{}", ns, m));
             }
@@ -2400,7 +2485,8 @@ impl DynamicHub {
         });
 
         // Include registered activations
-        for a in self.inner.activations.values() {
+        for e in self.table().entries.values() {
+            let a = &e.object;
             activations.push(ActivationInfo {
                 namespace: a.namespace().to_string(),
                 version: a.version().to_string(),
@@ -2492,12 +2578,13 @@ impl DynamicHub {
             // AUTH-11: a sign-in that ended proves no one, on every method.
             let (auth, ended) = super::grant_gate::standing(gate, auth);
             let decide = |info| super::grant_gate::decide(gate, &self.inner.namespace, method, info, &params, auth, &self.inner.signed_in_grants);
-            let admit = match self.gate_index().methods.get(method) {
+            let index = self.gate_index();
+            let admit = match index.methods.get(method) {
                 Some(info) => decide(Some(info)),
                 // NEST-5: a path through a slot is decided on the slot's
                 // grant; a grant written as its literal path still decides
                 // first (the slot grant is additive).
-                None => match self.gate_info(method) {
+                None => match index.info(method) {
                     Some(slot) => decide(None).or_else(|_| decide(Some(slot))),
                     None => decide(None),
                 },
@@ -2552,7 +2639,7 @@ impl DynamicHub {
                 self.inner.default_deny,
                 &self.inner.audit_sink,
                 method,
-                self.gate_info(method),
+                self.gate_index().info(method),
                 auth,
                 raw_ctx.and_then(|ctx| ctx.peer.map(|peer| peer.ip())),
             )
@@ -2566,14 +2653,17 @@ impl DynamicHub {
             self.check_ir_names(&params, auth)?;
         }
 
-        // Handle plexus's own methods
+        // NEST-15: routing is `peer(name)` from the root down — the
+        // service's own name answers the root itself (its `call`, `hash`,
+        // `schema`, `ir`), every other name the root's table; the entry
+        // routes the rest of the path below it.
         let stream = if namespace == self.inner.namespace {
             Activation::call(self, method_name, params, auth, raw_ctx).await?
         } else {
-            let activation = self.inner.activations.get(namespace)
+            let entry = self.table().entries.get(namespace).map(|e| e.object.clone())
                 .ok_or_else(|| PlexusError::ActivationNotFound(namespace.to_string()))?;
 
-            activation.call(method_name, params, auth, raw_ctx).await?
+            entry.call(method_name, params, auth, raw_ctx).await?
         };
 
         // CA-1 (trak facet ccc924ad): schema responses leaving this hub get
@@ -2619,14 +2709,14 @@ impl DynamicHub {
             .map(|s| s.to_string())
             .ok_or_else(|| PlexusError::ActivationNotFound(handle.plugin_id.to_string()))?;
 
-        let activation = self.inner.activations.get(&path)
+        let activation = self.table().entries.get(&path).map(|e| e.object.clone())
             .ok_or_else(|| PlexusError::ActivationNotFound(path.clone()))?;
         activation.resolve_handle(handle).await
     }
 
     /// Get activation schema
     pub fn get_activation_schema(&self, namespace: &str) -> Option<Schema> {
-        self.inner.activations.get(namespace).map(|a| a.schema())
+        self.table().entries.get(namespace).map(|e| e.object.schema())
     }
 
     /// Get a snapshot of the activation registry (safe to use outside locks)
@@ -2656,8 +2746,8 @@ impl DynamicHub {
         schemas.push(Activation::plugin_schema(self));
 
         // Include registered activations
-        for a in self.inner.activations.values() {
-            schemas.push(a.plugin_schema());
+        for e in self.table().entries.values() {
+            schemas.push(e.object.plugin_schema());
         }
 
         schemas
@@ -2672,8 +2762,8 @@ impl DynamicHub {
     /// Get help for a method
     pub fn get_method_help(&self, method: &str) -> Option<String> {
         let (namespace, method_name) = self.parse_method(method).ok()?;
-        let activation = self.inner.activations.get(namespace)?;
-        activation.method_help(method_name)
+        let table = self.table();
+        table.entries.get(namespace)?.object.method_help(method_name)
     }
 
     fn parse_method<'a>(&self, method: &'a str) -> Result<(&'a str, &'a str), PlexusError> {
@@ -2694,9 +2784,9 @@ impl DynamicHub {
     /// its `hash` and every caller's view hash digest in this order.
     /// Called by `#[plexus_macros::activation]` when its `hub` flag is set.
     pub fn plugin_children(&self) -> Vec<ChildSummary> {
-        self.inner.activations.values()
-            .map(|a| {
-                let schema = a.plugin_schema();
+        self.table().entries.values()
+            .map(|e| {
+                let schema = e.object.plugin_schema();
                 ChildSummary {
                     namespace: schema.namespace,
                     description: schema.description,
@@ -2853,8 +2943,8 @@ impl DynamicHub {
         // CHILD-WIRE: for each registered child router with capability bits set,
         // register {ns}.list_children / {ns}.search_children as subscriptions.
         // Per-activation namespaced (not top-level _list_children).
-        for (ns, router) in self.inner.child_routers.iter() {
-            register_child_capability_methods(&mut module, ns, router.clone(), self.inner.gate.clone())?;
+        for (ns, e) in self.table().entries.iter() {
+            register_child_capability_methods(&mut module, ns, e.router.clone(), self.inner.gate.clone())?;
         }
 
         Ok(module)
@@ -3035,8 +3125,8 @@ impl DynamicHub {
 
         // CHILD-WIRE: for each registered child router with capability bits set,
         // register {ns}.list_children / {ns}.search_children as subscriptions.
-        for (ns, router) in hub.inner.child_routers.iter() {
-            register_child_capability_methods(&mut module, ns, router.clone(), hub.inner.gate.clone())?;
+        for (ns, e) in hub.table().entries.iter() {
+            register_child_capability_methods(&mut module, ns, e.router.clone(), hub.inner.gate.clone())?;
         }
 
         Ok(module)
@@ -3536,8 +3626,9 @@ impl ChildRouter for DynamicHub {
 
     async fn get_child(&self, name: &str) -> Option<Box<dyn ChildRouter>> {
         // Look up registered activations that implement ChildRouter
-        self.inner.child_routers.get(name)
+        self.table().entries.get(name).map(|e| e.router.clone())
             .map(|router| {
+
                 // Clone the Arc and wrap in Box for the trait object
                 Box::new(ArcChildRouter(router.clone())) as Box<dyn ChildRouter>
             })

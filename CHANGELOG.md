@@ -5,6 +5,29 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.10.2
+
+NEST-15 (additive): **the service root is the primitive — a table of peers
+answered by `peer(name)`, and it can change while the service serves.**
+`DynamicHub::root()` is the root ([`ServiceRoot`]): `peer(name)` (a `Box<dyn
+Peer>`), `names`, `contains`, `insert` / `replace` (an activation, a
+`RemoteChild`), `insert_peer(name, Arc<dyn Peer>, replace)` (any peer, its
+schema's grants and roles requalified to `name`), `remove`, `hash` and
+`watch` (a `tokio::sync::watch` of the service's hash, told on every
+change). Routing is `peer(name)` from the root down: the service's own name
+answers the root itself (`call`, `hash`, `schema`, `ir`), every other name
+the table. `.register(..)`, `.register_hub(..)` and `--child` are the
+table's entries at build, unchanged. The gate's index, the `<service>.call`
+input index, `<service>.schema` / `.hash` / `.hashes` / `.ir`, the schema's
+`children`, `declared_roles`, `auth.requires` and the activation registry
+are read from the table: a change drops what was described and indexed, and
+moves the service's hash — in every item's `plexus_hash` too
+(`PlexusContext` is moved when the service that set it changes). An entry
+added at runtime is reached through `<service>.call`; direct `<ns>.<method>`
+JSON-RPC names (a service without a gate) and `<ns>.list_children` stay the
+build-time entries'. Refusals: `RootError::{Taken, Shadows, BadName}`.
+No wire change for a service whose table does not change.
+
 ## [Unreleased] — 0.10.1
 
 NEST-11 (additive): **a child calls its service back, under a call it

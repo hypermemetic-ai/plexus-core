@@ -464,6 +464,13 @@ impl Catalog {
         }
     }
 
+    /// NEST-15: forget every method under the top-level name `ns` (a peer the
+    /// service no longer serves).
+    pub(crate) fn remove_under(&self, ns: &str) {
+        let prefix = format!("{ns}.");
+        self.0.write().unwrap_or_else(|p| p.into_inner()).retain(|k, _| !k.starts_with(&prefix));
+    }
+
     /// NEST-5: an untyped slot (`solar.{planet}`), granted whole.
     pub(crate) fn add_slots(&self, untyped: &[String]) {
         let mut slots = self.1.write().unwrap_or_else(|p| p.into_inner());

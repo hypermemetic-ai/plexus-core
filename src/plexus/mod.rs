@@ -44,6 +44,8 @@ pub mod remote_child;
 pub mod schema;
 // NEST-11: which service a call is routed in.
 pub mod service_scope;
+/// NEST-15: the service root — a table of peers answered by `peer(name)`.
+pub mod service_root;
 /// NEST-5: slot types and slot grants.
 pub mod slots;
 /// NEST-7: the primitive — an activation returns an activation.
@@ -77,6 +79,7 @@ pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME
 pub use grant_gate::{current_reach, with_reach, ForbiddenItem};
 pub use view::View;
 pub use service_scope::WeakService;
+pub use service_root::{RootError, ServiceRoot};
 pub use peer::{Contract, FindPeer, Interface, ListPeers, Peer, PeerError, PeerRouter, PeerSlot, PeerTransport, RouterPeer, Stamp};
 pub use auth_activation::{
     AuthActivation, AuthBackend, AuthClient, AuthEvent, AuthFailure, AuthSetup, LoginAnswer, LoginFlow, MembershipEntry, MembershipStore,

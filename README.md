@@ -52,6 +52,29 @@ let stream = hub.route("myactivation.method", json!({})).await?;
 
 > **When to use DynamicHub**: Only when you need to compose multiple top-level activations. For a single service, host the activation directly.
 
+### The service root: a top level that grows while it serves
+
+Underneath the builder, a service's top level is one table of peers
+answered by `peer(name)` (NEST-15): `.register(x)` and `--child` add an
+entry at build; `hub.root()` reads and changes the table while the service
+serves. Routing, the grant gate's index, `<service>.schema` / `.hash` /
+`.ir` and the schema's `children` all read it; a change moves the
+service's hash and is said on `root().watch()`.
+
+```rust
+let service = Arc::new(DynamicHub::new("svc"));               // no activations yet
+let root = service.root();
+root.insert(Weather)?;                                       // svc weather forecast — now
+let peer = root.peer("weather").await?;                      // the primitive: a Box<dyn Peer>
+root.insert_peer("sky", Arc::new(Weather) as Arc<dyn Peer>, false)?; // any Peer, under its own name
+root.remove("weather");
+```
+
+An entry added at runtime is reached through `<service>.call` (what
+synapse and the clients send); only entries registered at build also get
+direct `<ns>.<method>` RPC names on a service without a grant gate. The
+gate admits it as any activation: by the roles that list its grants.
+
 > **Migration Note**: `DynamicHub::new()` now requires an explicit namespace. Choose a namespace that identifies your application (e.g., "myapp", "substrate", "hub"). The `Plexus` type alias still works but is deprecated.
 
 ## Creating Activations

@@ -92,8 +92,8 @@ use plexus_auth_core::grants::{GrantsGeneration, Reach};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-pub use host::{host, serve_child, serve_child_on, serve_child_stdio, ChildPeer, HostTransport};
-pub use upcall::{HOST_CALL, HOST_CALL_UNSUB};
+pub use host::{host, serve_child, serve_child_on, serve_child_stdio, serve_child_with, ChildPeer, HostTransport, ServeChild};
+pub use upcall::{Consented, HOST_CALL, HOST_CALL_UNSUB};
 pub use link::MountTimings;
 pub use spec::{parse_duration, Backoff, ChildError, ChildOptions, ChildSpec};
 #[cfg(feature = "clap")]
@@ -115,7 +115,9 @@ use super::types::PlexusStreamItem;
 /// restart is held to. Its `_info`'s `backend`, and on `wss://` the key its
 /// certificate holds (sha256 of the SubjectPublicKeyInfo, hex): a renewed
 /// certificate over the same key is the same peer; a new key is not. A
-/// peer's own Ed25519 key, proved over the hop, joins it with DYNAUTH-5.
+/// peer's own Ed25519 key, proved at `_info` over a nonce, joins it
+/// (DYNAUTH-5): a restart proving another key is refused as one proving
+/// another certificate key is.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerIdentity {
     /// The backend its `_info` names.
@@ -123,11 +125,15 @@ pub struct PeerIdentity {
     /// On `wss://`: sha256 of its certificate's public key, hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key: Option<String>,
+    /// DYNAUTH-5: the Ed25519 key it proved at `_info` (`key:<hex>`), if it
+    /// proved one — what a peer token is addressed and bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl PeerIdentity {
     fn of(conn: &Conn) -> Self {
-        Self { backend: conn.ns().to_string(), tls_key: conn.tls_key.get().cloned() }
+        Self { backend: conn.ns().to_string(), tls_key: conn.tls_key.get().cloned(), key: conn.peer_key.get().cloned() }
     }
 }
 
@@ -137,6 +143,10 @@ impl std::fmt::Display for PeerIdentity {
         match &self.tls_key {
             Some(k) => write!(f, ", TLS key {}", &k[..k.len().min(16)]),
             None => write!(f, ", no TLS key"),
+        }?;
+        match &self.key {
+            Some(k) => write!(f, ", key {}", &k[..k.len().min(20)]),
+            None => Ok(()),
         }
     }
 }
@@ -340,6 +350,25 @@ impl RemoteChild {
     /// another is refused for good ([`RemoteChild::dead`]).
     pub fn identity(&self) -> Option<&PeerIdentity> {
         self.inner.shared.identity.get()
+    }
+
+    /// DYNAUTH-5: hold the child's calls back to the needs an admin
+    /// consented to, each on its scopes (`None`: no consent kept — every
+    /// declared need, as NEST-16 has it). A declared need not consented is
+    /// refused `forbidden` (`not_needed`), saying so.
+    pub fn set_consent(&self, consent: Option<Vec<Consented>>) {
+        self.inner.shared.upcalls.set_consent(consent);
+    }
+
+    /// DYNAUTH-5: the consent this mount holds its child's calls back to.
+    pub fn consent(&self) -> Option<Vec<Consented>> {
+        self.inner.shared.upcalls.consent().map(|c| c.to_vec())
+    }
+
+    /// DYNAUTH-5: the Ed25519 key the child proved at its mount
+    /// (`key:<hex>`), if it proved one; pinned with [`Self::identity`].
+    pub fn peer_key(&self) -> Option<&str> {
+        self.identity().and_then(|i| i.key.as_deref())
     }
 
     /// NEST-12: whether a live connection to the child is up now.

@@ -153,8 +153,38 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    serve_child_with(activation, r, w, ServeChild { peer, ..ServeChild::default() }).await
+}
+
+/// How a child serves (DYNAUTH-5): whose hops it takes, and the key it
+/// proves to the service that mounts it.
+#[derive(Debug, Clone)]
+pub struct ServeChild {
+    /// Whose hops it takes.
+    pub peer: ChildPeer,
+    /// DYNAUTH-5: the child's own Ed25519 key. With one, `_info {nonce}` is
+    /// answered `{backend, key, proof}` (the nonce and backend signed), so
+    /// the service registers and pins it; peer tokens are addressed and
+    /// bound to it (DYNAUTH-12).
+    pub key: Option<crate::plexus::peer_token::PeerKey>,
+}
+
+impl Default for ServeChild {
+    fn default() -> Self {
+        Self { peer: ChildPeer::Pipe, key: None }
+    }
+}
+
+/// [`serve_child_on`] with every option ([`ServeChild`]).
+pub async fn serve_child_with<A, R, W>(activation: A, r: R, w: W, opts: ServeChild) -> std::io::Result<()>
+where
+    A: Activation + Clone,
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let ns = activation.namespace().to_string();
-    let peer = Arc::new(peer);
+    let key = opts.key.clone().map(Arc::new);
+    let peer = Arc::new(opts.peer);
     let slots = Arc::new(slot_index(&activation));
     let (call_m, unsub_m) = (format!("{ns}.call"), format!("{ns}.call_unsub"));
     let (out, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -194,7 +224,7 @@ where
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         if method == "_info" || method == call_m {
             let (target, p, hop) = if method == "_info" {
-                ("_info".to_string(), Value::Null, None)
+                ("_info".to_string(), params.clone(), None)
             } else {
                 let Some(target) = params.get("method").and_then(Value::as_str) else {
                     send(&out, json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "Invalid params: method" } }));
@@ -206,7 +236,7 @@ where
             next_sid += 1;
             // spec/02: the subscription id before any of its items.
             send(&out, json!({ "jsonrpc": "2.0", "id": id, "result": sid }));
-            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots), Arc::clone(&link)));
+            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots), Arc::clone(&link), key.clone()));
             live.lock().unwrap().insert(sid, task.abort_handle());
         } else if method == unsub_m {
             let held = params.get(0).and_then(Value::as_u64).and_then(|sid| live.lock().unwrap().remove(&sid));
@@ -257,6 +287,7 @@ async fn run<A: Activation>(
     peer: Arc<ChildPeer>,
     slots: Arc<Slots>,
     link: Arc<HostLink>,
+    key: Option<Arc<crate::plexus::peer_token::PeerKey>>,
 ) {
     let item = |v: Value| {
         let frame = json!({ "jsonrpc": "2.0", "method": format!("{ns}.call"), "params": { "subscription": sid, "result": v } });
@@ -266,7 +297,13 @@ async fn run<A: Activation>(
     let done = || item(serde_json::to_value(PlexusStreamItem::Done { metadata: meta(&ns) }).unwrap_or_default());
 
     if target == "_info" {
-        item(json!({ "type": "data", "metadata": meta(&ns), "content_type": "_info", "content": { "backend": ns } }));
+        let mut content = json!({ "backend": ns });
+        // DYNAUTH-5: a child with a key proves it over the mount's nonce.
+        if let (Some(key), Some(nonce)) = (&key, params.get("nonce").and_then(Value::as_str)) {
+            content["key"] = json!(key.kid());
+            content["proof"] = json!(key.key_proof(nonce, &ns));
+        }
+        item(json!({ "type": "data", "metadata": meta(&ns), "content_type": "_info", "content": content }));
         done();
     } else if let Some(method) = target.strip_prefix(&format!("{ns}.")) {
         let hop: Option<Hop> = hop.and_then(|h| serde_json::from_value(h).ok());

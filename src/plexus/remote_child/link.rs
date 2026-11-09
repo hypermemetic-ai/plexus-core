@@ -23,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::spec::{ChildOptions, ChildSpec};
+use super::upcall::{self, Served, Upcalls};
 use crate::plexus::types::{PlexusStreamItem, StreamMetadata};
 use plexus_client::RemoteError;
 
@@ -144,6 +145,12 @@ pub(super) struct Conn {
     pub shutdown: Notify,
     buffer: usize,
     counters: Arc<Counters>,
+    /// NEST-11: the mount's calls back from its child, when it takes them
+    /// (a child it spawned or dialed); unset, a request from the far side
+    /// is refused.
+    pub up: OnceLock<Arc<Upcalls>>,
+    /// NEST-11: the calls back this connection is serving.
+    served: Arc<Served>,
 }
 
 /// One message, read in one pass: a notification's item stays raw until
@@ -199,6 +206,8 @@ impl Conn {
             shutdown: Notify::new(),
             buffer,
             counters,
+            up: OnceLock::new(),
+            served: Arc::default(),
         })
     }
 
@@ -274,7 +283,7 @@ impl Conn {
         let msg: Msg<'_> = match serde_json::from_slice(raw) {
             Ok(m) => m,
             Err(e) => match serde_json::from_slice::<Loose<'_>>(raw) {
-                Ok(Loose { id: Some(id), method: Some(method) }) => return self.refuse_request(id, &method),
+                Ok(Loose { id: Some(id), method: Some(method) }) => return self.request(id, &method, raw),
                 _ => {
                     tracing::warn!(target: "plexus::child", child = %self.name, "an unreadable message from the child: {e}");
                     return;
@@ -283,7 +292,7 @@ impl Conn {
         };
         if let Some(method) = msg.method {
             if let Some(id) = msg.id {
-                return self.refuse_request(id, &method);
+                return self.request(id, &method, raw);
             }
             match msg.params {
                 Some(Notif { subscription: Some(sub), result: Some(item) }) => self.route(sub.to_string(), item).await,
@@ -326,7 +335,18 @@ impl Conn {
         }
     }
 
-    /// A child asks its service nothing (spec/12): answered, not served.
+    /// A request from the child: a call back under a call it serves
+    /// (NEST-11, `_host.call`), when this mount takes them; anything else is
+    /// refused.
+    fn request(&self, id: Value, method: &str, raw: &[u8]) {
+        if let (Some(up), true) = (self.up.get(), method == upcall::HOST_CALL || method == upcall::HOST_CALL_UNSUB) {
+            let params = serde_json::from_slice::<Value>(raw).ok().and_then(|mut v| v.get_mut("params").map(Value::take)).unwrap_or(Value::Null);
+            return upcall::on_request(up, &self.served, &self.out, &self.name, id, method, params);
+        }
+        self.refuse_request(id, method)
+    }
+
+    /// A child asks its service nothing else (spec/12): answered, not served.
     fn refuse_request(&self, id: Value, method: &str) {
         tracing::warn!(target: "plexus::child", child = %self.name, %method, "a request from the child refused");
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "a service answers no requests from its child" } }));
@@ -397,6 +417,7 @@ impl Conn {
         let (subs, pending) = {
             let mut r = self.routes.lock().unwrap();
             self.alive.store(false, Ordering::Release);
+            self.served.abort_all();
             r.closing.clear();
             r.closing_subs.clear();
             r.answered.clear();
@@ -499,6 +520,8 @@ pub(super) struct Shared {
     dial: tokio::sync::Mutex<()>,
     /// The mounted schema's hash, as the child published it.
     pub mounted_hash: OnceLock<String>,
+    /// NEST-11: the child's calls back into the service.
+    pub upcalls: Arc<Upcalls>,
 }
 
 impl Drop for Shared {
@@ -563,7 +586,9 @@ pub(super) fn static_children(raw: &Value) -> Vec<String> {
 
 impl Shared {
     pub(super) fn new(spec: ChildSpec, opts: ChildOptions, principal: String) -> Arc<Self> {
+        let upcalls = Upcalls::new(opts.host.clone().or_else(crate::plexus::service_scope::current));
         Arc::new(Self {
+            upcalls,
             name: spec.name().to_string(),
             spec,
             opts,
@@ -664,6 +689,7 @@ impl Shared {
         };
         let (out, out_rx) = mpsc::unbounded_channel();
         let conn = Conn::new(&self.name, child.id(), out, self.opts.buffer, Arc::clone(&self.counters));
+        let _ = conn.up.set(Arc::clone(&self.upcalls));
         tokio::spawn(write_lines(stdin, out_rx));
         let reader = Arc::clone(&conn);
         let shared = Arc::downgrade(self);
@@ -763,6 +789,31 @@ impl Shared {
                 Err(unavailable(&self.name, &why))
             }
         }
+    }
+
+    /// Why the child will never be mounted again, if it will not (a restart
+    /// published another schema).
+    pub(super) fn dead(&self) -> Option<String> {
+        self.state.lock().unwrap().dead.clone()
+    }
+
+    /// Why the child is down, when it is: the last connection's end, or the
+    /// last start that failed.
+    pub(super) fn why_down(&self) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        if st.dead.is_some() {
+            return st.dead.clone();
+        }
+        match &st.conn {
+            Some(c) if c.alive() => None,
+            _ => Some(if st.why.is_empty() { "not connected".to_string() } else { st.why.clone() }),
+        }
+    }
+
+    /// Whether a live connection is up now.
+    pub(super) fn is_up(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.dead.is_none() && st.conn.as_ref().is_some_and(|c| c.alive())
     }
 
     fn live(&self) -> Result<Option<Arc<Conn>>, PlexusStreamItem> {

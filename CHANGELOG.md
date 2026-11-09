@@ -5,7 +5,45 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.10.0
+## [Unreleased] — 0.10.1
+
+NEST-11 (additive): **a child calls its service back, under a call it
+serves.** A child mounted by `RemoteChild` (spawned on stdio or dialed on a
+WebSocket) may send `_host.call {method, params, under}` on the mount's
+connection while a call the service forwarded to it is open, `under` that
+call's `hop.call` (plexus-wire spec/14, "A child calls its service back").
+The service routes it through its own routing and gate —
+`DynamicHub::route_with_ctx` — as the forwarded call's caller, within its
+reach (one more `admin@<scope>` ceiling layer), streams its items back as
+`_host.call` notifications, takes `_host.call_unsub`, and ends every call
+made under a forwarded call when that call ends or its grant is revoked. A
+call naming no live forwarded call is refused `unauthenticated` at the
+JSON-RPC layer, naming why; outside a call the child may ask for a schema
+only, answered from the service's own description. Any other request from
+a child is refused as before. New: `remote_child::host()` and
+`HostTransport` (a `plexus_client::Transport` back into the service, for
+the call being run, on the Rust far side), `HOST_CALL` /
+`HOST_CALL_UNSUB`, `WeakService` and `DynamicHub::downgrade`,
+`ChildOptions::host` / `with_host` (the service a child is mounted in;
+else the one the call it was connected in was routed in, else the first
+forwarded call's), `ChildStats::calls_back`, `RemoteChild::calls_open_back`.
+`DynamicHub::route_with_ctx` now runs knowing its service (the outermost
+one a call entered). Test: `tests/nest11_calls_back.rs`.
+
+NEST-12 (additive): **what a runtime peer set needs of a mount** (plexus-dyn).
+`ChildOptions::ping`: a WebSocket child is pinged at that period and marked
+down — every open call `child_unavailable`, the next one redialing — when
+nothing has come from it for twice as long; a dial whose upgrade never
+answers is given the mount's timeout. `RemoteChild::is_up`, `why_down`,
+`dead` (why a mount will never take its child back: "schema changed;
+restart the service" — a fresh `connect` mounts the new one), `up()` (bring
+it up now, within its backoff), `mounted_hash`; `ChildStats::up`. A mount
+reached through a slot of its service (a peer in `dyn.{peer}`) tells its
+child the method it was admitted for in the child's terms
+(`hop.limit.grant` = `{ns}.<method>`) rather than the service's slot grant,
+which the child could not read.
+
+## [0.10.0]
 
 ASK-2 / ASK-1 (breaking): **the server no longer asks its caller
 mid-call.** The `bidirectional` module goes — `BidirChannel`,

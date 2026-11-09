@@ -94,17 +94,32 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
         let value = HeaderValue::from_str(&format!("Bearer {proof}")).map_err(|e| e.to_string())?;
         req.headers_mut().insert(AUTHORIZATION, value);
     }
-    let (socket, _) = tokio_tungstenite::connect_async(req).await.map_err(|e| match e {
+    // NEST-12: a dial that never answers (a socket accepted and left) is
+    // given the mount's one timeout, as its `_info` is.
+    let dialed = tokio::time::timeout(shared.opts.timeout, tokio_tungstenite::connect_async(req))
+        .await
+        .map_err(|_| format!("dialing {url}: no answer to the upgrade in {:?}", shared.opts.timeout))?;
+    let (socket, _) = dialed.map_err(|e| match e {
         tokio_tungstenite::tungstenite::Error::Http(resp) => format!("the upgrade to {url} was refused: HTTP {}", resp.status()),
         e => format!("dialing {url}: {e}"),
     })?;
     let (mut sink, mut stream) = socket.split();
     let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let conn = Conn::new(&shared.name, None, out, shared.opts.buffer, Arc::clone(&shared.counters));
+    let _ = conn.up.set(Arc::clone(&shared.upcalls));
     let writer = Arc::clone(&conn);
+    // NEST-12: a ping every `ping`; the reader marks the socket down when
+    // nothing has come for twice as long.
+    let ping = shared.opts.ping;
+    let mut ticks = ping.map(|p| tokio::time::interval_at(tokio::time::Instant::now() + p, p));
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                _ = async { match ticks.as_mut() { Some(t) => { t.tick().await; } None => std::future::pending::<()>().await } } => {
+                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
+                }
                 first = out_rx.recv() => {
                     let Some(first) = first else { break };
                     let mut ok = sink.feed(Message::text(String::from_utf8_lossy(&first).into_owned())).await.is_ok();
@@ -126,8 +141,16 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     let weak = Arc::downgrade(shared);
     let url = url.to_string();
     tokio::spawn(async move {
+        let silent = ping.map(|p| p * 2);
         let why = loop {
-            match stream.next().await {
+            let next = match silent {
+                Some(d) => match tokio::time::timeout(d, stream.next()).await {
+                    Ok(n) => n,
+                    Err(_) => break format!("{url} answered nothing for {d:?} (pinged every {:?})", d / 2),
+                },
+                None => stream.next().await,
+            };
+            match next {
                 Some(Ok(Message::Text(t))) => reader.on_message(t.as_bytes()).await,
                 Some(Ok(Message::Binary(b))) => reader.on_message(&b).await,
                 Some(Ok(Message::Close(f))) => break format!("{url} closed the socket ({})", f.map(|f| f.code.to_string()).unwrap_or_else(|| "no code".into())),

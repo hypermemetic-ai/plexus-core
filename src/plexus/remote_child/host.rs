@@ -58,18 +58,34 @@
 //! What a trusted sender says is believed: the caller it names and the
 //! ceiling it gives. GRAFT-1's credential scoped to the call is what would
 //! let a child check the claim rather than the sender.
+//!
+//! # Calling the service back (NEST-11)
+//!
+//! While it serves a call, the activation may call its service back on the
+//! same connection: [`host()`] is a [`plexus_client::Transport`] for the
+//! call being run — a generated client takes it as any other — whose calls
+//! are `_host.call {method, params, under}`, `under` the hop's `call` id.
+//! The service routes each through its own gate as the hop's caller, within
+//! the hop's reach, and ends them when the call they were made under ends
+//! ([`super::RemoteChild`]'s side, `upcall.rs`). Dropping a call's stream
+//! sends `_host.call_unsub`.
 
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use plexus_client::{ItemStream, MethodRef, StreamItem, Transport, TransportError, TransportErrorKind};
 use plexus_client::{DenyReason, RemoteError};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::link::{meta, write_lines};
-use crate::call::{CallContext, Hop, InCall};
+use super::upcall::{HOST_CALL, HOST_CALL_UNSUB};
+use crate::call::{CallContext, CallError, Hop, InCall};
 use crate::plexus::plexus::{error_item, Activation};
 use crate::plexus::slots::Slots;
 use crate::plexus::types::PlexusStreamItem;
@@ -147,6 +163,7 @@ where
         let _ = out.send(serde_json::to_vec(&v).unwrap_or_default());
     };
     let live: Live = Arc::default();
+    let link = Arc::new(HostLink::new(out.clone()));
     let mut next_sid: u64 = 1;
     let mut lines = BufReader::new(r).lines();
     while let Some(line) = lines.next_line().await? {
@@ -159,6 +176,21 @@ where
         };
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
+        // NEST-11: an answer to a call back (spec/14 rule 2: no `method`, an
+        // id of this side's), or an item of one.
+        if msg.get("method").is_none() {
+            if let Some(n) = id.as_u64() {
+                link.answered(n, msg.get("result").cloned(), msg.get("error").cloned());
+            }
+            continue;
+        }
+        if method == HOST_CALL && id.is_null() {
+            let p = msg.get("params");
+            if let (Some(sid), Some(item)) = (p.and_then(|p| p.get("subscription")).and_then(Value::as_u64), p.and_then(|p| p.get("result"))) {
+                link.item(sid, item.clone()).await;
+            }
+            continue;
+        }
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         if method == "_info" || method == call_m {
             let (target, p, hop) = if method == "_info" {
@@ -174,7 +206,7 @@ where
             next_sid += 1;
             // spec/02: the subscription id before any of its items.
             send(&out, json!({ "jsonrpc": "2.0", "id": id, "result": sid }));
-            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots)));
+            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots), Arc::clone(&link)));
             live.lock().unwrap().insert(sid, task.abort_handle());
         } else if method == unsub_m {
             let held = params.get(0).and_then(Value::as_u64).and_then(|sid| live.lock().unwrap().remove(&sid));
@@ -190,6 +222,7 @@ where
     for (_, h) in live.lock().unwrap().drain() {
         h.abort();
     }
+    link.close();
     drop(out);
     let _ = writer.await;
     Ok(())
@@ -223,6 +256,7 @@ async fn run<A: Activation>(
     hop: Option<Value>,
     peer: Arc<ChildPeer>,
     slots: Arc<Slots>,
+    link: Arc<HostLink>,
 ) {
     let item = |v: Value| {
         let frame = json!({ "jsonrpc": "2.0", "method": format!("{ns}.call"), "params": { "subscription": sid, "result": v } });
@@ -270,7 +304,7 @@ async fn run<A: Activation>(
                     Some(hop) => {
                         // The hop's caller is the call's: `caller()` and a
                         // `#[from_auth]` parameter both name it.
-                        let ctx = CallContext::through_hop(hop);
+                        let ctx = CallContext::through_hop_with(hop, link);
                         let auth = ctx.auth().cloned();
                         crate::call::scope(ctx.clone(), async { activation.call(method, params, auth.as_ref(), None).await })
                             .await
@@ -292,4 +326,218 @@ async fn run<A: Activation>(
         refuse(RemoteError::ActivationNotFound { activation: target.split('.').next().unwrap_or_default().to_string() });
     }
     live.lock().unwrap().remove(&sid);
+}
+
+// ------------------------------------------------------------------ NEST-11
+
+/// The far side's link back to the service on this connection: the calls
+/// it opened there, by the request id it minted and then the subscription id
+/// the service minted (spec/14 rule 2: ids are per direction).
+pub(super) struct HostLink {
+    /// Taken at the end of input, so the writer ends with the last call.
+    out: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    next: AtomicU64,
+    pending: Mutex<HashMap<u64, Opening>>,
+    subs: Mutex<HashMap<u64, mpsc::Sender<Value>>>,
+    closed: AtomicBool,
+}
+
+struct Opening {
+    reply: oneshot::Sender<Result<u64, Value>>,
+    items: mpsc::Sender<Value>,
+}
+
+const BUFFER: usize = 1024;
+
+impl HostLink {
+    fn new(out: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self { out: Mutex::new(Some(out)), next: AtomicU64::new(1), pending: Mutex::default(), subs: Mutex::default(), closed: AtomicBool::new(false) }
+    }
+
+    fn send(&self, v: &Value) {
+        if let Some(out) = self.out.lock().unwrap().as_ref() {
+            let _ = out.send(serde_json::to_vec(v).unwrap_or_default());
+        }
+    }
+
+    /// The service answered request `id`: a call opened (its subscription
+    /// routed before the next frame is read, so no item beats it) or
+    /// refused; an unsubscribe's answer is nobody's.
+    fn answered(&self, id: u64, result: Option<Value>, error: Option<Value>) {
+        let Some(open) = self.pending.lock().unwrap().remove(&id) else { return };
+        match (result.as_ref().and_then(Value::as_u64), error) {
+            (Some(sid), _) => {
+                self.subs.lock().unwrap().insert(sid, open.items);
+                if open.reply.send(Ok(sid)).is_err() {
+                    // Its caller let go before it opened.
+                    self.unsubscribe(sid);
+                }
+            }
+            (None, e) => {
+                let _ = open.reply.send(Err(e.unwrap_or_else(|| json!({ "message": "an answer with neither a subscription nor an error" }))));
+            }
+        }
+    }
+
+    /// One item of a call back; the terminal one ends it.
+    async fn item(&self, sid: u64, item: Value) {
+        let terminal = matches!(item.get("type").and_then(Value::as_str), Some("done" | "error"));
+        let tx = {
+            let mut subs = self.subs.lock().unwrap();
+            if terminal {
+                subs.remove(&sid)
+            } else {
+                subs.get(&sid).cloned()
+            }
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(item).await;
+        }
+    }
+
+    fn unsubscribe(&self, sid: u64) {
+        self.subs.lock().unwrap().remove(&sid);
+        if !self.closed.load(Ordering::Acquire) {
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": HOST_CALL_UNSUB, "params": [sid] }));
+        }
+    }
+
+    /// The connection ended: every call back ends, unanswered.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.out.lock().unwrap().take();
+        self.pending.lock().unwrap().clear();
+        self.subs.lock().unwrap().clear();
+    }
+
+    /// Open `method` with `params` under the forwarded call `under`.
+    async fn open(self: Arc<Self>, method: String, params: Value, under: Option<String>) -> Result<CallBack, StreamItem> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(refused_item(&json!({ "message": "the connection to the service has closed" })));
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (items, rx) = mpsc::channel(BUFFER);
+        let (reply, answer) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, Opening { reply, items });
+        let mut p = json!({ "method": method, "params": params });
+        if let Some(u) = under {
+            p["under"] = json!(u);
+        }
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": HOST_CALL, "params": p }));
+        match answer.await {
+            Ok(Ok(sid)) => Ok(CallBack { rx, sid, link: self, over: false }),
+            Ok(Err(e)) => Err(refused_item(&e)),
+            Err(_) => Err(refused_item(&json!({ "message": "the connection to the service closed before the call opened" }))),
+        }
+    }
+}
+
+/// A JSON-RPC refusal (`{code, message, data?}`) as the one error item a
+/// client reads: its `data` when that is a typed [`RemoteError`].
+fn refused_item(e: &Value) -> StreamItem {
+    let message = e.get("message").and_then(Value::as_str).unwrap_or("the service refused the call").to_string();
+    let error = e
+        .get("data")
+        .and_then(|d| serde_json::from_value::<RemoteError>(d.clone()).ok())
+        .unwrap_or_else(|| RemoteError::Execution { message: message.clone() });
+    StreamItem::Error {
+        metadata: None,
+        recoverable: false,
+        message: Some(message),
+        code: e.get("code").map(|c| c.to_string()),
+        error,
+        fields: Default::default(),
+    }
+}
+
+/// One open call back: its items until the terminal one; dropped before
+/// it, the service is told (`_host.call_unsub`).
+struct CallBack {
+    rx: mpsc::Receiver<Value>,
+    sid: u64,
+    link: Arc<HostLink>,
+    over: bool,
+}
+
+impl Stream for CallBack {
+    type Item = Result<StreamItem, TransportError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.over {
+            return Poll::Ready(None);
+        }
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(v)) => {
+                let item = serde_json::from_value::<StreamItem>(v)
+                    .map_err(|e| TransportError::new(TransportErrorKind::Protocol, format!("an item from the service does not read: {e}")));
+                if matches!(item, Ok(StreamItem::Done { .. } | StreamItem::Error { .. }) | Err(_)) {
+                    self.over = true;
+                }
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => {
+                self.over = true;
+                Poll::Ready(Some(Err(TransportError::new(TransportErrorKind::Closed, "the connection to the service closed"))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for CallBack {
+    fn drop(&mut self) {
+        if !self.over {
+            self.link.unsubscribe(self.sid);
+        }
+    }
+}
+
+/// NEST-11 · a [`Transport`] back into the service that forwarded the call
+/// being run: [`host()`]. Every call it makes names that call (`under`), so
+/// the service routes it as that call's caller, within its reach, through
+/// its own gate; it ends when that call ends.
+#[derive(Clone)]
+pub struct HostTransport {
+    link: Arc<HostLink>,
+    under: Option<String>,
+}
+
+impl std::fmt::Debug for HostTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostTransport").field("under", &self.under).finish()
+    }
+}
+
+impl HostTransport {
+    /// The forwarded call every call made through this names.
+    pub fn under(&self) -> Option<&str> {
+        self.under.as_deref()
+    }
+}
+
+impl Transport for HostTransport {
+    fn call(&self, method: MethodRef, params: Value) -> ItemStream<'_> {
+        let opened = Arc::clone(&self.link).open(method.qualified(), params, self.under.clone());
+        Box::pin(
+            futures::stream::once(async move {
+                match opened.await {
+                    Ok(call) => call.left_stream(),
+                    Err(item) => futures::stream::once(async move { Ok(item) }).right_stream(),
+                }
+            })
+            .flatten(),
+        )
+    }
+}
+
+/// NEST-11 · the service that forwarded the call being run, as a
+/// [`Transport`] a generated client takes: `FooClient::new(host()?)`. An
+/// error outside a call, and in a call that did not come through the seam.
+pub fn host() -> Result<HostTransport, CallError> {
+    let ctx = crate::call::context()?;
+    let link = ctx.host_link().cloned().ok_or(CallError::NoHop)?;
+    let link = link.downcast::<HostLink>().map_err(|_| CallError::NoHop)?;
+    let under = ctx.hop().map(|h| h.call.clone()).filter(|c| !c.is_empty());
+    Ok(HostTransport { link, under })
 }

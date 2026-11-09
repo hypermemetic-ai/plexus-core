@@ -87,7 +87,7 @@ fn nonce() -> [u8; 32] {
 /// the webpki roots and `roots` (a PEM file of more), every certificate
 /// validated.
 #[cfg(feature = "child-wss")]
-fn tls_config(roots: Option<&Path>) -> Result<Arc<rustls::ClientConfig>, String> {
+pub(super) fn tls_config(roots: Option<&Path>) -> Result<Arc<rustls::ClientConfig>, String> {
     use rustls::pki_types::{pem::PemObject, CertificateDer};
     let mut store = rustls::RootCertStore::empty();
     store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

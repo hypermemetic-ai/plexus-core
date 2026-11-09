@@ -80,13 +80,17 @@ async fn far_anywhere() -> (u16, jsonrpsee::server::ServerHandle) {
     (port, server.start(module))
 }
 
-/// A stand-in relay on `ip`: answers `_info` (`backend: relay`) and the
-/// offer (mounted as `peers.<mount>`), then holds the socket.
-async fn stand_in_relay(ip: std::net::IpAddr) -> u16 {
+/// A stand-in relay on `ip`: answers `_info` (`backend: relay`, its key
+/// proved over the nonce — KEEL-8) and the offer (mounted as
+/// `peers.<mount>`), then holds the socket. Its port and its key.
+async fn stand_in_relay(ip: std::net::IpAddr) -> (u16, String) {
+    let relay = Arc::new(plexus_core::plexus::peer_token::PeerKey::generate());
+    let kid = relay.kid().to_string();
     let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
+            let relay = Arc::clone(&relay);
             tokio::spawn(async move {
                 let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else { return };
                 while let Some(Ok(m)) = ws.next().await {
@@ -97,12 +101,13 @@ async fn stand_in_relay(ip: std::net::IpAddr) -> u16 {
                     if method == "_info" {
                         let md = StreamMetadata::new(vec!["relay".into()], "0".into());
                         out.push(json!({ "jsonrpc": "2.0", "id": id, "result": "s1" }));
-                        let data = PlexusStreamItem::data(md.clone(), "_info".into(), json!({ "backend": "relay" }));
+                        let nonce = v["params"]["nonce"].as_str().unwrap_or_default();
+                        let data = PlexusStreamItem::data(md.clone(), "_info".into(), json!({ "backend": "relay", "key": relay.kid(), "proof": relay.key_proof(nonce, "relay") }));
                         out.push(json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": "s1", "result": data } }));
                         out.push(json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": "s1", "result": PlexusStreamItem::done(md) } }));
                     } else if method == "relay.offer" {
                         let mount = v["params"]["mount"].as_str().unwrap_or("x").to_string();
-                        out.push(json!({ "jsonrpc": "2.0", "id": id, "result": { "offered": true, "mount": mount, "path": format!("peers.{mount}"), "service": { "principal": "key:stand-in" } } }));
+                        out.push(json!({ "jsonrpc": "2.0", "id": id, "result": { "offered": true, "mount": mount, "path": format!("peers.{mount}"), "service": { "principal": relay.kid() } } }));
                     }
                     for f in out {
                         if ws.send(Message::text(f.to_string())).await.is_err() {
@@ -113,7 +118,7 @@ async fn stand_in_relay(ip: std::net::IpAddr) -> u16 {
             });
         }
     });
-    port
+    (port, kid)
 }
 
 // ------------------------------------------------------------------ acceptance 2
@@ -226,8 +231,8 @@ async fn the_override_dials_a_child_and_says_so() {
 async fn the_override_dials_out_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let k = key(dir.path(), 3);
-    let near = stand_in_relay("127.0.0.1".parse().unwrap()).await;
-    let exposed = Exposed::new(DialOut::new(format!("ws://127.0.0.1:{near}/ws"), &k).mount("p"));
+    let (near, near_key) = stand_in_relay("127.0.0.1".parse().unwrap()).await;
+    let exposed = Exposed::new(DialOut::new(format!("ws://127.0.0.1:{near}/ws"), &k).trust(near_key).mount("p"));
     exposed.serve(PingActivation);
     assert_eq!(exposed.mounted(Duration::from_secs(10)).await.unwrap(), "peers.p");
     assert!(matches!(exposed.state(), DialState::Mounted { insecure: false, .. }), "{:?}", exposed.state());
@@ -238,11 +243,11 @@ async fn the_override_dials_out_and_says_so() {
         println!("measure: no address beyond loopback here; the override is not dialed");
         return;
     };
-    let far = stand_in_relay(ip).await;
+    let (far, far_key) = stand_in_relay(ip).await;
     let url = format!("ws://{ip}:{far}/ws");
     let c = Config::new();
     c.seed(&TRANSPORT_INSECURE_WS, Source::Flag, Some(true));
-    for opts in [DialOut::new(url.clone(), &k).mount("p").insecure_ws(true), DialOut::new(url.clone(), &k).mount("p").configured(&c)] {
+    for opts in [DialOut::new(url.clone(), &k).trust(far_key.clone()).mount("p").insecure_ws(true), DialOut::new(url.clone(), &k).trust(far_key.clone()).mount("p").configured(&c)] {
         let exposed = Exposed::new(opts);
         exposed.serve(PingActivation);
         assert_eq!(exposed.mounted(Duration::from_secs(10)).await.unwrap(), "peers.p");

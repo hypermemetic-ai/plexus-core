@@ -128,6 +128,8 @@ struct PeersInner {
     events: broadcast::Sender<PeerEvent>,
     next_socket: AtomicU64,
     on_change: RwLock<Vec<Box<dyn Fn() + Send + Sync>>>,
+    /// KEEL-8: the key the relay proves to a peer's `_info {nonce}`.
+    key: Option<Arc<crate::plexus::peer_token::PeerKey>>,
 }
 
 /// The peers connected now, as an activation: `peers.list`, `peers.watch`,
@@ -180,6 +182,7 @@ impl Peers {
                 events: broadcast::channel(256).0,
                 next_socket: AtomicU64::new(1),
                 on_change: RwLock::new(Vec::new()),
+                key: None,
             }),
         }
     }
@@ -204,6 +207,21 @@ impl Peers {
         let mut s = self;
         if let Some(inner) = Arc::get_mut(&mut s.inner) {
             inner.opts.timeout = timeout;
+        }
+        s
+    }
+
+    /// KEEL-8: the relay's own key. A peer dialing out names the relay by
+    /// it ([`DialOut::trust`](super::DialOut::trust)) and asks it proved:
+    /// a socket's `_info {nonce}` is answered `{backend, key, proof}` (the
+    /// nonce and the service's name signed, DYNAUTH-5's proof), and the
+    /// hop's acting service is this key's principal. Without one a peer
+    /// that dials out is refused at its `_info`.
+    pub fn with_key(self, key: crate::plexus::peer_token::PeerKey) -> Self {
+        let mut s = self;
+        if let Some(inner) = Arc::get_mut(&mut s.inner) {
+            inner.principal = key.kid().to_string();
+            inner.key = Some(Arc::new(key));
         }
         s
     }
@@ -442,6 +460,12 @@ impl PeerSocket {
     pub fn on_frame(self: &Arc<Self>, frame: &[u8]) -> bool {
         let Ok(shape) = serde_json::from_slice::<Shape>(frame) else { return false };
         match (&shape.method, &shape.id) {
+            // KEEL-8: the relay proves its key over a dialing peer's nonce.
+            (Some(m), Some(id)) if m == "_info" && self.peers.inner.key.is_some() && shape.params.as_ref().and_then(|p| p.get("nonce")).is_some_and(Value::is_string) => {
+                let nonce = shape.params.as_ref().and_then(|p| p.get("nonce")).and_then(Value::as_str).unwrap_or_default();
+                self.prove(id, nonce);
+                true
+            }
             (Some(m), Some(id)) if *m == format!("{}.offer", self.peers.inner.service) => {
                 let (me, id, params) = (Arc::clone(self), id.clone(), shape.params.unwrap_or(Value::Null));
                 tokio::spawn(async move {
@@ -459,6 +483,24 @@ impl PeerSocket {
                 item && self.link.lock().unwrap().is_some() && self.inbound.send(frame.to_vec()).is_ok()
             }
             _ => false,
+        }
+    }
+
+    /// KEEL-8: `_info {nonce}` answered as a subscription of one item —
+    /// `{backend, key, proof}` — and its end.
+    fn prove(&self, id: &Value, nonce: &str) {
+        let Some(key) = &self.peers.inner.key else { return };
+        let service = &self.peers.inner.service;
+        let sid = format!("info-{}", self.id);
+        let content = json!({ "backend": service, "key": key.kid(), "proof": key.key_proof(nonce, service) });
+        let item = PlexusStreamItem::data(meta(service), "_info".into(), content);
+        let frames = [
+            json!({ "jsonrpc": "2.0", "id": id, "result": sid }),
+            json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": sid, "result": item } }),
+            json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": sid, "result": PlexusStreamItem::done(meta(service)) } }),
+        ];
+        for f in frames {
+            let _ = self.out.send(serde_json::to_vec(&f).unwrap_or_default());
         }
     }
 

@@ -7,7 +7,7 @@
 //! peer connected there.
 //!
 //! ```ignore
-//! let exposed = Exposed::new(DialOut::new("wss://relay.example/ws", "~/.plexus/keys/alice.key").mount("alice"));
+//! let exposed = Exposed::new(DialOut::new("wss://relay.example/ws", "~/.plexus/keys/alice.key").trust("key:<relay's>").mount("alice"));
 //! exposed.serve(Greeter::new(exposed.clone()));   // reconnects, within its backoff, until stopped
 //! exposed.mounted(Duration::from_secs(10)).await?; // `peers.alice` at the relay
 //! let items = exposed.call("peers.bob.hello", json!({ "name": "alice" })).await;
@@ -16,12 +16,15 @@
 //! | when | then |
 //! | -- | -- |
 //! | the socket opens | `_info` names the relay's `{svc}`; the offer goes as `{svc}.offer {namespace, activations, mount?}`; the relay asks the schema over the socket and answers the offer once mounted |
-//! | the relay calls `{ns}.call {method, params, hop}` | served as a child serves (RETURNS-47's host): each call in the hop's context, the hop believed from the relay alone ([`DialOut::trust`]) |
+//! | no trusted key ([`DialOut::trust`]) | refused before dialing (KEEL-8) |
+//! | the socket opens | the relay proves the trusted key at `_info {nonce}` (DYNAUTH-5's proof); none, or another: refused, nothing it sends served |
+//! | the relay calls `{ns}.call {method, params, hop}` | served as a child serves (RETURNS-47's host) on a proven connection: each call in the hop's context, the hop believed only when it names the proven key |
 //! | this side calls [`Exposed::call`] | `{svc}.call {method, params}` on the same socket: decided by the relay's gate as this key |
 //! | the socket drops | every call either way ends; the state is `down`; it dials again within [`DialOut::backoff`] and offers again |
 //! | the offer is refused | the state is `refused` naming why; it does not dial again until [`Exposed::serve`] is called again |
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,10 +60,12 @@ pub struct DialOut {
     /// The mount name asked for (`peers.<mount>`); none: the activation's
     /// namespace.
     pub mount: Option<String>,
-    /// The relay's principal, pinned (spec/14 rule 4): a hop is believed
-    /// only when it names this principal as the service acting. None: the
-    /// socket this side dialed is the relay's alone, and every hop on it is
-    /// the relay's (as a pipe's are its parent's).
+    /// The relay's key (`key:<64 hex>`), pinned (spec/14 rule 4). KEEL-8:
+    /// required — none, and the dial-out is refused before dialing. At each
+    /// connect the relay proves it at `_info` (the nonce signed, as a
+    /// mount's child proves its key, DYNAUTH-5); a relay that proves none,
+    /// or another, is refused and nothing it sends is served. A hop is
+    /// believed only when it names this key as the service acting.
     pub trust: Option<String>,
     /// Dialing again after the socket drops.
     pub backoff: Backoff,
@@ -71,6 +76,10 @@ pub struct DialOut {
     /// ([`check_ws_url`]); on: dialed, and [`DialState::Mounted`] says
     /// `insecure`.
     pub insecure_ws: bool,
+    /// KEEL-8 (DYNAUTH-8): a PEM file of certificate authorities a `wss://`
+    /// relay's certificate may chain to, beside the webpki roots — as a
+    /// mount's [`ChildOptions::tls_roots`](super::ChildOptions::tls_roots).
+    pub tls_roots: Option<PathBuf>,
 }
 
 impl DialOut {
@@ -85,6 +94,7 @@ impl DialOut {
             backoff: Backoff { initial: Duration::from_millis(250), max: Duration::from_secs(10), per_minute: usize::MAX },
             timeout: Duration::from_secs(10),
             insecure_ws: false,
+            tls_roots: None,
         }
     }
 
@@ -94,7 +104,8 @@ impl DialOut {
         self
     }
 
-    /// Believe hops only from `principal` (the relay's key, pinned).
+    /// The relay's key (`key:<64 hex>`): it must prove it at each connect,
+    /// and hops are believed only from it (pinned).
     pub fn trust(mut self, principal: impl Into<String>) -> Self {
         self.trust = Some(principal.into());
         self
@@ -112,13 +123,24 @@ impl DialOut {
         self
     }
 
+    /// KEEL-8: a PEM file of CAs a `wss://` relay may chain to
+    /// ([`DialOut::tls_roots`]).
+    pub fn tls_roots(mut self, roots: impl Into<PathBuf>) -> Self {
+        self.tls_roots = Some(roots.into());
+        self
+    }
+
     /// KEEL-7: [`DialOut::insecure_ws`] as `transport.insecure_ws` in `c`
-    /// says, when it says more than its default.
+    /// says, when it says more than its default; KEEL-8: and
+    /// [`DialOut::tls_roots`] as `transport.tls_roots` says.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn configured(mut self, c: &crate::plexus::config::Config) -> Self {
-        use crate::plexus::config::{settings::TRANSPORT_INSECURE_WS, Source};
+        use crate::plexus::config::{settings::{TRANSPORT_INSECURE_WS, TRANSPORT_TLS_ROOTS}, Source};
         if c.source(&TRANSPORT_INSECURE_WS) != Source::Default {
             self.insecure_ws = c.get(&TRANSPORT_INSECURE_WS);
+        }
+        if c.source(&TRANSPORT_TLS_ROOTS) != Source::Default {
+            self.tls_roots = c.get(&TRANSPORT_TLS_ROOTS).map(Into::into);
         }
         self
     }
@@ -357,6 +379,12 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     if let Err(why) = check_ws_url(&opts.url, opts.insecure_ws) {
         return Outcome::Refused(format!("{INSECURE_TRANSPORT}: {why}"));
     }
+    // KEEL-8: a relay is named by its key before it is dialed; the socket is
+    // never a pipe, so nothing on it is believed without that key's proof.
+    let trusted = match trusted_key(opts.trust.as_deref()) {
+        Ok(k) => k,
+        Err(why) => return Outcome::Refused(why),
+    };
     if opts.url.starts_with("wss://") && !cfg!(feature = "child-wss") {
         return Outcome::Refused("a wss:// relay needs plexus-core's `child-wss` feature (TLS)".into());
     }
@@ -375,25 +403,39 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
         Ok(v) => req.headers_mut().insert(AUTHORIZATION, v),
         Err(e) => return Outcome::Refused(e.to_string()),
     };
-    // spec/14: a client that serves must not delay small writes (Nagle).
-    let socket = match tokio_tungstenite::connect_async_with_config(req, None, true).await {
-        Ok((s, _)) => s,
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => return dropped(format!("the upgrade to {} was refused: HTTP {}", opts.url, resp.status())),
-        Err(e) => return dropped(format!("dialing {}: {e}", opts.url)),
+    // KEEL-8: the TLS a mount's dial is made with (`tls_roots` honoured),
+    // and its one timeout on the upgrade (a socket accepted and left).
+    #[cfg(feature = "child-wss")]
+    let connecting = {
+        let tls = match opts.url.starts_with("wss://") {
+            true => match super::ws::tls_config(opts.tls_roots.as_deref()) {
+                Ok(c) => Some(tokio_tungstenite::Connector::Rustls(c)),
+                Err(why) => return Outcome::Refused(why),
+            },
+            false => None,
+        };
+        // spec/14: a client that serves must not delay small writes (Nagle).
+        tokio_tungstenite::connect_async_tls_with_config(req, None, true, tls)
+    };
+    #[cfg(not(feature = "child-wss"))]
+    let connecting = tokio_tungstenite::connect_async_with_config(req, None, true);
+    let socket = match tokio::time::timeout(opts.timeout, connecting).await {
+        Err(_) => return dropped(format!("dialing {}: no answer to the upgrade in {:?}", opts.url, opts.timeout)),
+        Ok(Ok((s, _))) => s,
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => return dropped(format!("the upgrade to {} was refused: HTTP {}", opts.url, resp.status())),
+        Ok(Err(e)) => return dropped(format!("dialing {}: {e}", opts.url)),
     };
     let (mut sink, mut stream) = socket.split();
 
     // This side's calls out: a client `Conn` on the socket's outbound queue.
     let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let conn = Conn::new("relay", None, out.clone(), 64, Arc::clone(&inner.counters));
-    // The calls in: RETURNS-47's host, on a pipe of lines this side feeds.
+    // The calls in: RETURNS-47's host, on a pipe of lines this side feeds —
+    // started only once the relay has proved the trusted key (KEEL-8).
     let (mut host_in, host_r) = tokio::io::duplex(1 << 16);
     let (host_w, host_out) = tokio::io::duplex(1 << 16);
-    let peer = match &opts.trust {
-        Some(p) => ChildPeer::connection(p.clone(), [p.clone()]),
-        None => ChildPeer::Pipe,
-    };
-    let host = tokio::spawn(serve_child_on(activation.clone(), host_r, host_w, peer));
+    let proven = Arc::new(AtomicBool::new(false));
+    let mut host: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
 
     // Writer: the client's frames and the host's lines, in the order made.
     let out_host = out.clone();
@@ -431,6 +473,7 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     // to the host; the offer's answer to its waiter; the rest to the client.
     let (offer_tx, offer_rx) = oneshot::channel::<Value>();
     let reader_conn = Arc::clone(&conn);
+    let (reader_proven, refuse_out) = (Arc::clone(&proven), out.clone());
     let reader = tokio::spawn(async move {
         let mut offer_tx = Some(offer_tx);
         let why = loop {
@@ -448,6 +491,13 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
             };
             let (method, id) = (shape.get("method"), shape.get("id"));
             if method.is_some() && id.is_some() {
+                // KEEL-8: a call before the relay proved its key is answered
+                // refused, never served.
+                if !reader_proven.load(Ordering::Acquire) {
+                    let refusal = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32001, "message": "the relay has not proved its key", "data": { "error_kind": "forbidden" } } });
+                    let _ = refuse_out.send(serde_json::to_vec(&refusal).unwrap_or_default());
+                    continue;
+                }
                 let mut line = text;
                 line.push(b'\n');
                 if host_in.write_all(&line).await.is_err() {
@@ -466,37 +516,52 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
         why
     });
 
-    let ended = |why: String, was_mounted: bool| {
-        host.abort();
+    let ended = |host: Option<tokio::task::JoinHandle<std::io::Result<()>>>, why: String, was_mounted: bool| {
+        if let Some(h) = host {
+            h.abort();
+        }
         host_lines.abort();
         writer.abort();
         Outcome::Dropped { why, was_mounted }
     };
 
-    // The relay's namespace: its `_info`.
+    // The relay's namespace and its key, proved: its `_info` over a nonce
+    // (DYNAUTH-5's proof, the one a mount asks of its child).
+    let asked = crate::plexus::peer_token::random_nonce();
     let info = async {
-        let (_, mut rx) = conn.open("_info", Value::Null, opts.timeout).await.map_err(|e| format!("{e:?}"))?;
+        let (_, mut rx) = conn.open("_info", json!({ "nonce": asked }), opts.timeout).await.map_err(|e| format!("{e:?}"))?;
         while let Some(item) = rx.recv().await {
             if let PlexusStreamItem::Data { content, .. } = item {
-                if let Some(b) = content.into_value().get("backend").and_then(Value::as_str) {
-                    return Ok(b.to_string());
+                let content = content.into_value();
+                if let Some(b) = content.get("backend").and_then(Value::as_str) {
+                    let field = |k: &str| content.get(k).and_then(Value::as_str).map(str::to_string);
+                    return Ok((b.to_string(), field("key"), field("proof")));
                 }
             }
         }
-        Err::<String, String>("its `_info` names no backend".into())
+        Err::<_, String>("its `_info` names no backend".into())
     };
-    let service = match tokio::time::timeout(opts.timeout, info).await {
+    let (service, key, key_proof) = match tokio::time::timeout(opts.timeout, info).await {
         Ok(Ok(s)) => s,
         Ok(Err(why)) => {
             reader.abort();
-            return ended(format!("asking the relay's `_info`: {why}"), false);
+            return ended(host, format!("asking the relay's `_info`: {why}"), false);
         }
         Err(_) => {
             reader.abort();
-            return ended(format!("the relay did not answer `_info` in {:?}", opts.timeout), false);
+            return ended(host, format!("the relay did not answer `_info` in {:?}", opts.timeout), false);
         }
     };
+    if let Err(why) = relay_proved(&trusted, &service, &asked, key.as_deref(), key_proof.as_deref()) {
+        reader.abort();
+        ended(host, String::new(), false);
+        tracing::warn!(target: "plexus::audit", url = %opts.url, "dial-out refused: {why}");
+        return Outcome::Refused(why);
+    }
     let _ = conn.ns.set(service.clone());
+    let _ = conn.peer_key.set(trusted.clone());
+    host = Some(tokio::spawn(serve_child_on(activation.clone(), host_r, host_w, ChildPeer::connection(trusted.clone(), [trusted.clone()]))));
+    proven.store(true, Ordering::Release);
 
     // The offer (spec/14), answered once the relay has mounted this side.
     let ns = activation.namespace().to_string();
@@ -510,16 +575,16 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
         Ok(Ok(a)) => a,
         Ok(Err(_)) => {
             let why = reader.await.unwrap_or_else(|_| "the socket".into());
-            return ended(format!("before the offer was answered: {why}"), false);
+            return ended(host, format!("before the offer was answered: {why}"), false);
         }
         Err(_) => {
             reader.abort();
-            return ended(format!("the offer was not answered in {:?}", opts.timeout * 2), false);
+            return ended(host, format!("the offer was not answered in {:?}", opts.timeout * 2), false);
         }
     };
     if let Some(e) = answer.get("error") {
         reader.abort();
-        ended(String::new(), false);
+        ended(host, String::new(), false);
         let kind = e.pointer("/data/error_kind").and_then(Value::as_str).unwrap_or("refused");
         let message = e.get("message").and_then(Value::as_str).unwrap_or("");
         return Outcome::Refused(format!("{kind}: {message}"));
@@ -528,10 +593,14 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     let mount = result.get("mount").and_then(Value::as_str).unwrap_or(&ns).to_string();
     let path = result.get("path").and_then(Value::as_str).unwrap_or(&mount).to_string();
     let relay = result.pointer("/service/principal").and_then(Value::as_str).unwrap_or("").to_string();
-    if let Some(pinned) = &opts.trust {
-        if *pinned != relay {
-            tracing::warn!(target: "plexus::dial", %pinned, named = %relay, "the relay names another principal than the one pinned; its hops will be refused");
-        }
+    // KEEL-8: the relay acts as the key it proved, or not at all — another
+    // principal named here is refused, as a remount proving another key is.
+    if relay != trusted {
+        reader.abort();
+        ended(host, String::new(), false);
+        let why = format!("the relay proved {trusted} but names {} as the service acting: refused, as another key is", if relay.is_empty() { "no principal" } else { &relay });
+        tracing::warn!(target: "plexus::audit", url = %opts.url, "dial-out refused: {why}");
+        return Outcome::Refused(why);
     }
     *inner.live.lock().unwrap() = Some(Live { conn: Arc::clone(&conn), service: service.clone() });
     let insecure = is_insecure_ws(&opts.url);
@@ -542,7 +611,32 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     inner.state.send_replace(DialState::Mounted { mount, path, service, relay, insecure });
 
     let why = reader.await.unwrap_or_else(|_| "the socket".into());
-    ended(why, true)
+    ended(host, why, true)
+}
+
+/// KEEL-8: the relay's key a dial-out trusts — `key:<64 hex>` — or why the
+/// dial-out may not dial.
+fn trusted_key(trust: Option<&str>) -> Result<String, String> {
+    let Some(t) = trust else {
+        return Err("no trusted key: a dial-out names its relay by key (`DialOut::trust`, `key:<64 hex>`), which the relay proves at each connect; without one nothing it sends could be believed".into());
+    };
+    match crate::plexus::peer_token::key_of(t) {
+        Some(_) => Ok(t.to_string()),
+        None => Err(format!("the trusted relay `{t}` is not a key (`key:<64 hex>`): a relay is named by the key it proves")),
+    }
+}
+
+/// KEEL-8: whether the relay's `_info` proved `trusted` over `nonce`.
+fn relay_proved(trusted: &str, backend: &str, nonce: &str, key: Option<&str>, proof: Option<&str>) -> Result<(), String> {
+    let Some(key) = key else {
+        return Err(format!("the relay proved no key at `_info` (trusted: {trusted})"));
+    };
+    if key != trusted {
+        return Err(format!("the relay proved another key ({key}) than the one trusted ({trusted})"));
+    }
+    crate::plexus::peer_token::check_key_proof(key, proof.unwrap_or_default(), nonce, backend)
+        .map(|_| ())
+        .map_err(|e| format!("the relay's `_info` names the key {key} without proving it: {e}"))
 }
 
 /// The principal a key file's proof proves (`key:<64 hex>`), or why the key

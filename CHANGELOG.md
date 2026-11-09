@@ -35,6 +35,16 @@ alone, unless the service keeps NEST-11's rule for it for this release:
 `ChildOptions::legacy_upcalls` / `with_legacy_upcalls`,
 `--child-legacy-upcalls`. `RemoteChild::needs()` (its whole tree's).
 
+DYNAUTH-7 (additive): **revocation and audit.** `RemoteChild::revoke(why)`:
+nothing more is forwarded to the child (so no token is minted for it), and
+every call it is making back ends with one error item saying why;
+`RemoteChild::revoked`. `PeerKey::save` (a key file replaced in place,
+0600). `AuditRecord::presented_call`: an exchange's record names the call
+of the token presented, joining each hop to the one before; every mint and
+exchange is a `plexus::audit` tracing event and goes to the issuer's sink —
+iss, sub, the actor chain, aud, scope, call, jti, exp, method; never the
+token, a signature or a proof.
+
 DYNAUTH-6 (additive): **calls back narrowed by grant; onward calls are
 exchanges.** A call back made under a token is routed with that token in
 scope; a call it reaches into another child is minted as an RFC 8693

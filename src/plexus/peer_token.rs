@@ -203,6 +203,16 @@ impl PeerKey {
         Ok(Self::from_seed(seed))
     }
 
+    /// DYNAUTH-7: write it to `path`, replacing what is there (a new file
+    /// beside it, 0600, renamed into place).
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let tmp = path.with_extension("key.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let text = base64::engine::general_purpose::STANDARD.encode(self.signing.to_bytes());
+        write_private(&tmp, text.as_bytes()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Its id: `key:<hex>` of its public half.
     pub fn kid(&self) -> &str {
         &self.kid
@@ -761,11 +771,27 @@ pub struct AuditRecord {
     pub jti: String,
     pub exp: u64,
     pub method: String,
+    /// For an exchange: the call of the token presented — what joins this
+    /// hop's record to the one before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presented_call: Option<String>,
 }
 
 impl AuditRecord {
-    fn of(kind: AuditKind, c: &PeerClaims) -> Self {
-        Self { kind, iss: c.iss.clone(), sub: c.sub.clone(), act: c.actors(), aud: c.aud.clone(), scope: c.scope.clone(), call: c.call.clone(), jti: c.jti.clone(), exp: c.exp, method: c.method.clone() }
+    fn of(kind: AuditKind, c: &PeerClaims, presented: Option<&PeerClaims>) -> Self {
+        Self {
+            kind,
+            iss: c.iss.clone(),
+            sub: c.sub.clone(),
+            act: c.actors(),
+            aud: c.aud.clone(),
+            scope: c.scope.clone(),
+            call: c.call.clone(),
+            jti: c.jti.clone(),
+            exp: c.exp,
+            method: c.method.clone(),
+            presented_call: presented.map(|p| p.call.clone()),
+        }
     }
 }
 
@@ -779,6 +805,7 @@ fn audit(sink: Option<&Arc<dyn TokenAudit>>, r: AuditRecord) {
         target: "plexus::audit",
         kind = ?r.kind, iss = %r.iss, sub = %r.sub, act = ?r.act, aud = %r.aud,
         scope = %r.scope.join(" "), call = %r.call, jti = %r.jti, exp = r.exp, method = %r.method,
+        presented_call = r.presented_call.as_deref().unwrap_or(""),
         "peer token"
     );
     if let Some(s) = sink {
@@ -909,7 +936,7 @@ impl TokenIssuer {
             exp: now + self.ttl.as_secs(),
         };
         let token = key.sign_compact(json!({ "typ": TOKEN_TYP, "kid": key.kid() }), &serde_json::to_value(&claims).unwrap_or_default());
-        audit(self.sink.as_ref(), AuditRecord::of(kind, &claims));
+        audit(self.sink.as_ref(), AuditRecord::of(kind, &claims, req.presented.as_ref()));
         Ok((token, claims))
     }
 
@@ -1208,6 +1235,8 @@ mod tests {
         let records = sink.0.lock().unwrap().clone();
         assert_eq!(records.iter().map(|r| r.kind).collect::<Vec<_>>(), [AuditKind::Mint, AuditKind::Exchange]);
         assert_eq!(records[1].act.len(), 3);
+        assert_eq!(records[1].presented_call.as_deref(), Some(c.call.as_str()), "an exchange's record is joined to the hop before it");
+        assert_eq!(records[0].presented_call, None);
         let text = serde_json::to_string(&records).unwrap();
         for secret in [&t, &t2, &proof] {
             for part in secret.split('.').filter(|p| p.len() > 8) {
@@ -1298,5 +1327,11 @@ mod tests {
             assert!(PeerKey::load_or_create(&path).is_err());
         }
         assert!(!format!("{a:?}").contains(&b64(&a.signing.to_bytes())));
+        // Replaced in place, still private.
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        let c = PeerKey::generate();
+        c.save(&path).unwrap();
+        assert_eq!(PeerKey::load_or_create(&path).unwrap().kid(), c.kid());
     }
 }

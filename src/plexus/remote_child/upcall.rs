@@ -73,11 +73,17 @@ pub(super) struct Under {
     minted: Option<Minted>,
 }
 
+tokio::task_local! {
+    /// DYNAUTH-6: the token a call back is made under, while it is routed.
+    static PRESENTED: crate::plexus::peer_token::PeerClaims;
+}
+
 /// DYNAUTH-6: the token a call back was made under, while that call back
 /// is routed — so a call it reaches into another child is an exchange
-/// (RFC 8693), not a fresh mint. `None` until DYNAUTH-6.
+/// (RFC 8693: the same `sub`, the presenter in `act`, a scope never wider),
+/// not a fresh mint.
 pub(super) fn presented() -> Option<crate::plexus::peer_token::PeerClaims> {
-    None
+    PRESENTED.try_with(Clone::clone).ok()
 }
 
 /// DYNAUTH-12: a token minted for one forwarded call, and what it says.
@@ -238,8 +244,12 @@ impl Drop for UnderGuard {
 }
 
 /// `auth`, its reach narrowed to `reach`'s scopes: one more ceiling layer,
-/// `admin@<scope>` each (any grant, only there) — none when `reach` holds
-/// everywhere. NEST-16 (TM-1): for a need, the layer is its own grant on
+/// `admin@<scope>` each — none when `reach` holds everywhere. DYNAUTH-6:
+/// `admin@X` in a ceiling layer is not the admin role: it reads "any grant,
+/// only on X" (the gate's `admin` lists every grant), so it narrows by
+/// *where* only — the outer bound, kept for a child under the legacy rule.
+/// What a child may *do* is the need's own grant (below) and its token's
+/// scope. NEST-16 (TM-1): for a need, the layer is its own grant on
 /// each of those scopes (`shop.items@*` when everywhere), so the call back
 /// reaches that method and nothing else, whatever the caller holds.
 fn narrowed(auth: &AuthContext, reach: &Reach, grant: Option<&str>) -> AuthContext {
@@ -486,7 +496,12 @@ async fn pump(route: Route, out: &mpsc::UnboundedSender<Vec<u8>>, sid: u64, name
                 (Some(a), Some(g), Some(scopes)) if !scopes.iter().any(|s| s == "*") => Some(consented(&a, g, scopes)),
                 (a, _, _) => a,
             };
-            service.route_with_ctx(target, args, auth.as_ref(), None).await
+            // DYNAUTH-6: a call it reaches into another child is minted as
+            // an exchange of the token this call back was made under.
+            match &u.minted {
+                Some(m) => PRESENTED.scope(m.claims.clone(), service.route_with_ctx(target, args, auth.as_ref(), None)).await,
+                None => service.route_with_ctx(target, args, auth.as_ref(), None).await,
+            }
         }
         None => service.schema_for_child(target, args).await,
     };

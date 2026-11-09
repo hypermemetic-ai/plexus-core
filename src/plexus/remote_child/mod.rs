@@ -478,7 +478,7 @@ impl RemoteChild {
     /// (bound to it) or one on the service's own pipe (`pipe:<name>`). A
     /// WebSocket child that proved no key gets none.
     fn mint(&self, auth: Option<&AuthContext>, reach: &Reach, hop: &Value, path: &str, call: &str) -> Result<Option<upcall::Minted>, String> {
-        use crate::plexus::peer_token::{mint_scope, MintRequest};
+        use crate::plexus::peer_token::{mint_scope, onward_scope, MintRequest};
         let Some(issuer) = self.inner.shared.opts.tokens.as_ref() else { return Ok(None) };
         let Some(sub) = auth.and_then(|a| a.principal()).map(|p| p.to_string()) else { return Ok(None) };
         let peer_key = self.peer_key().map(str::to_string);
@@ -491,8 +491,12 @@ impl RemoteChild {
             .map(|svc| self.inner.shared.upcalls.need_grants(&svc))
             .unwrap_or_default();
         let forwarded = hop.get("limit").and_then(|l| l.get("grant")).and_then(Value::as_str);
-        let scope = mint_scope(forwarded, &held, &needs);
         let presented = upcall::presented();
+        // DYNAUTH-6: onward from a call back, never wider than its token.
+        let scope = match &presented {
+            Some(p) => onward_scope(p, reach.grant().map(|g| g.as_str()), forwarded, &held, &needs),
+            None => mint_scope(forwarded, &held, &needs),
+        };
         let req = MintRequest { sub, peer_key, name: self.name().to_string(), scope, call: call.to_string(), method: path.to_string(), presented };
         let (token, claims) = issuer.mint(req).map_err(|e| e.to_string())?;
         Ok(Some(upcall::Minted { token, claims }))

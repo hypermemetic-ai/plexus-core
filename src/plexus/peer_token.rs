@@ -65,6 +65,11 @@ pub const ALG: &str = "EdDSA";
 pub const MAX_LIFETIME: Duration = Duration::from_secs(60);
 /// How far apart two clocks may be.
 pub const SKEW: Duration = Duration::from_secs(30);
+/// The method a proof of possession names to exchange a token
+/// ([`TokenIssuer::exchange`]), under the token's own `call`.
+pub const EXCHANGE: &str = "exchange";
+/// RFC 8693's identifier of the token type issued.
+pub const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 /// The context a peer's key proof at `_info` is signed over (domain
 /// separation: no other signature can be passed off as one).
 pub const KEY_PROOF_CONTEXT: &str = "plexus-peer-key/v1";
@@ -452,6 +457,35 @@ pub fn mint_scope(forwarded: Option<&str>, reach: &[String], needs: &[(String, V
         };
         for s in scopes {
             push(g, s);
+        }
+    }
+    out
+}
+
+/// DYNAUTH-6 (RFC 8693): the scope of the token for an onward call — one a
+/// peer made back through its service under `presented`, which reaches
+/// another peer. Never wider than `presented`: each need of the next peer
+/// only where `presented` holds the same grant ([`narrow`]); the forwarded
+/// grant (the next peer's terms) only on the scopes where `presented` holds
+/// `admitted` — the grant the service admitted the onward call on, in its
+/// own terms (`dyn.{peer}`). Within `reach` as [`mint_scope`] is.
+pub fn onward_scope(presented: &PeerClaims, admitted: Option<&str>, forwarded: Option<&str>, reach: &[String], needs: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut out = narrow(Some(&mint_scope(None, reach, needs)), &presented.scope);
+    if let (Some(a), Some(f)) = (admitted, forwarded) {
+        for held in presented.scopes_for(a) {
+            for r in reach {
+                let s = if scope_within(r, &held) {
+                    r.as_str()
+                } else if scope_within(&held, r) {
+                    held.as_str()
+                } else {
+                    continue;
+                };
+                let e = format!("{f}@{s}");
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
         }
     }
     out
@@ -886,10 +920,13 @@ impl TokenIssuer {
     #[allow(clippy::too_many_arguments)]
     pub fn exchange(&self, subject: &str, proof: Option<&str>, name: &str, peer_key: Option<String>, requested: Option<&[String]>, call: &str, method: &str, seen: &ProofCache) -> Result<(String, PeerClaims), TokenError> {
         let presented = self.verify_own(subject)?;
-        if presented.cnf.is_some() {
-            let proof = proof.ok_or_else(|| TokenError::Proof("a key-bound token is exchanged with a proof".into()))?;
-            check_proof(proof, subject, &presented, "exchange", &presented.call, now(), seen)?;
+        // A token bound to no key (a pipe's) is its pipe's alone: it is
+        // never exchanged by whoever holds its bytes.
+        if presented.cnf.is_none() {
+            return Err(TokenError::Proof("a token bound to no key (a pipe's) is not exchanged".into()));
         }
+        let proof = proof.ok_or_else(|| TokenError::Proof("a key-bound token is exchanged with a proof".into()))?;
+        check_proof(proof, subject, &presented, EXCHANGE, &presented.call, now(), seen)?;
         let scope = narrow(requested, &presented.scope);
         self.mint(MintRequest { sub: presented.sub.clone(), peer_key, name: name.into(), scope, call: call.into(), method: method.into(), presented: Some(presented) })
     }
@@ -1114,6 +1151,9 @@ mod tests {
         assert_eq!(c2.aud, b.kid());
         let at_b = Verifier::new(b.kid(), &issuer.jwks()).unwrap();
         assert_eq!(at_b.verify(&t2, &Expect::default()).unwrap(), c2);
+        // A pipe's token (bound to no key) is never exchanged.
+        let (pipe, _) = issuer.mint(MintRequest { peer_key: None, ..req(&a) }).unwrap();
+        assert!(matches!(issuer.exchange(&pipe, None, "b", Some(b.kid().into()), None, "c", "m", &seen), Err(TokenError::Proof(w)) if w.contains("pipe")));
         // Nothing asked: the presented scope, no wider.
         let proof = prove(&a, &t, "exchange", &c.call);
         let (_, c3) = issuer.exchange(&t, Some(&proof), "b", Some(b.kid().into()), None, "call-3", "far.x", &seen).unwrap();
@@ -1208,6 +1248,39 @@ mod tests {
             }
         }
         assert_eq!(minted, 16 * 16 * 8 * 2);
+    }
+
+    /// DYNAUTH-6: an onward token never holds more than the presented one —
+    /// a need only where it held the same grant, the forwarded grant only
+    /// where it held the grant the onward call was admitted on.
+    #[test]
+    fn an_onward_scope_never_widens() {
+        let scopes = ["*", "A", "B"];
+        let subsets = |n: usize| -> Vec<Vec<String>> {
+            (0..(1usize << n)).map(|m| (0..n).filter(|i| m & (1 << i) != 0).map(|i| scopes[i].to_string()).collect()).collect()
+        };
+        let peer = PeerKey::generate();
+        let issuer = TokenIssuer::new(PeerKey::generate());
+        for held_slot in subsets(3) {
+            for held_need in subsets(3) {
+                let mut presented_scope: Vec<String> = held_slot.iter().map(|s| format!("dyn.{{peer}}@{s}")).collect();
+                presented_scope.extend(held_need.iter().map(|s| format!("shop.items@{s}")));
+                let (_, presented) = issuer.mint(MintRequest { scope: presented_scope.clone(), ..req(&peer) }).unwrap();
+                for reach in subsets(3) {
+                    for consent in subsets(3) {
+                        let needs = vec![("shop.items".to_string(), consent.clone()), ("auth.grant".to_string(), vec!["*".to_string()])];
+                        let got = onward_scope(&presented, Some("dyn.{peer}"), Some("far.forecast"), &reach, &needs);
+                        for e in &got {
+                            let (g, s) = e.rsplit_once('@').unwrap();
+                            let host_grant = if g == "far.forecast" { "dyn.{peer}" } else { g };
+                            assert!(presented.scopes_for(host_grant).iter().any(|h| h == "*" || h == s), "{e} wider than {presented_scope:?}");
+                            assert!(reach.iter().any(|r| r == "*" || r == s), "{e} outside the reach {reach:?}");
+                            assert_ne!(g, "auth.grant", "a need the presented token did not hold");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

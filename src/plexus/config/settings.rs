@@ -94,8 +94,8 @@ pub(crate) fn declare_core(c: &Config) {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::plexus::ChildOptions {
-    /// NEST-21: these options with every `child.*` and `transport.tls_roots`
-    /// setting `c` holds above its default (a flag, the file, a runtime
+    /// NEST-21: these options with every `child.*`, `transport.tls_roots`
+    /// and (KEEL-7) `transport.insecure_ws` setting `c` holds above its default (a flag, the file, a runtime
     /// set) put over them. Read at each mount, so a change applies to the
     /// next one.
     pub fn configured(mut self, c: &Config) -> Self {
@@ -115,6 +115,10 @@ impl crate::plexus::ChildOptions {
         }
         if c.source(&TRANSPORT_TLS_ROOTS) != Source::Default {
             self.tls_roots = c.get(&TRANSPORT_TLS_ROOTS).map(Into::into);
+        }
+        // KEEL-7: the override every dial reads, not plexus-dyn's alone.
+        if c.source(&TRANSPORT_INSECURE_WS) != Source::Default {
+            self.insecure_ws = c.get(&TRANSPORT_INSECURE_WS);
         }
         self
     }
@@ -139,6 +143,9 @@ impl crate::plexus::ChildOptions {
         }
         if let Some(r) = &self.tls_roots {
             c.seed(&TRANSPORT_TLS_ROOTS, Source::Flag, Some(Some(r.display().to_string())));
+        }
+        if self.insecure_ws != d.insecure_ws {
+            c.seed(&TRANSPORT_INSECURE_WS, Source::Flag, Some(self.insecure_ws));
         }
     }
 }

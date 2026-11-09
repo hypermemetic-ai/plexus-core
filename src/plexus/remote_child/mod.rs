@@ -95,7 +95,7 @@ use tokio::sync::mpsc;
 pub use host::{host, serve_child, serve_child_on, serve_child_stdio, serve_child_with, ChildPeer, HostTransport, ServeChild};
 pub use upcall::{Consented, HOST_CALL, HOST_CALL_UNSUB};
 pub use link::MountTimings;
-pub use spec::{parse_duration, Backoff, ChildError, ChildOptions, ChildSpec};
+pub use spec::{check_ws_url, is_insecure_ws, is_loopback_host, parse_duration, Backoff, ChildError, ChildOptions, ChildSpec, INSECURE_TRANSPORT};
 #[cfg(feature = "clap")]
 pub use args::ChildArgs;
 pub use dial_in::{PeerEvent, PeerInfo, PeerRoles, PeerSocket, Peers, PeersMethods};
@@ -241,7 +241,7 @@ pub struct RemoteChild {
 
 impl std::fmt::Debug for RemoteChild {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteChild").field("spec", &self.inner.shared.spec.to_string()).field("stats", &self.stats()).finish()
+        f.debug_struct("RemoteChild").field("spec", &self.inner.shared.spec.to_string()).field("insecure", &self.insecure()).field("stats", &self.stats()).finish()
     }
 }
 
@@ -314,6 +314,11 @@ impl RemoteChild {
         shared.install(conn);
         timings.merge_ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::info!(target: "plexus::child", child = %name, spawn_ms = timings.spawn_ms, schema_ms = timings.schema_ms, merge_ms = timings.merge_ms, methods = schema.methods.len(), children = nodes.len(), "child mounted");
+        if let ChildSpec::Ws { url, .. } = &shared.spec {
+            if is_insecure_ws(url) {
+                tracing::warn!(target: "plexus::child", child = %name, %url, "insecure: mounted over plain ws:// beyond loopback (transport.insecure_ws); its hops and key proof cross in clear");
+            }
+        }
         let inner = Inner::new(shared, schema, nodes, timings);
         // NEST-16: the child's calls back are held to what it needs.
         inner.shared.upcalls.set_needs(inner.needs.as_deref());
@@ -445,6 +450,13 @@ impl RemoteChild {
     /// The mount's name.
     pub fn name(&self) -> &str {
         &self.inner.shared.name
+    }
+
+    /// KEEL-7: whether the mount is plain `ws://` beyond loopback — dialed
+    /// only because `transport.insecure_ws` allowed it, every hop and proof
+    /// on it in clear. Said wherever the mount is listed.
+    pub fn insecure(&self) -> bool {
+        matches!(&self.inner.shared.spec, ChildSpec::Ws { url, .. } if is_insecure_ws(url))
     }
 
     /// The spec it was mounted from.

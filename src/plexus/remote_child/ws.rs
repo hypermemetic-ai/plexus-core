@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::link::{gone, Conn, Shared};
+use super::spec::{check_ws_url, INSECURE_TRANSPORT};
 
 const PROOF_PREFIX: &str = "plexus-key.";
 const PROOF_CONTEXT: &str = "plexus-key-login/v1";
@@ -123,6 +124,9 @@ fn tls_key_of(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>)
 }
 
 pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, String> {
+    // KEEL-7: the transport decided before any socket opens or any proof is
+    // signed — `ws://` beyond loopback only under `transport.insecure_ws`.
+    check_ws_url(url, shared.opts.insecure_ws).map_err(|why| format!("{INSECURE_TRANSPORT}: {why}"))?;
     if url.starts_with("wss://") && !cfg!(feature = "child-wss") {
         return Err("a wss:// child needs plexus-core's `child-wss` feature (TLS)".into());
     }

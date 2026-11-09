@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 0.11.0
 
+KEEL-7 (breaking: `ChildOptions` and `DialOut` gain `insecure_ws`,
+`DialState::Mounted` gains `insecure`): **plain `ws://` beyond loopback is
+refused by plexus-core's own dials.** A `ws://` child (`--child`,
+`RemoteChild::connect`, every redial) and a dial-out (`Exposed`) ask
+`check_ws_url` before any socket opens or any key proof is signed: `wss://`
+anywhere, `ws://` only to loopback (`is_loopback_host`: 127.0.0.0/8, `::1`,
+a mapped 127.x, `localhost`), else refused `insecure_transport: …`, naming
+`transport.insecure_ws` (a child: `ChildError::Start`; a dial-out:
+`DialState::Refused`, not dialed again). The override is
+`ChildOptions::insecure_ws` (read from `transport.insecure_ws` by
+`configured`, seeded by `seed`) or `DialOut::insecure_ws` /
+`DialOut::configured`; such a mount says so — `RemoteChild::insecure()`, its
+`Debug`, `DialState::Mounted { insecure: true }`, and a warning at mount.
+plexus-dyn's `check_url` now calls `check_ws_url`; it keeps no copy.
+
 NEST-21 (additive; `DynamicHubInner` gains a field, `redact` two
 functions): **configuration at runtime.** `plexus::config`: a subsystem
 declares each knob once as a typed `Setting<T>` (`setting!("key", default =

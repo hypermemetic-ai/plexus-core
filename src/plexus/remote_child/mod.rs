@@ -111,6 +111,36 @@ use super::schema::{MethodRole, PluginSchema};
 use super::streaming::PlexusStream;
 use super::types::PlexusStreamItem;
 
+/// DYNAUTH-8 (TM-3): who a child proved it was at its mount — what a
+/// restart is held to. Its `_info`'s `backend`, and on `wss://` the key its
+/// certificate holds (sha256 of the SubjectPublicKeyInfo, hex): a renewed
+/// certificate over the same key is the same peer; a new key is not. A
+/// peer's own Ed25519 key, proved over the hop, joins it with DYNAUTH-5.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerIdentity {
+    /// The backend its `_info` names.
+    pub backend: String,
+    /// On `wss://`: sha256 of its certificate's public key, hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
+}
+
+impl PeerIdentity {
+    fn of(conn: &Conn) -> Self {
+        Self { backend: conn.ns().to_string(), tls_key: conn.tls_key.get().cloned() }
+    }
+}
+
+impl std::fmt::Display for PeerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend `{}`", self.backend)?;
+        match &self.tls_key {
+            Some(k) => write!(f, ", TLS key {}", &k[..k.len().min(16)]),
+            None => write!(f, ", no TLS key"),
+        }
+    }
+}
+
 /// What the seam has seen of one child.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChildStats {
@@ -270,6 +300,7 @@ impl RemoteChild {
             }
         };
         let _ = shared.mounted_hash.set(hash);
+        let _ = shared.identity.set(PeerIdentity::of(&conn));
         shared.install(conn);
         timings.merge_ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::info!(target: "plexus::child", child = %name, spawn_ms = timings.spawn_ms, schema_ms = timings.schema_ms, merge_ms = timings.merge_ms, methods = schema.methods.len(), children = nodes.len(), "child mounted");
@@ -302,6 +333,13 @@ impl RemoteChild {
             calls_back: self.inner.shared.upcalls.made.load(Ordering::Relaxed),
             up: self.inner.shared.is_up(),
         }
+    }
+
+    /// DYNAUTH-8 (TM-3): who the child proved it was when it was mounted —
+    /// pinned for the life of this mount: a restart (or redial) that proves
+    /// another is refused for good ([`RemoteChild::dead`]).
+    pub fn identity(&self) -> Option<&PeerIdentity> {
+        self.inner.shared.identity.get()
     }
 
     /// NEST-12: whether a live connection to the child is up now.

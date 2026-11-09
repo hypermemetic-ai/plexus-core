@@ -157,6 +157,11 @@ pub struct ChildOptions {
     /// `host.notify`). Kept for one release, for dendrites built before
     /// `needs`; a child that declares needs is held to them either way.
     pub legacy_upcalls: bool,
+    /// DYNAUTH-8: a PEM file of certificate authorities a `wss://` child's
+    /// certificate may chain to, beside the webpki roots (a private CA, a
+    /// test network's). Certificates are always validated; nothing turns
+    /// that off.
+    pub tls_roots: Option<PathBuf>,
 }
 
 impl Default for ChildOptions {
@@ -175,6 +180,7 @@ impl Default for ChildOptions {
             host: None,
             ping: None,
             legacy_upcalls: false,
+            tls_roots: None,
         }
     }
 }

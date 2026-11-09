@@ -82,6 +82,46 @@ fn nonce() -> [u8; 32] {
     n
 }
 
+/// DYNAUTH-8: the TLS a `wss://` child is dialed with — rustls on ring,
+/// the webpki roots and `roots` (a PEM file of more), every certificate
+/// validated.
+#[cfg(feature = "child-wss")]
+fn tls_config(roots: Option<&Path>) -> Result<Arc<rustls::ClientConfig>, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let mut store = rustls::RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = roots {
+        let shown = path.display();
+        let certs = CertificateDer::pem_file_iter(path)
+            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+            .map_err(|e| format!("the TLS roots {shown}: {e}"))?;
+        if certs.is_empty() {
+            return Err(format!("the TLS roots {shown} hold no certificate"));
+        }
+        for c in certs {
+            store.add(c).map_err(|e| format!("the TLS roots {shown}: {e}"))?;
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS: {e}"))?
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// DYNAUTH-8 (TM-3): sha256 (hex) of the key the far side's certificate
+/// holds — its SubjectPublicKeyInfo, so a renewal over the same key keeps it.
+#[cfg(feature = "child-wss")]
+fn tls_key_of(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) -> Option<String> {
+    use sha2::Digest;
+    let tokio_tungstenite::MaybeTlsStream::Rustls(tls) = stream else { return None };
+    let leaf = tls.get_ref().1.peer_certificates()?.first()?;
+    let cert = webpki::EndEntityCert::try_from(leaf).ok()?;
+    let spki = cert.subject_public_key_info();
+    Some(sha2::Sha256::digest(spki.as_ref()).iter().map(|b| format!("{b:02x}")).collect())
+}
+
 pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, String> {
     if url.starts_with("wss://") && !cfg!(feature = "child-wss") {
         return Err("a wss:// child needs plexus-core's `child-wss` feature (TLS)".into());
@@ -96,17 +136,33 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     }
     // NEST-12: a dial that never answers (a socket accepted and left) is
     // given the mount's one timeout, as its `_info` is.
-    let dialed = tokio::time::timeout(shared.opts.timeout, tokio_tungstenite::connect_async(req))
+    #[cfg(feature = "child-wss")]
+    let connecting = {
+        let tls = match url.starts_with("wss://") {
+            true => Some(tokio_tungstenite::Connector::Rustls(tls_config(shared.opts.tls_roots.as_deref())?)),
+            false => None,
+        };
+        tokio_tungstenite::connect_async_tls_with_config(req, None, false, tls)
+    };
+    #[cfg(not(feature = "child-wss"))]
+    let connecting = tokio_tungstenite::connect_async(req);
+    let dialed = tokio::time::timeout(shared.opts.timeout, connecting)
         .await
         .map_err(|_| format!("dialing {url}: no answer to the upgrade in {:?}", shared.opts.timeout))?;
     let (socket, _) = dialed.map_err(|e| match e {
         tokio_tungstenite::tungstenite::Error::Http(resp) => format!("the upgrade to {url} was refused: HTTP {}", resp.status()),
         e => format!("dialing {url}: {e}"),
     })?;
+    #[cfg(feature = "child-wss")]
+    let tls_key = tls_key_of(socket.get_ref());
     let (mut sink, mut stream) = socket.split();
     let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let conn = Conn::new(&shared.name, None, out, shared.opts.buffer, Arc::clone(&shared.counters));
     let _ = conn.up.set(Arc::clone(&shared.upcalls));
+    #[cfg(feature = "child-wss")]
+    if let Some(k) = tls_key {
+        let _ = conn.tls_key.set(k);
+    }
     let writer = Arc::clone(&conn);
     // NEST-12: a ping every `ping`; the reader marks the socket down when
     // nothing has come for twice as long.

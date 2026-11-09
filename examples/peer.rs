@@ -4,8 +4,8 @@
 //! socket it calls the other peers (`greeter ask`).
 //!
 //! ```sh
-//! cargo run --example peer -- --name alice --expose ws://127.0.0.1:4741/ws --key ~/.plexus/keys/alice.key
-//! cargo run --example peer -- --name bob   --expose ws://127.0.0.1:4741/ws --key ~/.plexus/keys/bob.key
+//! cargo run --example peer -- --name alice --expose ws://127.0.0.1:4741/ws --key ~/.plexus/keys/alice.key --trust "$(synapse _key show relay)"
+//! cargo run --example peer -- --name bob   --expose ws://127.0.0.1:4741/ws --key ~/.plexus/keys/bob.key --trust "$(synapse _key show relay)"
 //! synapse --url ws://127.0.0.1:4741/ws relay peers alice ask --peer bob --name carol
 //! ```
 
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             "--key" => key = Some(value()?),
             "--trust" => trust = Some(value()?),
             "-h" | "--help" => {
-                println!("peer --name NAME --expose ws://RELAY/ws --key FILE [--trust RELAY_PRINCIPAL]");
+                println!("peer --name NAME --expose ws://RELAY/ws --key FILE --trust RELAY_KEY (key:<64 hex>, which the relay proves)");
                 return Ok(());
             }
             other => anyhow::bail!("unknown flag {other} (--help)"),

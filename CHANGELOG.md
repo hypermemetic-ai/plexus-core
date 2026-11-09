@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 0.11.0
 
+KEEL-8 (breaking: a dial-out without `DialOut::trust` is refused;
+`DialOut` gains `tls_roots`): **a dial-out believes its relay only as the
+key the relay proves.** `Exposed` refuses before dialing when no trusted
+key is named (or the name is not `key:<64 hex>`). At each connect it asks
+the relay's `_info {nonce}` and requires the trusted key proved over it
+(DYNAUTH-5's proof, `check_key_proof`); a relay that proves none, another
+key, or a forged proof — or whose offer answer names another principal —
+is `DialState::Refused` and not dialed again. Until the proof, a call the
+relay sends is answered refused; the host starts only after it, on
+`ChildPeer::connection(trusted, [trusted])` — the dial-out never makes a
+`ChildPeer::Pipe`, so a hop is believed only when it names the proven key.
+The upgrade is dialed with a mount's TLS client (`tls_roots`, from the
+option or `transport.tls_roots` via `DialOut::configured`) and under
+`DialOut::timeout`, as a mount's dial is. The relay side: `Peers::with_key`
+answers a socket's `_info {nonce}` with `{backend, key, proof}` and makes
+that key the hop's acting principal. Examples `relay` (`--key` is proved)
+and `peer` (`--trust` required) follow.
+
 KEEL-7 (breaking: `ChildOptions` and `DialOut` gain `insecure_ws`,
 `DialState::Mounted` gains `insecure`): **plain `ws://` beyond loopback is
 refused by plexus-core's own dials.** A `ws://` child (`--child`,

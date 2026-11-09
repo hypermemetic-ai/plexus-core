@@ -97,6 +97,8 @@ fn key(dir: &std::path::Path, name: &str, seed: u8) -> (std::path::PathBuf, Stri
 
 struct Relay {
     url: String,
+    /// KEEL-8: the key the relay proves, which every peer names.
+    principal: String,
     peers: Peers,
     service: Arc<DynamicHub>,
     serving: tokio::task::JoinHandle<()>,
@@ -111,7 +113,9 @@ impl Drop for Relay {
 /// A relay whose `member`s may offer and call every peer.
 async fn relay(members: &[&str]) -> Relay {
     let port = port();
-    let peers = Peers::new("peers", "relay", "service:relay").with_timeout(Duration::from_secs(5));
+    let key = plexus_core::plexus::peer_token::PeerKey::generate();
+    let principal = key.kid().to_string();
+    let peers = Peers::new("peers", "relay", "service:relay").with_timeout(Duration::from_secs(5)).with_key(key);
     let plain = DynamicHub::new("relay").register(peers.clone());
     let base = RoleTable::from_lists(plain.declared_roles().iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let mut listed = MemoryMemberships::new();
@@ -164,12 +168,12 @@ async fn relay(members: &[&str]) -> Relay {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Relay { url, peers, service, serving }
+    Relay { url, principal, peers, service, serving }
 }
 
 /// A greeter that dials `relay` as `name`, signed in with `key`.
 async fn peer(relay: &Relay, name: &str, key: &std::path::Path) -> Exposed {
-    let exposed = Exposed::new(DialOut::new(relay.url.clone(), key).mount(name).agent(name));
+    let exposed = Exposed::new(DialOut::new(relay.url.clone(), key).trust(relay.principal.clone()).mount(name).agent(name));
     exposed.serve(GreeterActivation { name: name.into() });
     exposed
 }

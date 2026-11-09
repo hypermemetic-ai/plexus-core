@@ -15,6 +15,10 @@
 //! peer connected; `--admin` holds everything; `--everyone` makes every
 //! signed-in key a member. Anyone else is refused, and an anonymous socket
 //! sees the anonymous view.
+//!
+//! KEEL-8: a peer dials out only to a relay it names by key (`peer --trust
+//! "$(synapse _key show relay)"`), which the relay proves at each connect
+//! with `--key`'s; without `--key` every dial-out is refused at `_info`.
 
 use std::sync::Arc;
 
@@ -144,7 +148,10 @@ async fn main() -> anyhow::Result<()> {
         None => format!("service:{NS}"),
     };
 
-    let peers = Peers::new("peers", NS, principal.clone());
+    let mut peers = Peers::new("peers", NS, principal.clone());
+    if let Some(k) = &a.key {
+        peers = peers.with_key(plexus_core::plexus::peer_token::PeerKey::load_or_create(std::path::Path::new(&expand(k))).map_err(anyhow::Error::msg)?);
+    }
     let plain = DynamicHub::new(NS).register(peers.clone());
     let mut listed = MemoryMemberships::new();
     for m in &a.members {

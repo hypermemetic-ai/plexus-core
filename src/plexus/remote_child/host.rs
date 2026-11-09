@@ -167,11 +167,20 @@ pub struct ServeChild {
     /// the service registers and pins it; peer tokens are addressed and
     /// bound to it (DYNAUTH-12).
     pub key: Option<crate::plexus::peer_token::PeerKey>,
+    /// DYNAUTH-12: verify each hop's token (`hop.token`) — signed by an
+    /// issuer this verifier trusts (the service's `dyn.jwks`), addressed to
+    /// this child (its key's id; `pipe:<name>` on a pipe), naming the hop's
+    /// call and the method called, fresh and not seen before, its `sub` the
+    /// hop's caller and its scope holding the hop's grant where the hop
+    /// says it was admitted. A hop whose token verifies is believed whoever
+    /// sent it; one without, or whose token does not, is refused
+    /// `forbidden`, saying why. A schema call needs none.
+    pub tokens: Option<Arc<crate::plexus::peer_token::Verifier>>,
 }
 
 impl Default for ServeChild {
     fn default() -> Self {
-        Self { peer: ChildPeer::Pipe, key: None }
+        Self { peer: ChildPeer::Pipe, key: None, tokens: None }
     }
 }
 
@@ -184,6 +193,7 @@ where
 {
     let ns = activation.namespace().to_string();
     let key = opts.key.clone().map(Arc::new);
+    let tokens = opts.tokens.clone();
     let peer = Arc::new(opts.peer);
     let slots = Arc::new(slot_index(&activation));
     let (call_m, unsub_m) = (format!("{ns}.call"), format!("{ns}.call_unsub"));
@@ -193,7 +203,7 @@ where
         let _ = out.send(serde_json::to_vec(&v).unwrap_or_default());
     };
     let live: Live = Arc::default();
-    let link = Arc::new(HostLink::new(out.clone()));
+    let link = Arc::new(HostLink::new(out.clone(), key.clone()));
     let mut next_sid: u64 = 1;
     let mut lines = BufReader::new(r).lines();
     while let Some(line) = lines.next_line().await? {
@@ -236,7 +246,7 @@ where
             next_sid += 1;
             // spec/02: the subscription id before any of its items.
             send(&out, json!({ "jsonrpc": "2.0", "id": id, "result": sid }));
-            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots), Arc::clone(&link), key.clone()));
+            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots), Arc::clone(&link), key.clone(), tokens.clone()));
             live.lock().unwrap().insert(sid, task.abort_handle());
         } else if method == unsub_m {
             let held = params.get(0).and_then(Value::as_u64).and_then(|sid| live.lock().unwrap().remove(&sid));
@@ -288,6 +298,7 @@ async fn run<A: Activation>(
     slots: Arc<Slots>,
     link: Arc<HostLink>,
     key: Option<Arc<crate::plexus::peer_token::PeerKey>>,
+    tokens: Option<Arc<crate::plexus::peer_token::Verifier>>,
 ) {
     let item = |v: Value| {
         let frame = json!({ "jsonrpc": "2.0", "method": format!("{ns}.call"), "params": { "subscription": sid, "result": v } });
@@ -308,9 +319,25 @@ async fn run<A: Activation>(
     } else if let Some(method) = target.strip_prefix(&format!("{ns}.")) {
         let hop: Option<Hop> = hop.and_then(|h| serde_json::from_value(h).ok());
         let introspection = method == "schema" || method.ends_with(".schema");
+        // DYNAUTH-12: a verifying child believes a hop by its token.
+        let verdict = match (&tokens, &hop) {
+            (Some(v), Some(h)) if !introspection => Some(check_hop_token(v, h, &target)),
+            _ => None,
+        };
+        if let Some(Err(why)) = &verdict {
+            let mut e = PlexusStreamItem::error(meta(&ns), RemoteError::Forbidden {
+                reason: DenyReason::MissingGrant { grant: target.clone(), scope: "*".into(), roles: vec![], held_on: vec![] },
+            }, false);
+            if let PlexusStreamItem::Error { message, .. } = &mut e {
+                *message = format!("the hop's token is refused: {why}");
+            }
+            item(serde_json::to_value(e).unwrap_or_default());
+            live.lock().unwrap().remove(&sid);
+            return;
+        }
         // Who may send a hop: one this child does not take is refused
-        // (a schema call answers without it).
-        let untrusted = hop.as_ref().is_some_and(|h| !peer.takes(h));
+        // (a schema call answers without it) — unless its token verified.
+        let untrusted = !matches!(verdict, Some(Ok(()))) && hop.as_ref().is_some_and(|h| !peer.takes(h));
         let hop = if untrusted && introspection { None } else { hop };
         // The far side decides again, before the method runs: no hop is
         // nobody; a hop no gate decided (`limit: null`, or no grant) or one
@@ -365,6 +392,24 @@ async fn run<A: Activation>(
     live.lock().unwrap().remove(&sid);
 }
 
+/// DYNAUTH-12: whether `hop`'s token is the one for this call of `target`:
+/// verified (see [`ServeChild::tokens`]), its `sub` the hop's caller, its
+/// scope holding the hop's grant on every scope the hop says.
+fn check_hop_token(v: &crate::plexus::peer_token::Verifier, hop: &crate::call::Hop, target: &str) -> Result<(), String> {
+    use crate::plexus::peer_token::{is_within, Expect};
+    let token = hop.token.as_deref().ok_or("the hop carries no token, and this child takes a hop only by its token")?;
+    let claims = v.verify(token, &Expect { call: Some(&hop.call), method: Some(target) }).map_err(|e| e.to_string())?;
+    if hop.caller() != Some(claims.sub.as_str()) {
+        return Err(format!("it is {}'s, and the hop is for {}", claims.sub, hop.caller().unwrap_or("nobody")));
+    }
+    let limit = hop.limit.as_ref().ok_or("the hop has no verdict")?;
+    let asked: Vec<String> = limit.held_on.iter().map(|s| format!("{}@{s}", limit.grant)).collect();
+    if asked.is_empty() || !is_within(&asked, &claims.scope) {
+        return Err(format!("its scope does not hold {}", asked.join(" ")));
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ NEST-11
 
 /// The far side's link back to the service on this connection: the calls
@@ -377,6 +422,9 @@ pub(super) struct HostLink {
     pending: Mutex<HashMap<u64, Opening>>,
     subs: Mutex<HashMap<u64, mpsc::Sender<Value>>>,
     closed: AtomicBool,
+    /// DYNAUTH-12: the child's key, to prove possession of the token a call
+    /// back is made under.
+    key: Option<Arc<crate::plexus::peer_token::PeerKey>>,
 }
 
 struct Opening {
@@ -387,8 +435,8 @@ struct Opening {
 const BUFFER: usize = 1024;
 
 impl HostLink {
-    fn new(out: mpsc::UnboundedSender<Vec<u8>>) -> Self {
-        Self { out: Mutex::new(Some(out)), next: AtomicU64::new(1), pending: Mutex::default(), subs: Mutex::default(), closed: AtomicBool::new(false) }
+    fn new(out: mpsc::UnboundedSender<Vec<u8>>, key: Option<Arc<crate::plexus::peer_token::PeerKey>>) -> Self {
+        Self { out: Mutex::new(Some(out)), next: AtomicU64::new(1), pending: Mutex::default(), subs: Mutex::default(), closed: AtomicBool::new(false), key }
     }
 
     fn send(&self, v: &Value) {
@@ -449,7 +497,7 @@ impl HostLink {
     }
 
     /// Open `method` with `params` under the forwarded call `under`.
-    async fn open(self: Arc<Self>, method: String, params: Value, under: Option<String>) -> Result<CallBack, StreamItem> {
+    async fn open(self: Arc<Self>, method: String, params: Value, under: Option<String>, token: Option<String>) -> Result<CallBack, StreamItem> {
         if self.closed.load(Ordering::Acquire) {
             return Err(refused_item(&json!({ "message": "the connection to the service has closed" })));
         }
@@ -458,6 +506,12 @@ impl HostLink {
         let (reply, answer) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, Opening { reply, items });
         let mut p = json!({ "method": method, "params": params });
+        // DYNAUTH-12: the token this call is made under, and a proof of
+        // possession by the child's key, for this method and call.
+        if let (Some(key), Some(t), Some(u)) = (&self.key, &token, &under) {
+            p["token"] = json!(t);
+            p["proof"] = json!(crate::plexus::peer_token::prove(key, t, &method, u));
+        }
         if let Some(u) = under {
             p["under"] = json!(u);
         }
@@ -538,6 +592,8 @@ impl Drop for CallBack {
 pub struct HostTransport {
     link: Arc<HostLink>,
     under: Option<String>,
+    /// DYNAUTH-12: the token of the call it is made under.
+    token: Option<String>,
 }
 
 impl std::fmt::Debug for HostTransport {
@@ -555,7 +611,7 @@ impl HostTransport {
 
 impl Transport for HostTransport {
     fn call(&self, method: MethodRef, params: Value) -> ItemStream<'_> {
-        let opened = Arc::clone(&self.link).open(method.qualified(), params, self.under.clone());
+        let opened = Arc::clone(&self.link).open(method.qualified(), params, self.under.clone(), self.token.clone());
         Box::pin(
             futures::stream::once(async move {
                 match opened.await {
@@ -576,5 +632,50 @@ pub fn host() -> Result<HostTransport, CallError> {
     let link = ctx.host_link().cloned().ok_or(CallError::NoHop)?;
     let link = link.downcast::<HostLink>().map_err(|_| CallError::NoHop)?;
     let under = ctx.hop().map(|h| h.call.clone()).filter(|c| !c.is_empty());
-    Ok(HostTransport { link, under })
+    let token = ctx.hop().and_then(|h| h.token.clone());
+    Ok(HostTransport { link, under, token })
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use crate::plexus::peer_token::{MintRequest, PeerKey, TokenIssuer, Verifier};
+
+    fn hop(for_: &str, grant: &str, held: &[&str], call: &str, token: Option<String>) -> crate::call::Hop {
+        serde_json::from_value(json!({ "principal": "service:host", "for": [for_], "limit": { "grant": grant, "held_on": held }, "call": call, "token": token })).unwrap()
+    }
+
+    /// DYNAUTH-12: a verifying child takes a hop by its token alone, and
+    /// only for its caller, call, method and grant.
+    #[test]
+    fn a_hop_is_taken_by_its_token() {
+        let (host, me, other) = (PeerKey::generate(), PeerKey::generate(), PeerKey::generate());
+        let issuer = TokenIssuer::new(host);
+        let caller = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mint = |aud: &PeerKey, scope: &[&str], call: &str| {
+            issuer
+                .mint(MintRequest { sub: caller.into(), peer_key: Some(aud.kid().into()), name: "w".into(), scope: scope.iter().map(|s| s.to_string()).collect(), call: call.into(), method: "weather.forecast".into(), presented: None })
+                .unwrap()
+                .0
+        };
+        let v = Verifier::new(me.kid(), &issuer.jwks()).unwrap();
+        let ok = hop(caller, "weather.forecast", &["*"], "c1", Some(mint(&me, &["weather.forecast@*"], "c1")));
+        assert_eq!(check_hop_token(&v, &ok, "weather.forecast"), Ok(()));
+        // The same token again: replayed.
+        assert!(check_hop_token(&v, &ok, "weather.forecast").unwrap_err().contains("replayed"));
+        // No token.
+        assert!(check_hop_token(&v, &hop(caller, "weather.forecast", &["*"], "c2", None), "weather.forecast").unwrap_err().contains("no token"));
+        // Another's audience.
+        let theirs = hop(caller, "weather.forecast", &["*"], "c3", Some(mint(&other, &["weather.forecast@*"], "c3")));
+        assert!(check_hop_token(&v, &theirs, "weather.forecast").unwrap_err().contains("addressed to"));
+        // Another call's.
+        let moved = hop(caller, "weather.forecast", &["*"], "c4", Some(mint(&me, &["weather.forecast@*"], "c5")));
+        assert!(check_hop_token(&v, &moved, "weather.forecast").unwrap_err().contains("another call"));
+        // Another caller named in the hop than the token's `sub`.
+        let lied = hop("key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "weather.forecast", &["*"], "c6", Some(mint(&me, &["weather.forecast@*"], "c6")));
+        assert!(check_hop_token(&v, &lied, "weather.forecast").unwrap_err().contains("the hop is for"));
+        // A hop claiming more than its token holds.
+        let wide = hop(caller, "weather.forecast", &["*"], "c7", Some(mint(&me, &["weather.forecast@MENGER"], "c7")));
+        assert!(check_hop_token(&v, &wide, "weather.forecast").unwrap_err().contains("does not hold"));
+    }
 }

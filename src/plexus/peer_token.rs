@@ -424,6 +424,39 @@ pub fn narrow(requested: Option<&[String]>, presented: &[String]) -> Vec<String>
     out
 }
 
+/// The scope a forwarded call's token holds (D3: the caller's reach ∩ the
+/// peer's needs ∩ consent): the forwarded grant on each scope the call was
+/// admitted on (`reach`, `["*"]` when everywhere), and each need's grant on
+/// each scope both its consent and the reach hold. Never a scope the reach
+/// does not hold.
+pub fn mint_scope(forwarded: Option<&str>, reach: &[String], needs: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |g: &str, s: &str| {
+        let e = format!("{g}@{s}");
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    };
+    let everywhere = reach.iter().any(|r| r == "*");
+    if let Some(g) = forwarded {
+        for r in reach {
+            push(g, r);
+        }
+    }
+    for (g, consented) in needs {
+        let any = consented.iter().any(|c| c == "*");
+        let scopes: Vec<&String> = match (everywhere, any) {
+            (true, _) => consented.iter().collect(),
+            (false, true) => reach.iter().collect(),
+            (false, false) => consented.iter().filter(|c| reach.contains(c)).collect(),
+        };
+        for s in scopes {
+            push(g, s);
+        }
+    }
+    out
+}
+
 // ------------------------------------------------------------------ errors
 
 /// Why a token or a proof is refused. Says what, never the token.
@@ -822,10 +855,10 @@ impl TokenIssuer {
             None => (req.sub.clone(), Some(Actor::after(key.kid(), None)), req.scope.clone(), AuditKind::Mint),
             Some(p) => {
                 // RFC 8693: the subject stays; the presenter joins the
-                // chain; the scope never widens.
-                let scope = narrow(Some(&req.scope), &p.scope);
+                // chain. The scope is the caller's to narrow (`exchange`,
+                // `onward_scope`): never wider than the presented one's.
                 let prior = Actor::after(p.aud.clone(), p.act.clone());
-                (p.sub.clone(), Some(Actor::after(key.kid(), Some(prior))), scope, AuditKind::Exchange)
+                (p.sub.clone(), Some(Actor::after(key.kid(), Some(prior))), req.scope.clone(), AuditKind::Exchange)
             }
         };
         let claims = PeerClaims {
@@ -1141,6 +1174,40 @@ mod tests {
                 assert!(!text.contains(part), "an audit record holds a token's or a proof's bytes");
             }
         }
+    }
+
+    /// DYNAUTH-12's property: `scope ⊆ reach` for every mint — over every
+    /// reach, forwarded grant and consent drawn from a small lattice.
+    #[test]
+    fn every_mint_s_scope_is_within_the_reach() {
+        let scopes = ["*", "A", "B", "C"];
+        let subsets = |n: usize| -> Vec<Vec<String>> {
+            (0..(1usize << n)).map(|m| (0..n).filter(|i| m & (1 << i) != 0).map(|i| scopes[i].to_string()).collect()).collect()
+        };
+        let (host, peer) = (PeerKey::generate(), PeerKey::generate());
+        let issuer = TokenIssuer::new(host);
+        let mut minted = 0;
+        for reach in subsets(scopes.len()) {
+            for consent_a in subsets(scopes.len()) {
+                for consent_b in subsets(3) {
+                    for forwarded in [None, Some("far.m")] {
+                        let needs = vec![("shop.items".to_string(), consent_a.clone()), ("dyn.{peer}".to_string(), consent_b.clone())];
+                        let scope = mint_scope(forwarded, &reach, &needs);
+                        let (_, c) = issuer.mint(MintRequest { scope, ..req(&peer) }).unwrap();
+                        minted += 1;
+                        for e in &c.scope {
+                            let (g, s) = e.rsplit_once('@').unwrap();
+                            assert!(reach.iter().any(|r| r == "*" || r == s), "{e} outside the reach {reach:?}");
+                            if g != "far.m" {
+                                let consent = needs.iter().find(|(n, _)| n == g).map(|(_, c)| c).unwrap();
+                                assert!(consent.iter().any(|c| c == "*" || c == s), "{e} outside its consent {consent:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(minted, 16 * 16 * 8 * 2);
     }
 
     #[test]

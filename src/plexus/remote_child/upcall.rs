@@ -69,6 +69,22 @@ pub(super) struct Under {
     service: WeakService,
     /// `Some(why)` once the forwarded call has ended.
     ended: watch::Sender<Option<String>>,
+    /// DYNAUTH-12: the token minted for the forwarded call, if one was.
+    minted: Option<Minted>,
+}
+
+/// DYNAUTH-6: the token a call back was made under, while that call back
+/// is routed — so a call it reaches into another child is an exchange
+/// (RFC 8693), not a fresh mint. `None` until DYNAUTH-6.
+pub(super) fn presented() -> Option<crate::plexus::peer_token::PeerClaims> {
+    None
+}
+
+/// DYNAUTH-12: a token minted for one forwarded call, and what it says.
+#[derive(Clone)]
+pub(super) struct Minted {
+    pub token: String,
+    pub claims: crate::plexus::peer_token::PeerClaims,
 }
 
 /// What a mount keeps for its child's calls back: the service it is in and
@@ -78,6 +94,8 @@ pub(super) struct Upcalls {
     under: Mutex<HashMap<String, Arc<Under>>>,
     /// Calls the child made back, in all.
     pub made: AtomicU64,
+    /// DYNAUTH-12: the proofs of possession seen, each once.
+    proofs: crate::plexus::peer_token::ProofCache,
     /// NEST-16: the methods the child's schema says it needs (`None`: it
     /// declares none), set when it is mounted.
     needs: Mutex<Option<Arc<[String]>>>,
@@ -94,7 +112,7 @@ pub(super) struct Upcalls {
 
 impl Upcalls {
     pub(super) fn new(host: Option<WeakService>, legacy: bool) -> Arc<Self> {
-        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), needs: Mutex::default(), consent: Mutex::default(), legacy })
+        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), proofs: Default::default(), needs: Mutex::default(), consent: Mutex::default(), legacy })
     }
 
     /// NEST-16: what the mounted child's schema says it needs.
@@ -158,12 +176,30 @@ impl Upcalls {
 
     /// A forwarded call opens: the child may call back under `id` until the
     /// guard is dropped (or [`UnderGuard::end`]ed).
-    pub(super) fn open(self: &Arc<Self>, id: &str, auth: Option<&AuthContext>, reach: &Reach) -> Option<UnderGuard> {
+    pub(super) fn open(self: &Arc<Self>, id: &str, auth: Option<&AuthContext>, reach: &Reach, minted: Option<Minted>) -> Option<UnderGuard> {
         let service = service_scope::current().or_else(|| self.host())?;
         let (ended, _) = watch::channel(None);
-        let under = Arc::new(Under { auth: auth.cloned(), reach: reach.clone(), service, ended });
+        let under = Arc::new(Under { auth: auth.cloned(), reach: reach.clone(), service, ended, minted });
         self.under.lock().unwrap().insert(id.to_string(), Arc::clone(&under));
         Some(UnderGuard { up: Arc::clone(self), id: id.to_string(), under })
+    }
+
+    /// DYNAUTH-12: the needs a token minted now may hold, each by the grant
+    /// the service holds a call to it to and the scopes it is consented on
+    /// (`["*"]` without consent kept).
+    pub(super) fn need_grants(&self, service: &crate::plexus::DynamicHub) -> Vec<(String, Vec<String>)> {
+        let needs = self.needs.lock().unwrap().clone().unwrap_or_else(|| Vec::<String>::new().into());
+        let consent = self.consent.lock().unwrap().clone();
+        needs
+            .iter()
+            .filter_map(|m| {
+                let scopes = match &consent {
+                    None => vec!["*".to_string()],
+                    Some(c) => c.iter().find(|c| &c.method == m)?.scopes.clone(),
+                };
+                Some((service.grant_at(m)?, scopes))
+            })
+            .collect()
     }
 
     /// How many forwarded calls the child may call back under now.
@@ -225,6 +261,24 @@ fn narrowed(auth: &AuthContext, reach: &Reach, grant: Option<&str>) -> AuthConte
     }
     ctx.metadata[CEILING_KEY] = Value::Array(layers);
     ctx
+}
+
+/// DYNAUTH-12: the token and proof a keyed child presents with a call
+/// back, checked against the token minted for the call it names.
+fn presented_ok(up: &Upcalls, m: &Minted, params: &Value, method: &str, under: &str) -> Result<(), String> {
+    if let Some(t) = params.get("token").and_then(Value::as_str) {
+        if t != m.token {
+            return Err("the token presented is not the one minted for this call".into());
+        }
+    }
+    if m.claims.cnf.is_none() {
+        return Ok(());
+    }
+    let proof = params.get("proof").and_then(Value::as_str).ok_or_else(|| {
+        "a call back under a key-bound token carries a proof of possession (`proof`): none was sent".to_string()
+    })?;
+    crate::plexus::peer_token::check_proof(proof, &m.token, &m.claims, method, under, crate::plexus::peer_token::now(), &up.proofs)
+        .map_err(|e| format!("the call back's {e}"))
 }
 
 /// DYNAUTH-5: `auth` with one more ceiling layer, `grant@<scope>` for each
@@ -293,6 +347,8 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
         return send(refusal(&id, &PlexusError::invalid_params("`_host.call` names the `method` it calls")));
     };
     let args = params.get("params").cloned().unwrap_or_else(|| json!({}));
+    // DYNAUTH-12: the method as the child asked it (what its proof names).
+    let presented = target.clone();
     let under_id = params.get("under").and_then(Value::as_str).map(str::to_string);
     // NEST-16: the standard upward interface, the child's needs, or (a
     // child that declares none, under the legacy option) NEST-11's rule.
@@ -307,9 +363,35 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
         }
     }
     let route = match &under_id {
-        Some(u) => match up.under.lock().unwrap().get(u) {
-            Some(under) if standard => Route::Standard(under.service.clone(), under.auth.clone()),
-            Some(under) => Route::Under(Arc::clone(under), need),
+        Some(u) => match up.under.lock().unwrap().get(u).cloned() {
+            Some(under) => {
+                // DYNAUTH-12: under a call whose token is bound to the
+                // child's key, every call back carries a proof of
+                // possession by that key, for this method and call (a
+                // child on the service's own pipe needs none, D3).
+                if let Some(m) = &under.minted {
+                    if let Err(e) = presented_ok(up, m, &params, &presented, u) {
+                        return send(refusal_said(&id, &PlexusError::Unauthenticated(e.clone()), &e));
+                    }
+                }
+                if standard {
+                    Route::Standard(under.service.clone(), under.auth.clone())
+                } else {
+                    // DYNAUTH-12: a need is held to the token's scope too.
+                    let need = match (&under.minted, need, under.service.upgrade()) {
+                        (Some(m), Some(_), Some(svc)) => {
+                            let held = svc.grant_at(&target).map(|g| m.claims.scopes_for(&g)).unwrap_or_default();
+                            if held.is_empty() {
+                                let e = parent::not_needed(&target);
+                                return send(refusal_said(&id, &e, &format!("`{target}` is not within the scope of the token minted for this call")));
+                            }
+                            Some(held)
+                        }
+                        (_, n, _) => n,
+                    };
+                    Route::Under(under, need)
+                }
+            }
             None => {
                 return send(refusal(&id, &PlexusError::Unauthenticated(format!(
                     "no call `{u}` is open into this child: a child calls its service only under a call it is serving, while it is open"
@@ -514,5 +596,32 @@ mod tests {
         let who = AuthContext::for_principal(&"key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(), "s", vec![], Value::Null);
         let c = consented(&who, "shop.items", &["MENGER".to_string()]);
         assert_eq!(c.metadata[CEILING_KEY], json!([["shop.items@MENGER"]]));
+    }
+
+    /// DYNAUTH-12: a keyed child's call back carries a proof by its key,
+    /// for this method and call; a pipe child's needs none.
+    #[test]
+    fn a_call_back_under_a_bound_token_needs_its_proof() {
+        use crate::plexus::peer_token::{prove, MintRequest, PeerKey, TokenIssuer};
+        let (host, child, thief) = (PeerKey::generate(), PeerKey::generate(), PeerKey::generate());
+        let issuer = TokenIssuer::new(host);
+        let req = |peer_key: Option<String>| MintRequest { sub: "key:x".into(), peer_key, name: "w".into(), scope: vec![], call: "u1".into(), method: "w.m".into(), presented: None };
+        let (token, claims) = issuer.mint(req(Some(child.kid().into()))).unwrap();
+        let m = Minted { token: token.clone(), claims };
+        let up = Upcalls::new(None, false);
+        let no_proof = presented_ok(&up, &m, &json!({}), "shop.items", "u1").unwrap_err();
+        assert!(no_proof.contains("proof"), "{no_proof}");
+        let good = json!({ "token": token, "proof": prove(&child, &token, "shop.items", "u1") });
+        assert_eq!(presented_ok(&up, &m, &good, "shop.items", "u1"), Ok(()));
+        assert!(presented_ok(&up, &m, &good, "shop.items", "u1").is_err(), "a proof is used once");
+        let stolen = json!({ "proof": prove(&thief, &token, "shop.items", "u1") });
+        assert!(presented_ok(&up, &m, &stolen, "shop.items", "u1").unwrap_err().contains("another key"));
+        let other_method = json!({ "proof": prove(&child, &token, "shop.items", "u1") });
+        assert!(presented_ok(&up, &m, &other_method, "auth.grant", "u1").is_err());
+        let other_token = json!({ "token": "a.b.c", "proof": prove(&child, &token, "shop.items", "u1") });
+        assert!(presented_ok(&up, &m, &other_token, "shop.items", "u1").unwrap_err().contains("not the one"));
+        // A pipe's token: bound to no key, no proof asked.
+        let (token, claims) = issuer.mint(req(None)).unwrap();
+        assert_eq!(presented_ok(&up, &Minted { token, claims }, &json!({}), "shop.items", "u1"), Ok(()));
     }
 }

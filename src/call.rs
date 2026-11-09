@@ -437,7 +437,7 @@ impl<S: Stream> Stream for InCall<S> {
 
 /// spec/12's hop, as a child reads it: who acts, for whom, within what.
 /// `for` grants nothing; `limit` is a ceiling, never a grant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hop {
     /// Who acts: the service that forwarded the call.
     pub principal: String,
@@ -452,6 +452,26 @@ pub struct Hop {
     /// The hop's id for this call, to join the two logs.
     #[serde(default)]
     pub call: String,
+    /// DYNAUTH-12: the peer token the service minted for this one call
+    /// (`plexus::peer_token`): addressed to this child, bound to its key,
+    /// naming `call` and the method. A child that verifies
+    /// (`ServeChild::tokens`) believes the hop by it rather than by its
+    /// sender. Never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+// DYNAUTH-12: a hop's token is never shown.
+impl std::fmt::Debug for Hop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hop")
+            .field("principal", &self.principal)
+            .field("for_", &self.for_)
+            .field("limit", &self.limit)
+            .field("call", &self.call)
+            .field("token", &self.token.as_ref().map(|_| "…"))
+            .finish()
+    }
 }
 
 /// The near side's decision, as a ceiling (spec/12 `limit`).

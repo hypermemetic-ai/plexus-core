@@ -35,6 +35,19 @@ alone, unless the service keeps NEST-11's rule for it for this release:
 `ChildOptions::legacy_upcalls` / `with_legacy_upcalls`,
 `--child-legacy-upcalls`. `RemoteChild::needs()` (its whole tree's).
 
+DYNAUTH-6 (additive): **calls back narrowed by grant; onward calls are
+exchanges.** A call back made under a token is routed with that token in
+scope; a call it reaches into another child is minted as an RFC 8693
+exchange — the same `sub`, `act` extended by the presenter, a scope
+(`peer_token::onward_scope`) never wider than the presented one: each need
+only where the presented token holds that grant, the forwarded grant only
+where it holds the grant the onward call was admitted on.
+`TokenIssuer::exchange` (the method form) refuses a token bound to no key
+and checks the proof for method `exchange` under the token's `call`;
+`EXCHANGE`, `JWT_TOKEN_TYPE`. The NEST-11 `admin@<scope>` ceiling is kept
+as the outer bound and documented as "any grant, only there" (not the admin
+role); what a child may do is its need's grant and its token's scope (TM-1).
+
 DYNAUTH-12 (additive; `Hop` gains a field): **per-call peer tokens (D3,
 TM-4).** `plexus::peer_token`: an EdDSA compact JWS, `typ`
 `plexus-peer+jwt`, claims `iss sub act aud scope cnf.jkt call method jti

@@ -473,6 +473,31 @@ impl RemoteChild {
         (json!({ "principal": self.inner.shared.principal, "for": for_, "limit": limit, "call": call }), call)
     }
 
+    /// DYNAUTH-12: mint the token for one forwarded call — for a signed-in
+    /// caller, when the service issues tokens, to a child that proved a key
+    /// (bound to it) or one on the service's own pipe (`pipe:<name>`). A
+    /// WebSocket child that proved no key gets none.
+    fn mint(&self, auth: Option<&AuthContext>, reach: &Reach, hop: &Value, path: &str, call: &str) -> Result<Option<upcall::Minted>, String> {
+        use crate::plexus::peer_token::{mint_scope, MintRequest};
+        let Some(issuer) = self.inner.shared.opts.tokens.as_ref() else { return Ok(None) };
+        let Some(sub) = auth.and_then(|a| a.principal()).map(|p| p.to_string()) else { return Ok(None) };
+        let peer_key = self.peer_key().map(str::to_string);
+        if peer_key.is_none() && !matches!(self.spec(), ChildSpec::Stdio { .. }) {
+            return Ok(None);
+        }
+        let held: Vec<String> = if reach.is_everywhere() { vec!["*".into()] } else { reach.held_on().iter().map(|s| s.to_string()).collect() };
+        let needs = crate::plexus::service_scope::current()
+            .and_then(|w| w.upgrade())
+            .map(|svc| self.inner.shared.upcalls.need_grants(&svc))
+            .unwrap_or_default();
+        let forwarded = hop.get("limit").and_then(|l| l.get("grant")).and_then(Value::as_str);
+        let scope = mint_scope(forwarded, &held, &needs);
+        let presented = upcall::presented();
+        let req = MintRequest { sub, peer_key, name: self.name().to_string(), scope, call: call.to_string(), method: path.to_string(), presented };
+        let (token, claims) = issuer.mint(req).map_err(|e| e.to_string())?;
+        Ok(Some(upcall::Minted { token, claims }))
+    }
+
     /// NEST-4: the kept static child at `path` (dotted, relative to the mount).
     fn node(&self, path: &str) -> Option<&PluginSchema> {
         self.inner.nodes.iter().find(|(p, _)| p == path).map(|(_, s)| s)
@@ -586,10 +611,21 @@ impl RemoteChild {
             Err(item) => return one(item),
         };
         shared.counters.calls.fetch_add(1, Ordering::Relaxed);
-        let (hop, call_id) = self.hop(&conn, auth, &reach, method);
-        // NEST-11: the child may call back under this call while it is open.
-        let under = shared.upcalls.open(&call_id, auth, &reach);
+        let (mut hop, call_id) = self.hop(&conn, auth, &reach, method);
         let path = format!("{}.{method}", conn.ns());
+        // DYNAUTH-12: the token for this one call, when the service issues.
+        let minted = match self.mint(auth, &reach, &hop, &path, &call_id) {
+            Ok(m) => m,
+            Err(why) => {
+                let e = PlexusError::Unauthenticated(format!("no token could be minted for `{}`: {why}", self.name()));
+                return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false));
+            }
+        };
+        if let Some(m) = &minted {
+            hop["token"] = json!(m.token);
+        }
+        // NEST-11: the child may call back under this call while it is open.
+        let under = shared.upcalls.open(&call_id, auth, &reach, minted);
         let call = json!({ "method": path, "params": params, "hop": hop });
         match conn.open(&format!("{}.call", conn.ns()), call, shared.opts.timeout).await {
             Ok((sid, rx)) => {

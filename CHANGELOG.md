@@ -35,6 +35,27 @@ alone, unless the service keeps NEST-11's rule for it for this release:
 `ChildOptions::legacy_upcalls` / `with_legacy_upcalls`,
 `--child-legacy-upcalls`. `RemoteChild::needs()` (its whole tree's).
 
+DYNAUTH-12 (additive; `Hop` gains a field): **per-call peer tokens (D3,
+TM-4).** `plexus::peer_token`: an EdDSA compact JWS, `typ`
+`plexus-peer+jwt`, claims `iss sub act aud scope cnf.jkt call method jti
+iat exp` (≤ 60 s), hand-rolled on ed25519-dalek (`verify_strict`); `alg`
+pinned by the verifier, `typ` checked, `crit` refused. `TokenIssuer`
+(mint, JWKS, rotation, `verify_own`), `Verifier` (audience, trusted JWKS,
+±30 s skew, a `jti` cache until `exp`), `prove` / `check_proof` (a proof of
+possession: `{ath, jti, method, call, iat}` signed by the key `cnf.jkt`
+names), `mint_scope` (the forwarded grant on the call's reach, each need on
+reach ∩ consent). With `ChildOptions::tokens` a mount mints one token per
+forwarded call for a signed-in caller — `aud` the child's proved key, or
+`pipe:<name>` on the service's own pipe; a keyless WebSocket child gets
+none — and carries it as `hop.token`; a call back under a key-bound token
+must carry `proof` (and may carry `token`), else it is refused
+`unauthenticated`; a need called back is held to the token's scope.
+`ServeChild::tokens` (a `Verifier`): the far side believes a hop by its
+token (verified, its `sub` the hop's caller, its scope holding the hop's
+grant) rather than by its sender, and refuses one without; `host()` sends
+the token and a proof by `ServeChild::key` with each call back. `Hop`'s
+`Debug` never shows the token.
+
 DYNAUTH-5 (additive): **a peer proves its key; its needs held to consent.**
 A mount asks `_info {nonce}`; a far side with a key (`ServeChild::key`,
 `serve_child_with`) answers `{backend, key, proof}` — the nonce and backend

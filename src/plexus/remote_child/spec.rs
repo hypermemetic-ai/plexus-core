@@ -162,6 +162,14 @@ pub struct ChildOptions {
     /// test network's). Certificates are always validated; nothing turns
     /// that off.
     pub tls_roots: Option<PathBuf>,
+    /// DYNAUTH-12: the service's peer-token issuer. With one, every call
+    /// forwarded for a signed-in caller carries a token minted for it
+    /// (`hop.token`): `aud` the child's proved key (bound to it), or
+    /// `pipe:<name>` for a child on the service's own pipe; scope the
+    /// forwarded grant and the child's needs (consented), within the call's
+    /// reach. A WebSocket child that proved no key gets none. A keyed child
+    /// calling back presents a proof of possession with each call.
+    pub tokens: Option<std::sync::Arc<crate::plexus::peer_token::TokenIssuer>>,
 }
 
 impl Default for ChildOptions {
@@ -181,6 +189,7 @@ impl Default for ChildOptions {
             ping: None,
             legacy_upcalls: false,
             tls_roots: None,
+            tokens: None,
         }
     }
 }

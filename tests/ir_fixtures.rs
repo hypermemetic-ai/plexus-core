@@ -109,3 +109,27 @@ fn canonical_is_synapses_form() {
         "{\n  \"a\": \"x\\u0001\\n\\\"\",\n  \"b\": [\n    1,\n    {\n      \"c\": {},\n      \"d\": []\n    }\n  ],\n  \"k\": 1.8446744073709551615e19,\n  \"m\": 1.5,\n  \"n\": 5.0e-2,\n  \"z\": 1000.0\n}\n"
     );
 }
+
+/// ASK-1: IR 3.1 is 3.0 without the bidir keys and nothing in their place;
+/// an older schema's `bidirectional` (the in-call question, gone) and its
+/// request and response types are read and ignored.
+#[test]
+fn an_older_bidirectional_is_ignored() {
+    let plain = json("conformance/expected/schema.json");
+    let mut schema = plain.clone();
+    for m in schema["methods"].as_array_mut().unwrap() {
+        m["bidirectional"] = serde_json::json!(true);
+        m["request_type"] = serde_json::json!({"type": "string"});
+        m["response_type"] = serde_json::json!({"type": "string"});
+    }
+    let ns = &["conformance".to_string()];
+    let built = ir::build_one("conformance", ns, &schema).expect("the fixture's IR").to_json();
+    let want = ir::build_one("conformance", ns, &plain).expect("the fixture's IR").to_json();
+    assert_eq!(built, want, "an older schema's bidir keys change nothing");
+    assert_eq!(built["irVersion"], "3.1");
+    for (path, m) in built["irMethods"].as_object().unwrap() {
+        for gone in ["mdBidirType", "mdBidirResponseType", "mdBidirResponseSchema", "mdAsks"] {
+            assert!(m.get(gone).is_none(), "{path}: {gone} in {m}");
+        }
+    }
+}

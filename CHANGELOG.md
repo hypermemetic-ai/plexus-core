@@ -5,7 +5,97 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 0.10.0
+
+ASK-2 / ASK-1 (breaking): **the server no longer asks its caller
+mid-call.** The `bidirectional` module goes — `BidirChannel`,
+`StandardBidirChannel`, `StandardRequest` / `StandardResponse`,
+`SelectOption`, `BidirError`, the pending-request registry,
+`create_bidir_stream` / `wrap_stream_with_bidir` — with
+`PlexusStreamItem::Request`, `{ns}.respond`, and `MethodSchema`'s
+`bidirectional`, `request_type` and `response_type` (and their builders).
+Nothing replaces them: Plexus has no in-call or protocol-wide confirmation
+(owner, ASK-1); a service that wants one builds it as its own methods. An
+older schema's `bidirectional`, `request_type` and `response_type` are read
+and ignored. The IR is 3.1: 3.0 without each method's `mdBidirType`,
+`mdBidirResponseType` and `mdBidirResponseSchema`. The input half
+(`Input<T>`, `{ns}.input`, `DuplexGate`, `answer_by`) is unchanged. Every
+schema hash moves (goldens regenerated).
+
+NEST-6: **a mounted child's dynamic children are reachable through the
+mount.** The walk keeps each slot on its parent with its type (a `#[peer]`
+slot is a slot, no longer walked as a level), so the host's gate decides
+`<mount>.solar.earth.info` on the slot grant `<mount>.solar.{planet}.info`
+(an untyped slot whole, `<mount>.belt.{rock}`), and `RemoteChild` forwards it
+with `hop.limit.grant` the slot grant in the child's terms — it no longer
+refuses a call into a slot. The far side (`serve_child*`) checks a hop's
+grant against the slot a path goes through as well as the literal path. A
+slot's list and search methods are forwarded like any method, and an unknown
+name is the child's own not-found, unchanged. `<mount>.<path>.<name>.schema`
+is the one schema that crosses the hop (spec/12 rule 7's exception): once per
+name, kept under the name and the `plexus_hash` it came with, at most
+`--child-schema-cache` names (`ChildArgs::child_schema_cache`,
+`ChildOptions::schema_cache`, default 1024, least recently used out); an item
+through the name with another `plexus_hash` drops it, a restart drops every
+name. `ChildStats` counts `name_schemas`, `name_schema_hits` and
+`names_kept`. The hub answers `<activation>.<name>.schema` for a name in an
+activation's own slot by routing it (it was `method_not_found` in the
+caller's view). `ChildArgs::default()` is the flags' defaults (a derived
+`Default` said 0 for every count, so `--child-max-depth` 0).
+
+NEST-7: **the primitive — an activation returns an activation** (`plexus::peer`).
+`trait Peer` is the erased activation (`interface`, `call`, `peer`),
+blanket-implemented for every `Activation + ChildRouter` (`RemoteChild`
+included). `Interface { name, hash, ir, methods, schema }` is a peer's shape
+(the hash of each method's shape hash; `satisfies` is the shape check).
+`PeerError` (`not_found`, `not_grafted`, `unavailable`, `shape_mismatch`,
+`timeout`, `forbidden`) is a typed error item: `ChildRouter::peer_child` is
+what routing asks, and a peer that could not be returned is its error, never
+"not found". `MethodRole::Peer { list_method, search_method, interface }` is a
+`#[plexus_macros::peer]` slot, reached as `<parent>.<slot>.<name>` (on the
+wire a `static_child` marked `peer`, so synapse navigates it); `PeerSlot`
+routes it, checking a typed peer against the slot's interface. A contract's
+client runs over a `PeerTransport`, which checks the backend against the
+client's `Stamp` (equal; `drift` once; else `ShapeMismatch`) and again when
+an item's `plexus_hash` moves. The slot grant (NEST-5) covers peer slots:
+`host.{integration}.repos`, `garden.{dendrite}`.
+
+NEST-5: **slot types and slot grants, in-process.** A dynamic child's role
+carries its slot's type (`MethodRole::DynamicChild { child }`, the child
+type's schema; absent for `#[child(opaque)]` or a hand-written router), and
+the gate grants a slot once: `solar.{planet}.info` is `info` on every name in
+the slot, `solar.{planet}` an untyped slot whole (`plexus::slots`). A call to
+`solar.earth.info` matches the slot (a static child still wins) and is
+decided on the slot's grant, after a grant written as the literal path;
+`declared_roles`, `auth.requires`, `auth.role_set` and the caller's view read
+slots as they read static children. `Activation::slot_schema()` (the schema
+without an instance) is new. Breaking for a crate that builds
+`MethodRole::DynamicChild { list_method, search_method }` by hand: add
+`child: None`.
+
+### Added
+
+- **NEST-4: a remote child may have children.** `RemoteChild` no longer
+  refuses a child whose schema has a child role or lists `children`. At
+  mount it walks the static tree depth-first (`{ns}.<path>.schema` for each
+  static child; a service root's `children`), at most `--child-max-depth`
+  levels (`ChildOptions::max_depth`, default 8) and within the one
+  `--child-timeout`, keeps it and hashes it: a restart whose tree hash
+  differs is refused `schema changed; restart the service`, as a flat
+  child's is. The kept tree is the mount's `static_child_schemas`, so the
+  host gates `<mount>.a.b.m` by its full path with the child's roles renamed
+  at every level, as it does an in-process child's. `<mount>.a.b.schema` is
+  answered from the kept tree (nothing crosses the hop); `<mount>.a.b.m` is
+  forwarded as `{ns}.call {method: "{ns}.a.b.m", hop}`, its grant the full
+  path. A dynamic child's slot is kept on its parent's schema, and a call
+  into it is refused naming the slot (`<mount>.a.{item}`) until NEST-6.
+
+### Fixed
+
+- **A mounted child's method grants are requalified under the mount name**
+  (`{ns}.m` → `<mount>.m`), as its roles already were: a child whose schema
+  states each method's `grant` (every macro-built one) and is mounted under
+  another name was hidden from every caller's view and admin-only.
 
 ## [0.9.0] — 2026-11-06
 

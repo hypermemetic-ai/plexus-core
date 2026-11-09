@@ -519,6 +519,48 @@ pub(super) fn schema_hash(raw: &Value) -> String {
     }
 }
 
+/// NEST-4 · what a mount keeps of a child: its own schema and, walked at
+/// mount, every static child below it by dotted path (`a`, `a.b`), each as
+/// the child published it.
+#[derive(Debug, Clone)]
+pub(super) struct Kept {
+    pub top: Value,
+    pub nodes: Vec<(String, Value)>,
+}
+
+impl Kept {
+    /// The whole tree's hash, compared across restarts: a flat child's is its
+    /// schema's, as before; a child with children adds each one's, by path,
+    /// so a changed grandchild changes it whatever the child's own hash
+    /// covers.
+    pub fn hash(&self) -> String {
+        let mut h = schema_hash(&self.top);
+        for (path, raw) in &self.nodes {
+            h.push_str(&format!(" {path}={}", schema_hash(raw)));
+        }
+        h
+    }
+}
+
+/// The static children a schema names, by the name each is reached through:
+/// its methods whose role is `static_child` when any method states a child
+/// role; else its `children` side-table (IR-4) — a service's root, whose
+/// registered activations are listed there and nowhere else.
+pub(super) fn static_children(raw: &Value) -> Vec<String> {
+    let methods = raw.get("methods").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let kind = |m: &Value| m.get("role").and_then(|r| r.get("kind").or(Some(r))).and_then(Value::as_str).map(str::to_string);
+    // A macro-built activation says its children by role (a static child's
+    // name is its method's, which may differ from the child's namespace);
+    // a service's root (a DynamicHub) lists its activations in `children`.
+    if methods.iter().any(|m| kind(m).is_some_and(|k| k.ends_with("_child"))) {
+        // NEST-6: a peer slot is a `static_child` marked `peer` on the
+        // wire (NEST-7) — a slot, reached by name, not a level to walk.
+        let peer = |m: &Value| m.get("role").and_then(|r| r.get("peer")).and_then(Value::as_bool).unwrap_or(false);
+        return methods.iter().filter(|m| kind(m).as_deref() == Some("static_child") && !peer(m)).filter_map(|m| m.get("name").and_then(Value::as_str)).map(str::to_string).collect();
+    }
+    raw.get("children").and_then(Value::as_array).map(|c| c.iter().filter_map(|c| c.get("namespace").and_then(Value::as_str)).map(str::to_string).collect()).unwrap_or_default()
+}
+
 impl Shared {
     pub(super) fn new(spec: ChildSpec, opts: ChildOptions, principal: String) -> Arc<Self> {
         Arc::new(Self {
@@ -546,8 +588,9 @@ impl Shared {
         json!({ "principal": self.principal, "for": [], "limit": null, "call": uuid::Uuid::new_v4().to_string() })
     }
 
-    /// Start (or dial) the child and ask its `_info` and its schema.
-    pub(super) async fn connect_once(self: &Arc<Self>) -> Result<(Arc<Conn>, Value, MountTimings), String> {
+    /// Start (or dial) the child and ask its `_info` and its schema, then
+    /// walk its static children (NEST-4), all within one `timeout`.
+    pub(super) async fn connect_once(self: &Arc<Self>) -> Result<(Arc<Conn>, Kept, MountTimings), String> {
         let t0 = Instant::now();
         let conn = match &self.spec {
             ChildSpec::Stdio { argv, .. } => self.spawn_stdio(argv)?,
@@ -558,9 +601,11 @@ impl Shared {
             let ns = info.get("backend").and_then(Value::as_str).ok_or("its `_info` names no backend")?.to_string();
             let _ = conn.ns.set(ns.clone());
             let t1 = Instant::now();
+            let deadline = t1 + self.opts.timeout;
             let params = json!({ "method": format!("{ns}.schema"), "params": {}, "hop": self.own_hop() });
             let schema = ask(&conn, &format!("{ns}.call"), params, self.opts.timeout).await.map_err(|e| format!("its schema: {e}"))?;
-            Ok::<_, String>((schema, t1))
+            let nodes = self.walk(&conn, &ns, &schema, deadline).await?;
+            Ok::<_, String>((Kept { top: schema, nodes }, t1))
         };
         match asked.await {
             Ok((schema, t1)) => {
@@ -572,6 +617,34 @@ impl Shared {
                 Err(why)
             }
         }
+    }
+
+    /// NEST-4 · the static tree below `top`, depth-first: `{ns}.<path>.schema`
+    /// for each static child, at most `max_depth` levels down and before
+    /// `deadline` (the mount's one timeout), each asked as the mount asks the
+    /// child's own (no caller, no verdict). A dynamic child is not walked:
+    /// its role, on its parent's schema, is the slot. Past the depth, or the
+    /// time, the mount fails naming the path.
+    pub(super) async fn walk(&self, conn: &Conn, ns: &str, top: &Value, deadline: Instant) -> Result<Vec<(String, Value)>, String> {
+        let mut out = Vec::new();
+        let mut stack: Vec<String> = static_children(top).into_iter().rev().collect();
+        while let Some(path) = stack.pop() {
+            let depth = path.split('.').count();
+            if depth > self.opts.max_depth {
+                return Err(format!("its child `{path}` is {depth} levels down, past --child-max-depth ({})", self.opts.max_depth));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!("its tree was not walked within {:?}: stopped at `{path}`", self.opts.timeout));
+            }
+            let params = json!({ "method": format!("{ns}.{path}.schema"), "params": {}, "hop": self.own_hop() });
+            let raw = ask(conn, &format!("{ns}.call"), params, left).await.map_err(|e| format!("the schema of its child `{path}`: {e}"))?;
+            for child in static_children(&raw).into_iter().rev() {
+                stack.push(format!("{path}.{child}"));
+            }
+            out.push((path, raw));
+        }
+        Ok(out)
     }
 
     fn spawn_stdio(self: &Arc<Self>, argv: &[String]) -> Result<Arc<Conn>, String> {
@@ -670,8 +743,8 @@ impl Shared {
         self.state.lock().unwrap().window.push_back(Instant::now());
         self.counters.restarts.fetch_add(1, Ordering::Relaxed);
         match self.connect_once().await {
-            Ok((conn, raw, t)) => {
-                let hash = schema_hash(&raw);
+            Ok((conn, kept, t)) => {
+                let hash = kept.hash();
                 if self.mounted_hash.get().is_some_and(|h| *h != hash) {
                     conn.shutdown.notify_one();
                     let why = "schema changed; restart the service".to_string();

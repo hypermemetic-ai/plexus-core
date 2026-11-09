@@ -1,6 +1,6 @@
 [package]
 name = "plexus-core"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
 license = "AGPL-3.0-only"
@@ -78,14 +78,14 @@ base64 = "0.22"
 # Hub macro for activation generation. The pairing: macros and core move on
 # the same minor line; only this direction can be a bound, since the macro
 # emits paths into this crate without depending on it.
-plexus-macros = { path = "../plexus-macros", version = "0.9.0" }
+plexus-macros = { path = "../plexus-macros", version = "0.10.0" }
 
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
 # Wasm-safe by construction; the dependency only runs this way (plexus-client
 # carries no server). Since PLEXUS-45 plexus-core builds for wasm32 too.
 # RETURNS-6: `schema` — the error frame carries plexus-client's `RemoteError`,
 # and `PlexusStreamItem` derives `JsonSchema`.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.9.0", features = ["schema"] }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.10.0", features = ["schema"] }
 
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code
@@ -141,10 +141,35 @@ required-features = ["child-ws"]
 name = "remote_child_perf"
 required-features = ["child-ws"]
 
+# VISION-5: a relay mounting the services that dial in, and a service that
+# dials out with no listening port; their test.
+[[example]]
+name = "relay"
+required-features = ["child-ws"]
+
+[[example]]
+name = "peer"
+required-features = ["child-ws"]
+
+[[test]]
+name = "dial"
+required-features = ["child-ws"]
+
 # RETURNS-47: no harness — the binary is the service and, run again by the
 # seam, the plugin on stdio, whose stdout carries the protocol alone.
 [[test]]
 name = "returns47_hop"
+harness = false
+
+# NEST-3/NEST-4: the host and, run again by the seam, a nested child on stdio.
+[[test]]
+name = "nest_spike"
+harness = false
+
+# NEST-6: dynamic children and peer slots through a mount; the host and, run
+# again by the seam, the child on stdio.
+[[test]]
+name = "nest6_dynamic"
 harness = false
 
 [dev-dependencies]
@@ -154,14 +179,14 @@ plexus-core = { path = ".", features = ["test-util"] }
 # PLEXUS-45: every other test dependency is the native suite's, as before.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.9.0", features = ["ws-native"] }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.10.0", features = ["ws-native"] }
 tempfile = "3"
 # POLYGLOT-5: tests/remote_child.rs signs a WebSocket child's trust in.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 base64 = "0.22"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-test = "0.4"
-# BIDIR-13: tests/question_matrix.rs answers a question from two sockets.
+# Tests that drive a service's module over a real WebSocket.
 jsonrpsee = { version = "0.26", features = ["server", "macros", "ws-client"] }
 # PERF-15: tests/describe_golden.rs pins each self-description answer by the
 # sha256 of its bytes (already in the lock, through jsonrpsee and ring's users).

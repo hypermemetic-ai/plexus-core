@@ -1,10 +1,9 @@
 //! PLEXUS-45 — plexus-core runs on `wasm32-unknown-unknown`, not only
 //! compiles: a `DynamicHub` with activations, dispatched in wasm.
 //!
-//! A plain call, a streaming call whose items are spaced by a timer, a
-//! question that times out (the bidirectional channel's `timeout`, through
-//! `plexus_core::rt`), the health activation (its `Instant`) and the schema
-//! read, all on the JS event loop with no tokio runtime.
+//! A plain call, a streaming call whose items are spaced by a timer, the
+//! health activation (its `Instant`) and the schema read, all on the JS
+//! event loop with no tokio runtime.
 //!
 //! Run under Node (no browser needed: everything here is JS's timers and
 //! clock, which Node has, and Node is what plexus-client's wasm tests use):
@@ -13,13 +12,11 @@
 //! `cargo test --target wasm32-unknown-unknown --no-default-features --test wasm_dispatch`.
 #![cfg(target_arch = "wasm32")]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
-use plexus_core::plexus::bidirectional::StandardBidirChannel;
-use plexus_core::plexus::{DynamicHub, PlexusStreamItem, StandardRequest, StandardResponse};
+use plexus_core::plexus::{DynamicHub, PlexusStreamItem};
 use plexus_core::activations::health::Health;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,7 +27,6 @@ use wasm_bindgen_test::wasm_bindgen_test;
 pub enum ClockEvent {
     Pong { msg: String },
     Tick { i: u64, after_ms: u64 },
-    Answer { answer: String },
     Error { message: String },
 }
 
@@ -60,23 +56,6 @@ impl Clock {
                 futures_timer::Delay::new(Duration::from_millis(gap_ms)).await;
                 yield ClockEvent::Tick { i, after_ms: start.elapsed().as_millis() as u64 };
             }
-        }
-    }
-
-    /// Asks a confirm nobody answers, waiting `timeout_ms`.
-    #[plexus_macros::method(bidirectional)]
-    pub async fn ask(&self, ctx: &Arc<StandardBidirChannel>, timeout_ms: u64) -> impl Stream<Item = ClockEvent> + Send + 'static {
-        let ctx = ctx.clone();
-        stream! {
-            let r = ctx
-                .request_with_timeout(StandardRequest::Confirm { message: "anyone?".into(), default: None }, Duration::from_millis(timeout_ms))
-                .await;
-            let answer = match r {
-                Ok(StandardResponse::Confirmed { value }) => format!("confirmed {value}"),
-                Ok(other) => format!("{other:?}"),
-                Err(e) => format!("err {e}"),
-            };
-            yield ClockEvent::Answer { answer };
         }
     }
 }
@@ -112,18 +91,6 @@ async fn a_streaming_call_on_the_event_loop() {
         assert_eq!(t["i"], i as u64);
     }
     assert!(ticks[2]["after_ms"].as_u64().unwrap() >= 55, "timers really waited: {ticks:?}");
-}
-
-#[wasm_bindgen_test]
-async fn a_question_times_out() {
-    let start = web_time::Instant::now();
-    let items = call(&hub(), "clock.ask", json!({"timeout_ms": 60})).await;
-    let waited = start.elapsed();
-    let answers = data(&items);
-    assert_eq!(answers.len(), 1, "{items:?}");
-    let answer = answers[0]["answer"].as_str().unwrap();
-    assert!(answer.starts_with("err") && answer.contains("60"), "a timeout: {answer}");
-    assert!(waited >= Duration::from_millis(50), "the timeout waited: {waited:?}");
 }
 
 #[wasm_bindgen_test]

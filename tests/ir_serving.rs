@@ -416,9 +416,9 @@ async fn walk(service: &DynamicHub) -> BTreeMap<String, Value> {
 async fn eq_the_hard_shapes_are_synapses() {
     let service = ir_hard_service::service();
     let schemas = serde_json::to_value(walk(&service).await).unwrap();
-    if std::env::var("IR_HARD_ACCEPT").as_deref() == Ok("1") {
+    let accept = std::env::var("IR_HARD_ACCEPT").as_deref() == Ok("1");
+    if accept {
         std::fs::write(hard("schemas.json"), serde_json::to_string_pretty(&schemas).unwrap() + "\n").unwrap();
-        return;
     }
     let kept: Value = serde_json::from_str(&std::fs::read_to_string(hard("schemas.json")).unwrap()).unwrap();
     assert!(schemas == kept, "the served schemas moved (IR_HARD_ACCEPT=1 writes them; then synapse's ir3-test the IR)");
@@ -428,6 +428,11 @@ async fn eq_the_hard_shapes_are_synapses() {
         ("ir.beta-inner.json", json!({"namespaces": ["beta", "alpha.inner"]})),
     ] {
         let served = ir_of(&service, params, None).await.expect("the IR");
+        // The IR too (plexus-core's is held equal to synapse's:
+        // regenerate synapse's goldens from the same schemas).
+        if accept {
+            std::fs::write(hard(file), ir::canonical(&served)).unwrap();
+        }
         let golden = std::fs::read_to_string(hard(file)).unwrap();
         assert!(ir::canonical(&served) == golden, "{file}: the service's IR is not synapse's");
     }

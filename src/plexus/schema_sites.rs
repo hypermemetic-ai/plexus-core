@@ -85,8 +85,6 @@ fn walk_plugin(plugin: &PluginSchema, mode: Mode) -> Vec<String> {
         for (what, s) in [
             ("error", &m.error),
             ("progress", &m.progress),
-            ("request_type", &m.request_type),
-            ("response_type", &m.response_type),
             ("input", &m.input),
         ] {
             if let Some(s) = s {

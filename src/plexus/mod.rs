@@ -33,6 +33,7 @@ pub mod input;
 pub mod hub_transport;
 pub mod method_enum;
 pub mod middleware;
+pub mod parent;
 pub mod path;
 pub mod plexus;
 // POLYGLOT-5: the child seam's second implementation — a process or a socket.
@@ -106,7 +107,7 @@ pub use crate::types::Handle;
 pub use schema::{
     AuthPosture, Cardinality, ChildHashes, ChildSummary, DeprecationInfo, MethodExample, MethodRole,
     MethodSchema, ParamSchema, PluginHashes, PluginSchema, RequiredCredential, Schema,
-    SchemaParams, SchemaProperty, SchemaResult, SchemaType, ViewKind, JSON_TYPES,
+    Need, SchemaParams, SchemaProperty, SchemaResult, SchemaType, ViewKind, JSON_TYPES,
     X_PLEXUS_VALUES,
 };
 pub use types::{PlexusStreamItem, StreamMetadata};
@@ -119,3 +120,5 @@ pub use streaming::{wrap_one, wrap_one_result, wrap_result_stream, wrap_progress
 pub use dispatch::{HubDispatch, StreamItem, from_dispatch_stream};
 pub use crate::request::PlexusRequestField;
 pub use hub_context::{HubContext, ParentAware, NoParent};
+// NEST-16: a graft that knows its parent.
+pub use parent::{NeedsMiss, Notice, Parent, ParentTransport, Upward, UpwardError};

@@ -65,6 +65,10 @@ pub enum RootError {
     /// Not one segment of `[A-Za-z0-9_-]`.
     #[error("`{name}` is not a top-level name: one segment of letters, digits, `_` and `-`")]
     BadName { name: String },
+    /// NEST-16: the entry is a graft whose needs this service does not
+    /// serve as it was built against.
+    #[error("{0}")]
+    Needs(super::parent::NeedsMiss),
 }
 
 /// A top-level name: one segment.
@@ -266,6 +270,9 @@ impl ActivationObject for PeerObject {
     }
     fn plugin_schema(&self) -> PluginSchema {
         served_as(&self.name, self.peer.interface().schema().clone())
+    }
+    fn needs(&self) -> Option<Vec<super::schema::Need>> {
+        self.peer.interface().schema().needs.clone()
     }
     fn static_child_schemas(&self) -> Vec<(String, PluginSchema)> {
         Vec::new()

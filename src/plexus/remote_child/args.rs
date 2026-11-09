@@ -57,6 +57,11 @@ pub struct ChildArgs {
     /// goes first. 0 keeps none.
     #[arg(long = "child-schema-cache", value_name = "N", default_value_t = 1024, hide_short_help = true)]
     pub child_schema_cache: usize,
+    /// NEST-16: a child that declares no `needs` may call up anything its
+    /// caller could (NEST-11's rule), not only the standard upward
+    /// interface. Kept for one release.
+    #[arg(long = "child-legacy-upcalls", hide_short_help = true)]
+    pub child_legacy_upcalls: bool,
 }
 
 /// The flags' own defaults (a derived `Default` would say 0 for each
@@ -72,6 +77,7 @@ impl Default for ChildArgs {
             child_key: None,
             child_max_depth: d.max_depth,
             child_schema_cache: d.schema_cache,
+            child_legacy_upcalls: d.legacy_upcalls,
         }
     }
 }
@@ -86,6 +92,7 @@ impl ChildArgs {
             key: self.child_key.clone(),
             max_depth: self.child_max_depth,
             schema_cache: self.child_schema_cache,
+            legacy_upcalls: self.child_legacy_upcalls,
             ..ChildOptions::for_service(service)
         }
     }

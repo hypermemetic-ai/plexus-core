@@ -266,6 +266,10 @@ pub fn spec_fields(error: &RemoteError) -> serde_json::Map<String, Value> {
             DenyReason::NotAccepted => {
                 m.insert("reason".into(), "not_accepted".into());
             }
+            DenyReason::NotNeeded { method } => {
+                m.insert("reason".into(), "not_needed".into());
+                m.insert("method".into(), method.as_str().into());
+            }
         },
         RemoteError::TooManyCalls { max, child } => {
             m.insert("max".into(), (*max).into());

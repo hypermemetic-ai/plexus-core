@@ -1,6 +1,6 @@
 [package]
 name = "plexus-core"
-version = "0.10.2"
+version = "0.11.0"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
 license = "AGPL-3.0-only"
@@ -78,14 +78,14 @@ base64 = "0.22"
 # Hub macro for activation generation. The pairing: macros and core move on
 # the same minor line; only this direction can be a bound, since the macro
 # emits paths into this crate without depending on it.
-plexus-macros = { path = "../plexus-macros", version = "0.10.0" }
+plexus-macros = { path = "../plexus-macros", version = "0.11.0" }
 
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
 # Wasm-safe by construction; the dependency only runs this way (plexus-client
 # carries no server). Since PLEXUS-45 plexus-core builds for wasm32 too.
 # RETURNS-6: `schema` — the error frame carries plexus-client's `RemoteError`,
 # and `PlexusStreamItem` derives `JsonSchema`.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.10.0", features = ["schema"] }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.11.0", features = ["schema"] }
 
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code
@@ -178,6 +178,10 @@ harness = false
 name = "nest11_calls_back"
 harness = false
 
+[[test]]
+name = "nest16_graft"
+harness = false
+
 [dev-dependencies]
 # RETURNS-47: this crate's own tests use `call::test::in_call`.
 plexus-core = { path = ".", features = ["test-util"] }
@@ -185,7 +189,7 @@ plexus-core = { path = ".", features = ["test-util"] }
 # PLEXUS-45: every other test dependency is the native suite's, as before.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # LOCAL-6: tests/hub_transport.rs runs one client over the WebSocket too.
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.10.0", features = ["ws-native"] }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.11.0", features = ["ws-native"] }
 tempfile = "3"
 # POLYGLOT-5: tests/remote_child.rs signs a WebSocket child's trust in.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

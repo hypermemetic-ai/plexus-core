@@ -706,6 +706,46 @@ pub struct PluginSchema {
     /// gate answers, so those stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ViewKind>,
+
+    /// NEST-16: what this activation calls of the service it is grafted
+    /// onto — each method by its path from that service's root and the
+    /// shape hash it was built against (`#[activation(parent = ShopClient)]`,
+    /// inferred from the bodies). `None` (absent on the wire, so every older
+    /// schema reads): the activation declares nothing — it may call its
+    /// service's standard upward interface alone (`host.schema`,
+    /// `host.whoami`, `host.log`, `host.notify`). `Some([])`: it knows its
+    /// parent and calls none of its methods.
+    ///
+    /// Not in `PluginSchema`'s own JSON Schema (`schemars(skip)`): that
+    /// schema is every activation's `schema` method's `returns`, and a new
+    /// property there would move every service's hash for a field few
+    /// schemas carry. A client reads it as an extra key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub needs: Option<Vec<Need>>,
+}
+
+/// NEST-16: one method an activation calls of the service it is grafted
+/// onto (its parent): a graft is refused where `method` is missing, or its
+/// shape moved from `hash`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct Need {
+    /// The method's dotted path from the parent's root: `shop.items`,
+    /// `shop.ui.slots.list`.
+    pub method: String,
+    /// The method's shape hash ([`super::peer::Interface::method_hash`]) as
+    /// the child was built against it; empty when it could not be known at
+    /// build (an entry named by hand in `uses(…)`): then only its presence
+    /// is checked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hash: String,
+}
+
+impl Need {
+    /// A need for `method`, its shape `hash` (empty: presence only).
+    pub fn new(method: impl Into<String>, hash: impl Into<String>) -> Self {
+        Self { method: method.into(), hash: hash.into() }
+    }
 }
 
 /// AUTH-4: the two views of a gated hub. On the wire, `"anonymous"` or
@@ -1130,6 +1170,12 @@ fn is_false(v: &bool) -> bool {
 }
 
 impl PluginSchema {
+    /// NEST-16: what this activation calls of its parent ([`Need`]).
+    pub fn with_needs(mut self, needs: Vec<Need>) -> Self {
+        self.needs = Some(needs);
+        self
+    }
+
     /// Compute all three hashes (self, children, composite).
     ///
     /// RETURNS-10: SHA-256, 16 lowercase hex, each the
@@ -1361,6 +1407,7 @@ impl PluginSchema {
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
             view: None,
+            needs: None,
         }
     }
 
@@ -1392,6 +1439,7 @@ impl PluginSchema {
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
             view: None,
+            needs: None,
         }
     }
 
@@ -1423,6 +1471,7 @@ impl PluginSchema {
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
             view: None,
+            needs: None,
         }
     }
 
@@ -1455,6 +1504,7 @@ impl PluginSchema {
             deprecation: None,
             roles: std::collections::BTreeMap::new(),
             view: None,
+            needs: None,
         }
     }
 

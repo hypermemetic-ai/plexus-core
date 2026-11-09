@@ -174,12 +174,20 @@ struct Inner {
     timings: MountTimings,
     /// NEST-6: each dynamic instance's schema, asked once per name.
     names: names::Names,
+    /// NEST-16: what the child needs of its service: its own schema's
+    /// `needs` and every static child's, as one list (`None`: none declares).
+    needs: Option<Vec<crate::plexus::schema::Need>>,
 }
 
 impl Inner {
     pub(super) fn new(shared: Arc<Shared>, schema: PluginSchema, nodes: Vec<(String, PluginSchema)>, timings: MountTimings) -> Self {
         let names = names::Names::new(shared.opts.schema_cache);
-        Self { shared, schema, nodes, timings, names }
+        let declared = schema.needs.is_some() || nodes.iter().any(|(_, n)| n.needs.is_some());
+        let mut needs: Vec<crate::plexus::schema::Need> = schema.needs.iter().chain(nodes.iter().filter_map(|(_, n)| n.needs.as_ref())).flatten().cloned().collect();
+        needs.sort();
+        needs.dedup_by(|a, b| a.method == b.method);
+        let needs = declared.then_some(needs);
+        Self { shared, schema, nodes, timings, names, needs }
     }
 }
 
@@ -265,7 +273,10 @@ impl RemoteChild {
         shared.install(conn);
         timings.merge_ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::info!(target: "plexus::child", child = %name, spawn_ms = timings.spawn_ms, schema_ms = timings.schema_ms, merge_ms = timings.merge_ms, methods = schema.methods.len(), children = nodes.len(), "child mounted");
-        Ok(Self { inner: Arc::new(Inner::new(shared, schema, nodes, timings)) })
+        let inner = Inner::new(shared, schema, nodes, timings);
+        // NEST-16: the child's calls back are held to what it needs.
+        inner.shared.upcalls.set_needs(inner.needs.as_deref());
+        Ok(Self { inner: Arc::new(inner) })
     }
 
     #[allow(unused_variables)]
@@ -325,6 +336,12 @@ impl RemoteChild {
             }),
             Err(other) => Err(format!("{other:?}")),
         }
+    }
+
+    /// NEST-16: what the child's schema says it needs of the service it is
+    /// mounted in (`None`: it declares nothing).
+    pub fn needs(&self) -> Option<&[crate::plexus::schema::Need]> {
+        self.inner.needs.as_deref()
     }
 
     /// NEST-11: forwarded calls open now that the child may call back under.
@@ -627,6 +644,10 @@ impl Drop for CallStream {
 #[async_trait]
 impl Activation for RemoteChild {
     type Methods = ChildMethods;
+
+    fn needs(&self) -> Option<Vec<crate::plexus::schema::Need>> {
+        self.inner.needs.clone()
+    }
 
     fn namespace(&self) -> &str {
         self.name()

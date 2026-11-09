@@ -35,6 +35,17 @@ alone, unless the service keeps NEST-11's rule for it for this release:
 `ChildOptions::legacy_upcalls` / `with_legacy_upcalls`,
 `--child-legacy-upcalls`. `RemoteChild::needs()` (its whole tree's).
 
+DYNAUTH-8 (additive): **transport hardening.** `plexus::redact` — one
+redactor for frame logs (`redact_str`, `redact_value`, `CREDENTIAL_KEYS`):
+a credential key keeps its name and loses its value. A stdio child's stderr,
+relayed into the service's log, goes through it. `child-wss` builds its own
+rustls client (ring; the webpki roots plus the new
+`ChildOptions::tls_roots`, a PEM file of more CAs) and every mount pins its
+child's identity — `RemoteChild::identity()`, a `PeerIdentity` of its
+`_info` backend and, on `wss://`, the sha256 of its certificate's public
+key; a restart or redial that proves another is refused for good
+(`dead()`), as one publishing another schema is.
+
 ## 0.10.2 (unreleased; folded into 0.11.0)
 
 NEST-15 (additive): **the service root is the primitive — a table of peers

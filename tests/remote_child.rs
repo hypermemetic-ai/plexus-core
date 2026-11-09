@@ -565,3 +565,37 @@ async fn same_answers_as_in_process() {
     assert_eq!(x.len(), 200);
     handle.stop().unwrap();
 }
+
+// ------------------------------------------------------------- DYNAUTH-8
+
+/// A child that logs a frame carrying a credential on its stderr (as
+/// plexus-transport's stdio did at debug): the line the service relays
+/// holds none of the credential's bytes.
+#[tokio::test]
+async fn a_childs_stderr_is_relayed_without_its_credentials() {
+    use std::sync::Mutex;
+    const SECRET: &str = "ghu_dynauth8StderrSecret";
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Log {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let log = Log::default();
+    let w = log.clone();
+    let sub = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_ansi(false).with_writer(move || w.clone()).finish();
+    let _g = tracing::subscriber::set_default(sub);
+    let line = format!(r#"Received request: {{"method":"x.call","params":{{"repo":"a/b","credential":"{SECRET}"}}}}"#);
+    let spec = ChildSpec::Stdio { name: "talky".into(), argv: vec!["sh".into(), "-c".into(), format!("echo '{line}' >&2; sleep 2")] };
+    let e = RemoteChild::connect(spec, ChildOptions { timeout: Duration::from_millis(500), ..ChildOptions::default() }).await.unwrap_err();
+    assert!(e.to_string().contains("_info"), "{e}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let text = String::from_utf8_lossy(&log.0.lock().unwrap()).to_string();
+    assert!(text.contains("Received request") && text.contains("a/b"), "relayed: {text}");
+    assert!(!text.contains(SECRET), "a credential relayed: {text}");
+}

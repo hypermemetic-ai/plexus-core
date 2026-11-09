@@ -36,6 +36,8 @@ pub mod middleware;
 pub mod parent;
 pub mod path;
 pub mod plexus;
+/// DYNAUTH-8: frame logs never carry a credential.
+pub mod redact;
 // POLYGLOT-5: the child seam's second implementation — a process or a socket.
 // PLEXUS-45: native only. A browser has no processes, and a ws child waits
 // for a browser-WebSocket transport (a later ticket); on wasm32 the module
@@ -71,7 +73,7 @@ pub use in_process::InProcessTransport;
 pub use input::{Delivered, Input, InputTable};
 pub use hub_transport::HubTransport;
 #[cfg(not(target_arch = "wasm32"))]
-pub use remote_child::{Backoff, ChildError, ChildMethods, ChildOptions, ChildSpec, ChildStats, MountTimings, RemoteChild};
+pub use remote_child::{Backoff, ChildError, ChildMethods, ChildOptions, ChildSpec, ChildStats, MountTimings, PeerIdentity, RemoteChild};
 #[cfg(all(feature = "clap", not(target_arch = "wasm32")))]
 pub use remote_child::ChildArgs;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]

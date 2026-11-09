@@ -151,6 +151,9 @@ pub(super) struct Conn {
     pub up: OnceLock<Arc<Upcalls>>,
     /// NEST-11: the calls back this connection is serving.
     served: Arc<Served>,
+    /// DYNAUTH-8: on `wss://`, the sha256 (hex) of the key the far side's
+    /// certificate holds (its SubjectPublicKeyInfo).
+    pub tls_key: OnceLock<String>,
 }
 
 /// One message, read in one pass: a notification's item stays raw until
@@ -208,6 +211,7 @@ impl Conn {
             counters,
             up: OnceLock::new(),
             served: Arc::default(),
+            tls_key: OnceLock::new(),
         })
     }
 
@@ -522,6 +526,10 @@ pub(super) struct Shared {
     pub mounted_hash: OnceLock<String>,
     /// NEST-11: the child's calls back into the service.
     pub upcalls: Arc<Upcalls>,
+    /// DYNAUTH-8 (TM-3): who the child proved it was at the mount, pinned:
+    /// a restart that proves another is refused, as one that publishes
+    /// another schema is.
+    pub identity: OnceLock<super::PeerIdentity>,
 }
 
 impl Drop for Shared {
@@ -597,6 +605,7 @@ impl Shared {
             state: Mutex::new(LinkState { conn: None, down_since: None, why: String::new(), window: VecDeque::new(), dead: None }),
             dial: tokio::sync::Mutex::new(()),
             mounted_hash: OnceLock::new(),
+            identity: OnceLock::new(),
         })
     }
 
@@ -709,7 +718,9 @@ impl Shared {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(l)) = lines.next_line().await {
                 let _e = span.enter();
-                tracing::info!(target: "plexus::child", child = %name, "{l}");
+                // DYNAUTH-8: a child that logs its frames (plexus-transport's
+                // stdio at debug did) never puts a credential in this log.
+                tracing::info!(target: "plexus::child", child = %name, "{}", crate::plexus::redact::redact_str(&l));
             }
         });
         Ok(conn)
@@ -775,6 +786,14 @@ impl Shared {
                     conn.shutdown.notify_one();
                     let why = "schema changed; restart the service".to_string();
                     tracing::error!(target: "plexus::child", child = %self.name, mounted = ?self.mounted_hash.get(), published = %hash, "the restarted child published another schema; not remounted: restart the service");
+                    self.state.lock().unwrap().dead = Some(why.clone());
+                    return Err(unavailable(&self.name, &why));
+                }
+                let proved = super::PeerIdentity::of(&conn);
+                if let Some(pinned) = self.identity.get().filter(|p| **p != proved) {
+                    conn.shutdown.notify_one();
+                    let why = format!("its identity changed: {pinned}, now {proved}; connect it again to trust the new one");
+                    tracing::error!(target: "plexus::child", child = %self.name, %pinned, %proved, "the restarted child proved another identity; not remounted");
                     self.state.lock().unwrap().dead = Some(why.clone());
                     return Err(unavailable(&self.name, &why));
                 }

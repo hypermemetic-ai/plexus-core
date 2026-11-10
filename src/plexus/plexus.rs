@@ -1245,7 +1245,9 @@ pub(crate) struct DynamicHubInner {
     /// BIDIR-6: every method path the service knows, and whether it takes an
     /// `Input` (see [`DynamicHub::may_take_input`]). Built once, on the first
     /// call (NEST-15: and again after the root's table changes).
-    input_index: std::sync::RwLock<Option<Arc<HashMap<String, bool>>>>,
+    /// PERF.115-49: FxHash — read on every `{ns}.call`, keyed by the
+    /// service's own method paths.
+    input_index: std::sync::RwLock<Option<Arc<rustc_hash::FxHashMap<String, bool>>>>,
     /// AUTH-2 — the grant gate: when set, every call is decided by it
     /// before routing (default deny). `None` (the default): dispatch exactly
     /// as before it existed. See [`super::grant_gate`].
@@ -2192,17 +2194,19 @@ impl DynamicHub {
     /// none — its own, each activation's, each static child's. A path they do
     /// not show (a dynamic child's) may.
     pub(crate) fn may_take_input(&self, method: &str) -> bool {
-        let kept = self.inner.input_index.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let index = match kept {
-            Some(index) => index,
-            None => {
+        // PERF.115-49: answered under the read guard, no `Arc` taken.
+        if let Some(index) = self.inner.input_index.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            return index.get(method).copied().unwrap_or(true);
+        }
+        let index = {
+            {
                 let own = Activation::plugin_schema(self).methods.into_iter().map(|m| (format!("{}.{}", self.inner.namespace, m.name), m.input.is_some()));
                 let schemas: Vec<PluginSchema> = self.table().entries.values().map(|e| e.object.plugin_schema()).chain(self.static_children()).collect();
                 let theirs = schemas.into_iter().flat_map(|schema| {
                     let ns = schema.namespace;
                     schema.methods.into_iter().map(move |m| (format!("{ns}.{}", m.name), m.input.is_some()))
                 });
-                let index: Arc<HashMap<String, bool>> = Arc::new(own.chain(theirs).collect());
+                let index: Arc<rustc_hash::FxHashMap<String, bool>> = Arc::new(own.chain(theirs).collect());
                 *self.inner.input_index.write().unwrap_or_else(|p| p.into_inner()) = Some(index.clone());
                 index
             }
@@ -2835,16 +2839,18 @@ impl DynamicHub {
                     // KEEL-32: the own-namespace form is the bare form.
                     let method = self.bare_introspection(method);
                     let grant = plexus_auth_core::grants::Grant::new(method.to_string());
-                    in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
+                    // PERF.115-49: boxed — the introspection path's future is
+                    // the largest, and inline every call's future was its size.
+                    Box::pin(in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
                         match self.introspect_in_view(method, &params, auth, raw_ctx).await {
                             Some(answer) => answer,
                             None => self.route_ungated(method, params, auth, raw_ctx).await,
                         }
-                    })
+                    }))
                     .await
                 }
                 super::grant_gate::Admit::Reach(reach) => {
-                    in_call(crate::call::CallContext::admitted(auth, reach), self.route_ungated(method, params, auth, raw_ctx)).await
+                    in_call(crate::call::CallContext::admitted_by_gate(auth, reach), self.route_ungated(method, params, auth, raw_ctx)).await
                 }
             };
         }
@@ -2873,7 +2879,9 @@ impl DynamicHub {
                 .scope_registry
                 .as_deref()
                 .unwrap_or_else(|| super::scope_gate::empty_registry());
-            super::scope_gate::enforce(
+            // PERF.115-49: boxed — configured by no tenant; inline, its
+            // future was part of every call's.
+            Box::pin(super::scope_gate::enforce(
                 registry,
                 self.inner.default_deny,
                 &self.inner.audit_sink,
@@ -2881,7 +2889,7 @@ impl DynamicHub {
                 self.gate_index().info(method),
                 auth,
                 raw_ctx.and_then(|ctx| ctx.peer.map(|peer| peer.ip())),
-            )
+            ))
             .await?;
         }
 

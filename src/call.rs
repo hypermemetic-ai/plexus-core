@@ -74,16 +74,19 @@ pub struct CallContext(Arc<Inner>);
 
 struct Inner {
     auth: Option<AuthContext>,
-    reach: OnceLock<Reach>,
-    /// An introspection call's reach, asked of the gate only if something
-    /// reads it (PERF-15: an introspection answer looks no role up).
-    deferred: Option<(Arc<Gate>, Grant)>,
-    hop: Option<Hop>,
+    /// PERF.115-49: the caller is the one the gate decided `reach` for
+    /// ([`Reach::caller`]), read there rather than kept twice; `auth` is
+    /// then `None`.
+    auth_in_reach: bool,
+    reach: ReachCell,
+    /// Boxed (PERF.115-49): only a call through the child seam has one, and
+    /// inline it was 144 of every context's bytes.
+    hop: Option<Box<Hop>>,
     /// What a trait-impl method's verifier answered for this call
     /// (`#[plexus_macros::from_auth(…)]` on the method): [`verified`]. Shared
     /// by a context narrowed from this one (`with_reach`: the same call);
     /// another caller's context (`with_auth`, `ungated`) starts its own.
-    verified: Verified,
+    verified: OnceLock<Verified>,
     /// NEST-11: in a child, its link back to the service that forwarded the
     /// call (`remote_child::host`).
     host: Option<Arc<dyn Any + Send + Sync>>,
@@ -91,21 +94,32 @@ struct Inner {
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
 
+/// PERF.115-49: the call's reach — known when the context is made (every
+/// call the dispatch admits: no `Once` to set it through), or an
+/// introspection call's, asked of the gate only if something reads it
+/// (PERF-15: an introspection answer looks no role up).
+enum ReachCell {
+    Known(Reach),
+    Deferred(Arc<Gate>, Grant, OnceLock<Reach>),
+}
+
 impl Inner {
-    fn with(auth: Option<AuthContext>, reach: Option<Reach>, deferred: Option<(Arc<Gate>, Grant)>, hop: Option<Hop>) -> Self {
-        let cell = OnceLock::new();
-        if let Some(r) = reach {
-            let _ = cell.set(r);
-        }
-        Inner { auth, reach: cell, deferred, hop, verified: Verified::default(), host: None }
+    fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Box<Hop>>) -> Self {
+        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None }
+    }
+
+    /// The call's verified slot, made when first set or shared (PERF.115-49:
+    /// a call whose method has no verifier allocates none).
+    fn verified(&self) -> &Verified {
+        self.verified.get_or_init(Verified::default)
     }
 }
 
 impl fmt::Debug for CallContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CallContext")
-            .field("principal", &self.0.auth.as_ref().and_then(|a| a.principal()).map(|p| p.to_string()))
-            .field("reach", &self.0.reach.get())
+            .field("principal", &self.auth().and_then(|a| a.principal()).map(|p| p.to_string()))
+            .field("reach", &self.reach())
             .field("hop", &self.0.hop)
             .finish()
     }
@@ -116,14 +130,30 @@ impl CallContext {
     /// stands (none: anonymous), `reach` what the gate answered — or
     /// [`Reach::everywhere`] on a service without a gate.
     pub(crate) fn admitted(auth: Option<&AuthContext>, reach: Reach) -> Self {
-        Self(Arc::new(Inner::with(auth.cloned(), Some(reach), None, None)))
+        Self(Arc::new(Inner::with(auth.cloned(), ReachCell::Known(reach), None)))
+    }
+
+    /// PERF.115-49: a call a gated service's dispatch admitted on the
+    /// gate's `reach` — whose caller is the identity that stands, the one
+    /// the gate was asked about ([`Reach::caller`]), so the context reads it
+    /// from the reach rather than cloning it again. Only for a reach the
+    /// gate answered for this call's own caller.
+    pub(crate) fn admitted_by_gate(auth: Option<&AuthContext>, reach: Reach) -> Self {
+        debug_assert_eq!(
+            reach.caller().map(|a| (&a.user_id, &a.session_id)),
+            auth.map(|a| (&a.user_id, &a.session_id)),
+            "a gate's reach names the caller it was decided for"
+        );
+        let mut inner = Inner::with(None, ReachCell::Known(reach), None);
+        inner.auth_in_reach = true;
+        Self(Arc::new(inner))
     }
 
     /// An introspection call a gated service let through (AUTH-4): its
     /// reach is the caller's for the path, as the gate answers a public
     /// method's — asked only when read.
     pub(crate) fn introspection(auth: Option<&AuthContext>, gate: Arc<Gate>, grant: Grant) -> Self {
-        Self(Arc::new(Inner::with(auth.cloned(), None, Some((gate, grant)), None)))
+        Self(Arc::new(Inner::with(auth.cloned(), ReachCell::Deferred(gate, grant, OnceLock::new()), None)))
     }
 
     /// A call that came through the child seam (owner, 2026-11-04: children
@@ -147,7 +177,7 @@ impl CallContext {
             Some(l) if !unreadable => ceiling_reach(auth.as_ref(), &l.grant, &hop.held_on()),
             _ => Reach::nowhere(),
         };
-        Self(Arc::new(Inner::with(auth, Some(reach), None, Some(hop))))
+        Self(Arc::new(Inner::with(auth, ReachCell::Known(reach), Some(Box::new(hop)))))
     }
 
     /// NEST-11: [`CallContext::through_hop`], with the link back to the
@@ -184,7 +214,7 @@ impl CallContext {
         } else {
             (Reach::nowhere(), None)
         };
-        let mut inner = Inner::with(auth, Some(reach), None, hop);
+        let mut inner = Inner::with(auth, ReachCell::Known(reach), hop);
         inner.host = self.0.host.clone().filter(|_| keeps_identity);
         Self(Arc::new(inner))
     }
@@ -192,7 +222,12 @@ impl CallContext {
     /// This context with its identity replaced: a call routed from inside
     /// another, through a service with no gate of its own.
     pub(crate) fn with_auth(&self, auth: Option<&AuthContext>) -> Self {
-        let mut inner = Inner::with(auth.cloned(), self.0.reach.get().cloned(), self.0.deferred.clone(), self.0.hop.clone());
+        let reach = match &self.0.reach {
+            ReachCell::Known(r) => ReachCell::Known(r.clone()),
+            ReachCell::Deferred(_, _, cell) if cell.get().is_some() => ReachCell::Known(cell.get().unwrap().clone()),
+            ReachCell::Deferred(gate, grant, _) => ReachCell::Deferred(gate.clone(), grant.clone(), OnceLock::new()),
+        };
+        let mut inner = Inner::with(auth.cloned(), reach, self.0.hop.clone());
         inner.host = self.0.host.clone();
         Self(Arc::new(inner))
     }
@@ -200,8 +235,8 @@ impl CallContext {
     /// This context with its reach replaced: the same call, so the same
     /// verified value (the same slot, set once for both).
     pub(crate) fn with_reach(&self, reach: Reach) -> Self {
-        let mut inner = Inner::with(self.0.auth.clone(), Some(reach), None, self.0.hop.clone());
-        inner.verified = Arc::clone(&self.0.verified);
+        let mut inner = Inner::with(self.auth().cloned(), ReachCell::Known(reach), self.0.hop.clone());
+        inner.verified = OnceLock::from(Arc::clone(self.0.verified()));
         inner.host = self.0.host.clone();
         Self(Arc::new(inner))
     }
@@ -209,22 +244,24 @@ impl CallContext {
     /// The identity the gate admitted (in a child, the one the hop names, or
     /// the one its forward policy derived); `None` for an anonymous call.
     pub fn auth(&self) -> Option<&AuthContext> {
-        self.0.auth.as_ref()
+        match (self.0.auth_in_reach, &self.0.reach) {
+            (true, ReachCell::Known(reach)) => reach.caller(),
+            _ => self.0.auth.as_ref(),
+        }
     }
 
     /// The reach the gate answered (in a child through the seam, the hop's
     /// ceiling).
     pub fn reach(&self) -> Option<&Reach> {
-        if let Some(reach) = self.0.reach.get() {
-            return Some(reach);
-        }
-        let (gate, grant) = self.0.deferred.as_ref()?;
-        Some(self.0.reach.get_or_init(|| gate.reach_of_public(self.0.auth.as_ref(), grant)))
+        Some(match &self.0.reach {
+            ReachCell::Known(reach) => reach,
+            ReachCell::Deferred(gate, grant, cell) => cell.get_or_init(|| gate.reach_of_public(self.0.auth.as_ref(), grant)),
+        })
     }
 
     /// The hop the call came through, in a child.
     pub fn hop(&self) -> Option<&Hop> {
-        self.0.hop.as_ref()
+        self.0.hop.as_deref()
     }
 
     /// The caller this context names: an error for a call that came
@@ -369,7 +406,8 @@ pub fn admits_everywhere(grant: &str) -> Result<(), PlexusError> {
 /// no verifier of type `T`.
 pub fn verified<T: Clone + Send + Sync + 'static>() -> Result<T, CallError> {
     let ctx = context()?;
-    let held = ctx.0.verified.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let Some(slot) = ctx.0.verified.get() else { return Err(CallError::NotVerified) };
+    let held = slot.lock().unwrap_or_else(|p| p.into_inner()).clone();
     held.and_then(|v| v.downcast_ref::<T>().cloned()).ok_or(CallError::NotVerified)
 }
 
@@ -380,7 +418,7 @@ pub fn verified<T: Clone + Send + Sync + 'static>() -> Result<T, CallError> {
 #[doc(hidden)]
 pub fn __keep_verified<T: Send + Sync + 'static>(value: T) -> Result<(), CallError> {
     let ctx = context()?;
-    let mut held = ctx.0.verified.lock().unwrap_or_else(|p| p.into_inner());
+    let mut held = ctx.0.verified().lock().unwrap_or_else(|p| p.into_inner());
     if held.is_some() {
         return Err(CallError::AlreadyVerified);
     }

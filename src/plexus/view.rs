@@ -145,12 +145,17 @@ struct Asker<'a> {
 }
 
 impl Asker<'_> {
-    /// Whether the view keeps a method, and its `held_on` there.
-    fn keep(&self, grant: &str, public: bool) -> Option<Option<Vec<String>>> {
+    /// Whether the view keeps a method, and its `held_on` there. KEEL-31: a
+    /// method that acts `everywhere` is kept only where it is held on `*` —
+    /// where the gate would admit it.
+    fn keep(&self, grant: &str, public: bool, everywhere: bool) -> Option<Option<Vec<String>>> {
         let Some(who) = self.who else {
             return public.then_some(None);
         };
         let held: Vec<String> = self.gate.held_on_by(who, &Grant::new(grant)).iter().map(|s| s.as_str().to_string()).collect();
+        if everywhere {
+            return held.iter().any(|s| s == "*").then_some(Some(held));
+        }
         if !held.is_empty() {
             return Some(Some(held));
         }
@@ -180,7 +185,9 @@ pub(crate) struct Described {
 /// on menger is as large as `tickets.schema` itself.
 struct Below {
     namespace: String,
-    grants: Vec<(String, bool)>,
+    /// Each method's grant, whether it is `public`, and whether it acts
+    /// `everywhere` (KEEL-31).
+    grants: Vec<(String, bool, bool)>,
 }
 
 impl Below {
@@ -189,7 +196,7 @@ impl Below {
             .methods
             .iter()
             .filter(|m| matches!(m.role, MethodRole::Rpc) && !m.is_auto_schema())
-            .map(|m| (m.grant_or(&child.namespace), m.public))
+            .map(|m| (m.grant_or(&child.namespace), m.public, m.everywhere))
             .collect();
         Below { namespace: child.namespace.clone(), grants }
     }
@@ -382,8 +389,8 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, base: &Described, at: usiz
         if m.role.is_slot() {
             let slot = super::slots::slot_path(ns, &m.name);
             let reached = reaches_below(asker, &slot, &base.below).unwrap_or(false)
-                || asker.keep(&slot, false).is_some()
-                || asker.keep(&m.grant_or(ns), m.public).is_some();
+                || asker.keep(&slot, false, false).is_some()
+                || asker.keep(&m.grant_or(ns), m.public, m.everywhere).is_some();
             if reached {
                 kept.push((i, None));
             }
@@ -398,7 +405,7 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, base: &Described, at: usiz
             }
         }
         let grant = m.grant_or(ns);
-        if let Some(held) = asker.keep(&grant, m.public) {
+        if let Some(held) = asker.keep(&grant, m.public, m.everywhere) {
             kept.push((i, held));
         }
     }
@@ -429,7 +436,7 @@ fn reaches_below(asker: &Asker<'_>, path: &str, children: &[Below]) -> Option<bo
     let below = format!("{path}.");
     let mut known = children.iter().filter(|c| c.namespace == path || c.namespace.starts_with(&below)).peekable();
     known.peek()?;
-    Some(known.flat_map(|c| c.grants.iter()).any(|(grant, public)| asker.keep(grant, *public).is_some()))
+    Some(known.flat_map(|c| c.grants.iter()).any(|(grant, public, everywhere)| asker.keep(grant, *public, *everywhere).is_some()))
 }
 
 /// Recompute `self_hash`, `children_hash` and `hash` over what the schema

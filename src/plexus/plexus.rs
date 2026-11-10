@@ -2709,7 +2709,12 @@ impl DynamicHub {
                 // grant; a grant written as its literal path still decides
                 // first (the slot grant is additive).
                 None => match index.info(method) {
-                    Some(slot) => decide(None).or_else(|_| decide(Some(slot))),
+                    // KEEL-31: a slot's method that acts everywhere is
+                    // decided on `*` by its literal path too.
+                    Some(slot) => {
+                        let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, ..Default::default() };
+                        decide(Some(&literal)).or_else(|_| decide(Some(slot)))
+                    }
                     None => decide(None),
                 },
             }

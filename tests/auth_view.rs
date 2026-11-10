@@ -446,13 +446,17 @@ async fn role_set_changes_the_next_view() {
     assert_eq!(out["type"], "error");
     let out = one(&w, "auth.role_set", json!({"role": "admin", "grants": []}), Some(&root)).await;
     assert_eq!(out["type"], "error");
-    // Admin on MENGER only is not admin on *: refused in band, typed.
-    let out = one(&w, "auth.role_set", json!({"role": "editor", "grants": []}), Some(&key(MENGER_ADMIN, "m"))).await;
-    println!("WIRE auth.role_set refused in band: {out}");
-    assert_eq!(out["error_kind"], "forbidden");
-    assert_eq!(out["grant"], "auth.role_set");
-    assert_eq!(out["scope"], "*");
-    assert_eq!(out["held_on"], json!(["MENGER"]));
+    // Admin on MENGER only is not admin on *: KEEL-31, `role_set` acts
+    // everywhere, so the gate refuses it before it opens, typed.
+    let refused = call(&w, "auth.role_set", json!({"role": "editor", "grants": []}), Some(&key(MENGER_ADMIN, "m"))).await;
+    match refused {
+        Err(PlexusError::Forbidden { reason: plexus_core::plexus::AuthzDenyReason::MissingGrant { grant, scope, held_on, .. } }) => {
+            assert_eq!(grant.as_str(), "auth.role_set");
+            assert!(scope.is_everywhere());
+            assert_eq!(held_on.iter().map(|s| s.as_str()).collect::<Vec<_>>(), ["MENGER"]);
+        }
+        other => panic!("a scoped admin's role_set: {other:?}"),
+    }
 }
 
 /// MACRO-12: `auth.*`'s parameters are types — a value that is not a role
@@ -569,9 +573,10 @@ async fn signup_waits_and_an_admin_sees_it() {
     let list = call(&w, "auth.waiting", json!({}), Some(&root)).await.unwrap();
     println!("WIRE auth.waiting: {}", json!(list));
     assert_eq!(list, vec![json!({"type": "waiting", "principal": NEW, "name": "worker-9", "provider": "key", "since": since})]);
-    // Not for a non-admin; admin on MENGER only is refused in band.
+    // Not for a non-admin; admin on MENGER only is refused by the gate
+    // (KEEL-31: `waiting` acts everywhere).
     assert!(matches!(call(&w, "auth.waiting", json!({}), Some(&key(ADA, "a"))).await, Err(PlexusError::Forbidden { .. })));
-    assert_eq!(one(&w, "auth.waiting", json!({}), Some(&key(MENGER_ADMIN, "m"))).await["error_kind"], "forbidden");
+    assert!(matches!(call(&w, "auth.waiting", json!({}), Some(&key(MENGER_ADMIN, "m"))).await, Err(PlexusError::Forbidden { .. })));
     // Granted, it leaves the list.
     one(&w, "auth.grant", json!({"principal": NEW, "role": "viewer", "scope": "MENGER"}), Some(&root)).await;
     assert!(call(&w, "auth.waiting", json!({}), Some(&root)).await.unwrap().is_empty());

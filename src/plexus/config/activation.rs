@@ -248,7 +248,8 @@ fn holds_critical(auth: Option<&AuthContext>) -> bool {
     let gate = crate::plexus::service_scope::current().and_then(|w| w.upgrade()).and_then(|s| s.gate().cloned());
     match gate {
         None => true,
-        Some(g) => g.check(auth, &plexus_auth_core::grants::Grant::new(CRITICAL_GRANT), None).is_ok(),
+        // KEEL-31: a critical setting is the whole service's: held on `*`.
+        Some(g) => g.check_everywhere(auth, &plexus_auth_core::grants::Grant::new(CRITICAL_GRANT)).is_ok(),
     }
 }
 
@@ -270,7 +271,7 @@ impl ConfigKeyActivation {
     /// `confirm_within` (`60s`): applied at once, reverted unless
     /// `confirm` comes in time — so a change that cuts the caller off undoes
     /// itself.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn set(&self, auth: Option<&AuthContext>, value: Value, confirm_within: Option<String>) -> SettingEvent {
         let within = match confirm_within.as_deref().map(parse_duration).transpose() {
             Ok(w) => w,
@@ -292,7 +293,7 @@ impl ConfigKeyActivation {
 
     /// Take its runtime value away: back to the flag's, the file's or the
     /// default.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn reset(&self, auth: Option<&AuthContext>) -> SettingEvent {
         if let Err(e) = self.may_write(auth, None) {
             return e;
@@ -304,7 +305,7 @@ impl ConfigKeyActivation {
     }
 
     /// Keep the change made with `confirm_within`.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn confirm(&self, auth: Option<&AuthContext>) -> SettingEvent {
         if let Err(e) = self.may_write(auth, None) {
             return e;

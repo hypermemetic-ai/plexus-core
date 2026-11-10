@@ -764,6 +764,7 @@ impl AuthActivation {
     /// Set a role's grants (admin on `*`). Each entry a grant
     /// (`tickets.get`) or an existing role whose grants it includes.
     #[plexus_macros::method(
+        everywhere,
         group = "admin",
         description = "Set a role's grants (admin on *)",
         params(role = "The role (not admin)", grants = "Grants (tickets.get) or roles to include")
@@ -772,6 +773,8 @@ impl AuthActivation {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
+            // KEEL-31: the gate decides it on `*` (`everywhere`); kept as a
+            // backstop for a reach handed in by hand.
             if !reach.is_everywhere() {
                 yield needs_everywhere(&inner.gate, "auth.role_set", &reach);
                 return;
@@ -884,11 +887,12 @@ impl AuthActivation {
 
     /// Who signed up or asked for access and holds nothing of its own yet
     /// ([`Memberships::own_held`]; admin on `*`).
-    #[plexus_macros::method(group = "admin", description = "Who asked for access and holds nothing yet (admin on *)")]
+    #[plexus_macros::method(everywhere, group = "admin", description = "Who asked for access and holds nothing yet (admin on *)")]
     async fn waiting(&self, auth: &AuthContext, reach: Reach) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
+            // KEEL-31: the gate decides it on `*`; kept as a backstop.
             if !reach.is_everywhere() {
                 yield needs_everywhere(&inner.gate, "auth.waiting", &reach);
                 return;

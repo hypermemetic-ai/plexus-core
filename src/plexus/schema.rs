@@ -956,6 +956,18 @@ pub struct MethodSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 
+    /// KEEL-31: the method acts on the whole service
+    /// (`#[plexus_macros::method(everywhere)]`): it names no target because
+    /// its target is everything — a key rotated, a process spawned, a peer
+    /// connected. A gate admits it only where its grant is held on `*`,
+    /// within every ceiling layer; a role held on some scope is not enough.
+    /// Never with `public` or `target`.
+    ///
+    /// Optional on the wire (`serde(default)`, skipped when false) so a
+    /// method without it, and every older schema and client, is unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub everywhere: bool,
+
     /// AUTH-3: the method's `///` doc comment, when it says more than
     /// `description` (the macro used to drop it whenever `description =
     /// "..."` was given).
@@ -1663,6 +1675,7 @@ impl MethodSchema {
             public: false,
             grant: None,
             target: None,
+            everywhere: false,
             long_description: None,
             held_on: None,
             group: None,
@@ -1913,6 +1926,13 @@ impl MethodSchema {
     /// AUTH-3: name the param that locates what this call acts on.
     pub fn with_target(mut self, target: impl Into<String>) -> Self {
         self.target = Some(target.into());
+        self
+    }
+
+    /// KEEL-31: mark the method as acting on the whole service — its grant
+    /// is needed on `*` ([`MethodSchema::everywhere`]).
+    pub fn with_everywhere(mut self, everywhere: bool) -> Self {
+        self.everywhere = everywhere;
         self
     }
 

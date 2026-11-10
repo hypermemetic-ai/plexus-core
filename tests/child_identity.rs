@@ -3,7 +3,8 @@
 //! the child's own `target`), its `roles(...)` are seeded qualified by that
 //! path, and the call reaches it with the caller whole (`SameService`):
 //! principal stamp, session, ceiling. A child that says
-//! `forward = "identity_only"` still gets today's narrowing.
+//! `forward = "identity_only"` still gets today's narrowing — less its
+//! session key, never less its ceiling (KEEL-51).
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
@@ -31,6 +32,7 @@ fn seen(auth: &AuthContext) -> Seen {
         "user": auth.user_id,
         "session": auth.session_id,
         "ceiling": auth.metadata.get(plexus_auth_core::CEILING_KEY).cloned(),
+        "session_key": auth.metadata.get("session_key").cloned(),
     }))
 }
 
@@ -263,18 +265,20 @@ async fn a_ceiling_holds_inside_the_child() {
 }
 
 #[tokio::test]
-async fn identity_only_when_chosen_drops_the_session_and_ceiling() {
+async fn identity_only_when_chosen_drops_the_session_key_and_keeps_the_ceiling() {
     let host = members().await;
-    let hub = host.service();
+    let service = host.service();
     let viewer_only = ceilinged(BOB, json!(["viewer@*"]));
-    let out = data(hub.route("tickets.mirror.whoami", json!({}), Some(&viewer_only)).await.unwrap()).await;
+    let out = data(service.route("tickets.mirror.whoami", json!({}), Some(&viewer_only)).await.unwrap()).await;
     // The verified user id and session id are kept, and (RETURNS-47) the
     // principal stamp with them — it is the identity, so a `key:` caller is
-    // still named in the child; the rest of the metadata — the session key,
-    // the ceiling — is not.
+    // still named in the child; the rest of the metadata — the session
+    // key — is not. KEEL-51: the ceiling is a bound, not a credential: it
+    // is kept with the identity, so the deputy cannot act past it.
     assert_eq!(out[0]["user"], json!(viewer_only.user_id));
     assert_eq!(out[0]["session"], json!("s1"));
-    assert_eq!(out[0]["ceiling"], Value::Null);
+    assert_eq!(out[0]["session_key"], Value::Null);
+    assert_eq!(out[0]["ceiling"], json!(["viewer@*"]));
     assert_eq!(out[0]["principal"], json!(BOB));
 }
 

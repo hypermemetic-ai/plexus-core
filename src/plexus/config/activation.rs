@@ -247,7 +247,13 @@ impl ConfigKeyActivation {
 fn holds_critical(auth: Option<&AuthContext>) -> bool {
     let gate = crate::plexus::service_scope::current().and_then(|w| w.upgrade()).and_then(|s| s.gate().cloned());
     match gate {
-        None => true,
+        // KEEL-31: no gate here — in a child serving a hop, the hop's verdict
+        // (held on `*`) decides; a service with no gate and no hop admits
+        // every call, as it always has.
+        None => match crate::call::context() {
+            Ok(ctx) if ctx.hop().is_some() => ctx.reach().is_some_and(|r| r.is_everywhere()),
+            _ => true,
+        },
         // KEEL-31: a critical setting is the whole service's: held on `*`.
         Some(g) => g.check_everywhere(auth, &plexus_auth_core::grants::Grant::new(CRITICAL_GRANT)).is_ok(),
     }

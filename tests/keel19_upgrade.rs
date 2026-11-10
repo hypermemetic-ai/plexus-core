@@ -15,7 +15,7 @@
 
 use futures::{SinkExt, Stream, StreamExt};
 use plexus_core::plexus::peer_token::{check_key_proof_for, random_nonce, MintRequest, PeerKey, TokenIssuer, Verifier};
-use plexus_core::plexus::remote_child::{dial_proof, serve_child_with, serve_child_ws, ChildOptions, ChildPeer, ChildSpec, KeyedUpgrade, RemoteChild, ServeChild, KEYED_MOUNT_NEEDS_A_KEY};
+use plexus_core::plexus::remote_child::{dial_proof, serve_child_with, serve_child_ws, ChildOptions, ChildPeer, ChildSpec, KeyedUpgrade, RemoteChild, ServeChild, CHILD_DIAL_AGENT, KEYED_MOUNT_NEEDS_A_KEY, UPGRADE_LEDGER_MAX};
 
 /// spec/00's key-proof context (the one form for a child dial and a sign-in).
 const CONTEXT: &str = "plexus-key-login/v1";
@@ -78,9 +78,10 @@ fn proof_in(context: &str, seed: u8, aud: &str, nonce: u8, ts: i64) -> String {
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
     let n = b64.encode([nonce; 32]);
-    let sig = key.sign(format!("{context}\n{aud}\nt\n{n}\n{ts}").as_bytes());
+    let agent = CHILD_DIAL_AGENT;
+    let sig = key.sign(format!("{context}\n{aud}\n{agent}\n{n}\n{ts}").as_bytes());
     let hex: String = key.verifying_key().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    let body = json!({ "v": 1, "key": hex, "aud": aud, "agent": "t", "nonce": n, "ts": ts, "sig": b64.encode(sig.to_bytes()) });
+    let body = json!({ "v": 1, "key": hex, "aud": aud, "agent": agent, "nonce": n, "ts": ts, "sig": b64.encode(sig.to_bytes()) });
     format!("plexus-key.{}", b64.encode(body.to_string()))
 }
 
@@ -91,7 +92,7 @@ fn now() -> i64 {
 /// M's own socket to V: dialed with M's key proof.
 async fn dial_as(seed: u8, port: u16) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://127.0.0.1:{port}");
-    let proof = dial_proof(&PeerKey::from_seed([seed; 32]), &url, "m");
+    let proof = dial_proof(&PeerKey::from_seed([seed; 32]), &url);
     let mut req = url.into_client_request().unwrap();
     req.headers_mut().insert("authorization", HeaderValue::from_str(&format!("Bearer {proof}")).unwrap());
     tokio_tungstenite::connect_async(req).await.unwrap().0
@@ -217,18 +218,52 @@ fn an_upgrade_proof_is_verified() {
     assert!(up.verify(&forged).unwrap_err().contains("signature"), "a proof signed by another key");
     assert!(up.verify("Bearer nothing").is_err());
     // `dial_proof` is what it takes.
-    assert!(up.verify(&dial_proof(&PeerKey::from_seed([5; 32]), aud, "dyn")).is_ok());
+    assert!(up.verify(&dial_proof(&PeerKey::from_seed([5; 32]), aud)).is_ok());
 }
 
-/// spec/00: `dial_proof` is the proof plexus-auth-core's sign-in adapter
-/// takes too — one form (P2's separate context is a plexus-wire change).
+/// P2, with no change to the wire: a child dial is signed as the reserved
+/// agent `plexus.child-dial` (in the signed bytes). A child takes nothing
+/// else — a sign-in proof is refused — and the sign-in adapter refuses a
+/// child dial.
 #[tokio::test]
-async fn a_dial_proof_is_spec_00_s() {
+async fn a_sign_in_proof_and_a_child_dial_are_told_apart() {
     use plexus_auth_core::identity::{Authenticator, Presentation};
     let aud = "ws://127.0.0.1:4481";
+    let login = plexus_auth_core::adapters::sign_key_proof(&[5; 32], aud, "dyn", &[7; 32], now());
+    assert!(KeyedUpgrade::new([aud]).verify(&login).unwrap_err().contains("not a child dial"), "a sign-in taken as a child dial");
     let adapter = plexus_auth_core::adapters::KeyProofAdapter::new([aud]).unwrap();
-    let dial = dial_proof(&PeerKey::from_seed([5; 32]), aud, "dyn");
-    assert!(adapter.authenticate(&Presentation::Bearer { token: dial }).await.is_ok());
+    let dial = dial_proof(&PeerKey::from_seed([5; 32]), aud);
+    assert!(adapter.authenticate(&Presentation::Bearer { token: dial }).await.is_err(), "a child dial taken as a sign-in");
+    // Each still takes its own.
+    assert!(KeyedUpgrade::new([aud]).verify(&dial_proof(&PeerKey::from_seed([5; 32]), aud)).is_ok());
+    let login = plexus_auth_core::adapters::sign_key_proof(&[5; 32], aud, "dyn", &[9; 32], now());
+    assert!(adapter.authenticate(&Presentation::Bearer { token: login }).await.is_ok());
+}
+
+/// P3a (repro4): a full ledger refuses new upgrades; it never forgets a
+/// proof early, so a flood of proofs by fresh keys cannot evict a captured
+/// one and replay it.
+#[test]
+fn a_full_ledger_refuses_and_never_forgets_early() {
+    let aud = "ws://127.0.0.1:4801";
+    let up = KeyedUpgrade::new([aud]);
+    // Captured, and as late in its window as the flood (90 s to expire).
+    let captured = proof_in(CONTEXT, 255, aud, 255, now() + 30);
+    let started = std::time::Instant::now();
+    assert!(up.verify(&captured).is_ok());
+    assert!(up.verify(&captured).unwrap_err().contains("used before"));
+    // The flood: valid proofs by fresh keys, 30 s ahead (expiring last).
+    let mut accepted = 1;
+    for i in 0..UPGRADE_LEDGER_MAX {
+        if up.verify(&proof_in(CONTEXT, (i % 256) as u8, aud, (i / 256) as u8, now() + 30)).is_ok() {
+            accepted += 1;
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(80), "the flood outlived the window: {:?}", started.elapsed());
+    assert_eq!(accepted, UPGRADE_LEDGER_MAX, "the ledger holds exactly its most");
+    let full = up.verify(&dial_proof(&PeerKey::generate(), aud)).unwrap_err();
+    assert!(full.contains("refused until some expire"), "{full}");
+    assert!(up.verify(&captured).is_err(), "the captured proof replayed after the flood");
 }
 
 /// P1: a keyed child cannot be served on a string — not on the service's

@@ -180,11 +180,14 @@ none of this):
    the upgrade's `plexus-key.` proof (`serve_child_ws` does it) — and is
    believed from that principal alone. `serve_child_with` refuses one,
    whatever `ChildPeer` it is given.
-2. A keyless, non-verifying child (`serve_child_with`) believes any sender
-   its `ChildPeer` takes: on a `Pipe` that is everyone who can write its
-   input — such a child must never be exposed on a network listener; on
-   `ChildPeer::connection` it is the string it was given, which proves
-   nothing by itself.
+2. A keyless, non-verifying child (`serve_child_with`) believes every
+   sender its `ChildPeer` takes. Served as `ChildPeer::Pipe` on a
+   WebSocket, it believes every sender who can reach that socket, as
+   whoever the frame claims to be. **Do not do this**: a keyless child
+   belongs on its parent's stdin/stdout or a socket only that parent can
+   open; a child reachable over a network has a key and is served with
+   `serve_child_ws`. On `ChildPeer::connection` the sender is the string it
+   was given, which proves nothing by itself.
 3. With a verifier, the hop's token must verify: an EdDSA JWS signed by a trusted
    JWKS key (`iss` = `kid`), `aud` this child, within its times, naming
    `hop.call` and M, its `sub` the hop's caller, its scope holding the
@@ -222,14 +225,30 @@ none of this):
    method, within the consent of now; once per (`jti`, audience, method);
    the token bound to the presenter's key.
 
-Replay: an upgrade's key proof is taken once while its 60 s window lasts
-(`KeyedUpgrade` remembers at most 4096; past that the oldest goes), and a
-token's `jti` once while it lives — in memory: a restarted child forgets,
-so a proof or token captured in the last 60 s can be replayed to it once
-after a restart. Key files and the data directory are the user's own, 0600
-and 0700, never read through a symbolic link. A child dial's key proof is
-spec/00's one form, the same bytes as a sign-in to a service at that URL
-(a context of its own is a plexus-wire change, not made).
+Replay: an upgrade's key proof is taken once while its 60 s window lasts,
+and a token's `jti` once while it lives. `KeyedUpgrade` holds at most 4096
+proofs (`UPGRADE_LEDGER_MAX`); full, it **refuses** a new upgrade — never
+forgets a proof early — until proofs leave their window: the dialer gets
+HTTP 401 with `this child holds 4096 key proofs in their 60 s window: a new
+upgrade is refused until some expire`, and the child logs a warning on
+target `plexus::audit` (`child upgrade ledger full`, with the count held
+and refused) at most once per 10 s. So at most 4096 upgrades a minute are
+taken per child (about 68 a second, sustained); a flood can deny upgrades
+for a minute, never replay one. Both are kept in memory: a restarted child
+forgets, so a proof or token captured in the 60 s before a restart can be
+replayed to it once after it (a token only while it lives, at most its
+`exp`).
+
+Key files and the data directory are the user's own, 0600 and 0700, never
+read through a symbolic link.
+
+A child dial's key proof is spec/00's one form, signed as the reserved agent
+`plexus.child-dial` (`CHILD_DIAL_AGENT`; `agent` is in the signed bytes): a
+child takes only that agent, and plexus-auth-core's `KeyProofAdapter`
+(0.3.2) refuses it as a sign-in. So a dial's proof captured cannot be
+replayed as a sign-in to a service at that URL, nor a sign-in proof as a
+dial. A context of its own would be a plexus-wire spec/00 change, not
+made.
 
 ## License
 

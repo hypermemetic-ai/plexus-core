@@ -35,7 +35,10 @@ use ed25519_dalek::Signer;
 /// ```compile_fail
 /// let p: plexus_core::plexus::remote_child::Proven = "key:00".to_string().into();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Clone`: it is the proof of one socket's upgrade, consumed by serving
+/// that socket ([`super::serve_child_proven`]).
+#[derive(Debug, PartialEq, Eq)]
 pub struct Proven {
     principal: String,
 }
@@ -52,18 +55,26 @@ impl Proven {
 /// change, not made here: a sign-in proof and a child dial are one form.)
 pub(super) const KEY_PROOF_CONTEXT: &str = "plexus-key-login/v1";
 
-/// The most (key, nonce) pairs a [`KeyedUpgrade`] remembers: past it the
-/// oldest goes first.
+/// The most (key, nonce) pairs a [`KeyedUpgrade`] holds at once. Full, it
+/// refuses new upgrades until entries leave their 60 s window — it never
+/// forgets one early (KEEL-19, P3a: an evicted proof could be replayed).
 pub const UPGRADE_LEDGER_MAX: usize = 4096;
+
+/// KEEL-19 (P2): the agent id a child dial's key proof is signed as. spec/00
+/// has one key-proof form for a dial and a sign-in; `agent` is in the signed
+/// bytes, so a child takes only a proof made as this agent, and a sign-in
+/// adapter (plexus-auth-core's `KeyProofAdapter`) refuses one.
+pub const CHILD_DIAL_AGENT: &str = "plexus.child-dial";
 
 fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
-/// A spec/00 key proof by `key`, for the child at `aud` (its URL), as
-/// `agent` — what a mount sends at the upgrade (`ws::dial` does), and what
-/// an embedder's client of a keyed child sends.
-pub fn dial_proof(key: &crate::plexus::peer_token::PeerKey, aud: &str, agent: &str) -> String {
+/// A spec/00 key proof by `key`, for the child at `aud` (its URL), as the
+/// reserved agent [`CHILD_DIAL_AGENT`] — what a mount sends at the upgrade
+/// (`ws::dial` does), and what an embedder's client of a keyed child sends.
+pub fn dial_proof(key: &crate::plexus::peer_token::PeerKey, aud: &str) -> String {
+    let agent = CHILD_DIAL_AGENT;
     let mut n = [0u8; 32];
     n[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     n[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -87,6 +98,9 @@ pub fn dial_proof(key: &crate::plexus::peer_token::PeerKey, aud: &str, agent: &s
 pub struct KeyedUpgrade {
     audiences: Vec<String>,
     seen: Mutex<HashMap<(String, String), i64>>,
+    /// When the last "ledger full" warning was written, and how many
+    /// refusals since were not (at most one line per 10 s).
+    full_said: Mutex<(Option<std::time::Instant>, u64)>,
 }
 
 impl std::fmt::Debug for KeyedUpgrade {
@@ -98,7 +112,7 @@ impl std::fmt::Debug for KeyedUpgrade {
 impl KeyedUpgrade {
     /// Proofs addressed to one of `audiences` (`ws://127.0.0.1:<port>`, …).
     pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(audiences: I) -> Self {
-        Self { audiences: audiences.into_iter().map(|a| a.as_ref().trim().trim_end_matches('/').to_string()).collect(), seen: Default::default() }
+        Self { audiences: audiences.into_iter().map(|a| a.as_ref().trim().trim_end_matches('/').to_string()).collect(), seen: Default::default(), full_said: Default::default() }
     }
 
     /// The principal the bearer value `bearer` proves, or why not.
@@ -112,6 +126,9 @@ impl KeyedUpgrade {
         let ts = p.get("ts").and_then(serde_json::Value::as_i64).ok_or("a key proof with no `ts`")?;
         if p.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
             return Err("a key proof whose `v` is not 1".into());
+        }
+        if agent != CHILD_DIAL_AGENT {
+            return Err(format!("a key proof as agent `{agent}`, not a child dial (`{CHILD_DIAL_AGENT}`): a sign-in proof is not taken here"));
         }
         if !self.audiences.iter().any(|a| a == aud.trim_end_matches('/')) {
             return Err(format!("a key proof for `{aud}`, not for this child"));
@@ -129,10 +146,15 @@ impl KeyedUpgrade {
         if seen.contains_key(&(key.clone(), nonce.clone())) {
             return Err("a key proof used before".into());
         }
-        // P3: bounded — past the most, the oldest goes.
-        while seen.len() >= UPGRADE_LEDGER_MAX {
-            let Some(oldest) = seen.iter().min_by_key(|(_, until)| **until).map(|(k, _)| k.clone()) else { break };
-            seen.remove(&oldest);
+        // P3a: bounded, and full it refuses — never forgets a proof early.
+        if seen.len() >= UPGRADE_LEDGER_MAX {
+            let mut said = self.full_said.lock().unwrap();
+            said.1 += 1;
+            if said.0.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+                tracing::warn!(target: "plexus::audit", held = seen.len(), refused = said.1, audiences = ?self.audiences, "child upgrade ledger full: new upgrades refused until proofs leave their 60 s window");
+                *said = (Some(std::time::Instant::now()), 0);
+            }
+            return Err(format!("this child holds {UPGRADE_LEDGER_MAX} key proofs in their 60 s window: a new upgrade is refused until some expire"));
         }
         seen.insert((key.clone(), nonce), ts + 60);
         Ok(Proven { principal: format!("key:{key}") })

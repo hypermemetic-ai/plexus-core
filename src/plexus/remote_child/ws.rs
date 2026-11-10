@@ -130,7 +130,9 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     if let Some(path) = &shared.opts.key {
         let key = read_seed(path)?;
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-        let proof = key_proof(&key, LOGIN_CONTEXT, url.trim_end_matches('/'), &shared.opts.agent, &nonce(), ts);
+        // KEEL-19 (P2): a child dial is signed as the reserved agent, never as
+        // a sign-in (spec/00's one form; `agent` is in the signed bytes).
+        let proof = key_proof(&key, LOGIN_CONTEXT, url.trim_end_matches('/'), super::proven::CHILD_DIAL_AGENT, &nonce(), ts);
         let value = HeaderValue::from_str(&format!("Bearer {proof}")).map_err(|e| e.to_string())?;
         req.headers_mut().insert(AUTHORIZATION, value);
     }
@@ -242,6 +244,7 @@ where
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     let proven = std::sync::Mutex::new(None::<Result<super::Proven, String>>);
+    #[allow(clippy::result_large_err)] // tungstenite's handshake callback's own signature
     let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
         let bearer = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or_default();
         let verdict = upgrade.verify(bearer);

@@ -105,7 +105,7 @@ pub use dial_in::{PeerEvent, PeerInfo, PeerRoles, PeerSocket, Peers, PeersMethod
 pub use dial_out::{key_principal, DialOut, DialState, Exposed};
 #[cfg(feature = "child-ws")]
 pub use ws::serve_child_ws;
-pub use proven::{dial_proof, KeyedUpgrade, Proven, UPGRADE_LEDGER_MAX};
+pub use proven::{dial_proof, KeyedUpgrade, Proven, CHILD_DIAL_AGENT, UPGRADE_LEDGER_MAX};
 
 use link::{meta, too_many, unavailable, Conn, Counters, Shared, SubKey};
 

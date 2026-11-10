@@ -104,7 +104,7 @@ impl World {
     fn serve_b_with(&self, by: &PeerKey, trusted: &PeerKey, v: Arc<Verifier>) -> Input {
         // KEEL-19: B's input proven as `by` — by verifying `by`'s dial proof,
         // as `serve_child_ws` does at the upgrade; never a written string.
-        let proven = KeyedUpgrade::new(["ws://b.test"]).verify(&dial_proof(by, "ws://b.test", "t")).unwrap();
+        let proven = KeyedUpgrade::new(["ws://b.test"]).verify(&dial_proof(by, "ws://b.test")).unwrap();
         let (to_b, b_in) = tokio::io::duplex(1 << 16);
         let (b_out, from_b) = tokio::io::duplex(1 << 16);
         tokio::spawn(serve_child_proven(WeatherActivation, b_in, b_out, proven, vec![trusted.kid().to_string()], Some(self.b.clone()), Some(v)));

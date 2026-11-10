@@ -60,8 +60,9 @@ minted for calls into itself):
   principal the prover's connection proved (on a pipe, the one its parent
   names). A mount checks it was made for its own principal; a dial-out
   checks its relay's was made for its own key (KEEL-8's `relay_proved`, the
-  relay's `Peers::with_key` answer): one form, `PeerKey::key_proof(nonce,
-  backend, asker)` / `check_key_proof(key, proof, nonce, backend, asker)`.
+  relay's `Peers::with_key` answer): one form, `PeerKey::key_proof_for(nonce,
+  backend, asker)` / `check_key_proof_for(key, proof, nonce, backend, asker)`
+  (third pass's names).
   Not bound: the URL dialed, or a TLS exporter on `wss`.
 - **The consent of now** (KEEL-20's first row): `Upcalls::decide` answers
   the scopes both the token holds and consent allows now; a call back and
@@ -112,17 +113,40 @@ could write as the service's key):
   opened `O_NOFOLLOW`, must be the effective user's and 0600, and are made
   `O_EXCL`; `ensure_private_dir` and `read_private_if_any` (new) do the same
   for a directory (0700) and a private file.
-- `KeyedUpgrade` remembers at most 4096 proofs (`UPGRADE_LEDGER_MAX`).
 - `_info` is refused as the target of `{ns}.call`.
-- Not done: a child dial's own key-proof context (P2) — spec/00 has one
-  form for a dial and a sign-in, and the polyglot children (plexus-wire's
-  conformance stub) verify it; a second context is a plexus-wire change.
+
+Fifth pass:
+
+- **A full upgrade ledger refuses; it never forgets early.** `KeyedUpgrade`
+  holds at most 4096 proofs (`UPGRADE_LEDGER_MAX`), each until its 60 s
+  window ends (expired ones are dropped at every upgrade). Full, it refuses
+  the upgrade — HTTP 401 at `serve_child_ws`, `this child holds 4096 key
+  proofs in their 60 s window: a new upgrade is refused until some expire`
+  — and warns on `plexus::audit` (`child upgrade ledger full`, the count
+  held and refused) at most once per 10 s. (Before, it evicted the
+  earliest-expiring proof, which a flood of proofs by fresh keys could use
+  to replay a captured one.) At most 4096 upgrades a minute per child.
+- **A child dial is not a sign-in, with no wire change.** A child dial's key
+  proof is signed as the reserved agent `plexus.child-dial`
+  (`CHILD_DIAL_AGENT`; `ws::dial`, `dial_proof`); `KeyedUpgrade` takes
+  only that agent (`a key proof as agent `…`, not a child dial`), and
+  plexus-auth-core 0.3.2's `KeyProofAdapter`, which this release requires,
+  refuses it as a sign-in. So a captured dial is not a sign-in at a service
+  on the child's URL, and a captured sign-in is not a dial. The form and
+  context stay spec/00's. A dial-out (KEEL-8) signs into its relay as its
+  own agent, as before: that is a sign-in.
+- `Proven` is not `Clone`: the proof of one socket's upgrade, consumed by
+  serving it. `dial_proof(key, aud)`.
 
 **Behaviour changes for a security release (no signature changed):**
-`serve_child_with` refuses, at start, every keyed or key-verifying child;
-a key file that is a link, another user's or open to others is refused; a service with no dial key refuses a
-keyed peer at mount; `TokenIssuer::exchange` binds its token to the
-presenter and gives it once.
+`serve_child_with` refuses, at start, every keyed or key-verifying child
+(`InvalidInput`: serve it with `serve_child_ws` / `serve_child_proven`);
+a key file that is a link, another user's or open to group or others is
+refused; a service with no dial key refuses a keyed peer at mount
+(`keyed_mount_needs_a_key`); `TokenIssuer::exchange` binds its token to the
+presenter and gives it once; a sign-in proof made as agent
+`plexus.child-dial` is refused (plexus-auth-core 0.3.2), and a child's
+upgrade is refused with a full ledger.
 
 **Required upgrade of both sides (wire):** `KEY_PROOF_CONTEXT` is v2, so a
 0.11.1 service refuses the `_info` key proof of a 0.11.0 peer (it is not
@@ -130,7 +154,10 @@ mounted until upgraded), and a 0.11.1 dial-out refuses a 0.11.0 relay's.
 A 0.11.1 verifying peer refuses a 0.11.0 service's forwarded hops (no
 `hop.proof`) and the token of a 0.11.0 `dyn.exchange` sent by its presenter.
 A 0.11.0 verifying peer ignores `hop.proof` and still believes any verified
-token whoever sends it — upgrade the peers.
+token whoever sends it — upgrade the peers. A 0.11.0 service's dial (agent
+not `plexus.child-dial`) is refused at a 0.11.1 keyed child's upgrade; a
+0.11.1 dial reaches a 0.11.0 child, which checks no upgrade proof. So
+upgrade the service and its keyed peers together.
 
 ## [Unreleased] — 0.11.0
 

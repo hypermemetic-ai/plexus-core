@@ -16,14 +16,15 @@
 use futures::stream::{Stream, StreamExt};
 use plexus_core::call;
 use plexus_core::plexus::{
-    current_reach, with_reach, Activation, AuthContext, Gate, Membership, Memberships, PlexusError, PlexusStream,
-    PlexusStreamItem, Reach, RemoteError, Resolve, RoleTable, ScopeRef,
+    current_reach, with_reach, Activation, AuthContext, PlexusError, PlexusStream, PlexusStreamItem, Reach, RemoteError,
 };
 use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
+use plexus_testkit::parts::{who, Shortcodes};
+use plexus_testkit::World;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -143,33 +144,22 @@ impl contract::Peeker for P {
     }
 }
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
 fn plain() -> DynamicHub {
     DynamicHub::new("svc").register(PubActivation::default()).register(P::default())
 }
-fn gated() -> DynamicHub {
-    let m = Arc::new(Members::default());
-    m.0.lock().unwrap().push(Membership { principal: ADA.parse().unwrap(), role: plexus_auth_core::RoleName::new("viewer"), scope: ScopeRef::parse("MENGER") });
-    m.0.lock().unwrap().push(Membership { principal: BOB.parse().unwrap(), role: plexus_auth_core::RoleName::new("viewer"), scope: ScopeRef::parse("OTHER") });
-    let declared = plain().declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    plain().with_gate(Arc::new(Gate::new(m, Arc::new(roles), Arc::new(Shortcodes))))
-}
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], serde_json::Value::Null)
+/// ADA views MENGER, BOB views OTHER; `CODE-n` → `[CODE, *]`.
+async fn gated() -> Arc<DynamicHub> {
+    let host = World::new()
+        .host()
+        .named("svc")
+        .with(PubActivation::default())
+        .with(P::default())
+        .resolving(Shortcodes)
+        .without_named_callers()
+        .member_at(ADA, "viewer", "MENGER")
+        .member_at(BOB, "viewer", "OTHER")
+        .await;
+    host.service().clone()
 }
 /// A stream's items: data as its content; anything else as its type and
 /// kind (metadata — provenance, time — differs between activations).
@@ -198,7 +188,7 @@ async fn outcome(service: &DynamicHub, m: &str, caller: Option<&str>) -> String 
 
 #[tokio::test]
 async fn r1_public_method_anonymous_from_auth_vs_caller() {
-    let service = gated();
+    let service = gated().await;
     let a = outcome(&service, "pub.peek", None).await;
     let b = outcome(&service, "peeker.peek", None).await;
     assert!(a.starts_with("ERR") && a.contains("unauthenticated"), "{a}");
@@ -212,7 +202,7 @@ async fn r1_public_method_anonymous_from_auth_vs_caller() {
 
 #[tokio::test]
 async fn r1_a_public_method_with_no_verifier_runs_for_anyone_on_both_forms() {
-    let service = gated();
+    let service = gated().await;
     let a = outcome(&service, "pub.open", None).await;
     let b = outcome(&service, "peeker.open", None).await;
     assert_eq!(a, b);
@@ -236,7 +226,7 @@ async fn r2_auth_required_is_enforced_on_a_trait_impl_ungated() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r3_concurrent_calls_do_not_leak_callers() {
-    let service = Arc::new(gated());
+    let service = gated().await;
     let mut tasks = Vec::new();
     for i in 0..40 {
         let service = service.clone();

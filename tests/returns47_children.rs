@@ -19,12 +19,9 @@
 
 use futures::{Stream, StreamExt};
 use plexus_core::call;
-use plexus_core::plexus::{
-    Activation, AuthContext, Gate, Grant, Membership, Memberships, PlexusError, PlexusStreamItem, Reach, Resolve,
-    RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{Activation, AuthContext, Grant, PlexusError, PlexusStreamItem, Reach, Resolve, ScopeRef};
 use plexus_macros::PlexusRequest;
-use std::sync::{Arc, Mutex};
+use plexus_testkit::World;
 
 const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -193,15 +190,9 @@ impl ParentActivation {
 
 // ------------------------------------------------------------------ the call
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Shortcodes;
-impl Resolve for Shortcodes {
+/// A target is a scope of its own name, inside everything.
+struct OwnName;
+impl Resolve for OwnName {
     fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
         Some(vec![ScopeRef::named(target), ScopeRef::Everywhere])
     }
@@ -211,19 +202,23 @@ fn ada() -> AuthContext {
     AuthContext::for_principal(&ADA.parse().unwrap(), "s1", vec!["viewer".into()], serde_json::json!({ "k": "v" }))
 }
 
-/// ADA's reach as a gate answers it: viewer on MENGER.
-fn menger_reach() -> Reach {
-    let m = Arc::new(Members::default());
-    m.0.lock().unwrap().push(Membership { principal: ADA.parse().unwrap(), role: plexus_auth_core::RoleName::new("viewer"), scope: ScopeRef::parse("MENGER") });
-    let roles = RoleTable::from_lists([("viewer", ["parent.call"].into_iter())]);
-    let gate = Gate::new(m, Arc::new(roles), Arc::new(Shortcodes));
-    gate.check(Some(&ada()), &Grant::new("parent.call".to_string()), None).expect("ADA views MENGER")
+/// ADA's reach as a gate answers it: viewer on MENGER, a role listing
+/// `parent.call` alone.
+async fn menger_reach() -> Reach {
+    let host = World::new()
+        .host()
+        .resolving(OwnName)
+        .without_named_callers()
+        .role("viewer", ["parent.call"])
+        .member_at(ADA, "viewer", "MENGER")
+        .await;
+    host.gate().check(Some(&ada()), &Grant::new("parent.call".to_string()), None).expect("ADA views MENGER")
 }
 
 /// One call through the parent, inside a call admitted for ADA within MENGER.
 async fn through(path: &str) -> String {
     let caller = ada();
-    call::test::in_call(Some(&caller), menger_reach(), async {
+    call::test::in_call(Some(&caller), menger_reach().await, async {
         match ParentActivation.call(path, serde_json::json!({}), Some(&caller), None).await {
             Ok(s) => {
                 let items: Vec<String> = s

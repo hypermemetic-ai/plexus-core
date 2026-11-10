@@ -1,7 +1,7 @@
 //! What a [`Host`](crate::Host) is made of, for a test that builds
 //! something the host does not: who holds what ([`Members`]), where every
-//! target lives ([`Everywhere`]), a caller's context ([`who`]) and a call's
-//! answer as values ([`items`]).
+//! target lives ([`Everywhere`], or by its shortcode: [`Shortcodes`]), a
+//! caller's context ([`who`]) and a call's answer as values ([`items`]).
 
 use std::sync::Mutex;
 
@@ -21,8 +21,20 @@ pub struct Members(pub Mutex<Vec<Membership>>);
 impl Members {
     /// `who` holds `role` everywhere.
     pub fn hold(&self, who: &str, role: &str) {
+        self.hold_at(who, role, "*");
+    }
+
+    /// `who` holds `role` on `scope` — `*`, or a scope's name (`MENGER`).
+    pub fn hold_at(&self, who: &str, role: &str, scope: &str) {
         let principal = who.parse().unwrap_or_else(|e| panic!("{who}: not a principal: {e:?}"));
-        self.0.lock().unwrap().push(Membership { principal, role: RoleName::new(role), scope: ScopeRef::Everywhere });
+        self.0.lock().unwrap().push(Membership { principal, role: RoleName::new(role), scope: ScopeRef::parse(scope) });
+    }
+
+    /// `who` holds nothing any more, anywhere. (Say so to the gate if a
+    /// test needs it to notice: `moved`.)
+    pub fn forget(&self, who: &str) {
+        let principal: Principal = who.parse().unwrap_or_else(|e| panic!("{who}: not a principal: {e:?}"));
+        self.0.lock().unwrap().retain(|m| m.principal != principal);
     }
 }
 
@@ -63,6 +75,21 @@ pub struct Everywhere;
 impl Resolve for Everywhere {
     fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
         Some(vec![ScopeRef::Everywhere])
+    }
+}
+
+/// A ticket lives in its shortcode: `CODE-n` → `[CODE, *]`, a bare `CODE`
+/// → `[CODE, *]`; a target that is no shortcode (empty, or not all
+/// upper-case letters) locates nothing, and the call is refused.
+pub struct Shortcodes;
+
+impl Resolve for Shortcodes {
+    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
+        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
+        if code.is_empty() || !code.chars().all(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
+        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
     }
 }
 

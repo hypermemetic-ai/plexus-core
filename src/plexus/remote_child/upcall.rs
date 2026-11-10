@@ -114,11 +114,25 @@ pub(super) struct Upcalls {
     ///
     /// [`ChildOptions::legacy_upcalls`]: super::ChildOptions::legacy_upcalls
     legacy: bool,
+    /// DYNAUTH-7: revoked, and why: no call is forwarded, no token minted,
+    /// and (KEEL-19) nothing is decided for it — no call back, no exchange.
+    revoked: Mutex<Option<String>>,
+}
+
+/// KEEL-19: what [`Upcalls::decide`] answers for a need: the scopes it is
+/// consented on now (`["*"]` anywhere), and, decided under a token, the
+/// scopes both that token holds its grant on and the consent holds now
+/// (KEEL-20's first row: a consent narrowed while a call is open narrows
+/// the next call back made under it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Decided {
+    pub consented: Vec<String>,
+    pub held: Option<Vec<String>>,
 }
 
 impl Upcalls {
     pub(super) fn new(host: Option<WeakService>, legacy: bool) -> Arc<Self> {
-        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), proofs: Default::default(), needs: Mutex::default(), consent: Mutex::default(), legacy })
+        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), proofs: Default::default(), needs: Mutex::default(), consent: Mutex::default(), legacy, revoked: Mutex::default() })
     }
 
     /// NEST-16: what the mounted child's schema says it needs.
@@ -134,6 +148,52 @@ impl Upcalls {
     /// DYNAUTH-5: the consent kept now.
     pub(super) fn consent(&self) -> Option<Arc<[Consented]>> {
         self.consent.lock().unwrap().clone()
+    }
+
+    /// DYNAUTH-7: revoke: no call back is decided from now, and every one
+    /// open ends saying why.
+    pub(super) fn revoke(&self, why: &str) {
+        *self.revoked.lock().unwrap() = Some(why.to_string());
+        self.end_all(&format!("revoked: {why}"));
+    }
+
+    /// DYNAUTH-7: why the child is revoked, if it is.
+    pub(super) fn revoked(&self) -> Option<String> {
+        self.revoked.lock().unwrap().clone()
+    }
+
+    /// KEEL-19 · **the one decision** of what this child may reach of its
+    /// service — a call back's ([`on_request`]) and an exchange's
+    /// ([`super::RemoteChild::may_exchange`]) alike: the standard interface
+    /// (`Ok(None)`), or a need — declared, consented, and the child not
+    /// revoked — and, under `token` (the token its call was made under, and
+    /// the service that names the need's grant), only where that token holds
+    /// the need's grant. `Err` the refusal, typed and said.
+    pub(super) fn decide(&self, method: &str, token: Option<(&crate::plexus::DynamicHub, &crate::plexus::peer_token::PeerClaims)>) -> Result<Option<Decided>, (PlexusError, String)> {
+        if parent::is_standard(method) {
+            return Ok(None);
+        }
+        if let Some(why) = self.revoked() {
+            return Err((PlexusError::Unauthenticated(format!("this child is revoked ({why})")), format!("this child is revoked ({why}): nothing it asks is decided for it")));
+        }
+        let Some(consented) = self.allows(method)? else { return Ok(None) };
+        let held = match token {
+            None => None,
+            Some((svc, claims)) => {
+                let held = svc.grant_at(method).map(|g| claims.scopes_for(&g)).unwrap_or_default();
+                if held.is_empty() {
+                    let e = parent::not_needed(method);
+                    return Err((e, format!("`{method}` is not within the scope of the token minted for this call")));
+                }
+                let both = intersect(&held, &consented);
+                if both.is_empty() {
+                    let e = parent::not_needed(method);
+                    return Err((e, format!("`{method}` is consented on {consented:?} now, and the token holds it on {held:?}: nowhere both")));
+                }
+                Some(both)
+            }
+        };
+        Ok(Some(Decided { consented, held }))
     }
 
     /// NEST-16: may the child call `method` up — the standard interface, a
@@ -170,7 +230,7 @@ impl Upcalls {
 
     /// The service the child is in: the one given, else the one a call was
     /// routed in when it was first seen.
-    fn host(&self) -> Option<WeakService> {
+    pub(super) fn host(&self) -> Option<WeakService> {
         let mut h = self.host.lock().unwrap();
         if h.as_ref().and_then(WeakService::upgrade).is_none() {
             if let Some(now) = service_scope::current() {
@@ -186,7 +246,16 @@ impl Upcalls {
         let service = service_scope::current().or_else(|| self.host())?;
         let (ended, _) = watch::channel(None);
         let under = Arc::new(Under { auth: auth.cloned(), reach: reach.clone(), service, ended, minted });
-        self.under.lock().unwrap().insert(id.to_string(), Arc::clone(&under));
+        {
+            // KEEL-19: a revoked child is opened nothing to call back under —
+            // asked under the lock `revoke`'s `end_all` drains, after the
+            // mark is set, so an open either sees the mark or is drained.
+            let mut open = self.under.lock().unwrap();
+            if self.revoked().is_some() {
+                return None;
+            }
+            open.insert(id.to_string(), Arc::clone(&under));
+        }
         Some(UnderGuard { up: Arc::clone(self), id: id.to_string(), under })
     }
 
@@ -228,6 +297,28 @@ impl Upcalls {
     pub(super) fn open_now(&self) -> usize {
         self.under.lock().unwrap().len()
     }
+}
+
+/// Each scope both `a` and `b` hold, the narrower of each pair (`*` holds
+/// every scope).
+fn intersect(a: &[String], b: &[String]) -> Vec<String> {
+    let within = |inner: &str, outer: &str| outer == "*" || inner == outer;
+    let mut out: Vec<String> = Vec::new();
+    for x in a {
+        for y in b {
+            let s = if within(x, y) {
+                x
+            } else if within(y, x) {
+                y
+            } else {
+                continue;
+            };
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
 }
 
 /// A forwarded call's standing for the child's calls back: dropped, the
@@ -378,8 +469,9 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
     let under_id = params.get("under").and_then(Value::as_str).map(str::to_string);
     // NEST-16: the standard upward interface, the child's needs, or (a
     // child that declares none, under the legacy option) NEST-11's rule.
-    let need = match up.allows(&target) {
-        Ok(need) => need,
+    // KEEL-19: decided by the one function an exchange is decided by.
+    let need = match up.decide(&target, None) {
+        Ok(need) => need.map(|d| d.consented),
         Err((e, said)) => return send(refusal_said(&id, &e, &said)),
     };
     let standard = matches!(target.as_str(), parent::HOST_WHOAMI | parent::HOST_LOG | parent::HOST_NOTIFY);
@@ -405,14 +497,10 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
                 } else {
                     // DYNAUTH-12: a need is held to the token's scope too.
                     let need = match (&under.minted, need, under.service.upgrade()) {
-                        (Some(m), Some(_), Some(svc)) => {
-                            let held = svc.grant_at(&target).map(|g| m.claims.scopes_for(&g)).unwrap_or_default();
-                            if held.is_empty() {
-                                let e = parent::not_needed(&target);
-                                return send(refusal_said(&id, &e, &format!("`{target}` is not within the scope of the token minted for this call")));
-                            }
-                            Some(held)
-                        }
+                        (Some(m), Some(_), Some(svc)) => match up.decide(&target, Some((&svc, &m.claims))) {
+                            Ok(d) => d.and_then(|d| d.held),
+                            Err((e, said)) => return send(refusal_said(&id, &e, &said)),
+                        },
                         (_, n, _) => n,
                     };
                     Route::Under(under, need)
@@ -654,6 +742,35 @@ mod tests {
         // A pipe's token: bound to no key, no proof asked.
         let (token, claims) = issuer.mint(req(None)).unwrap();
         assert_eq!(presented_ok(&up, &Minted { token, claims }, &json!({}), "shop.items", "u1"), Ok(()));
+    }
+
+    /// KEEL-19: the one decision — a need declared and consented is decided;
+    /// once the child is revoked, nothing but the standard interface is.
+    #[test]
+    fn a_revoked_child_is_decided_nothing() {
+        let up = Upcalls::new(None, false);
+        let need = |m: &str| crate::plexus::schema::Need { method: m.into(), hash: String::new() };
+        up.set_needs(Some(&[need("dyn.peer.b.forecast")]));
+        up.set_consent(Some(vec![Consented { method: "dyn.peer.b.forecast".into(), scopes: vec!["*".into()] }]));
+        assert_eq!(up.decide("dyn.peer.b.forecast", None).unwrap(), Some(Decided { consented: vec!["*".into()], held: None }));
+        up.revoke("compromised");
+        let (_, said) = up.decide("dyn.peer.b.forecast", None).unwrap_err();
+        assert!(said.contains("revoked (compromised)"), "{said}");
+        assert_eq!(up.decide(parent::HOST_WHOAMI, None).unwrap(), None, "the standard interface is not this ticket's");
+    }
+
+    /// KEEL-19 (KEEL-22's first row): once revoked, nothing is opened to call
+    /// back under — whatever `forward` awaited before it asked.
+    #[tokio::test]
+    async fn a_revoked_child_is_opened_nothing() {
+        let up = Upcalls::new(None, false);
+        let svc = crate::plexus::DynamicHub::new("svc");
+        let reach = plexus_auth_core::grants::Reach::everywhere();
+        let open = |id: &'static str| crate::plexus::service_scope::scope(svc.downgrade(), { let up = Arc::clone(&up); let reach = reach.clone(); async move { up.open(id, None, &reach, None) } });
+        assert!(open("c1").await.is_some());
+        up.revoke("compromised");
+        assert!(open("c2").await.is_none(), "opened after the revoke");
+        assert_eq!(up.open_now(), 0);
     }
 
     /// DYNAUTH-7: a revoked child's calls back end, each saying why.

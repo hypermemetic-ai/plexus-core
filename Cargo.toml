@@ -1,6 +1,6 @@
 [package]
 name = "plexus-core"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 description = "Core infrastructure for Plexus RPC: Activation trait, DynamicHub, schemas"
 license = "AGPL-3.0-only"
@@ -91,6 +91,10 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.11.0", f
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1" }
 
+# KEEL-19 (P5): a key file opened O_NOFOLLOW, its owner the effective user.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # PLEXUS-45: natively, every dependency exactly as before PLEXUS-45.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"] }
@@ -165,6 +169,11 @@ required-features = ["child-ws"]
 
 [[test]]
 name = "dial"
+required-features = ["child-ws"]
+
+# KEEL-19: a keyed child served on a verified upgrade; repro3.
+[[test]]
+name = "keel19_upgrade"
 required-features = ["child-ws"]
 
 # RETURNS-47: no harness — the binary is the service and, run again by the
@@ -247,3 +256,12 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+
+# KEEL-19: the upgrade ledger's test signs and verifies 4096 key proofs inside
+# one 60 s window; the curve, optimized, keeps it to seconds in a test build.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

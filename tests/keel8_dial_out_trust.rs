@@ -64,6 +64,15 @@ enum Proves {
     Forged,
     /// The trusted key, but the offer's answer names another principal.
     NamesOther,
+    /// KEEL-19: the trusted key, signed by it, but for another asker (a
+    /// proof relayed from a dial of someone else's).
+    ForAnother,
+}
+
+/// KEEL-19: the dialing service's principal (`key_file`'s key): what the
+/// relay's `_info` proof is made for.
+fn dialer() -> String {
+    PeerKey::from_seed([11u8; 32]).kid().to_string()
 }
 
 /// A call into the dialed-out service, as a relay sends it: `hop.principal`
@@ -102,16 +111,20 @@ async fn stand_in(trusted: Arc<PeerKey>, proves: Proves) -> (u16, mpsc::Unbounde
                         match proves {
                             Proves::Trusted | Proves::NamesOther => {
                                 content["key"] = json!(trusted.kid());
-                                content["proof"] = json!(trusted.key_proof(nonce, "relay"));
+                                content["proof"] = json!(trusted.key_proof_for(nonce, "relay", &dialer()));
+                            }
+                            Proves::ForAnother => {
+                                content["key"] = json!(trusted.kid());
+                                content["proof"] = json!(trusted.key_proof_for(nonce, "relay", MALLORY));
                             }
                             Proves::Nothing => {}
                             Proves::Other => {
                                 content["key"] = json!(other.kid());
-                                content["proof"] = json!(other.key_proof(nonce, "relay"));
+                                content["proof"] = json!(other.key_proof_for(nonce, "relay", &dialer()));
                             }
                             Proves::Forged => {
                                 content["key"] = json!(trusted.kid());
-                                content["proof"] = json!(other.key_proof(nonce, "relay"));
+                                content["proof"] = json!(other.key_proof_for(nonce, "relay", &dialer()));
                             }
                         }
                         let md = StreamMetadata::new(vec!["relay".into()], "0".into());
@@ -235,6 +248,7 @@ async fn a_relay_that_proves_none_or_another_is_refused_and_nothing_it_sends_run
         (Proves::Other, "proved another key"),
         (Proves::Forged, "without proving it"),
         (Proves::NamesOther, "as the service acting"),
+        (Proves::ForAnother, "without proving it"),
     ] {
         let relay = Arc::new(PeerKey::generate());
         let (port, mut rx) = stand_in(Arc::clone(&relay), proves).await;

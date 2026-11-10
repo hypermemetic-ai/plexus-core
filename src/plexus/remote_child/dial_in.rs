@@ -492,7 +492,9 @@ impl PeerSocket {
         let Some(key) = &self.peers.inner.key else { return };
         let service = &self.peers.inner.service;
         let sid = format!("info-{}", self.id);
-        let content = json!({ "backend": service, "key": key.kid(), "proof": key.key_proof(nonce, service) });
+        // KEEL-19: made for the dialing peer the socket proved, no other.
+        let asker = self.principal.clone().unwrap_or_default();
+        let content = json!({ "backend": service, "key": key.kid(), "proof": key.key_proof_for(nonce, service, &asker), "asker": asker });
         let item = PlexusStreamItem::data(meta(service), "_info".into(), content);
         let frames = [
             json!({ "jsonrpc": "2.0", "id": id, "result": sid }),

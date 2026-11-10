@@ -234,15 +234,15 @@ async fn each_level_schema_is_answered_from_the_kept_tree() {
     let child = mount("mnt").await;
     let host = gated(&child).await;
     let before = child.stats().calls;
-    let top = host.as_(VIEWER).call("mnt.schema", json!({})).await;
+    let top = host.as_(VIEWER).call("mnt.schema", json!({})).await.values();
     assert_eq!(top[0]["namespace"], "mnt", "{top:?}");
     let names: Vec<&str> = top[0]["methods"].as_array().unwrap().iter().filter_map(|m| m["name"].as_str()).collect();
     assert!(names.contains(&"a"), "the root lists its child: {names:?}");
-    let a = host.as_(VIEWER).call("mnt.a.schema", json!({})).await;
+    let a = host.as_(VIEWER).call("mnt.a.schema", json!({})).await.values();
     assert_eq!(a[0]["namespace"], "a", "{a:?}");
-    let b = host.as_(VIEWER).call("mnt.a.b.schema", json!({})).await;
+    let b = host.as_(VIEWER).call("mnt.a.b.schema", json!({})).await.values();
     assert_eq!(b[0]["namespace"], "b", "{b:?}");
-    let one = host.as_(VIEWER).call("mnt.a.b.c.schema", json!({ "method": "m" })).await;
+    let one = host.as_(VIEWER).call("mnt.a.b.c.schema", json!({ "method": "m" })).await.values();
     assert_eq!(one[0]["name"], "m", "{one:?}");
     assert_eq!(child.stats().calls, before, "no schema call crossed the hop (spec/12 rule 7)");
 }
@@ -250,13 +250,13 @@ async fn each_level_schema_is_answered_from_the_kept_tree() {
 async fn every_method_is_gated_by_its_full_path() {
     let child = mount("mnt").await;
     let host = gated(&child).await;
-    let got = host.as_(VIEWER).call("mnt.a.b.c.m", json!({})).await;
+    let got = host.as_(VIEWER).call("mnt.a.b.c.m", json!({})).await.values();
     assert_eq!(got[0], json!({ "at": "c", "grant": "nest.a.b.c.m", "for": VIEWER }), "routed four levels, the far side's grant the full path, its caller the hop's: {got:?}");
-    let got = host.as_(VIEWER).call("mnt.a.m", json!({})).await;
+    let got = host.as_(VIEWER).call("mnt.a.m", json!({})).await.values();
     assert_eq!(got[0]["at"], "a", "{got:?}");
-    let refused = host.as_(VIEWER).call("mnt.a.b.m", json!({})).await;
+    let refused = host.as_(VIEWER).call("mnt.a.b.m", json!({})).await.values();
     assert!(refused[0]["route_error"].as_str().is_some_and(|r| r.contains("mnt.a.b.m") && r.contains("editor")), "a viewer is refused the editor's: {refused:?}");
-    let got = host.as_(EDITOR).call("mnt.a.b.m", json!({})).await;
+    let got = host.as_(EDITOR).call("mnt.a.b.m", json!({})).await.values();
     assert_eq!(got[0], json!({ "at": "b", "grant": "nest.a.b.m", "for": EDITOR }), "{got:?}");
 }
 
@@ -266,15 +266,15 @@ async fn a_call_into_a_dynamic_slot_is_forwarded_on_the_slot_grant() {
     // with that grant in the child's terms; the far side checks the slot.
     let child = mount("mnt").await;
     let host = gated(&child).await;
-    let got = host.as_(VIEWER).call("mnt.a.earth.m", json!({})).await;
+    let got = host.as_(VIEWER).call("mnt.a.earth.m", json!({})).await.values();
     assert_eq!(got[0], json!({ "at": "item", "grant": "nest.a.{item}.m", "for": VIEWER }), "{got:?}");
-    let got = host.as_(VIEWER).call("mnt.a.b.zz.m", json!({})).await;
+    let got = host.as_(VIEWER).call("mnt.a.b.zz.m", json!({})).await.values();
     assert_eq!(got[0], json!({ "at": "item", "grant": "nest.a.b.{opaque}.m", "for": VIEWER }), "{got:?}");
     // An unknown name: the child's own not-found, relayed.
-    let got = host.as_(VIEWER).call("mnt.a.pluto.m", json!({})).await;
+    let got = host.as_(VIEWER).call("mnt.a.pluto.m", json!({})).await.values();
     assert_eq!(got[0]["error"]["kind"], "activation_not_found", "{got:?}");
     // An instance's schema: crosses once.
-    let got = host.as_(VIEWER).call("mnt.a.earth.schema", json!({})).await;
+    let got = host.as_(VIEWER).call("mnt.a.earth.schema", json!({})).await.values();
     assert_eq!(got[0]["namespace"], "item", "{got:?}");
 }
 
@@ -294,7 +294,7 @@ async fn restart_with_a_changed_grandchild_is_refused() {
     let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let got = loop {
-        let got = every_item(host.as_(VIEWER).route("mnt.a.m", json!({})).await).await;
+        let got = every_item(host.as_(VIEWER).stream("mnt.a.m", json!({})).await).await;
         if got[0].get("at").is_none() || std::time::Instant::now() > deadline {
             break got;
         }
@@ -305,7 +305,7 @@ async fn restart_with_a_changed_grandchild_is_refused() {
     } else {
         // the first call after the exit may meet the old connection going
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        every_item(host.as_(VIEWER).route("mnt.a.m", json!({})).await).await
+        every_item(host.as_(VIEWER).stream("mnt.a.m", json!({})).await).await
     };
     std::env::remove_var("NEST_VARIANT");
     assert!(got[0]["message"].as_str().is_some_and(|m| m.contains("schema changed; restart the service")), "{got:?}");

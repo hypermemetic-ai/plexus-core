@@ -201,9 +201,9 @@ async fn grafted_it_calls_items_as_the_caller() {
     let child = mount("restock", service, false).await;
     assert_eq!(child.needs().unwrap(), [Need::new("shop.items", child.needs().unwrap()[0].hash.clone())]);
     service.root().insert(child).expect("shop serves what restock needs");
-    let got = host.as_(VIEWER).call("restock.low", json!({})).await;
+    let got = host.as_(VIEWER).call("restock.low", json!({})).await.values();
     assert_eq!(got[0]["low"], json!({ "items": ["flour", "salt"], "caller": VIEWER }), "{got:?}");
-    let got = host.as_(EDITOR).call("restock.who", json!({})).await;
+    let got = host.as_(EDITOR).call("restock.who", json!({})).await.values();
     assert_eq!(got[0]["who"]["for"], EDITOR, "{got:?}");
     assert_eq!(got[0]["who"]["child"], "restock", "{got:?}");
 }
@@ -215,12 +215,12 @@ async fn its_call_past_its_needs_is_refused_by_the_host() {
     let service = host.service();
     let child = mount("restock", service, false).await;
     service.root().insert(child).unwrap();
-    let got = host.as_(EDITOR).call("restock.sneak", json!({})).await;
+    let got = host.as_(EDITOR).call("restock.sneak", json!({})).await.values();
     assert_eq!(got[0]["refused"]["kind"], "forbidden", "{got:?}");
     assert_eq!(got[0]["refused"]["reason"], "not_needed", "{got:?}");
     assert_eq!(got[0]["refused"]["method"], "shop.secret", "{got:?}");
     // The editor does hold it, straight.
-    let straight = host.as_(EDITOR).call("shop.secret", json!({})).await;
+    let straight = host.as_(EDITOR).call("shop.secret", json!({})).await.values();
     assert_eq!(straight[0], json!({ "till": 42 }));
 }
 
@@ -260,9 +260,9 @@ async fn in_process_it_calls_items_as_the_caller() {
     let host = shop_host().with(Restock).await;
     let service = host.service();
     service.check_grafts().unwrap();
-    let got = host.as_(VIEWER).call("restock.low", json!({})).await;
+    let got = host.as_(VIEWER).call("restock.low", json!({})).await.values();
     assert_eq!(got[0]["low"]["caller"], VIEWER, "{got:?}");
-    let got = host.as_(VIEWER).call("restock.who", json!({})).await;
+    let got = host.as_(VIEWER).call("restock.who", json!({})).await.values();
     assert_eq!(got[0]["who"]["for"], VIEWER, "{got:?}");
     // The transport holds to the needs before sending anything.
     let t = ParentTransport::local(service.clone(), Some(who(EDITOR)), "restock", Restock::__plexus_parent_needs());
@@ -283,7 +283,7 @@ async fn a_child_with_no_needs_calls_the_standard_four_only() {
     service.root().insert(child).unwrap();
     let up = |m: &'static str| {
         let host = host.clone();
-        async move { host.as_(EDITOR).call("plain.up", json!({ "method": m })).await.remove(0) }
+        async move { host.as_(EDITOR).call("plain.up", json!({ "method": m })).await.values().remove(0) }
     };
     assert_eq!(up("host.whoami").await["for"], EDITOR);
     assert_eq!(up("host.log").await, json!({ "logged": true }));
@@ -297,7 +297,7 @@ async fn a_child_with_no_needs_calls_the_standard_four_only() {
     let legacy = shop_host().await;
     let child = mount("plain", legacy.service(), true).await;
     legacy.service().root().insert(child).unwrap();
-    let got = legacy.as_(EDITOR).call("plain.up", json!({ "method": "shop.items" })).await;
+    let got = legacy.as_(EDITOR).call("plain.up", json!({ "method": "shop.items" })).await.values();
     assert_eq!(got[0]["caller"], EDITOR, "{got:?}");
 }
 

@@ -11,13 +11,11 @@
 
 use async_stream::stream;
 use futures::stream::Stream;
-use plexus_core::plexus::{Activation, MethodRole};
-use plexus_core::{DynamicHub, PlexusError};
-use plexus_testkit::parts::{items, who};
-use plexus_testkit::{World, VIEWER};
-use serde_json::{json, Value};
+use plexus_core::plexus::{Activation, AuthEvent, MethodRole};
+use plexus_testkit::parts::who;
+use plexus_testkit::{Forbidden, Host, World, VIEWER};
+use serde_json::json;
 use std::future::IntoFuture;
-use std::sync::Arc;
 
 // ------------------------------------------------------------------ the kids
 
@@ -111,28 +109,18 @@ const LITERAL: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 /// `space`, logged in: VIEWER holds viewer; LITERAL holds `literal`, a
 /// grant written as a literal path, which still decides (the slot grant is
 /// additive).
-fn hub() -> Arc<DynamicHub> {
+fn space() -> Host {
     let host = World::new().host().named("space").with(SolarActivation).with(BeltActivation).with_auth();
-    let host = futures::executor::block_on(host.role("literal", ["solar.mars.rename"]).member(LITERAL, "literal").into_future());
-    host.service().clone()
+    futures::executor::block_on(host.role("literal", ["solar.mars.rename"]).member(LITERAL, "literal").into_future())
 }
 
-/// `ok:<first item>` or `refused:<grant>`.
-async fn call(hub: &DynamicHub, method: &str, params: Value, p: &str) -> String {
-    match hub.route(method, params, Some(&who(p))).await {
-        Ok(s) => {
-            let got = items(Ok(s)).await;
-            match got.first() {
-                Some(Value::String(s)) => format!("ok:{s}"),
-                other => format!("other:{other:?}"),
-            }
-        }
-        Err(PlexusError::Forbidden { reason: plexus_core::AuthzDenyReason::MissingGrant { grant, .. } }) => {
-            format!("refused:{}", grant.as_str())
-        }
-        Err(e) => format!("err:{e}"),
-    }
+/// What a row expects: the one item it answers, or the grant it is refused
+/// for.
+enum Then {
+    Answers(&'static str),
+    RefusedFor(&'static str),
 }
+use Then::{Answers, RefusedFor};
 
 // ------------------------------------------------------------------ the rows
 
@@ -176,38 +164,38 @@ fn a_schema_without_role_child_still_reads() {
 /// `solar.earth.info` and refuses `solar.earth.rename`; rows 3–5, 8 and 9.
 #[tokio::test]
 async fn one_grant_per_slot_decides_every_name_in_it() {
-    let hub = hub();
+    let space = space();
     let rows = [
-        // (method, params, who, expected)
-        ("solar.earth.info", json!({}), VIEWER, "ok:planet earth"),
-        ("solar.mars.info", json!({}), VIEWER, "ok:planet mars"),
-        ("solar.earth.rename", json!({"to": "terra"}), VIEWER, "refused:solar.{planet}.rename"),
+        // (method, params, who, then)
+        ("solar.earth.info", json!({}), VIEWER, Answers("planet earth")),
+        ("solar.mars.info", json!({}), VIEWER, Answers("planet mars")),
+        ("solar.earth.rename", json!({"to": "terra"}), VIEWER, RefusedFor("solar.{planet}.rename")),
         // A static child named in the slot's place wins, as in routing: its own grant.
-        ("solar.sun.info", json!({}), VIEWER, "refused:solar.sun.info"),
+        ("solar.sun.info", json!({}), VIEWER, RefusedFor("solar.sun.info")),
         // A nested slot: the same rule one level at a time.
-        ("solar.earth.luna.phase", json!({}), VIEWER, "ok:full"),
+        ("solar.earth.luna.phase", json!({}), VIEWER, Answers("full")),
         // An untyped slot is admitted whole.
-        ("belt.ceres.info", json!({}), VIEWER, "ok:planet ceres"),
-        ("belt.ceres.rename", json!({"to": "x"}), VIEWER, "ok:ceres -> x"),
+        ("belt.ceres.info", json!({}), VIEWER, Answers("planet ceres")),
+        ("belt.ceres.rename", json!({"to": "x"}), VIEWER, Answers("ceres -> x")),
         // A literal-path grant still decides as before.
-        ("solar.mars.rename", json!({"to": "red"}), LITERAL, "ok:mars -> red"),
-        ("solar.earth.rename", json!({"to": "terra"}), LITERAL, "refused:solar.{planet}.rename"),
+        ("solar.mars.rename", json!({"to": "red"}), LITERAL, Answers("mars -> red")),
+        ("solar.earth.rename", json!({"to": "terra"}), LITERAL, RefusedFor("solar.{planet}.rename")),
     ];
-    let mut bad = Vec::new();
-    for (m, p, w, want) in rows {
-        let got = call(&hub, m, p, w).await;
-        if got != want {
-            bad.push(format!("{m} as {}: want {want}, got {got}", if w == VIEWER { "viewer" } else { "literal" }));
+    for (method, params, who, then) in rows {
+        let got = space.as_(who).call(method, params).await;
+        match then {
+            Answers(item) => assert_eq!(got.answer::<String>(), item, "{got}"),
+            RefusedFor(grant) => {
+                got.refused(Forbidden).naming(grant);
+            }
         }
     }
-    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
 }
 
 /// The roles list the slot grants, qualified by the slot's path.
 #[test]
 fn roles_list_the_slot_grant() {
-    let hub = hub();
-    let declared = hub.declared_roles();
+    let declared = space().service().declared_roles();
     let viewer = &declared["viewer"];
     for g in ["solar.names", "solar.{planet}.info", "solar.{planet}.{moon}.phase", "belt.{rock}"] {
         assert!(viewer.contains(&g.to_string()), "viewer lists {g}: {viewer:?}");
@@ -217,30 +205,30 @@ fn roles_list_the_slot_grant() {
 /// Row 6: `auth.requires --method solar.earth.info` answers the slot grant.
 #[tokio::test]
 async fn auth_requires_answers_the_slot_grant() {
-    let hub = hub();
-    let ask = |m: &'static str| {
-        let hub = hub.clone();
+    let viewer = space().as_(VIEWER);
+    let requires = |method: &'static str| {
+        let viewer = viewer.clone();
         async move {
-            let s = hub.route("auth.requires", json!({ "method": m }), Some(&who(VIEWER))).await.expect("requires");
-            items(Ok(s)).await.into_iter().next().unwrap()
+            match viewer.call("auth.requires", json!({ "method": method })).await.answer::<AuthEvent>() {
+                AuthEvent::Requires { grant, roles, .. } => (grant, roles),
+                other => panic!("auth.requires {method} answered {other:?}"),
+            }
         }
     };
-    let r = ask("solar.earth.info").await;
-    assert_eq!(r["grant"], "solar.{planet}.info", "{r}");
-    assert!(r["roles"].as_array().unwrap().iter().any(|x| x == "viewer"), "{r}");
-    let r = ask("solar.earth.luna.phase").await;
-    assert_eq!(r["grant"], "solar.{planet}.{moon}.phase", "{r}");
-    let r = ask("belt.ceres.info").await;
-    assert_eq!(r["grant"], "belt.{rock}", "{r}");
-    let r = ask("solar.sun.info").await;
-    assert_eq!(r["grant"], "solar.sun.info", "{r}");
+    let (grant, roles) = requires("solar.earth.info").await;
+    assert_eq!(grant, "solar.{planet}.info");
+    assert!(roles.iter().any(|r| r == "viewer"), "{roles:?}");
+    assert_eq!(requires("solar.earth.luna.phase").await.0, "solar.{planet}.{moon}.phase");
+    assert_eq!(requires("belt.ceres.info").await.0, "belt.{rock}");
+    assert_eq!(requires("solar.sun.info").await.0, "solar.sun.info");
 }
 
 /// Row 7: a caller's view keeps the slot's entry when the caller holds a
 /// method of the slot.
 #[test]
 fn a_callers_view_keeps_the_slot() {
-    let hub = hub();
+    let space = space();
+    let hub = space.service();
     let view = hub.view(Some(&who(VIEWER)));
     let solar = view.schema_of("solar").expect("viewer sees solar");
     let names: Vec<&str> = solar.methods.iter().map(|m| m.name.as_str()).collect();

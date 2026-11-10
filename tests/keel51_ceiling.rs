@@ -181,8 +181,8 @@ async fn keel51_a_ceiling_that_allows_it_still_does() {
 async fn keel51_a_sign_in_that_ended_ends_the_call_back() {
     let host = shop_host().await;
     for peer in ["restock", "local"] {
-        let ending = AuthContext::for_principal(&ADMIN.parse().unwrap(), "ending", vec![], json!({ EXPIRES_AT_KEY: now() + 1 }));
-        let got = Caller::new(host.service().clone(), Some(ending)).call(&format!("garden.dendrite.{peer}.later"), json!({ "ms": 2100 })).await.answers(1);
+        let ending = AuthContext::for_principal(&ADMIN.parse().unwrap(), "ending", vec![], json!({ EXPIRES_AT_KEY: now() + 2 }));
+        let got = Caller::new(host.service().clone(), Some(ending)).call(&format!("garden.dendrite.{peer}.later"), json!({ "ms": 3100 })).await.answers(1);
         assert!(got[0].get("low").is_none(), "{peer}: the call back ran on a sign-in that had ended: {got:?}");
         // Refused as a sign-in that no longer stands (the typed client's
         // error names the kind, `unauthenticated`).

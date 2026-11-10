@@ -293,7 +293,7 @@ pub fn check_key_proof_for(key: &str, proof: &str, nonce: &str, backend: &str, a
     Ok(vk)
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     // `create_new` is O_CREAT|O_EXCL: it never opens what is there, a link

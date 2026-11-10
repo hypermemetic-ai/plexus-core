@@ -34,6 +34,50 @@ a call back made after the session ended still ran.
   ceiling admitted, a call back after the sign-in ended refused);
   `forward_policy_dispatch` checks every policy keeps the bounds.
 
+## [0.11.3] — unreleased
+
+NEST-25 — additive: **dial-in seams for an embedder's table, and first
+contact the way ssh does it.**
+
+- `remote_child::Admission` (`decide` an offer before anything is asked of
+  its socket — `Decision::Admit`, `Refuse`, or `Pending`, the node told only
+  `_offer.pending` and its pairing code; `vet` the schema read before the
+  mount; hear `mounted` and `closed`), `Offer`, `OfferRefused`,
+  `Peers::with_admission`, `Peers::with_options` (a mount's `ChildOptions`,
+  its backoff kept none), `Peers::socket_from(auth, from, close)`,
+  `PeerSocket::{id, close, is_closed}`. plexus-dyn's dial-in kind is built on
+  them.
+- **The pairing code** (`remote_child::pairing`): a node's `_info {nonce,
+  commit}` is answered with a fresh `host_nonce`; its offer reveals
+  `pairing_nonce` (checked against `commit`: `pairing_mismatch`) and signs
+  both nonces, both keys, the service and the mount (`possession`,
+  `possession_input`) — its key proven on this connection (`Offer::
+  key_proven`; a forged one is refused `unauthenticated`). `pairing_code`
+  (8 RFC 4648 base32 characters of a domain-separated SHA-256 of both keys
+  and both nonces, `XXXX-XXXX`), `normalize_code`, `commitment`,
+  `key_fingerprint` (`SHA256:<base64>`), `KnownHosts` (`<url> key:<hex>`,
+  0600, never through a link; never re-pins a URL).
+- A dial-in mount's identity key is the key its connection proved, so
+  consent, KEEL-19's one key one mount and minted tokens bind to it; its
+  calls back (`_host.call`) are taken into the mount's calls back, as a
+  dialed child's. A dial-out serves with its own key (a call back under a
+  minted token proves possession) and gives its host's calls back an id
+  space of their own (`h:<n>`), apart from its client's numbered ids.
+- `Exposed::with_first_contact(known_hosts, ask)`, `with_known_hosts`,
+  `with_pending_for`, `pending()`, `code()`, `FirstContact`: with no
+  `DialOut::trust`, the key a known-hosts file pins for the URL is trusted;
+  at first contact the host proves a key, and nothing more is sent or served
+  until `ask` says yes (which pins it); a host presenting another key than
+  the one pinned is refused `host_key_changed`, unasked. `trust` stays the
+  strict mode; neither trust nor a known-hosts file is refused before
+  dialing, as KEEL-8 has it.
+- Review round 1: at first contact a host whose `_info` gives no
+  `host_nonce` is refused `no_pairing_code` (never asked about without a
+  code); `Admission::mounted` answers `Result` (a mount the embedder refuses
+  leaves this table and the offer is refused); `pairing::canonical_url`, by
+  which `KnownHosts` keys each host, and a lock (`<file>.lock`) around its
+  read-modify-write.
+
 ## [0.11.2] — 2026-11-10
 
 Performance (PERF.115-49), no behaviour changed: a call's context is built

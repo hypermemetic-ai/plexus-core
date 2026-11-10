@@ -250,7 +250,7 @@ where
 }
 
 /// The far side's loop, its options already admitted.
-async fn serve<A, R, W>(activation: A, r: R, w: W, opts: ServeChild) -> std::io::Result<()>
+pub(super) async fn serve<A, R, W>(activation: A, r: R, w: W, opts: ServeChild) -> std::io::Result<()>
 where
     A: Activation + Clone,
     R: AsyncRead + Unpin + Send,

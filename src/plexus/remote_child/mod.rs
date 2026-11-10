@@ -846,6 +846,12 @@ impl Activation for RemoteChild {
         let Some(m) = found else {
             return Err(PlexusError::MethodNotFound { activation: self.name().to_string(), method: method.to_string() });
         };
+        // KEEL-31 (host side): a method the child's kept schema marks
+        // `everywhere` is forwarded only for a call admitted on `*` — a far
+        // side built before the rule would not decide it again.
+        if m.everywhere {
+            crate::call::admits_everywhere(&format!("{}.{method}", self.name()))?;
+        }
         // BIDIR-6: a hop forwards no input half yet; the far side would wait
         // for items that never come.
         if m.input.is_some() {

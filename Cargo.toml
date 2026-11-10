@@ -90,6 +90,9 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.11.0", f
 # VerifiedUser / Principal from here for backward compatibility. New code
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.2" }
+# PERF.115-49: the input index read on every call (already in the graph through jsonrpsee).
+rustc-hash = "2"
+
 
 # KEEL-19 (P5): a key file opened O_NOFOLLOW, its owner the effective user.
 [target.'cfg(unix)'.dependencies]

@@ -74,6 +74,10 @@ pub struct CallContext(Arc<Inner>);
 
 struct Inner {
     auth: Option<AuthContext>,
+    /// PERF.115-49: the caller is the one the gate decided `reach` for
+    /// ([`Reach::caller`]), read there rather than kept twice; `auth` is
+    /// then `None`.
+    auth_in_reach: bool,
     reach: ReachCell,
     /// Boxed (PERF.115-49): only a call through the child seam has one, and
     /// inline it was 144 of every context's bytes.
@@ -101,7 +105,7 @@ enum ReachCell {
 
 impl Inner {
     fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Box<Hop>>) -> Self {
-        Inner { auth, reach, hop, verified: OnceLock::new(), host: None }
+        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None }
     }
 
     /// The call's verified slot, made when first set or shared (PERF.115-49:
@@ -114,7 +118,7 @@ impl Inner {
 impl fmt::Debug for CallContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CallContext")
-            .field("principal", &self.0.auth.as_ref().and_then(|a| a.principal()).map(|p| p.to_string()))
+            .field("principal", &self.auth().and_then(|a| a.principal()).map(|p| p.to_string()))
             .field("reach", &self.reach())
             .field("hop", &self.0.hop)
             .finish()
@@ -127,6 +131,22 @@ impl CallContext {
     /// [`Reach::everywhere`] on a service without a gate.
     pub(crate) fn admitted(auth: Option<&AuthContext>, reach: Reach) -> Self {
         Self(Arc::new(Inner::with(auth.cloned(), ReachCell::Known(reach), None)))
+    }
+
+    /// PERF.115-49: a call a gated service's dispatch admitted on the
+    /// gate's `reach` — whose caller is the identity that stands, the one
+    /// the gate was asked about ([`Reach::caller`]), so the context reads it
+    /// from the reach rather than cloning it again. Only for a reach the
+    /// gate answered for this call's own caller.
+    pub(crate) fn admitted_by_gate(auth: Option<&AuthContext>, reach: Reach) -> Self {
+        debug_assert_eq!(
+            reach.caller().map(|a| (&a.user_id, &a.session_id)),
+            auth.map(|a| (&a.user_id, &a.session_id)),
+            "a gate's reach names the caller it was decided for"
+        );
+        let mut inner = Inner::with(None, ReachCell::Known(reach), None);
+        inner.auth_in_reach = true;
+        Self(Arc::new(inner))
     }
 
     /// An introspection call a gated service let through (AUTH-4): its
@@ -215,7 +235,7 @@ impl CallContext {
     /// This context with its reach replaced: the same call, so the same
     /// verified value (the same slot, set once for both).
     pub(crate) fn with_reach(&self, reach: Reach) -> Self {
-        let mut inner = Inner::with(self.0.auth.clone(), ReachCell::Known(reach), self.0.hop.clone());
+        let mut inner = Inner::with(self.auth().cloned(), ReachCell::Known(reach), self.0.hop.clone());
         inner.verified = OnceLock::from(Arc::clone(self.0.verified()));
         inner.host = self.0.host.clone();
         Self(Arc::new(inner))
@@ -224,7 +244,10 @@ impl CallContext {
     /// The identity the gate admitted (in a child, the one the hop names, or
     /// the one its forward policy derived); `None` for an anonymous call.
     pub fn auth(&self) -> Option<&AuthContext> {
-        self.0.auth.as_ref()
+        match (self.0.auth_in_reach, &self.0.reach) {
+            (true, ReachCell::Known(reach)) => reach.caller(),
+            _ => self.0.auth.as_ref(),
+        }
     }
 
     /// The reach the gate answered (in a child through the seam, the hop's

@@ -5,6 +5,16 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] — 2026-11-10
+
+Performance (PERF.115-49), no behaviour changed: a call's context is built
+without a `Once` and without a verifier slot until one is used; the rarely used
+hop, the introspection branch and the scope gate's future are boxed, so every
+call's future is 2,112 bytes where it was 3,296; a gated call reads its caller
+from the gate's reach; `may_take_input` answers under its read lock. A gated
+call costs 12,993 instructions where 0.11.1 cost 17,920 (0.7: 14,794). Requires
+plexus-auth-core 0.3.3.
+
 ## [0.11.1]
 
 KEEL-19 (security, High): **a peer token is taken only from whoever it

@@ -3163,8 +3163,11 @@ impl DynamicHub {
         // CHILD-WIRE: for each registered child router with capability bits set,
         // register {ns}.list_children / {ns}.search_children as subscriptions.
         // Per-activation namespaced (not top-level _list_children).
-        for (ns, e) in self.table().entries.iter() {
-            register_child_capability_methods(&mut module, ns, e.router.clone(), self.inner.gate.clone())?;
+        // KEEL-33: not on a gated service — they would run beside the gate.
+        if self.inner.gate.is_none() {
+            for (ns, e) in self.table().entries.iter() {
+                register_child_capability_methods(&mut module, ns, e.router.clone())?;
+            }
         }
 
         Ok(module)
@@ -3350,8 +3353,11 @@ impl DynamicHub {
 
         // CHILD-WIRE: for each registered child router with capability bits set,
         // register {ns}.list_children / {ns}.search_children as subscriptions.
-        for (ns, e) in hub.table().entries.iter() {
-            register_child_capability_methods(&mut module, ns, e.router.clone(), hub.inner.gate.clone())?;
+        // KEEL-33: not on a gated service — they would run beside the gate.
+        if hub.inner.gate.is_none() {
+            for (ns, e) in hub.table().entries.iter() {
+                register_child_capability_methods(&mut module, ns, e.router.clone())?;
+            }
         }
 
         Ok(module)
@@ -3371,25 +3377,20 @@ impl DynamicHub {
 /// Activations that advertise neither bit produce no registrations — calling
 /// the methods returns standard `methodNotFound`. That's the wire-level
 /// signal that the activation doesn't support enumeration / search.
-/// RETURNS-47: the context a `{ns}.list_children` / `{ns}.search_children`
-/// call runs in, so a dynamic child's list or search method reads its caller
-/// as any method does: everywhere on a service without a gate; on a gated
-/// one the caller's reach for the method's path, asked of the gate only if
-/// read (as an introspection call's). These methods are not decided by the
-/// gate (a gap of their own); the context only says who is asking.
-fn listing_context(
-    gate: Option<&Arc<plexus_auth_core::grants::Gate>>,
-    ext: &jsonrpsee::Extensions,
-    method: &str,
-) -> crate::call::CallContext {
+///
+/// KEEL-33: registered only on a service **without a gate**. They run the
+/// router's list or search function with no grant decided — that function
+/// may be no method at all (a plain `fn`), so it has no grant of its own to
+/// decide them by. On a gated service the list method, when it is a method,
+/// is reached as any method is: through `{ns}.call`, by its own grant; and
+/// the names a caller may see are its view's.
+///
+/// RETURNS-47: the context such a call runs in, so a dynamic child's list
+/// or search method reads its caller as any method does: everywhere, as a
+/// service without a gate admits every call.
+fn listing_context(ext: &jsonrpsee::Extensions) -> crate::call::CallContext {
     let auth = ext.get::<Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-    match gate {
-        None => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
-        Some(gate) => {
-            let (auth, _) = super::grant_gate::standing(gate, auth);
-            crate::call::CallContext::introspection(auth, Arc::clone(gate), plexus_auth_core::grants::Grant::new(method.to_string()))
-        }
-    }
+    crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere())
 }
 
 #[allow(deprecated)] // ChildCapabilities is deprecated by IR-4 but still the wire-level signal
@@ -3397,7 +3398,6 @@ fn register_child_capability_methods(
     module: &mut RpcModule<()>,
     namespace: &str,
     router: Arc<dyn ChildRouter>,
-    gate: Option<Arc<plexus_auth_core::grants::Gate>>,
 ) -> Result<(), jsonrpsee::core::RegisterMethodError> {
     let caps = router.capabilities();
     if caps.is_empty() {
@@ -3412,14 +3412,13 @@ fn register_child_capability_methods(
         let list_unsub: &'static str =
             Box::leak(format!("{}.list_children_unsub", namespace).into_boxed_str());
         let router_for_list = router.clone();
-        let gate_for_list = gate.clone();
         module.register_subscription(
             list_method,
             PLEXUS_NOTIF_METHOD,
             list_unsub,
             move |_params, pending, _ctx, ext| {
                 let router = router_for_list.clone();
-                let ctx = listing_context(gate_for_list.as_ref(), &ext, list_method);
+                let ctx = listing_context(&ext);
                 Box::pin(async move {
                     // Collect names eagerly so the BoxStream's borrow on the
                     // router doesn't outlive list_children's call. For v1 this
@@ -3463,14 +3462,13 @@ fn register_child_capability_methods(
         let search_unsub: &'static str =
             Box::leak(format!("{}.search_children_unsub", namespace).into_boxed_str());
         let router_for_search = router.clone();
-        let gate_for_search = gate.clone();
         module.register_subscription(
             search_method,
             PLEXUS_NOTIF_METHOD,
             search_unsub,
             move |params, pending, _ctx, ext| {
                 let router = router_for_search.clone();
-                let ctx = listing_context(gate_for_search.as_ref(), &ext, search_method);
+                let ctx = listing_context(&ext);
                 Box::pin(async move {
                     let p: SearchChildrenParams = params.parse()?;
                     let collected: Vec<String> = crate::call::scope(ctx, async {
@@ -4374,7 +4372,7 @@ mod tests {
     fn build_module_for(router: WireFixture, ns: &str) -> RpcModule<()> {
         let mut module = RpcModule::new(());
         let arc: Arc<dyn ChildRouter> = Arc::new(router);
-        register_child_capability_methods(&mut module, ns, arc, None).expect("register");
+        register_child_capability_methods(&mut module, ns, arc).expect("register");
         module
     }
 

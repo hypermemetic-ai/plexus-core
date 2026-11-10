@@ -15,6 +15,14 @@ from the gate's reach; `may_take_input` answers under its read lock. A gated
 call costs 12,993 instructions where 0.11.1 cost 17,920 (0.7: 14,794). Requires
 plexus-auth-core 0.3.3.
 
+Omitted from 0.11.1's entry below, and in it: KEEL-31 (`#[method(everywhere)]`:
+a whole-service method runs only where its grant is held on `*`; decided by the
+gate, checked again in the method, required at start), KEEL-32 (a `.schema`
+path is answered only from the caller's view, with no lookup; a mounted child's
+schema requests are held to its consent, `ChildOptions::schemas`,
+`consent_required`, `revoked`), KEEL-33 (`list_children` and `search_children`
+are not served on a gated service).
+
 ## [0.11.1]
 
 KEEL-19 (security, High): **a peer token is taken only from whoever it

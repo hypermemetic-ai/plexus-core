@@ -41,7 +41,9 @@
 //! ```
 //!
 //! The parts a host is made of — [`parts::Members`], [`parts::Everywhere`],
-//! [`parts::Shortcodes`], [`parts::who`], [`parts::items`] — are public for
+//! [`parts::Shortcodes`], [`parts::who`] (each caller in a session of its
+//! own, [`parts::session_of`]), [`parts::items`] (or
+//! [`parts::every_item`], the closing `done` kept) — are public for
 //! a test that builds something the host does not (a second gate, a
 //! transport as a caller).
 //!

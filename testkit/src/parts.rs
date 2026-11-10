@@ -93,9 +93,17 @@ impl Resolve for Shortcodes {
     }
 }
 
-/// The context of a call made by the principal `p` (session `s1`).
+/// The context of a call made by the principal `p`, in its own session,
+/// [`session_of`]`(p)`: two callers never share one, so a test can tell a
+/// caller's session from another's (a hop's, a signed-out one's).
 pub fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
+    AuthContext::for_principal(&p.parse().unwrap(), session_of(p), vec![], Value::Null)
+}
+
+/// The session [`who`] gives the principal `p`: `sess-<p>`, the same on
+/// every call.
+pub fn session_of(p: &str) -> String {
+    format!("sess-{p}")
 }
 
 /// A session id planted in [`who_carrying_secrets`]'s context: a test
@@ -108,6 +116,22 @@ pub const KEY_SECRET: &str = "plexus-key.PROOFSECRET0123456789";
 /// ([`SESSION_SECRET`], [`KEY_SECRET`]) — what must never reach a child.
 pub fn who_carrying_secrets(p: &str) -> AuthContext {
     AuthContext::for_principal(&p.parse().unwrap(), SESSION_SECRET, vec![], json!({ "session_key": KEY_SECRET, "token": KEY_SECRET }))
+}
+
+/// [`items`], the closing `done` kept: for a test that reads item 0 of an
+/// answer that may be no more than its `done`, or counts every item a
+/// stream sends.
+pub async fn every_item(routed: Result<PlexusStream, PlexusError>) -> Vec<Value> {
+    match routed {
+        Err(e) => items(Err(e)).await,
+        Ok(stream) => stream
+            .map(|i| match i {
+                PlexusStreamItem::Data { content, .. } => content.into_value(),
+                other => serde_json::to_value(other).unwrap(),
+            })
+            .collect()
+            .await,
+    }
 }
 
 /// A call's answer as values: each data item's content, any other item as

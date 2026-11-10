@@ -141,6 +141,13 @@ fn members() -> HostBuilder {
         .member(ROOT, "admin")
 }
 
+/// `p` signed in as session `s1`: the session the editor's test checks
+/// the child sees intact, by that literal (the kit's `who` gives each
+/// principal a session of its own, `sess-<p>`).
+fn in_session_s1(p: &str) -> AuthContext {
+    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
+}
+
 fn ceilinged(p: &str, ceiling: Value) -> AuthContext {
     AuthContext::for_principal(
         &p.parse().unwrap(),
@@ -196,7 +203,7 @@ fn static_children_are_listed_by_path_with_qualified_grants() {
 async fn an_editor_calls_a_child_with_principal_session_and_ceiling_intact() {
     let host = members().await;
     let hub = host.service();
-    let out = data(hub.route("tickets.commits.link", json!({"id": "MENGER-2"}), Some(&who(ADA))).await.unwrap()).await;
+    let out = data(hub.route("tickets.commits.link", json!({"id": "MENGER-2"}), Some(&in_session_s1(ADA))).await.unwrap()).await;
     assert_eq!(out.len(), 1);
     assert_eq!(out[0]["principal"], json!(ADA));
     assert_eq!(out[0]["session"], json!("s1"));

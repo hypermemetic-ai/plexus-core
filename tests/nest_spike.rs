@@ -21,12 +21,11 @@ mod echo;
 #[path = "../../plexus-wire/reference/echo-rs/src/service.rs"]
 mod service;
 
-use futures::StreamExt;
-use plexus_core::plexus::{AuthContext, ChildOptions, ChildSpec, PlexusStream, PlexusStreamItem, RemoteChild, RoleTable};
+use plexus_core::plexus::{AuthContext, ChildOptions, ChildSpec, RemoteChild, RoleTable};
 use plexus_core::plexus::Activation;
-use plexus_core::{DynamicHub, PlexusError};
+use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
-use plexus_testkit::parts::items;
+use plexus_testkit::parts::{every_item, items};
 use plexus_testkit::{Host, World, EDITOR, VIEWER};
 use serde_json::{json, Value};
 
@@ -202,22 +201,6 @@ mod variant {
     }
 }
 use variant::Nest2Activation;
-
-/// The kit's `items` with the closing `done` kept, as this file read every
-/// answer before the kit: the restart below reads item 0 of whatever a call
-/// answers while the child goes, which may be no more than its `done`.
-async fn every_item(r: Result<PlexusStream, PlexusError>) -> Vec<Value> {
-    match r {
-        Err(e) => items(Err(e)).await,
-        Ok(stream) => stream
-            .map(|i| match i {
-                PlexusStreamItem::Data { content, .. } => content.into_value(),
-                other => serde_json::to_value(other).unwrap(),
-            })
-            .collect()
-            .await,
-    }
-}
 
 /// VIEWER holds viewer, EDITOR editor, both on `*`; the roles the host
 /// declares are the mount's, renamed at every level.

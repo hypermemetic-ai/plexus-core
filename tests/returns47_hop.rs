@@ -10,7 +10,7 @@ use plexus_core::call;
 use plexus_core::plexus::{AuthContext, ChildOptions, ChildSpec, RemoteChild, ScopeRef};
 use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
-use plexus_testkit::parts::{items, who};
+use plexus_testkit::parts::{every_item, who};
 use plexus_testkit::{Host, World};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -146,7 +146,7 @@ async fn with_no_gate_deciding_the_plugin_refuses_before_the_method() {
     // schema, asked at the mount with no limit either, was answered.
     let child = mounted().await;
     let service = DynamicHub::new("menger").register(child.clone());
-    let got = items(service.route("forge.repos", json!({}), Some(&who(ADA))).await).await;
+    let got = every_item(service.route("forge.repos", json!({}), Some(&who(ADA))).await).await;
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0]["type"], "error", "{got:?}");
     assert_eq!(got[0]["error_kind"], "forbidden", "{got:?}");

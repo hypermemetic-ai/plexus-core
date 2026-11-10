@@ -189,7 +189,11 @@ async fn nested_child_through_the_seam() {
     let calls = child.stats().calls;
     let a = first(host.route("deep.a.schema", json!({}), Some(&viewer)).await).await;
     assert_eq!(a["namespace"], "a", "{a}");
-    let b = first(host.route("deep.a.b.schema", json!({}), Some(&viewer)).await).await;
+    // KEEL-32: `deep.a.b` holds no method the viewer holds: its schema is
+    // not in the viewer's view, refused as not found; an editor's view has it.
+    let hidden = first(host.route("deep.a.b.schema", json!({}), Some(&viewer)).await).await;
+    assert!(hidden["route_error"].as_str().is_some_and(|r| r.contains("NotFound")), "{hidden}");
+    let b = first(host.route("deep.a.b.schema", json!({}), Some(&who(plexus_testkit::EDITOR))).await).await;
     assert_eq!(b["namespace"], "b", "{b}");
     assert_eq!(child.stats().calls, calls, "no schema call crossed the hop");
 

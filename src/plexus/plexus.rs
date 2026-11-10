@@ -1289,6 +1289,22 @@ impl GateIndex {
     fn info(&self, method: &str) -> Option<&super::scope_gate::MethodGateInfo> {
         self.methods.get(method).or_else(|| self.slots.resolve(method).and_then(|k| self.methods.get(&k)))
     }
+
+    /// KEEL-32: the index's key for the path `path` (a method's or a
+    /// child's): through a slot, the slot's (`solar.earth.info` →
+    /// `solar.{planet}.info`, `solar.earth` → `solar.{planet}`,
+    /// `dyn.peer.w` → `dyn.{peer}`); else the path itself.
+    fn slot_key(&self, path: &str) -> String {
+        if let Some(k) = self.slots.resolve(path) {
+            return k;
+        }
+        // As a child's path: one more segment makes it a method's.
+        const PROBE: &str = ".\u{0}";
+        match self.slots.resolve(&format!("{path}{PROBE}")) {
+            Some(k) => k.strip_suffix(PROBE).map(str::to_string).unwrap_or(k),
+            None => path.to_string(),
+        }
+    }
 }
 
 
@@ -1782,11 +1798,20 @@ impl DynamicHub {
                     }
                     // A visible nested child: its own routing answers.
                     Some(_) => return None,
-                    None if name.contains('.') => return None,
-                    // NEST-6: a name in the activation's dynamic slot
-                    // (`solar.earth.schema`): the instance's own schema,
-                    // which its routing answers.
-                    None if base.activations.iter().any(|a| a.namespace == ns && a.methods.iter().any(|m| m.role.is_slot())) => return None,
+                    // KEEL-32: a path below the activation — a static
+                    // child's (`tickets.commits.link`), or a name in a
+                    // dynamic or peer slot (NEST-6, NEST-7:
+                    // `solar.earth.schema`, `dyn.peer.w.schema`) — is
+                    // routed only when the caller holds a method at it or
+                    // below it (or the slot whole): routing it runs the
+                    // slot's lookup with the name the caller chose. Any
+                    // other is not found, never routed.
+                    None if ns != hub_ns
+                        && (name.contains('.') || base.activations.iter().any(|a| a.namespace == ns && a.methods.iter().any(|m| m.role.is_slot())))
+                        && self.shows_path(&format!("{ns}.{name}"), auth) =>
+                    {
+                        return None
+                    }
                     None => {
                         return Some(Err(PlexusError::MethodNotFound {
                             activation: ns.to_string(),
@@ -1831,6 +1856,60 @@ impl DynamicHub {
             base.keep_shell(key, shell);
         }
         Some(Ok(Box::pin(futures::stream::iter(items.into_iter().map(with(content))))))
+    }
+
+    /// KEEL-32: an introspection path in the service's own-namespace form
+    /// (`svc.vault.hidden.schema`) as its bare form (`vault.hidden.schema`),
+    /// so the two answer the same for every caller: routing reaches the same
+    /// place by both. A path whose first segment below the service names
+    /// one of the service's own methods (`svc.call.schema`) is the service's
+    /// own, and stays.
+    fn bare_introspection<'m>(&self, method: &'m str) -> &'m str {
+        let Some(rest) = method.strip_prefix(self.inner.namespace.as_str()).and_then(|r| r.strip_prefix('.')) else {
+            return method;
+        };
+        let Some((first, _)) = rest.split_once('.') else { return method };
+        let own = self.described().service.methods.iter().any(|m| m.name == first);
+        if own || first.is_empty() {
+            method
+        } else {
+            rest
+        }
+    }
+
+    /// KEEL-32: whether the caller's view shows the path `path` below an
+    /// activation (`vault.hidden`, `vault.hidden.rotate_master_key`,
+    /// `solar.earth`, `dyn.peer.w`): the caller holds — as the gate would
+    /// admit it, `everywhere` included — a method there or below it, read
+    /// from the gate's index through the slots (`solar.earth` →
+    /// `solar.{planet}`), or the path itself as a grant (an untyped slot
+    /// whole, or `admin`, which holds every grant). Asks nothing of an
+    /// activation: no child or peer is looked up to decide it.
+    fn shows_path(&self, path: &str, auth: Option<&super::auth::AuthContext>) -> bool {
+        let Some(gate) = self.inner.gate.as_ref() else { return true };
+        let signed_in = auth.and_then(|a| a.principal()).is_some();
+        let holds = |grant: &str, public: bool, everywhere: bool| {
+            if public || (signed_in && self.inner.signed_in_grants.contains(grant)) {
+                return true;
+            }
+            let Some(a) = auth else { return false };
+            let held = gate.held_on(a, &plexus_auth_core::grants::Grant::new(grant));
+            if everywhere {
+                held.iter().any(plexus_auth_core::grants::ScopeRef::is_everywhere)
+            } else {
+                !held.is_empty()
+            }
+        };
+        if holds(path, false, false) {
+            return true;
+        }
+        let index = self.gate_index();
+        let key = index.slot_key(path);
+        let below = format!("{key}.");
+        index.methods.iter().any(|(at, info)| {
+            (*at == key || at.starts_with(&below))
+                && holds(info.grant.as_deref().unwrap_or(at), info.public, info.everywhere)
+        })
     }
 
     /// RETURNS-40: the service's IR of the walks from `namespaces` (dotted
@@ -1880,6 +1959,11 @@ impl DynamicHub {
                 let mut todo: Vec<Vec<String>> = roots.clone();
                 while let Some(path) = todo.pop() {
                     if schemas.contains_key(&path) || permitted.as_ref().is_some_and(|p| !p.contains(&path.join("."))) {
+                        continue;
+                    }
+                    // KEEL-32: a path below an activation that `<path>.schema`
+                    // would refuse the caller is not walked either.
+                    if path.len() > 1 && !self.shows_path(&path.join("."), caller) {
                         continue;
                     }
                     // a schema the caller is not answered is one the walk skips
@@ -2724,6 +2808,8 @@ impl DynamicHub {
                 // RETURNS-47: in a context too — the caller's reach for the
                 // path, as the gate gives a public method's — never none.
                 super::grant_gate::Admit::Open => {
+                    // KEEL-32: the own-namespace form is the bare form.
+                    let method = self.bare_introspection(method);
                     let grant = plexus_auth_core::grants::Grant::new(method.to_string());
                     in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
                         match self.introspect_in_view(method, &params, auth, raw_ctx).await {

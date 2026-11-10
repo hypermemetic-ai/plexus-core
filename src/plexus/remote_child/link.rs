@@ -603,6 +603,15 @@ pub(super) fn static_children(raw: &Value) -> Vec<String> {
 impl Shared {
     pub(super) fn new(spec: ChildSpec, opts: ChildOptions, principal: String) -> Arc<Self> {
         let upcalls = Upcalls::new(opts.host.clone().or_else(crate::plexus::service_scope::current), opts.legacy_upcalls);
+        upcalls.set_schemas(&opts.schemas);
+        // KEEL-32 (R3-1): before the handshake — a child that asks at once
+        // finds nothing consented and, revoked, nothing at all.
+        if opts.consent_required {
+            upcalls.set_consent(Some(Vec::new()));
+        }
+        if let Some(why) = &opts.revoked {
+            upcalls.revoke(why);
+        }
         Arc::new(Self {
             upcalls,
             name: spec.name().to_string(),

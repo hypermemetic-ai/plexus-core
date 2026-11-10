@@ -247,9 +247,27 @@ impl ConfigKeyActivation {
 fn holds_critical(auth: Option<&AuthContext>) -> bool {
     let gate = crate::plexus::service_scope::current().and_then(|w| w.upgrade()).and_then(|s| s.gate().cloned());
     match gate {
-        None => true,
-        Some(g) => g.check(auth, &plexus_auth_core::grants::Grant::new(CRITICAL_GRANT), None).is_ok(),
+        // KEEL-31: no gate here — in a child serving a hop, the hop's verdict
+        // (held on `*`) decides; a service with no gate and no hop admits
+        // every call, as it always has.
+        None => match crate::call::context() {
+            Ok(ctx) if ctx.hop().is_some() => ctx.reach().is_some_and(|r| r.is_everywhere()),
+            _ => true,
+        },
+        // KEEL-31: a critical setting is the whole service's: held on `*`.
+        Some(g) => g.check_everywhere(auth, &plexus_auth_core::grants::Grant::new(CRITICAL_GRANT)).is_ok(),
     }
+}
+
+/// KEEL-31: a setting's writes act on the whole service — marked
+/// `everywhere`, which `with_config_service` checks before it serves them.
+pub const EVERYWHERE: &[&str] = &["set", "reset", "confirm"];
+
+/// KEEL-31: the setting's schema carries the mark on each write, or why not.
+pub(crate) fn require_everywhere() -> Result<(), String> {
+    let schema = <ConfigKeyActivation as crate::plexus::Activation>::slot_schema()
+        .ok_or_else(|| "config_key: no schema to check".to_string())?;
+    crate::plexus::grant_gate::require_everywhere(&schema, EVERYWHERE)
 }
 
 /// A setting (or a group of them).
@@ -270,7 +288,7 @@ impl ConfigKeyActivation {
     /// `confirm_within` (`60s`): applied at once, reverted unless
     /// `confirm` comes in time — so a change that cuts the caller off undoes
     /// itself.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn set(&self, auth: Option<&AuthContext>, value: Value, confirm_within: Option<String>) -> SettingEvent {
         let within = match confirm_within.as_deref().map(parse_duration).transpose() {
             Ok(w) => w,
@@ -292,7 +310,7 @@ impl ConfigKeyActivation {
 
     /// Take its runtime value away: back to the flag's, the file's or the
     /// default.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn reset(&self, auth: Option<&AuthContext>) -> SettingEvent {
         if let Err(e) = self.may_write(auth, None) {
             return e;
@@ -304,7 +322,7 @@ impl ConfigKeyActivation {
     }
 
     /// Keep the change made with `confirm_within`.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn confirm(&self, auth: Option<&AuthContext>) -> SettingEvent {
         if let Err(e) = self.may_write(auth, None) {
             return e;

@@ -332,6 +332,35 @@ pub fn context() -> Result<CallContext, CallError> {
     CALL.try_with(CallContext::clone).map_err(|_| CallError::OutsideCall)
 }
 
+/// KEEL-31: may the call this runs in run `grant`, a method that acts on
+/// the whole service (`#[plexus_macros::method(everywhere)]`)? Only when
+/// the reach it was admitted with is held on `*`: a gated service's verdict
+/// (the gate decided it on `*` — or, through an untyped slot, on the slot's
+/// grant, which must then be held on `*`), the hop's ceiling in a child
+/// reached through the seam (`limit.held_on` naming `*`), or a service
+/// without a gate (its dispatch admits everywhere). The macro calls it
+/// before such a method runs, wherever it is called from, so neither a
+/// near side that decided on a slot nor an older near side lets a scoped
+/// holder through. Outside any call — code calling the activation
+/// directly, with no dispatch and no hop — it allows, as before: no gate
+/// decided anything to consult.
+pub fn admits_everywhere(grant: &str) -> Result<(), PlexusError> {
+    let Ok(ctx) = context() else { return Ok(()) };
+    let held_on = match ctx.reach() {
+        Some(r) if r.is_everywhere() => return Ok(()),
+        Some(r) => r.held_on().to_vec(),
+        None => Vec::new(),
+    };
+    Err(PlexusError::Forbidden {
+        reason: crate::plexus::AuthzDenyReason::MissingGrant {
+            grant: Grant::new(grant),
+            scope: plexus_auth_core::grants::ScopeRef::Everywhere,
+            roles: Vec::new(),
+            held_on,
+        },
+    })
+}
+
 /// What the method's verifier answered for this call: on `impl Trait for
 /// Type`, `#[plexus_macros::from_auth(self.access.verify)]` on the method
 /// runs the verifier before the body — its error the call's refusal, out of

@@ -1289,6 +1289,22 @@ impl GateIndex {
     fn info(&self, method: &str) -> Option<&super::scope_gate::MethodGateInfo> {
         self.methods.get(method).or_else(|| self.slots.resolve(method).and_then(|k| self.methods.get(&k)))
     }
+
+    /// KEEL-32: the index's key for the path `path` (a method's or a
+    /// child's): through a slot, the slot's (`solar.earth.info` →
+    /// `solar.{planet}.info`, `solar.earth` → `solar.{planet}`,
+    /// `dyn.peer.w` → `dyn.{peer}`); else the path itself.
+    fn slot_key(&self, path: &str) -> String {
+        if let Some(k) = self.slots.resolve(path) {
+            return k;
+        }
+        // As a child's path: one more segment makes it a method's.
+        const PROBE: &str = ".\u{0}";
+        match self.slots.resolve(&format!("{path}{PROBE}")) {
+            Some(k) => k.strip_suffix(PROBE).map(str::to_string).unwrap_or(k),
+            None => path.to_string(),
+        }
+    }
 }
 
 
@@ -1604,6 +1620,11 @@ impl DynamicHub {
         let (_, untyped) = self.slot_children();
         catalog.add_slots(&untyped);
         let (auth, gate) = super::auth_activation::AuthActivation::mount(setup, catalog.clone());
+        // KEEL-31: refuse to start if the auth activation's whole-service
+        // methods lost their mark.
+        if let Err(why) = super::grant_gate::require_everywhere(&Activation::plugin_schema(&auth), super::auth_activation::EVERYWHERE) {
+            panic!("{why}");
+        }
         {
             let inner = self.inner_mut("Cannot mount auth: DynamicHub has multiple references");
             inner.auth_catalog = Some(catalog);
@@ -1782,11 +1803,20 @@ impl DynamicHub {
                     }
                     // A visible nested child: its own routing answers.
                     Some(_) => return None,
-                    None if name.contains('.') => return None,
-                    // NEST-6: a name in the activation's dynamic slot
-                    // (`solar.earth.schema`): the instance's own schema,
-                    // which its routing answers.
-                    None if base.activations.iter().any(|a| a.namespace == ns && a.methods.iter().any(|m| m.role.is_slot())) => return None,
+                    // KEEL-32: a path below the activation — a static
+                    // child's (`tickets.commits.link`), or a name in a
+                    // dynamic or peer slot (NEST-6, NEST-7:
+                    // `solar.earth.schema`, `dyn.peer.w.schema`) — is
+                    // routed only when the caller holds a method at it or
+                    // below it (or the slot whole): routing it runs the
+                    // slot's lookup with the name the caller chose. Any
+                    // other is not found, never routed.
+                    None if ns != hub_ns
+                        && (name.contains('.') || base.activations.iter().any(|a| a.namespace == ns && a.methods.iter().any(|m| m.role.is_slot())))
+                        && self.shows_path(&format!("{ns}.{name}"), auth) =>
+                    {
+                        return None
+                    }
                     None => {
                         return Some(Err(PlexusError::MethodNotFound {
                             activation: ns.to_string(),
@@ -1831,6 +1861,73 @@ impl DynamicHub {
             base.keep_shell(key, shell);
         }
         Some(Ok(Box::pin(futures::stream::iter(items.into_iter().map(with(content))))))
+    }
+
+    /// KEEL-32: an introspection path in the service's own-namespace form
+    /// (`svc.vault.hidden.schema`) as its bare form (`vault.hidden.schema`),
+    /// so the two answer the same for every caller: routing reaches the same
+    /// place by both. A path whose first segment below the service names
+    /// one of the service's own methods (`svc.call.schema`) is the service's
+    /// own, and stays.
+    fn bare_introspection<'m>(&self, method: &'m str) -> &'m str {
+        let Some(rest) = method.strip_prefix(self.inner.namespace.as_str()).and_then(|r| r.strip_prefix('.')) else {
+            return method;
+        };
+        let Some((first, _)) = rest.split_once('.') else { return method };
+        let own = self.described().service.methods.iter().any(|m| m.name == first);
+        if own || first.is_empty() {
+            method
+        } else {
+            rest
+        }
+    }
+
+    /// KEEL-32: a child's schema request, `<path>.schema` in either form, as
+    /// its bare path (`svc.vault.hidden.schema` → `vault.hidden`).
+    pub(crate) fn bare_schema_path(&self, method: &str) -> String {
+        self.bare_introspection(method).trim_end_matches(".schema").to_string()
+    }
+
+    /// KEEL-32: whether reaching `path` looks a name up in a dynamic or peer
+    /// slot (`dyn.peer.w`, `solar.earth`), by the service's index — asked of
+    /// no activation.
+    pub(crate) fn crosses_slot(&self, path: &str) -> bool {
+        self.gate_index().slot_key(path) != path
+    }
+
+    /// KEEL-32: whether the caller's view shows the path `path` below an
+    /// activation (`vault.hidden`, `vault.hidden.rotate_master_key`,
+    /// `solar.earth`, `dyn.peer.w`): the caller holds — as the gate would
+    /// admit it, `everywhere` included — a method there or below it, read
+    /// from the gate's index through the slots (`solar.earth` →
+    /// `solar.{planet}`), or the path itself as a grant (an untyped slot
+    /// whole, or `admin`, which holds every grant). Asks nothing of an
+    /// activation: no child or peer is looked up to decide it.
+    fn shows_path(&self, path: &str, auth: Option<&super::auth::AuthContext>) -> bool {
+        let Some(gate) = self.inner.gate.as_ref() else { return true };
+        let signed_in = auth.and_then(|a| a.principal()).is_some();
+        let holds = |grant: &str, public: bool, everywhere: bool| {
+            if public || (signed_in && self.inner.signed_in_grants.contains(grant)) {
+                return true;
+            }
+            let Some(a) = auth else { return false };
+            let held = gate.held_on(a, &plexus_auth_core::grants::Grant::new(grant));
+            if everywhere {
+                held.iter().any(plexus_auth_core::grants::ScopeRef::is_everywhere)
+            } else {
+                !held.is_empty()
+            }
+        };
+        if holds(path, false, false) {
+            return true;
+        }
+        let index = self.gate_index();
+        let key = index.slot_key(path);
+        let below = format!("{key}.");
+        index.methods.iter().any(|(at, info)| {
+            (*at == key || at.starts_with(&below))
+                && holds(info.grant.as_deref().unwrap_or(at), info.public, info.everywhere)
+        })
     }
 
     /// RETURNS-40: the service's IR of the walks from `namespaces` (dotted
@@ -1880,6 +1977,11 @@ impl DynamicHub {
                 let mut todo: Vec<Vec<String>> = roots.clone();
                 while let Some(path) = todo.pop() {
                     if schemas.contains_key(&path) || permitted.as_ref().is_some_and(|p| !p.contains(&path.join("."))) {
+                        continue;
+                    }
+                    // KEEL-32: a path below an activation that `<path>.schema`
+                    // would refuse the caller is not walked either.
+                    if path.len() > 1 && !self.shows_path(&path.join("."), caller) {
                         continue;
                     }
                     // a schema the caller is not answered is one the walk skips
@@ -2467,6 +2569,10 @@ impl DynamicHub {
     /// on its own grant.
     pub fn with_config_service(self) -> Self {
         let config = self.config();
+        // KEEL-31: refuse to start if a setting's writes lost their mark.
+        if let Err(why) = super::config::require_everywhere() {
+            panic!("{why}");
+        }
         self.register(super::config::ConfigActivation::new(config))
     }
 
@@ -2689,7 +2795,9 @@ impl DynamicHub {
                 "`{method}` is not a schema: outside a call, a child asks its service only for a schema"
             )));
         }
-        let ctx = crate::call::CallContext::admitted(None, plexus_auth_core::grants::Reach::everywhere());
+        // KEEL-32: decided by the mount before it gets here (`may_read_schema`);
+        // it runs with no reach, never everywhere.
+        let ctx = crate::call::CallContext::admitted(None, plexus_auth_core::grants::Reach::nowhere());
         let routed = self.route_ungated(method, params, None, None);
         super::service_scope::scope(self.downgrade(), in_call(ctx, routed)).await
     }
@@ -2709,7 +2817,12 @@ impl DynamicHub {
                 // grant; a grant written as its literal path still decides
                 // first (the slot grant is additive).
                 None => match index.info(method) {
-                    Some(slot) => decide(None).or_else(|_| decide(Some(slot))),
+                    // KEEL-31: a slot's method that acts everywhere is
+                    // decided on `*` by its literal path too.
+                    Some(slot) => {
+                        let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, ..Default::default() };
+                        decide(Some(&literal)).or_else(|_| decide(Some(slot)))
+                    }
                     None => decide(None),
                 },
             }
@@ -2719,6 +2832,8 @@ impl DynamicHub {
                 // RETURNS-47: in a context too — the caller's reach for the
                 // path, as the gate gives a public method's — never none.
                 super::grant_gate::Admit::Open => {
+                    // KEEL-32: the own-namespace form is the bare form.
+                    let method = self.bare_introspection(method);
                     let grant = plexus_auth_core::grants::Grant::new(method.to_string());
                     in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
                         match self.introspect_in_view(method, &params, auth, raw_ctx).await {
@@ -3072,8 +3187,11 @@ impl DynamicHub {
         // CHILD-WIRE: for each registered child router with capability bits set,
         // register {ns}.list_children / {ns}.search_children as subscriptions.
         // Per-activation namespaced (not top-level _list_children).
-        for (ns, e) in self.table().entries.iter() {
-            register_child_capability_methods(&mut module, ns, e.router.clone(), self.inner.gate.clone())?;
+        // KEEL-33: not on a gated service — they would run beside the gate.
+        if self.inner.gate.is_none() {
+            for (ns, e) in self.table().entries.iter() {
+                register_child_capability_methods(&mut module, ns, e.router.clone())?;
+            }
         }
 
         Ok(module)
@@ -3259,8 +3377,11 @@ impl DynamicHub {
 
         // CHILD-WIRE: for each registered child router with capability bits set,
         // register {ns}.list_children / {ns}.search_children as subscriptions.
-        for (ns, e) in hub.table().entries.iter() {
-            register_child_capability_methods(&mut module, ns, e.router.clone(), hub.inner.gate.clone())?;
+        // KEEL-33: not on a gated service — they would run beside the gate.
+        if hub.inner.gate.is_none() {
+            for (ns, e) in hub.table().entries.iter() {
+                register_child_capability_methods(&mut module, ns, e.router.clone())?;
+            }
         }
 
         Ok(module)
@@ -3280,25 +3401,20 @@ impl DynamicHub {
 /// Activations that advertise neither bit produce no registrations — calling
 /// the methods returns standard `methodNotFound`. That's the wire-level
 /// signal that the activation doesn't support enumeration / search.
-/// RETURNS-47: the context a `{ns}.list_children` / `{ns}.search_children`
-/// call runs in, so a dynamic child's list or search method reads its caller
-/// as any method does: everywhere on a service without a gate; on a gated
-/// one the caller's reach for the method's path, asked of the gate only if
-/// read (as an introspection call's). These methods are not decided by the
-/// gate (a gap of their own); the context only says who is asking.
-fn listing_context(
-    gate: Option<&Arc<plexus_auth_core::grants::Gate>>,
-    ext: &jsonrpsee::Extensions,
-    method: &str,
-) -> crate::call::CallContext {
+///
+/// KEEL-33: registered only on a service **without a gate**. They run the
+/// router's list or search function with no grant decided — that function
+/// may be no method at all (a plain `fn`), so it has no grant of its own to
+/// decide them by. On a gated service the list method, when it is a method,
+/// is reached as any method is: through `{ns}.call`, by its own grant; and
+/// the names a caller may see are its view's.
+///
+/// RETURNS-47: the context such a call runs in, so a dynamic child's list
+/// or search method reads its caller as any method does: everywhere, as a
+/// service without a gate admits every call.
+fn listing_context(ext: &jsonrpsee::Extensions) -> crate::call::CallContext {
     let auth = ext.get::<Arc<super::auth::AuthContext>>().map(|a| a.as_ref());
-    match gate {
-        None => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
-        Some(gate) => {
-            let (auth, _) = super::grant_gate::standing(gate, auth);
-            crate::call::CallContext::introspection(auth, Arc::clone(gate), plexus_auth_core::grants::Grant::new(method.to_string()))
-        }
-    }
+    crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere())
 }
 
 #[allow(deprecated)] // ChildCapabilities is deprecated by IR-4 but still the wire-level signal
@@ -3306,7 +3422,6 @@ fn register_child_capability_methods(
     module: &mut RpcModule<()>,
     namespace: &str,
     router: Arc<dyn ChildRouter>,
-    gate: Option<Arc<plexus_auth_core::grants::Gate>>,
 ) -> Result<(), jsonrpsee::core::RegisterMethodError> {
     let caps = router.capabilities();
     if caps.is_empty() {
@@ -3321,14 +3436,13 @@ fn register_child_capability_methods(
         let list_unsub: &'static str =
             Box::leak(format!("{}.list_children_unsub", namespace).into_boxed_str());
         let router_for_list = router.clone();
-        let gate_for_list = gate.clone();
         module.register_subscription(
             list_method,
             PLEXUS_NOTIF_METHOD,
             list_unsub,
             move |_params, pending, _ctx, ext| {
                 let router = router_for_list.clone();
-                let ctx = listing_context(gate_for_list.as_ref(), &ext, list_method);
+                let ctx = listing_context(&ext);
                 Box::pin(async move {
                     // Collect names eagerly so the BoxStream's borrow on the
                     // router doesn't outlive list_children's call. For v1 this
@@ -3372,14 +3486,13 @@ fn register_child_capability_methods(
         let search_unsub: &'static str =
             Box::leak(format!("{}.search_children_unsub", namespace).into_boxed_str());
         let router_for_search = router.clone();
-        let gate_for_search = gate.clone();
         module.register_subscription(
             search_method,
             PLEXUS_NOTIF_METHOD,
             search_unsub,
             move |params, pending, _ctx, ext| {
                 let router = router_for_search.clone();
-                let ctx = listing_context(gate_for_search.as_ref(), &ext, search_method);
+                let ctx = listing_context(&ext);
                 Box::pin(async move {
                     let p: SearchChildrenParams = params.parse()?;
                     let collected: Vec<String> = crate::call::scope(ctx, async {
@@ -4283,7 +4396,7 @@ mod tests {
     fn build_module_for(router: WireFixture, ns: &str) -> RpcModule<()> {
         let mut module = RpcModule::new(());
         let arc: Arc<dyn ChildRouter> = Arc::new(router);
-        register_child_capability_methods(&mut module, ns, arc, None).expect("register");
+        register_child_capability_methods(&mut module, ns, arc).expect("register");
         module
     }
 

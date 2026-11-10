@@ -117,6 +117,9 @@ pub(super) struct Upcalls {
     /// DYNAUTH-7: revoked, and why: no call is forwarded, no token minted,
     /// and (KEEL-19) nothing is decided for it — no call back, no exchange.
     revoked: Mutex<Option<String>>,
+    /// KEEL-32: the paths whose schemas it may read outside any call before
+    /// its needs are known ([`super::ChildOptions::schemas`]).
+    schemas: Mutex<Arc<[String]>>,
 }
 
 /// KEEL-19: what [`Upcalls::decide`] answers for a need: the scopes it is
@@ -132,7 +135,57 @@ pub(super) struct Decided {
 
 impl Upcalls {
     pub(super) fn new(host: Option<WeakService>, legacy: bool) -> Arc<Self> {
-        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), proofs: Default::default(), needs: Mutex::default(), consent: Mutex::default(), legacy, revoked: Mutex::default() })
+        Arc::new(Self { host: Mutex::new(host), under: Mutex::default(), made: AtomicU64::new(0), proofs: Default::default(), needs: Mutex::default(), consent: Mutex::default(), legacy, revoked: Mutex::default(), schemas: Mutex::new(Arc::from(Vec::new())) })
+    }
+
+    /// KEEL-32: see [`super::ChildOptions::schemas`].
+    pub(super) fn set_schemas(&self, paths: &[String]) {
+        *self.schemas.lock().unwrap() = paths.to_vec().into();
+    }
+
+    /// KEEL-32 · a schema the child asks for **outside any call**, answered
+    /// as the child — never as the service with everything, or anyone's
+    /// view but its own. `path` is the bare path (`weather.weather`,
+    /// `dyn.peer.w`), `crosses_slot` whether reaching it looks a name up in
+    /// a dynamic or peer slot. Answered when it is:
+    ///
+    /// - at or above one of its needs, declared and consented
+    ///   ([`Upcalls::decide`]'s rule): the shape of what it may call;
+    /// - at, above or below a path it was mounted to read
+    ///   ([`super::ChildOptions::schemas`]) — what it grows from at its
+    ///   start, before its needs are known;
+    /// - for a child under the legacy rule that declares no needs, a
+    ///   static path (no slot lookup on its way), as NEST-11 had it.
+    ///
+    /// A revoked child is answered nothing; anything else is not found —
+    /// never routed, so no dynamic child or peer is looked up for it.
+    pub(super) fn may_read_schema(&self, path: &str, crosses_slot: bool) -> Result<(), (PlexusError, String)> {
+        if let Some(why) = self.revoked() {
+            return Err((PlexusError::Unauthenticated(format!("this child is revoked ({why})")), format!("this child is revoked ({why}): it is answered no schema")));
+        }
+        let at_or_above = |n: &str| n == path || n.starts_with(&format!("{path}."));
+        let at_above_or_below = |s: &str| at_or_above(s) || path.starts_with(&format!("{s}."));
+        if self.schemas.lock().unwrap().iter().any(|s| at_above_or_below(s)) {
+            return Ok(());
+        }
+        let needs = self.needs.lock().unwrap().clone();
+        if let Some(needs) = &needs {
+            let consent = self.consent.lock().unwrap().clone();
+            let consented = |n: &String| consent.as_ref().is_none_or(|c| c.iter().any(|c| &c.method == n));
+            if needs.iter().filter(|n| consented(n)).any(|n| at_or_above(n)) {
+                return Ok(());
+            }
+        } else if self.legacy && !crosses_slot {
+            return Ok(());
+        }
+        let (ns, rest) = path.split_once('.').unwrap_or((path, ""));
+        let e = if rest.is_empty() {
+            PlexusError::ActivationNotFound(ns.to_string())
+        } else {
+            PlexusError::MethodNotFound { activation: ns.to_string(), method: rest.to_string() }
+        };
+        let said = format!("`{path}.schema` is not among what this child needs or was mounted to read: not found");
+        Err((e, said))
     }
 
     /// NEST-16: what the mounted child's schema says it needs.
@@ -243,7 +296,10 @@ impl Upcalls {
     /// A forwarded call opens: the child may call back under `id` until the
     /// guard is dropped (or [`UnderGuard::end`]ed).
     pub(super) fn open(self: &Arc<Self>, id: &str, auth: Option<&AuthContext>, reach: &Reach, minted: Option<Minted>) -> Option<UnderGuard> {
-        let service = service_scope::current().or_else(|| self.host())?;
+        // The service is learned here, with the first call forwarded (a
+        // schema the child asks outside any call is answered by it).
+        let known = self.host();
+        let service = service_scope::current().or(known)?;
         let (ended, _) = watch::channel(None);
         let under = Arc::new(Under { auth: auth.cloned(), reach: reach.clone(), service, ended, minted });
         {
@@ -516,7 +572,25 @@ pub(super) fn on_request(up: &Arc<Upcalls>, served: &Arc<Served>, out: &mpsc::Un
             let schema = target.ends_with(".schema");
             match (schema || standard, up.host()) {
                 (true, Some(host)) if standard => Route::Standard(host, None),
-                (true, Some(host)) => Route::Schema(host),
+                (true, Some(host)) => {
+                    // KEEL-32: answered as the child — its needs, what it
+                    // was mounted to read — or not found, never routed.
+                    if let Some(svc) = host.upgrade() {
+                        let own = format!("{}.schema", svc.runtime_namespace());
+                        if target == own {
+                            if let Some(why) = up.revoked() {
+                                let e = PlexusError::Unauthenticated(format!("this child is revoked ({why})"));
+                                return send(refusal(&id, &e));
+                            }
+                        } else {
+                            let path = svc.bare_schema_path(&target);
+                            if let Err((e, said)) = up.may_read_schema(&path, svc.crosses_slot(&path)) {
+                                return send(refusal_said(&id, &e, &said));
+                            }
+                        }
+                    }
+                    Route::Schema(host)
+                }
                 (true, None) => {
                     return send(refusal(&id, &PlexusError::Unauthenticated(
                         "this child's service is not known yet: it is learned with the first call forwarded to it".into(),

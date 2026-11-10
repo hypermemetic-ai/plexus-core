@@ -15,6 +15,7 @@
 //! | `public` method | runs (empty reach) | runs (its reach) |
 //! | introspection: `<ns>.schema`, the service's `hash` / `hashes` / `schema` / `ir` | runs | runs |
 //! | method with a `target`, value present | `Unauthenticated` | allowed iff a role held on a scope in the value's chain lists the grant, and every ceiling layer allows it there |
+//! | method that acts `everywhere` (KEEL-31) | `Unauthenticated` | allowed iff a role held on `*` lists the grant, and every ceiling layer allows it on `*` — held on a scope is refused, naming `*` |
 //! | method without a target (or the target param absent / null) | `Unauthenticated` | allowed iff the grant is held anywhere (within the ceiling) |
 //! | method no schema describes (a nested child path) | `Unauthenticated` | as "without a target", grant = the dotted path |
 //! | a signed-in grant (AUTH-5: `auth.whoami`, `auth.logout`, `auth.requires`) | `Unauthenticated` | runs (its reach), whatever the roles or ceiling |
@@ -185,6 +186,11 @@ pub(crate) fn decide(
         return Ok(Admit::Open);
     }
     let grant = Grant::new(info.and_then(|i| i.grant.clone()).unwrap_or_else(|| full_path.to_string()));
+    // KEEL-31: a method that acts on the whole service is decided on `*`,
+    // whatever else it says — the rule is the gate's, not the method's.
+    if info.is_some_and(|i| i.everywhere) {
+        return Ok(Admit::Reach(gate.check_everywhere(auth, &grant)?));
+    }
     if info.is_some_and(|i| i.public) {
         return Ok(Admit::Reach(gate.reach_of_public(auth, &grant)));
     }
@@ -212,6 +218,27 @@ pub(crate) fn decide(
             Ok(Admit::Reach(reach.expect("non-empty")))
         }
     }
+}
+
+/// KEEL-31: a backstop that does not depend on the macro — each of
+/// `methods` in `schema` is marked `everywhere`, or why not. A service
+/// whose own whole-service methods lost the mark (built with a macro that
+/// dropped the word) refuses to start rather than admit a scoped holder.
+pub fn require_everywhere(schema: &super::schema::PluginSchema, methods: &[&str]) -> Result<(), String> {
+    let unmarked: Vec<&str> = methods
+        .iter()
+        .copied()
+        .filter(|name| !schema.methods.iter().any(|m| m.name == *name && m.everywhere))
+        .collect();
+    if unmarked.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}: {} act on the whole service and must be marked `everywhere` in its schema; they are not — \
+         built with a plexus-macros that does not know the word (it needs 0.11.1 or later)",
+        schema.namespace,
+        unmarked.iter().map(|m| format!("{}.{m}", schema.namespace)).collect::<Vec<_>>().join(", "),
+    ))
 }
 
 /// A refusal as a client reads it back from an error stream item — the

@@ -138,6 +138,9 @@ pub(crate) struct MethodGateInfo {
     /// AUTH-2: `MethodSchema.target` — the param that locates what the call
     /// acts on.
     pub(crate) target: Option<String>,
+    /// KEEL-31: `MethodSchema.everywhere` — the method acts on the whole
+    /// service; its grant is needed on `*`.
+    pub(crate) everywhere: bool,
 }
 
 impl MethodGateInfo {
@@ -152,6 +155,7 @@ impl MethodGateInfo {
                 .unwrap_or_default(),
             grant: schema.grant.clone(),
             target: schema.target.clone(),
+            everywhere: schema.everywhere,
         }
     }
 }

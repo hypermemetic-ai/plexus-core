@@ -534,8 +534,6 @@ pub(super) struct Shared {
     /// a restart that proves another is refused, as one that publishes
     /// another schema is.
     pub identity: OnceLock<super::PeerIdentity>,
-    /// DYNAUTH-7: revoked, and why: no call is forwarded, no token minted.
-    pub revoked: Mutex<Option<String>>,
 }
 
 impl Drop for Shared {
@@ -612,7 +610,6 @@ impl Shared {
             dial: tokio::sync::Mutex::new(()),
             mounted_hash: OnceLock::new(),
             identity: OnceLock::new(),
-            revoked: Mutex::new(None),
         })
     }
 

@@ -375,14 +375,54 @@ impl RemoteChild {
     /// with one error item saying `why`. A token already in its hand lives
     /// out its `exp` (≤ 60 s) at a peer that verifies without asking.
     pub fn revoke(&self, why: &str) {
-        *self.inner.shared.revoked.lock().unwrap() = Some(why.to_string());
-        self.inner.shared.upcalls.end_all(&format!("revoked: {why}"));
+        self.inner.shared.upcalls.revoke(why);
         tracing::warn!(target: "plexus::audit", child = %self.name(), %why, "child revoked");
     }
 
     /// DYNAUTH-7: why the child is revoked, if it is.
     pub fn revoked(&self) -> Option<String> {
-        self.inner.shared.revoked.lock().unwrap().clone()
+        self.inner.shared.upcalls.revoked()
+    }
+
+    /// KEEL-19: may this child, presenting `presented` (a token minted for a
+    /// call into it), have it exchanged for one that reaches `need` — a path
+    /// of its service (`dyn.peer.b.forecast`), presented to the audience as
+    /// `forwarded` (the method in the audience's own terms)? Decided by the
+    /// one function its calls back are decided by (`Upcalls::decide`):
+    /// not revoked, `need` declared and consented, and held by the token.
+    /// Answers the exchanged token's scope: `forwarded` on each scope both
+    /// the token holds `need`'s grant on and the consent holds.
+    pub fn may_exchange(&self, need: &str, forwarded: &str, presented: &crate::plexus::peer_token::PeerClaims) -> Result<Vec<String>, String> {
+        if self.peer_key() != Some(presented.aud.as_str()) {
+            return Err(format!("the token presented is not `{}`'s", self.name()));
+        }
+        let up = &self.inner.shared.upcalls;
+        let svc = up.host().and_then(|h| h.upgrade()).ok_or_else(|| format!("`{}`'s service is not known yet", self.name()))?;
+        let decided = up.decide(need, Some((&svc, presented))).map_err(|(_, said)| said)?;
+        let Some(upcall::Decided { consented, held: Some(held) }) = decided else {
+            return Err(format!("`{need}` is not among `{}`'s needs", self.name()));
+        };
+        let within = |inner: &str, outer: &str| outer == "*" || inner == outer;
+        let mut scope: Vec<String> = Vec::new();
+        for h in &held {
+            for c in &consented {
+                let s = if within(h, c) {
+                    h
+                } else if within(c, h) {
+                    c
+                } else {
+                    continue;
+                };
+                let e = format!("{forwarded}@{s}");
+                if !scope.contains(&e) {
+                    scope.push(e);
+                }
+            }
+        }
+        if scope.is_empty() {
+            return Err(format!("`{need}` is consented on {consented:?}, and the token holds it on {held:?}: nowhere both"));
+        }
+        Ok(scope)
     }
 
     /// DYNAUTH-5: the Ed25519 key the child proved at its mount
@@ -626,7 +666,7 @@ impl RemoteChild {
         let shared = &self.inner.shared;
         let one = |item: PlexusStreamItem| -> PlexusStream { Box::pin(futures::stream::iter([item])) };
         // DYNAUTH-7: a revoked child is forwarded nothing.
-        if let Some(why) = shared.revoked.lock().unwrap().clone() {
+        if let Some(why) = shared.upcalls.revoked() {
             let e = PlexusError::Unauthenticated(format!("`{}` is revoked ({why}): no call is forwarded to it", self.name()));
             return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false));
         }

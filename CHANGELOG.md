@@ -5,6 +5,49 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1]
+
+KEEL-19 (security, High): **a peer token is taken only from whoever it
+names, and an exchange is the service's decision.** In 0.11.0 a verifying
+peer (`ServeChild::tokens`) believed a hop whose token verified whoever
+sent it, and `TokenIssuer::exchange` asked nothing of the presenter — so a
+peer handed a caller's token could exchange it for one addressed to another
+peer and call that peer directly as the caller.
+
+- **The audience knows who presents.** A token's `cnf` names the key that
+  must present it. A token the service forwards is bound to the audience's
+  own key, as before, and a verifying child takes it only from a sender
+  `ChildPeer` takes (the service's own connection, or its pipe): it narrows
+  what that sender says and no longer overrides `takes`. A token bound to
+  another key — an exchanged one, bound now to its presenter's key — is
+  taken only with that key's proof of possession in the hop (`hop.proof`:
+  `prove(key, token, <method>, <hop.call>)`), over a connection proven as
+  that key when the input is one.
+- **An exchange is decided.** `TokenIssuer::exchange_decided` (new) checks
+  the subject token and its proof, then hands its claims to the service's
+  decision (`decide`, answering an `Onward` — audience and scope — or an
+  `ExchangeRefusal` and why), and mints the token bound to the presenter.
+  `RemoteChild::may_exchange` (new) is that decision for a mounted child: it
+  asks the one function its calls back are asked by (`Upcalls::decide`: not
+  revoked, the need declared and consented, held by the token) and answers
+  the scope. `TokenIssuer::exchange` stays the undecided primitive, now bound
+  to the presenter too.
+- **Once.** A subject token is exchanged once per (`jti`, audience,
+  method); a second ask is refused.
+- **Audited.** Every refused exchange is a `plexus::audit` warning and goes
+  to `TokenAudit::refused` (new, a default no-op): `ExchangeRefused` names
+  the presenter, subject, audience, method, the subject's call and `jti`,
+  the reason and why — never a token or a proof.
+- A revoked child is decided nothing but the standard interface: its
+  exchange is refused at once (`RemoteChild::revoke` keeps the mark with its
+  calls back now).
+
+Wire: a hop may carry `proof` beside `token`. A 0.11.0 verifying peer
+ignores it and still believes any verified token (upgrade the peers); a
+0.11.1 peer refuses a token of a 0.11.0 service's `dyn.exchange` sent
+directly by its presenter (bound to the audience's key, which the presenter
+cannot prove), while hops the service forwards are unchanged.
+
 ## [Unreleased] — 0.11.0
 
 KEEL-8 (breaking: a dial-out without `DialOut::trust` is refused;

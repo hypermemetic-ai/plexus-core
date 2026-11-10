@@ -12,7 +12,7 @@
 //! | `act` | the actor chain, nearest first, nested as RFC 8693 §4.1 nests it |
 //! | `aud` | exactly one peer: its key (`key:<hex>`), or `pipe:<name>` for a child on the issuer's own pipe |
 //! | `scope` | space-separated `grant@scope` entries: the caller's reach ∩ the peer's needs ∩ consent |
-//! | `cnf.jkt` | the RFC 7638 thumbprint of the peer's Ed25519 key (RFC 7800, RFC 9449 §6); absent for a pipe |
+//! | `cnf.jkt` | the RFC 7638 thumbprint of the key that presents it (RFC 7800, RFC 9449 §6): the peer's own for a token the service forwards; the presenter's for an exchanged one (KEEL-19); absent for a pipe |
 //! | `call`, `method` | the forwarded call's id and the method it names |
 //! | `jti`, `iat`, `exp` | unique; `exp − iat ≤ 60 s` |
 //!
@@ -38,6 +38,11 @@
 //! presented for an onward call becomes one for the next peer — the same
 //! `sub`, `act` extended by the presenter, `aud` the next peer, and a scope
 //! that is the presented one's or narrower, never wider ([`narrow`]).
+//! KEEL-19: as a method ([`TokenIssuer::exchange_decided`]) it is the
+//! service's decision whether the presenter may reach that peer at all; the
+//! token is bound to the presenter's key (`cnf`), so the next peer takes it
+//! only with the presenter's proof; and a subject token is exchanged once
+//! per (`jti`, audience, method).
 //!
 //! **Audit** (DYNAUTH-7, TM-7): every mint and exchange writes one
 //! [`AuditRecord`] — iss, sub, the actor chain, aud, scope, call, jti, exp,
@@ -795,9 +800,100 @@ impl AuditRecord {
     }
 }
 
+/// KEEL-19: why an exchange was refused, as a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ExchangeRefusal {
+    /// The subject token is not one this issuer minted, or no longer lives.
+    Subject,
+    /// No proof of possession by the subject token's key, or a wrong one.
+    Proof,
+    /// The presenter is not a peer mounted in this service.
+    Presenter,
+    /// The presenter (or the audience) is revoked.
+    Revoked,
+    /// The presenter holds no consented need that covers the audience and
+    /// the method asked.
+    NotConsented,
+    /// The audience is not a peer that proved a key.
+    Audience,
+    /// This subject token was exchanged for this audience and method before.
+    Again,
+}
+
+impl ExchangeRefusal {
+    /// The word (`not_consented`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::Proof => "proof",
+            Self::Presenter => "presenter",
+            Self::Revoked => "revoked",
+            Self::NotConsented => "not_consented",
+            Self::Audience => "audience",
+            Self::Again => "again",
+        }
+    }
+}
+
+impl std::fmt::Display for ExchangeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// KEEL-19: one refused exchange (TM-7): who presented what, for whom, and
+/// why it was refused. Never the token, a signature or a proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeRefused {
+    pub iss: String,
+    /// The presenter: the subject token's audience (empty when the subject
+    /// token could not be read).
+    pub presenter: String,
+    pub sub: String,
+    /// The audience asked for (a peer's name, as the exchange named it).
+    pub aud: String,
+    pub method: String,
+    /// The call and `jti` of the subject token.
+    pub presented_call: String,
+    pub presented_jti: String,
+    pub reason: ExchangeRefusal,
+    pub why: String,
+}
+
 /// Where audit records go besides `tracing` (PRIVACY-1's sink, when it is).
 pub trait TokenAudit: Send + Sync {
     fn record(&self, r: &AuditRecord);
+    /// KEEL-19: an exchange refused. Nothing by default (the `tracing`
+    /// event is always written).
+    fn refused(&self, _r: &ExchangeRefused) {}
+}
+
+fn audit_refused(sink: Option<&Arc<dyn TokenAudit>>, r: ExchangeRefused) {
+    tracing::warn!(
+        target: "plexus::audit",
+        iss = %r.iss, presenter = %r.presenter, sub = %r.sub, aud = %r.aud, method = %r.method,
+        presented_call = %r.presented_call, presented_jti = %r.presented_jti, reason = %r.reason, why = %r.why,
+        "peer token exchange refused"
+    );
+    if let Some(s) = sink {
+        s.refused(&r);
+    }
+}
+
+/// KEEL-19: what a service decided an exchange may give — the audience (its
+/// name and the key it proved) and the scope of the token for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Onward {
+    /// The audience's name in the service (what the refusal and audit say).
+    pub name: String,
+    /// The audience's key (`key:<hex>`): `aud`; `None` for a child on the
+    /// issuer's own pipe (`pipe:<name>`).
+    pub peer_key: Option<String>,
+    /// The scope of the token for it, decided (never read back from the
+    /// subject token here: the decision is the service's).
+    pub scope: Vec<String>,
 }
 
 fn audit(sink: Option<&Arc<dyn TokenAudit>>, r: AuditRecord) {
@@ -841,6 +937,9 @@ pub struct TokenIssuer {
     retired: Mutex<Vec<(PeerKey, u64)>>,
     ttl: Duration,
     sink: Option<Arc<dyn TokenAudit>>,
+    /// KEEL-19: each (subject `jti`, audience, method) exchanged, until the
+    /// subject token's `exp` and the skew: a subject is exchanged once each.
+    exchanged: Mutex<HashMap<String, u64>>,
 }
 
 impl std::fmt::Debug for TokenIssuer {
@@ -852,7 +951,7 @@ impl std::fmt::Debug for TokenIssuer {
 impl TokenIssuer {
     /// An issuer signing with `key`, minting tokens of [`MAX_LIFETIME`].
     pub fn new(key: PeerKey) -> Self {
-        Self { key: RwLock::new(key), retired: Mutex::default(), ttl: MAX_LIFETIME, sink: None }
+        Self { key: RwLock::new(key), retired: Mutex::default(), ttl: MAX_LIFETIME, sink: None, exchanged: Mutex::default() }
     }
 
     /// Tokens of `ttl` (at most [`MAX_LIFETIME`]).
@@ -904,13 +1003,20 @@ impl TokenIssuer {
 
     /// [`Self::mint`] as of `now`.
     pub fn mint_at(&self, req: MintRequest, now: u64) -> Result<(String, PeerClaims), TokenError> {
+        self.mint_bound(req, None, now)
+    }
+
+    /// [`Self::mint_at`], its `cnf` the presenter's key when `presenter`
+    /// names one (KEEL-19: a token its holder presents to the audience
+    /// itself), else the audience's own (a token the service forwards).
+    fn mint_bound(&self, req: MintRequest, presenter: Option<Cnf>, now: u64) -> Result<(String, PeerClaims), TokenError> {
         let key = self.key.read().unwrap().clone();
         let (aud, cnf) = match &req.peer_key {
             Some(k) => {
                 let vk = key_of(k).ok_or_else(|| TokenError::Malformed(format!("`{k}` is not an Ed25519 key")))?;
-                (k.clone(), Some(Cnf { jkt: thumbprint(&vk) }))
+                (k.clone(), Some(presenter.unwrap_or(Cnf { jkt: thumbprint(&vk) })))
             }
-            None => (format!("pipe:{}", req.name), None),
+            None => (format!("pipe:{}", req.name), presenter),
         };
         let (sub, act, scope, kind) = match &req.presented {
             None => (req.sub.clone(), Some(Actor::after(key.kid(), None)), req.scope.clone(), AuditKind::Mint),
@@ -940,22 +1046,78 @@ impl TokenIssuer {
         Ok((token, claims))
     }
 
-    /// RFC 8693 token exchange, as a method answers it: `subject` (a token
-    /// this issuer minted, presented by its audience with `proof` when it is
-    /// key-bound) becomes a token for `audience` (`peer_key`, a name for a
-    /// pipe), its scope `requested` narrowed by the presented one.
+    /// RFC 8693 token exchange, the primitive: `subject` (a token this
+    /// issuer minted, presented by its audience with `proof`) becomes a
+    /// token for `audience` (`peer_key`; `name` its name), its scope
+    /// `requested` narrowed by the presented one — with no decision of
+    /// whether the presenter may reach that audience. A service decides that
+    /// with [`Self::exchange_decided`] (plexus-dyn's `dyn.exchange` does);
+    /// the token is bound to the presenter's key and taken once per
+    /// (subject `jti`, audience, method) either way.
     #[allow(clippy::too_many_arguments)]
     pub fn exchange(&self, subject: &str, proof: Option<&str>, name: &str, peer_key: Option<String>, requested: Option<&[String]>, call: &str, method: &str, seen: &ProofCache) -> Result<(String, PeerClaims), TokenError> {
-        let presented = self.verify_own(subject)?;
+        let name = name.to_string();
+        self.exchange_decided(subject, proof, &name, call, method, seen, |presented| {
+            Ok(Onward { name: name.clone(), peer_key, scope: narrow(requested, &presented.scope) })
+        })
+    }
+
+    /// KEEL-19 · RFC 8693 token exchange, decided by the service: `subject`
+    /// (a token this issuer minted, bound to its audience's key) presented
+    /// with `proof` (by that key, for [`EXCHANGE`] under the token's `call`)
+    /// becomes a token for the audience `decide` names, of the scope it
+    /// decides — `decide` is handed the subject's claims (its `aud` is the
+    /// presenter) and refuses with a [`ExchangeRefusal`] and why. The token
+    /// is **bound to the presenter**: its `cnf` is the subject's, so the
+    /// audience takes it only with the presenter's proof (`hop.proof`). A
+    /// subject is exchanged once per (`jti`, audience, `method`). Every
+    /// refusal is audited ([`ExchangeRefused`]); every exchange too.
+    /// `audience` is the name asked for (what a refusal's record says).
+    #[allow(clippy::too_many_arguments)]
+    pub fn exchange_decided<F>(&self, subject: &str, proof: Option<&str>, audience: &str, call: &str, method: &str, seen: &ProofCache, decide: F) -> Result<(String, PeerClaims), TokenError>
+    where
+        F: FnOnce(&PeerClaims) -> Result<Onward, (ExchangeRefusal, String)>,
+    {
+        let refused = |p: Option<&PeerClaims>, reason: ExchangeRefusal, err: TokenError| {
+            audit_refused(
+                self.sink.as_ref(),
+                ExchangeRefused {
+                    iss: self.kid(),
+                    presenter: p.map(|p| p.aud.clone()).unwrap_or_default(),
+                    sub: p.map(|p| p.sub.clone()).unwrap_or_default(),
+                    aud: audience.to_string(),
+                    method: method.to_string(),
+                    presented_call: p.map(|p| p.call.clone()).unwrap_or_default(),
+                    presented_jti: p.map(|p| p.jti.clone()).unwrap_or_default(),
+                    reason,
+                    why: err.to_string(),
+                },
+            );
+            err
+        };
+        let presented = self.verify_own(subject).map_err(|e| refused(None, ExchangeRefusal::Subject, e))?;
         // A token bound to no key (a pipe's) is its pipe's alone: it is
         // never exchanged by whoever holds its bytes.
-        if presented.cnf.is_none() {
-            return Err(TokenError::Proof("a token bound to no key (a pipe's) is not exchanged".into()));
+        let Some(presenter) = presented.cnf.clone() else {
+            return Err(refused(Some(&presented), ExchangeRefusal::Proof, TokenError::Proof("a token bound to no key (a pipe's) is not exchanged".into())));
+        };
+        let Some(proof) = proof.filter(|p| !p.is_empty()) else {
+            return Err(refused(Some(&presented), ExchangeRefusal::Proof, TokenError::Proof("a key-bound token is exchanged with a proof".into())));
+        };
+        check_proof(proof, subject, &presented, EXCHANGE, &presented.call, now(), seen).map_err(|e| refused(Some(&presented), ExchangeRefusal::Proof, e))?;
+        let onward = decide(&presented).map_err(|(reason, why)| refused(Some(&presented), reason, TokenError::Refused(why)))?;
+        {
+            let now = now();
+            let mut done = self.exchanged.lock().unwrap();
+            done.retain(|_, exp| *exp + SKEW.as_secs() >= now);
+            let once = format!("{}\n{}\n{method}", presented.jti, onward.peer_key.as_deref().unwrap_or(&onward.name));
+            if done.insert(once, presented.exp).is_some() {
+                let why = format!("this token was exchanged for `{}` and `{method}` already: a subject token is exchanged once for each", onward.name);
+                return Err(refused(Some(&presented), ExchangeRefusal::Again, TokenError::Refused(why)));
+            }
         }
-        let proof = proof.ok_or_else(|| TokenError::Proof("a key-bound token is exchanged with a proof".into()))?;
-        check_proof(proof, subject, &presented, EXCHANGE, &presented.call, now(), seen)?;
-        let scope = narrow(requested, &presented.scope);
-        self.mint(MintRequest { sub: presented.sub.clone(), peer_key, name: name.into(), scope, call: call.into(), method: method.into(), presented: Some(presented) })
+        let req = MintRequest { sub: presented.sub.clone(), peer_key: onward.peer_key, name: onward.name, scope: onward.scope, call: call.into(), method: method.into(), presented: Some(presented) };
+        self.mint_bound(req, Some(presenter), now())
     }
 
     /// A token this issuer minted (any audience), signature and times
@@ -1181,10 +1343,14 @@ mod tests {
         // A pipe's token (bound to no key) is never exchanged.
         let (pipe, _) = issuer.mint(MintRequest { peer_key: None, ..req(&a) }).unwrap();
         assert!(matches!(issuer.exchange(&pipe, None, "b", Some(b.kid().into()), None, "c", "m", &seen), Err(TokenError::Proof(w)) if w.contains("pipe")));
-        // Nothing asked: the presented scope, no wider.
+        // Nothing asked: the presented scope, no wider. (KEEL-19: for
+        // another method — the subject was exchanged for b and `far.x` once
+        // already, and is not again.)
         let proof = prove(&a, &t, "exchange", &c.call);
-        let (_, c3) = issuer.exchange(&t, Some(&proof), "b", Some(b.kid().into()), None, "call-3", "far.x", &seen).unwrap();
+        let (_, c3) = issuer.exchange(&t, Some(&proof), "b", Some(b.kid().into()), None, "call-3", "far.z", &seen).unwrap();
         assert_eq!(c3.scope, c.scope);
+        let proof = prove(&a, &t, "exchange", &c.call);
+        assert!(matches!(issuer.exchange(&t, Some(&proof), "b", Some(b.kid().into()), None, "call-4", "far.x", &seen), Err(TokenError::Refused(w)) if w.contains("once")));
         // narrow, exhaustively over a small lattice.
         let all = ["g@*", "g@A", "g@B", "h@*", "h@A"];
         for p in 0..(1 << all.len()) {
@@ -1243,6 +1409,50 @@ mod tests {
                 assert!(!text.contains(part), "an audit record holds a token's or a proof's bytes");
             }
         }
+    }
+
+    /// KEEL-19: an exchange is the service's decision; the token it gives is
+    /// bound to its presenter's key; a refusal is typed and audited, with no
+    /// secret in the record.
+    #[test]
+    fn a_decided_exchange_binds_its_presenter_and_a_refusal_is_audited() {
+        #[derive(Default)]
+        struct Sink(Mutex<Vec<ExchangeRefused>>);
+        impl TokenAudit for Sink {
+            fn record(&self, _r: &AuditRecord) {}
+            fn refused(&self, r: &ExchangeRefused) {
+                self.0.lock().unwrap().push(r.clone());
+            }
+        }
+        let sink = Arc::new(Sink::default());
+        let (host, a, b) = (PeerKey::generate(), PeerKey::generate(), PeerKey::generate());
+        let issuer = TokenIssuer::new(host).with_audit(sink.clone());
+        let (t, c) = issuer.mint(req(&a)).unwrap();
+        let seen = ProofCache::default();
+        let proof = prove(&a, &t, EXCHANGE, &c.call);
+        let no = issuer.exchange_decided(&t, Some(&proof), "b", "call-2", "far.x", &seen, |p| {
+            assert_eq!(p.aud, a.kid(), "the decision is handed the presenter");
+            Err((ExchangeRefusal::NotConsented, "a is not consented to reach b".into()))
+        });
+        assert!(matches!(&no, Err(TokenError::Refused(w)) if w.contains("not consented")), "{no:?}");
+        let records = sink.0.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert_eq!((records[0].reason, records[0].presenter.as_str(), records[0].aud.as_str()), (ExchangeRefusal::NotConsented, a.kid(), "b"));
+        let text = serde_json::to_string(&records).unwrap();
+        for part in t.split('.').chain(proof.split('.')).filter(|p| p.len() > 8) {
+            assert!(!text.contains(part), "a refusal's record holds a token's or a proof's bytes");
+        }
+        // No proof: refused before any decision, audited too.
+        let no_proof = issuer.exchange_decided(&t, None, "b", "call-3", "far.x", &seen, |_| unreachable!("decided without a proof"));
+        assert!(matches!(no_proof, Err(TokenError::Proof(_))));
+        assert_eq!(sink.0.lock().unwrap().last().map(|r| r.reason), Some(ExchangeRefusal::Proof));
+        // Decided: the token is for b, bound to a's key.
+        let proof = prove(&a, &t, EXCHANGE, &c.call);
+        let (_, c2) = issuer
+            .exchange_decided(&t, Some(&proof), "b", "call-4", "far.x", &seen, |_| Ok(Onward { name: "b".into(), peer_key: Some(b.kid().into()), scope: vec!["far.x@*".into()] }))
+            .unwrap();
+        assert_eq!((c2.aud.as_str(), c2.cnf.as_ref().map(|c| c.jkt.clone())), (b.kid(), Some(a.thumbprint())));
+        assert_eq!(c2.scope, ["far.x@*"], "the scope decided");
     }
 
     /// DYNAUTH-12's property: `scope ⊆ reach` for every mint — over every

@@ -172,9 +172,17 @@ pub struct ServeChild {
     /// this child (its key's id; `pipe:<name>` on a pipe), naming the hop's
     /// call and the method called, fresh and not seen before, its `sub` the
     /// hop's caller and its scope holding the hop's grant where the hop
-    /// says it was admitted. A hop whose token verifies is believed whoever
-    /// sent it; one without, or whose token does not, is refused
-    /// `forbidden`, saying why. A schema call needs none.
+    /// says it was admitted. One without, or whose token does not, is
+    /// refused `forbidden`, saying why. A schema call needs none.
+    ///
+    /// KEEL-19: a token is believed only from whoever its `cnf` names. A
+    /// token bound to this child's own key (or, on a pipe, to none) is one
+    /// the service forwards: it is taken only from a sender [`ChildPeer`]
+    /// takes, and only narrows what that sender says. A token bound to
+    /// another key is one its holder exchanged to present here itself
+    /// (`dyn.exchange`): it is taken only with that holder's proof of
+    /// possession (`hop.proof`, for the method called under `hop.call`),
+    /// over a connection proven as that key when the input is one.
     pub tokens: Option<Arc<crate::plexus::peer_token::Verifier>>,
 }
 
@@ -195,6 +203,8 @@ where
     let key = opts.key.clone().map(Arc::new);
     let tokens = opts.tokens.clone();
     let peer = Arc::new(opts.peer);
+    // KEEL-19: the presenters' proofs seen, each once.
+    let proofs = Arc::new(crate::plexus::peer_token::ProofCache::default());
     let slots = Arc::new(slot_index(&activation));
     let (call_m, unsub_m) = (format!("{ns}.call"), format!("{ns}.call_unsub"));
     let (out, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -246,7 +256,7 @@ where
             next_sid += 1;
             // spec/02: the subscription id before any of its items.
             send(&out, json!({ "jsonrpc": "2.0", "id": id, "result": sid }));
-            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots), Arc::clone(&link), key.clone(), tokens.clone()));
+            let task = tokio::spawn(run(activation.clone(), ns.clone(), out.clone(), Arc::clone(&live), sid, target, p, hop, Arc::clone(&peer), Arc::clone(&slots), Arc::clone(&link), key.clone(), tokens.clone(), Arc::clone(&proofs)));
             live.lock().unwrap().insert(sid, task.abort_handle());
         } else if method == unsub_m {
             let held = params.get(0).and_then(Value::as_u64).and_then(|sid| live.lock().unwrap().remove(&sid));
@@ -299,6 +309,7 @@ async fn run<A: Activation>(
     link: Arc<HostLink>,
     key: Option<Arc<crate::plexus::peer_token::PeerKey>>,
     tokens: Option<Arc<crate::plexus::peer_token::Verifier>>,
+    proofs: Arc<crate::plexus::peer_token::ProofCache>,
 ) {
     let item = |v: Value| {
         let frame = json!({ "jsonrpc": "2.0", "method": format!("{ns}.call"), "params": { "subscription": sid, "result": v } });
@@ -317,11 +328,16 @@ async fn run<A: Activation>(
         item(json!({ "type": "data", "metadata": meta(&ns), "content_type": "_info", "content": content }));
         done();
     } else if let Some(method) = target.strip_prefix(&format!("{ns}.")) {
+        // KEEL-19: a presenter's proof of possession rides beside its token.
+        let proof = hop.as_ref().and_then(|h| h.get("proof")).and_then(Value::as_str).map(str::to_string);
         let hop: Option<Hop> = hop.and_then(|h| serde_json::from_value(h).ok());
         let introspection = method == "schema" || method.ends_with(".schema");
-        // DYNAUTH-12: a verifying child believes a hop by its token.
+        // DYNAUTH-12: a verifying child believes a hop by its token —
+        // KEEL-19: and only from whoever the token says may present it.
         let verdict = match (&tokens, &hop) {
-            (Some(v), Some(h)) if !introspection => Some(check_hop_token(v, h, &target)),
+            (Some(v), Some(h)) if !introspection => {
+                Some(hop_token_claims(v, h, &target).and_then(|claims| presented_by(v, &peer, h, &claims, &target, proof.as_deref(), &proofs)))
+            }
             _ => None,
         };
         if let Some(Err(why)) = &verdict {
@@ -336,7 +352,8 @@ async fn run<A: Activation>(
             return;
         }
         // Who may send a hop: one this child does not take is refused
-        // (a schema call answers without it) — unless its token verified.
+        // (a schema call answers without it) — unless its token verified
+        // and was presented by the key it is bound to, proven (KEEL-19).
         let untrusted = !matches!(verdict, Some(Ok(()))) && hop.as_ref().is_some_and(|h| !peer.takes(h));
         let hop = if untrusted && introspection { None } else { hop };
         // The far side decides again, before the method runs: no hop is
@@ -395,7 +412,13 @@ async fn run<A: Activation>(
 /// DYNAUTH-12: whether `hop`'s token is the one for this call of `target`:
 /// verified (see [`ServeChild::tokens`]), its `sub` the hop's caller, its
 /// scope holding the hop's grant on every scope the hop says.
+#[cfg(test)]
 fn check_hop_token(v: &crate::plexus::peer_token::Verifier, hop: &crate::call::Hop, target: &str) -> Result<(), String> {
+    hop_token_claims(v, hop, target).map(|_| ())
+}
+
+/// [`check_hop_token`], answering the token's claims.
+fn hop_token_claims(v: &crate::plexus::peer_token::Verifier, hop: &crate::call::Hop, target: &str) -> Result<crate::plexus::peer_token::PeerClaims, String> {
     use crate::plexus::peer_token::{is_within, Expect};
     let token = hop.token.as_deref().ok_or("the hop carries no token, and this child takes a hop only by its token")?;
     let claims = v.verify(token, &Expect { call: Some(&hop.call), method: Some(target) }).map_err(|e| e.to_string())?;
@@ -406,6 +429,41 @@ fn check_hop_token(v: &crate::plexus::peer_token::Verifier, hop: &crate::call::H
     let asked: Vec<String> = limit.held_on.iter().map(|s| format!("{}@{s}", limit.grant)).collect();
     if asked.is_empty() || !is_within(&asked, &claims.scope) {
         return Err(format!("its scope does not hold {}", asked.join(" ")));
+    }
+    Ok(claims)
+}
+
+/// KEEL-19: whether this hop's token was presented by whoever it is bound
+/// to (see [`ServeChild::tokens`]). A token bound to this child's own key —
+/// or, addressed to a pipe, to none — is the service's forward: its sender
+/// must be one `peer` takes. One bound to another key is its holder's: the
+/// hop carries that key's proof for `target` under `hop.call`, and on a
+/// proven connection the connection is that key's and the hop names it.
+fn presented_by(
+    v: &crate::plexus::peer_token::Verifier,
+    peer: &ChildPeer,
+    hop: &Hop,
+    claims: &crate::plexus::peer_token::PeerClaims,
+    target: &str,
+    proof: Option<&str>,
+    proofs: &crate::plexus::peer_token::ProofCache,
+) -> Result<(), String> {
+    use crate::plexus::peer_token::{check_proof, key_of, now, thumbprint};
+    let own = key_of(v.audience()).map(|k| thumbprint(&k));
+    let Some(jkt) = claims.cnf.as_ref().map(|c| c.jkt.as_str()).filter(|j| Some(*j) != own.as_deref()) else {
+        if peer.takes(hop) {
+            return Ok(());
+        }
+        return Err("it is one the service forwards, taken only from the service's own connection, and this hop's sender is not one this child trusts to act for others".into());
+    };
+    let token = hop.token.as_deref().unwrap_or_default();
+    let proof = proof.ok_or("it is bound to its presenter's key, and the hop carries no proof of possession by it (`hop.proof`)")?;
+    check_proof(proof, token, claims, target, &hop.call, now(), proofs).map_err(|e| format!("its presenter's {e}"))?;
+    if let ChildPeer::Connection { proven, .. } = peer {
+        let proven_jkt = key_of(proven).map(|k| thumbprint(&k));
+        if proven_jkt.as_deref() != Some(jkt) || hop.principal != *proven {
+            return Err(format!("it is bound to its presenter's key, and this connection is proven as {proven}, not as the presenter named by the hop"));
+        }
     }
     Ok(())
 }

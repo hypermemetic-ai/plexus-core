@@ -42,6 +42,12 @@ contact the way ssh does it.**
   the one pinned is refused `host_key_changed`, unasked. `trust` stays the
   strict mode; neither trust nor a known-hosts file is refused before
   dialing, as KEEL-8 has it.
+- Review round 1: at first contact a host whose `_info` gives no
+  `host_nonce` is refused `no_pairing_code` (never asked about without a
+  code); `Admission::mounted` answers `Result` (a mount the embedder refuses
+  leaves this table and the offer is refused); `pairing::canonical_url`, by
+  which `KnownHosts` keys each host, and a lock (`<file>.lock`) around its
+  read-modify-write.
 
 ## [0.11.2] — 2026-11-10
 

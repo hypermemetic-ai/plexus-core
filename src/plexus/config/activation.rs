@@ -259,6 +259,17 @@ fn holds_critical(auth: Option<&AuthContext>) -> bool {
     }
 }
 
+/// KEEL-31: a setting's writes act on the whole service — marked
+/// `everywhere`, which `with_config_service` checks before it serves them.
+pub const EVERYWHERE: &[&str] = &["set", "reset", "confirm"];
+
+/// KEEL-31: the setting's schema carries the mark on each write, or why not.
+pub(crate) fn require_everywhere() -> Result<(), String> {
+    let schema = <ConfigKeyActivation as crate::plexus::Activation>::slot_schema()
+        .ok_or_else(|| "config_key: no schema to check".to_string())?;
+    crate::plexus::grant_gate::require_everywhere(&schema, EVERYWHERE)
+}
+
 /// A setting (or a group of them).
 #[plexus_macros::activation(namespace = "config_key", description = "A setting: get, set, reset, confirm")]
 impl ConfigKeyActivation {

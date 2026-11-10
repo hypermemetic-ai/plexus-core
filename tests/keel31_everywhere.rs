@@ -118,3 +118,24 @@ async fn the_view_shows_it_only_where_it_is_held_everywhere() {
     let tally: Value = host.as_(ADMIN).call("ops.tally.schema", json!({})).await.answer();
     assert!(tally.get("everywhere").is_none(), "absent unless said: {tally}");
 }
+
+/// KEEL-31 (N2): the backstop that does not depend on the macro — a
+/// service mounting the auth activation or the config service checks their
+/// whole-service methods are marked, and refuses to start otherwise.
+#[tokio::test]
+async fn the_services_own_whole_service_methods_are_marked() {
+    use plexus_core::plexus::{require_everywhere, PluginSchema};
+    let host = World::new().host().with_auth().configure(|s| s.with_config_service()).await;
+    let auth: PluginSchema = host.as_(ADMIN).call("auth.schema", json!({})).await.answer();
+    require_everywhere(&auth, &["role_set", "waiting"]).unwrap();
+    let config: PluginSchema = host.as_(ADMIN).call("config.schema", json!({})).await.answer();
+    let key = config.methods.iter().find(|m| m.name == "key").and_then(|m| m.role.slot_schema()).expect("the setting's slot type");
+    require_everywhere(&key, &["set", "reset", "confirm"]).unwrap();
+    // A schema that lost a mark is refused, naming the method.
+    let mut lost = auth.clone();
+    for m in lost.methods.iter_mut().filter(|m| m.name == "role_set") {
+        m.everywhere = false;
+    }
+    let why = require_everywhere(&lost, &["role_set", "waiting"]).unwrap_err();
+    assert!(why.contains("auth.role_set") && !why.contains("auth.waiting"), "{why}");
+}

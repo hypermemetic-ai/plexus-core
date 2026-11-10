@@ -558,6 +558,10 @@ fn principal_of(ctx: &AuthContext) -> Option<Principal> {
     ctx.principal()
 }
 
+/// KEEL-31: the auth activation's methods that act on the whole service —
+/// marked `everywhere`, which [`super::DynamicHub::with_auth`] checks.
+pub const EVERYWHERE: &[&str] = &["role_set", "waiting"];
+
 fn meta(ctx: &AuthContext, key: &str) -> Option<String> {
     ctx.get_metadata_string(key).filter(|s| !s.is_empty())
 }

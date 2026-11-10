@@ -77,7 +77,7 @@ base64 = "0.22"
 # Hub macro for activation generation. The pairing: macros and core move on
 # the same minor line; only this direction can be a bound, since the macro
 # emits paths into this crate without depending on it.
-plexus-macros = { path = "../plexus-macros", version = "0.11.0" }
+plexus-macros = { path = "../plexus-macros", version = "0.11.1" }
 
 # MACRO-2.B3: the client-side wire contract the in-process transport speaks.
 # Wasm-safe by construction; the dependency only runs this way (plexus-client

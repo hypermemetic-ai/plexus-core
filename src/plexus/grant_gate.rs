@@ -220,6 +220,27 @@ pub(crate) fn decide(
     }
 }
 
+/// KEEL-31: a backstop that does not depend on the macro — each of
+/// `methods` in `schema` is marked `everywhere`, or why not. A service
+/// whose own whole-service methods lost the mark (built with a macro that
+/// dropped the word) refuses to start rather than admit a scoped holder.
+pub fn require_everywhere(schema: &super::schema::PluginSchema, methods: &[&str]) -> Result<(), String> {
+    let unmarked: Vec<&str> = methods
+        .iter()
+        .copied()
+        .filter(|name| !schema.methods.iter().any(|m| m.name == *name && m.everywhere))
+        .collect();
+    if unmarked.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}: {} act on the whole service and must be marked `everywhere` in its schema; they are not — \
+         built with a plexus-macros that does not know the word (it needs 0.11.1 or later)",
+        schema.namespace,
+        unmarked.iter().map(|m| format!("{}.{m}", schema.namespace)).collect::<Vec<_>>().join(", "),
+    ))
+}
+
 /// A refusal as a client reads it back from an error stream item — the
 /// typed view of the `forbidden` shape [`super::types::spec_fields`] writes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -85,7 +85,7 @@ pub use remote_child::ChildArgs;
 #[deprecated(note = "Use GuidanceErrorType and GuidanceSuggestion from stream events instead")]
 pub use errors::{GuidedError, GuidedErrorData, TryRequest};
 pub use forward_registry::{ForwardPolicyRegistry, SameService, SAME_SERVICE_NAME};
-pub use grant_gate::{current_reach, with_reach, ForbiddenItem};
+pub use grant_gate::{current_reach, require_everywhere, with_reach, ForbiddenItem};
 pub use view::View;
 pub use service_scope::WeakService;
 pub use service_root::{RootError, ServiceRoot};

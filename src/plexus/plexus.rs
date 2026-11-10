@@ -1620,6 +1620,11 @@ impl DynamicHub {
         let (_, untyped) = self.slot_children();
         catalog.add_slots(&untyped);
         let (auth, gate) = super::auth_activation::AuthActivation::mount(setup, catalog.clone());
+        // KEEL-31: refuse to start if the auth activation's whole-service
+        // methods lost their mark.
+        if let Err(why) = super::grant_gate::require_everywhere(&Activation::plugin_schema(&auth), super::auth_activation::EVERYWHERE) {
+            panic!("{why}");
+        }
         {
             let inner = self.inner_mut("Cannot mount auth: DynamicHub has multiple references");
             inner.auth_catalog = Some(catalog);
@@ -2551,6 +2556,10 @@ impl DynamicHub {
     /// on its own grant.
     pub fn with_config_service(self) -> Self {
         let config = self.config();
+        // KEEL-31: refuse to start if a setting's writes lost their mark.
+        if let Err(why) = super::config::require_everywhere() {
+            panic!("{why}");
+        }
         self.register(super::config::ConfigActivation::new(config))
     }
 

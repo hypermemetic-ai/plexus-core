@@ -44,6 +44,7 @@ mod activation;
 pub mod settings;
 
 pub use activation::{ConfigActivation, SettingEvent, ConfigKeyActivation, ConfigRefusal, CRITICAL_GRANT};
+pub(crate) use activation::require_everywhere;
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;

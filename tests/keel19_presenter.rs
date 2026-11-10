@@ -28,7 +28,7 @@
 #![allow(deprecated)] // the undecided `exchange` primitive is the attacker's tool here
 
 use futures::Stream;
-use plexus_core::plexus::peer_token::{check_key_proof, prove, random_nonce, MintRequest, PeerKey, ProofCache, TokenError, TokenIssuer, Verifier, EXCHANGE};
+use plexus_core::plexus::peer_token::{check_key_proof_for, prove, random_nonce, MintRequest, PeerKey, ProofCache, TokenError, TokenIssuer, Verifier, EXCHANGE};
 use plexus_core::plexus::remote_child::{serve_child_with, ChildPeer, ServeChild};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -217,8 +217,8 @@ async fn b1_a_relayed_key_proof_is_refused_and_v_takes_nothing_from_m() {
     let _done = b.lines.next_line().await.unwrap();
     assert_eq!(info["asker"], m.kid(), "made for the asker the connection proved, not the one named: {info}");
     let (key, proof, backend) = (info["key"].as_str().unwrap(), info["proof"].as_str().unwrap(), info["backend"].as_str().unwrap());
-    assert!(check_key_proof(key, proof, &nonce, backend, w.host.kid()).is_err(), "the service refuses a proof made for M");
-    assert!(check_key_proof(key, proof, &nonce, backend, m.kid()).is_ok(), "it is V's proof, for M");
+    assert!(check_key_proof_for(key, proof, &nonce, backend, w.host.kid()).is_err(), "the service refuses a proof made for M");
+    assert!(check_key_proof_for(key, proof, &nonce, backend, m.kid()).is_ok(), "it is V's proof, for M");
     // Were M registered so: the token for a call into M, sent by M to V.
     let (t, p) = w.forwarded(w.b.kid(), "m1");
     refused(&b.call(hop(m.kid(), "m1", Some(&t), Some(p))).await, "the service's own connection");

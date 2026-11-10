@@ -206,15 +206,19 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let ns = activation.namespace().to_string();
-    // KEEL-19: a pipe proves nobody. A child that proves a key, or verifies
-    // tokens addressed to a key, is reached over a network, and its input
-    // is a connection whose sender the transport proved — never a `Pipe`,
-    // on which its `_info` proof could be asked for by anyone and a
+    // KEEL-19: a pipe proves nobody, and nor does a name. A child that
+    // proves a key, or verifies tokens addressed to a key, is reached over
+    // a network, and its input is a connection proven as a key (`key:<hex>`,
+    // what a transport verifies: `serve_child_ws`) — never a `Pipe`, nor a
+    // `Connection` "proven" as a name like `service:dyn` no transport can
+    // prove, on which its `_info` proof could be asked for by anyone and a
     // forwarded hop relayed by anyone.
-    if opts.peer == ChildPeer::Pipe && (opts.key.is_some() || opts.tokens.as_ref().is_some_and(|v| v.audience().starts_with("key:"))) {
+    let keyed = opts.key.is_some() || opts.tokens.as_ref().is_some_and(|v| v.audience().starts_with("key:"));
+    let proven_key = matches!(&opts.peer, ChildPeer::Connection { proven, .. } if crate::plexus::peer_token::key_of(proven).is_some());
+    if keyed && !proven_key {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "a child with a key, or verifying tokens addressed to a key, is served on a proven connection (ChildPeer::connection), never a pipe: on a pipe its key proof and its hops are anyone's",
+            "a child with a key, or verifying tokens addressed to a key, is served on a connection proven as a key (`key:<hex>`: serve_child_ws), never a pipe nor a principal no transport proves: there its key proof and its hops are anyone's",
         ));
     }
     let key = opts.key.clone().map(Arc::new);
@@ -345,7 +349,7 @@ async fn run<A: Activation>(
                 ChildPeer::Pipe => params.get("asker").and_then(Value::as_str).unwrap_or_default().to_string(),
             };
             content["key"] = json!(key.kid());
-            content["proof"] = json!(key.key_proof(nonce, &ns, &asker));
+            content["proof"] = json!(key.key_proof_for(nonce, &ns, &asker));
             content["asker"] = json!(asker);
         }
         item(json!({ "type": "data", "metadata": meta(&ns), "content_type": "_info", "content": content }));

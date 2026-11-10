@@ -167,6 +167,11 @@ required-features = ["child-ws"]
 name = "dial"
 required-features = ["child-ws"]
 
+# KEEL-19: a keyed child served on a verified upgrade; repro3.
+[[test]]
+name = "keel19_upgrade"
+required-features = ["child-ws"]
+
 # RETURNS-47: no harness — the binary is the service and, run again by the
 # seam, the plugin on stdio, whose stdout carries the protocol alone.
 [[test]]

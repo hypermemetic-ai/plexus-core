@@ -225,6 +225,130 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     Ok(conn)
 }
 
+// ------------------------------------------------------------------ KEEL-19
+
+/// KEEL-19 · the accepting side of a child's WebSocket: what verifies the
+/// key proof a service dials with (`Authorization: Bearer plexus-key.…`,
+/// spec/00 — [`key_proof`]'s form, plexus-auth-core's `KeyProofAdapter`'s)
+/// and so yields the principal a [`ChildPeer::connection`] is proven as.
+/// `aud` must be one of the URLs this child is dialed at, `ts` within 60 s
+/// past and 30 s ahead, each (key, nonce) once.
+///
+/// [`ChildPeer::connection`]: super::ChildPeer::connection
+pub struct KeyedUpgrade {
+    audiences: Vec<String>,
+    seen: std::sync::Mutex<std::collections::HashMap<(String, String), i64>>,
+}
+
+impl std::fmt::Debug for KeyedUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyedUpgrade").field("audiences", &self.audiences).finish()
+    }
+}
+
+impl KeyedUpgrade {
+    /// Proofs addressed to one of `audiences` (`ws://127.0.0.1:<port>`, …).
+    pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(audiences: I) -> Self {
+        Self { audiences: audiences.into_iter().map(|a| a.as_ref().trim().trim_end_matches('/').to_string()).collect(), seen: Default::default() }
+    }
+
+    /// The principal (`key:<hex>`) the bearer value `bearer` proves, or why not.
+    pub fn verify(&self, bearer: &str) -> Result<String, String> {
+        use ed25519_dalek::Signature;
+        let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let body = bearer.trim().strip_prefix(PROOF_PREFIX).ok_or("not a key proof (`plexus-key.…`)")?;
+        let p: serde_json::Value = b64.decode(body).ok().and_then(|j| serde_json::from_slice(&j).ok()).ok_or("a key proof that does not read")?;
+        let s = |k: &str| p.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+        let (key, aud, agent, nonce, sig) = (s("key"), s("aud"), s("agent"), s("nonce"), s("sig"));
+        let ts = p.get("ts").and_then(serde_json::Value::as_i64).ok_or("a key proof with no `ts`")?;
+        if p.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+            return Err("a key proof whose `v` is not 1".into());
+        }
+        if !self.audiences.iter().any(|a| a == aud.trim_end_matches('/')) {
+            return Err(format!("a key proof for `{aud}`, not for this child"));
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        if ts + 60 < now || ts > now + 30 {
+            return Err("a key proof out of its time window".into());
+        }
+        let vk = crate::plexus::peer_token::key_of(&format!("key:{key}")).ok_or("a key proof whose `key` is not an Ed25519 key")?;
+        let sig: [u8; 64] = b64.decode(&sig).ok().and_then(|b| b.try_into().ok()).ok_or("a key proof whose `sig` does not read")?;
+        vk.verify_strict(format!("{PROOF_CONTEXT}\n{aud}\n{agent}\n{nonce}\n{ts}").as_bytes(), &Signature::from_bytes(&sig)).map_err(|_| "a key proof whose signature does not verify")?;
+        let mut seen = self.seen.lock().unwrap();
+        seen.retain(|_, until| *until >= now);
+        if seen.insert((key.clone(), nonce), ts + 60).is_some() {
+            return Err("a key proof used before".into());
+        }
+        Ok(format!("key:{key}"))
+    }
+}
+
+/// KEEL-19 · serve `activation` as a keyed child on one accepted socket
+/// (`stream`, a TCP connection or anything like it): the WebSocket upgrade
+/// is taken only with a key proof `upgrade` verifies, and the child is then
+/// served ([`super::serve_child_with`]) on a connection proven as that key,
+/// trusting `trusted` (service principals, `key:<hex>`) to act for others.
+/// The child's `key` and token verifier (`tokens`) as [`super::ServeChild`]
+/// has them. An upgrade without a valid proof is refused (401) and served
+/// nothing.
+pub async fn serve_child_ws<A, S>(activation: A, stream: S, upgrade: &KeyedUpgrade, trusted: Vec<String>, key: Option<crate::plexus::peer_token::PeerKey>, tokens: Option<Arc<crate::plexus::peer_token::Verifier>>) -> std::io::Result<()>
+where
+    A: crate::plexus::plexus::Activation + Clone,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    let proven = std::sync::Mutex::new(None::<Result<String, String>>);
+    let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+        let bearer = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or_default();
+        let verdict = upgrade.verify(bearer);
+        let ok = verdict.is_ok();
+        *proven.lock().unwrap() = Some(verdict);
+        if ok {
+            Ok(resp)
+        } else {
+            let mut refused = ErrorResponse::new(Some("a child is dialed with a key proof".into()));
+            *refused.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+            Err(refused)
+        }
+    };
+    let ws = tokio_tungstenite::accept_hdr_async(stream, check).await;
+    let proven = match (proven.lock().unwrap().take(), ws) {
+        (Some(Ok(p)), Ok(ws)) => (p, ws),
+        (Some(Err(why)), _) => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, why)),
+        (_, Err(e)) => return Err(std::io::Error::other(e.to_string())),
+        (None, Ok(_)) => return Err(std::io::Error::other("no upgrade was checked")),
+    };
+    let (principal, ws) = proven;
+    let (mut sink, mut source) = ws.split();
+    let (mut in_w, in_r) = tokio::io::duplex(1 << 20);
+    let (out_w, out_r) = tokio::io::duplex(1 << 20);
+    let pump_in = async move {
+        while let Some(Ok(m)) = source.next().await {
+            match m {
+                Message::Text(t) => {
+                    if in_w.write_all(t.as_bytes()).await.is_err() || in_w.write_all(b"\n").await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    };
+    let pump_out = async move {
+        let mut lines = tokio::io::BufReader::new(out_r).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if sink.send(Message::text(l)).await.is_err() {
+                break;
+            }
+        }
+    };
+    let opts = super::ServeChild { peer: super::ChildPeer::connection(principal, trusted), key, tokens };
+    let (_, _, served) = tokio::join!(pump_in, pump_out, super::serve_child_with(activation, in_r, out_w, opts));
+    served
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

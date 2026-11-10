@@ -94,13 +94,15 @@ use tokio::sync::mpsc;
 
 pub use host::{host, serve_child, serve_child_on, serve_child_stdio, serve_child_with, ChildPeer, HostTransport, ServeChild};
 pub use upcall::{Consented, HOST_CALL, HOST_CALL_UNSUB};
-pub use link::MountTimings;
+pub use link::{MountTimings, KEYED_MOUNT_NEEDS_A_KEY};
 pub use spec::{check_ws_url, is_insecure_ws, is_loopback_host, parse_duration, Backoff, ChildError, ChildOptions, ChildSpec, INSECURE_TRANSPORT};
 #[cfg(feature = "clap")]
 pub use args::ChildArgs;
 pub use dial_in::{PeerEvent, PeerInfo, PeerRoles, PeerSocket, Peers, PeersMethods};
 #[cfg(feature = "child-ws")]
 pub use dial_out::{key_principal, DialOut, DialState, Exposed};
+#[cfg(feature = "child-ws")]
+pub use ws::{serve_child_ws, KeyedUpgrade};
 
 use link::{meta, too_many, unavailable, Conn, Counters, Shared, SubKey};
 
@@ -531,6 +533,11 @@ impl RemoteChild {
         let peer_key = self.peer_key().map(str::to_string);
         if peer_key.is_none() && !matches!(self.spec(), ChildSpec::Stdio { .. }) {
             return Ok(None);
+        }
+        // KEEL-19: no key-addressed token from a service that is not a key
+        // (the mount refuses such a peer first; this holds it here too).
+        if peer_key.is_some() && crate::plexus::peer_token::key_of(&self.inner.shared.principal).is_none() {
+            return Err(format!("{KEYED_MOUNT_NEEDS_A_KEY}: this service dials as `{}`, not a key", self.inner.shared.principal));
         }
         let held: Vec<String> = if reach.is_everywhere() { vec!["*".into()] } else { reach.held_on().iter().map(|s| s.to_string()).collect() };
         let needs = crate::plexus::service_scope::current()

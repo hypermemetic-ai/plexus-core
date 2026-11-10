@@ -111,20 +111,20 @@ async fn stand_in(trusted: Arc<PeerKey>, proves: Proves) -> (u16, mpsc::Unbounde
                         match proves {
                             Proves::Trusted | Proves::NamesOther => {
                                 content["key"] = json!(trusted.kid());
-                                content["proof"] = json!(trusted.key_proof(nonce, "relay", &dialer()));
+                                content["proof"] = json!(trusted.key_proof_for(nonce, "relay", &dialer()));
                             }
                             Proves::ForAnother => {
                                 content["key"] = json!(trusted.kid());
-                                content["proof"] = json!(trusted.key_proof(nonce, "relay", MALLORY));
+                                content["proof"] = json!(trusted.key_proof_for(nonce, "relay", MALLORY));
                             }
                             Proves::Nothing => {}
                             Proves::Other => {
                                 content["key"] = json!(other.kid());
-                                content["proof"] = json!(other.key_proof(nonce, "relay", &dialer()));
+                                content["proof"] = json!(other.key_proof_for(nonce, "relay", &dialer()));
                             }
                             Proves::Forged => {
                                 content["key"] = json!(trusted.kid());
-                                content["proof"] = json!(other.key_proof(nonce, "relay", &dialer()));
+                                content["proof"] = json!(other.key_proof_for(nonce, "relay", &dialer()));
                             }
                         }
                         let md = StreamMetadata::new(vec!["relay".into()], "0".into());

@@ -104,7 +104,7 @@ async fn stand_in_relay(ip: std::net::IpAddr) -> (u16, String) {
                         let md = StreamMetadata::new(vec!["relay".into()], "0".into());
                         out.push(json!({ "jsonrpc": "2.0", "id": id, "result": "s1" }));
                         let nonce = v["params"]["nonce"].as_str().unwrap_or_default();
-                        let data = PlexusStreamItem::data(md.clone(), "_info".into(), json!({ "backend": "relay", "key": relay.kid(), "proof": relay.key_proof(nonce, "relay", &dialer) }));
+                        let data = PlexusStreamItem::data(md.clone(), "_info".into(), json!({ "backend": "relay", "key": relay.kid(), "proof": relay.key_proof_for(nonce, "relay", &dialer) }));
                         out.push(json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": "s1", "result": data } }));
                         out.push(json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": "s1", "result": PlexusStreamItem::done(md) } }));
                     } else if method == "relay.offer" {

@@ -638,7 +638,7 @@ fn relay_proved(trusted: &str, backend: &str, nonce: &str, me: &str, key: Option
     if key != trusted {
         return Err(format!("the relay proved another key ({key}) than the one trusted ({trusted})"));
     }
-    crate::plexus::peer_token::check_key_proof(key, proof.unwrap_or_default(), nonce, backend, me)
+    crate::plexus::peer_token::check_key_proof_for(key, proof.unwrap_or_default(), nonce, backend, me)
         .map(|_| ())
         .map_err(|e| format!("the relay's `_info` names the key {key} without proving it: {e}"))
 }

@@ -259,8 +259,15 @@ impl PeerKey {
     /// ([`check_key_proof`]), so a peer cannot relay another's proof and be
     /// registered under its key. The one form for a mount's child and a
     /// dial-out's relay (KEEL-8).
-    pub fn key_proof(&self, nonce: &str, backend: &str, asker: &str) -> String {
+    pub fn key_proof_for(&self, nonce: &str, backend: &str, asker: &str) -> String {
         b64(&self.signing.sign(key_proof_input(nonce, backend, asker).as_bytes()).to_bytes())
+    }
+
+    /// 0.11.0's `_info` key proof, bound to no asker (`plexus-peer-key/v1`):
+    /// nothing in 0.11.1 accepts it. KEEL-19: use [`Self::key_proof_for`].
+    #[deprecated(since = "0.11.1", note = "a key proof bound to no asker can be relayed; use `key_proof_for(nonce, backend, asker)`")]
+    pub fn key_proof(&self, nonce: &str, backend: &str) -> String {
+        b64(&self.signing.sign(format!("plexus-peer-key/v1\n{nonce}\n{backend}").as_bytes()).to_bytes())
     }
 }
 
@@ -268,11 +275,19 @@ fn key_proof_input(nonce: &str, backend: &str, asker: &str) -> String {
     format!("{KEY_PROOF_CONTEXT}\n{nonce}\n{backend}\n{asker}")
 }
 
+/// 0.11.0's check of a key proof bound to no asker. KEEL-19: it refuses
+/// every proof — an unbound proof can be relayed by another peer — naming
+/// [`check_key_proof_for`].
+#[deprecated(since = "0.11.1", note = "refuses every proof: use `check_key_proof_for(key, proof, nonce, backend, asker)`")]
+pub fn check_key_proof(key: &str, _proof: &str, _nonce: &str, _backend: &str) -> Result<VerifyingKey, TokenError> {
+    Err(TokenError::Refused(format!("a key proof bound to no asker is refused (the key {key}): check it with `check_key_proof_for`, over the asker it was made for")))
+}
+
 /// Check a peer's `_info` key proof: `key` (`key:<hex>`) signed `nonce`,
 /// `backend` and `asker` — the checker's own principal, as the prover was
 /// to know it — with [`PeerKey::key_proof`]. A proof made for another
 /// asker does not verify.
-pub fn check_key_proof(key: &str, proof: &str, nonce: &str, backend: &str, asker: &str) -> Result<VerifyingKey, TokenError> {
+pub fn check_key_proof_for(key: &str, proof: &str, nonce: &str, backend: &str, asker: &str) -> Result<VerifyingKey, TokenError> {
     let vk = key_of(key).ok_or_else(|| TokenError::Malformed(format!("`{key}` is not an Ed25519 key")))?;
     let sig = signature_of(proof)?;
     vk.verify_strict(key_proof_input(nonce, backend, asker).as_bytes(), &sig).map_err(|_| TokenError::Signature)?;
@@ -1380,14 +1395,19 @@ mod tests {
     fn a_key_proof_at_info_is_checked() {
         let peer = PeerKey::generate();
         let (service, mallory) = ("key:5e5e", "key:ma11");
-        let p = peer.key_proof("n0nce", "far", service);
-        assert!(check_key_proof(peer.kid(), &p, "n0nce", "far", service).is_ok());
-        assert_eq!(check_key_proof(peer.kid(), &p, "other", "far", service).map(|_| ()), Err(TokenError::Signature));
-        assert_eq!(check_key_proof(PeerKey::generate().kid(), &p, "n0nce", "far", service).map(|_| ()), Err(TokenError::Signature));
+        let p = peer.key_proof_for("n0nce", "far", service);
+        assert!(check_key_proof_for(peer.kid(), &p, "n0nce", "far", service).is_ok());
+        assert_eq!(check_key_proof_for(peer.kid(), &p, "other", "far", service).map(|_| ()), Err(TokenError::Signature));
+        assert_eq!(check_key_proof_for(PeerKey::generate().kid(), &p, "n0nce", "far", service).map(|_| ()), Err(TokenError::Signature));
         // KEEL-19: made for another asker (a proof Mallory asked for and
         // relays to the service as its own): refused.
-        let relayed = peer.key_proof("n0nce", "far", mallory);
-        assert_eq!(check_key_proof(peer.kid(), &relayed, "n0nce", "far", service).map(|_| ()), Err(TokenError::Signature));
+        let relayed = peer.key_proof_for("n0nce", "far", mallory);
+        assert_eq!(check_key_proof_for(peer.kid(), &relayed, "n0nce", "far", service).map(|_| ()), Err(TokenError::Signature));
+        // The 0.11.0 forms stay (deprecated) and cannot pass: the old check
+        // refuses every proof; the old proof (v1) is refused by the new check.
+        assert!(matches!(check_key_proof(peer.kid(), &p, "n0nce", "far"), Err(TokenError::Refused(w)) if w.contains("check_key_proof_for")));
+        let v1 = peer.key_proof("n0nce", "far");
+        assert_eq!(check_key_proof_for(peer.kid(), &v1, "n0nce", "far", service).map(|_| ()), Err(TokenError::Signature));
     }
 
     #[test]

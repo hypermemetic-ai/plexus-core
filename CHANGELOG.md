@@ -71,8 +71,34 @@ minted for calls into itself):
 - `TokenIssuer::exchange` is deprecated and hidden (undecided; a service
   uses `exchange_decided`).
 
-**Breaking (Rust API):** `PeerKey::key_proof` and `check_key_proof` take an
-`asker`; `serve_child_with` refuses a keyed or key-verifying `Pipe`.
+Third pass (the review re-attacked: a service with no dial key acts as the
+name `service:dyn`, which no transport proves; a peer "trusting" that name
+signed its proof for it whoever asked):
+
+- **The asker is a proven key, on both sides.** `serve_child_with` refuses
+  (`InvalidInput`) a key, or a key-addressed verifier, on a `Pipe` or on a
+  `Connection` whose `proven` is not a `key:` principal. A service whose
+  own principal is not a key mounts no keyed peer — its mount is refused
+  `keyed_mount_needs_a_key` (`KEYED_MOUNT_NEEDS_A_KEY`), saying to give it
+  a dial key — and mints no key-addressed token.
+- **The accepting side, built** (`serve_child_ws`, `KeyedUpgrade`, beside
+  `ws.rs`): nothing in the tree verified the upgrade's `plexus-key.` proof
+  for a child and handed `ChildPeer::connection` the principal it proved
+  (plexus-transport verifies it for a service's callers, through
+  plexus-auth-core's `KeyProofAdapter`, but no child is served through it).
+  `serve_child_ws` takes the upgrade only with a key proof addressed to one
+  of the child's URLs, fresh and unseen, and serves the child on a
+  connection proven as that key.
+- `PeerKey::key_proof_for` / `check_key_proof_for` are the asker-bound
+  forms. `PeerKey::key_proof` and `check_key_proof` keep their 0.11.0
+  signatures, deprecated: the first makes a v1 proof nothing accepts, the
+  second refuses every proof, naming the new one.
+
+**Behaviour changes for a security release (no signature changed):**
+`serve_child_with` refuses, at start, a keyed or key-verifying child on a
+`Pipe` or on an unproven principal; a service with no dial key refuses a
+keyed peer at mount; `TokenIssuer::exchange` binds its token to the
+presenter and gives it once.
 
 **Required upgrade of both sides (wire):** `KEY_PROOF_CONTEXT` is v2, so a
 0.11.1 service refuses the `_info` key proof of a 0.11.0 peer (it is not

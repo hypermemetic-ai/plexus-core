@@ -1882,6 +1882,19 @@ impl DynamicHub {
         }
     }
 
+    /// KEEL-32: a child's schema request, `<path>.schema` in either form, as
+    /// its bare path (`svc.vault.hidden.schema` → `vault.hidden`).
+    pub(crate) fn bare_schema_path(&self, method: &str) -> String {
+        self.bare_introspection(method).trim_end_matches(".schema").to_string()
+    }
+
+    /// KEEL-32: whether reaching `path` looks a name up in a dynamic or peer
+    /// slot (`dyn.peer.w`, `solar.earth`), by the service's index — asked of
+    /// no activation.
+    pub(crate) fn crosses_slot(&self, path: &str) -> bool {
+        self.gate_index().slot_key(path) != path
+    }
+
     /// KEEL-32: whether the caller's view shows the path `path` below an
     /// activation (`vault.hidden`, `vault.hidden.rotate_master_key`,
     /// `solar.earth`, `dyn.peer.w`): the caller holds — as the gate would
@@ -2782,7 +2795,9 @@ impl DynamicHub {
                 "`{method}` is not a schema: outside a call, a child asks its service only for a schema"
             )));
         }
-        let ctx = crate::call::CallContext::admitted(None, plexus_auth_core::grants::Reach::everywhere());
+        // KEEL-32: decided by the mount before it gets here (`may_read_schema`);
+        // it runs with no reach, never everywhere.
+        let ctx = crate::call::CallContext::admitted(None, plexus_auth_core::grants::Reach::nowhere());
         let routed = self.route_ungated(method, params, None, None);
         super::service_scope::scope(self.downgrade(), in_call(ctx, routed)).await
     }

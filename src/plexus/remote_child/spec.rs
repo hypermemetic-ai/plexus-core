@@ -240,6 +240,12 @@ pub struct ChildOptions {
     /// reach. A WebSocket child that proved no key gets none. A keyed child
     /// calling back presents a proof of possession with each call.
     pub tokens: Option<std::sync::Arc<crate::plexus::peer_token::TokenIssuer>>,
+    /// KEEL-32: paths of the service whose schemas the child may read
+    /// outside any call before its needs are known — what it is grown
+    /// against at its start (plexus-dyn: a dendrite's `--via-host`
+    /// targets, `dyn.peer.<target>`). A path at, above or below one of these
+    /// is answered; any other only as the child's consented needs allow.
+    pub schemas: Vec<String>,
 }
 
 impl Default for ChildOptions {
@@ -261,6 +267,7 @@ impl Default for ChildOptions {
             tls_roots: None,
             insecure_ws: false,
             tokens: None,
+            schemas: Vec::new(),
         }
     }
 }
@@ -278,6 +285,13 @@ impl ChildOptions {
     /// ([`ChildOptions::legacy_upcalls`]).
     pub fn with_legacy_upcalls(mut self, on: bool) -> Self {
         self.legacy_upcalls = on;
+        self
+    }
+
+    /// KEEL-32: the paths whose schemas the child may read outside any
+    /// call before its needs are known ([`ChildOptions::schemas`]).
+    pub fn with_schemas<I: IntoIterator<Item = S>, S: Into<String>>(mut self, paths: I) -> Self {
+        self.schemas = paths.into_iter().map(Into::into).collect();
         self
     }
 

@@ -22,25 +22,33 @@
 //! | this side calls [`Exposed::call`] | `{svc}.call {method, params}` on the same socket: decided by the relay's gate as this key |
 //! | the socket drops | every call either way ends; the state is `down`; it dials again within [`DialOut::backoff`] and offers again |
 //! | the offer is refused | the state is `refused` naming why; it does not dial again until [`Exposed::serve`] is called again |
+//! | NEST-25: no `trust`, a known-hosts file ([`Exposed::with_first_contact`]) | the key pinned there for the URL is the trusted one; another key presented is refused loudly, never asked again |
+//! | NEST-25: first contact (no key known) | the relay proves a key at `_info`; nothing more is sent or served until the callback says yes (none: refused) — shown the key, its fingerprint and the pairing code; a yes pins it in the file |
+//! | NEST-25: the host holds the offer pending | the state stays `connecting`, [`Exposed::pending`] names the pairing code, the socket is kept within [`Exposed::with_pending_for`] |
+//! | NEST-25: this side's activation calls back (`_host.call`) | sent on the socket in an id space of its own (`h:<n>`), its answers and items routed back to it |
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::host::{serve_child_on, ChildPeer};
 use super::link::{unavailable, Conn, Counters, SubKey};
+use super::pairing::{commitment, key_fingerprint, pairing_code, KnownHosts};
 use super::spec::{check_ws_url, is_insecure_ws, INSECURE_TRANSPORT};
+use super::upcall::{HOST_CALL, HOST_CALL_UNSUB};
 use super::ws::{key_proof, principal_of, read_seed};
+use ed25519_dalek::Signer;
 use super::Backoff;
 use crate::plexus::plexus::Activation;
 use crate::plexus::streaming::PlexusStream;
@@ -176,12 +184,41 @@ struct Live {
     service: String,
 }
 
+/// NEST-25: what a node is shown at first contact with a host it has no key
+/// for — the key the host proved at `_info`, its fingerprint, and this
+/// connection's pairing code, which the host's operator sees too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstContact {
+    pub url: String,
+    /// `key:<64 hex>`.
+    pub key: String,
+    /// `SHA256:<base64>`, as ssh shows a host key.
+    pub fingerprint: String,
+    /// `XXXX-XXXX`, when the host answered the pairing (`host_nonce`).
+    pub code: Option<String>,
+}
+
+type Ask = Arc<dyn Fn(FirstContact) -> BoxFuture<'static, bool> + Send + Sync>;
+
+#[derive(Clone)]
+struct First {
+    hosts: KnownHosts,
+    ask: Option<Ask>,
+}
+
 struct ExposedInner {
     opts: DialOut,
     live: Mutex<Option<Live>>,
     state: watch::Sender<DialState>,
     task: Mutex<Option<tokio::task::AbortHandle>>,
     counters: Arc<Counters>,
+    /// NEST-25: the known-hosts file and who says yes at first contact.
+    first: Mutex<Option<First>>,
+    /// NEST-25: this connection's pairing code, and whether the host holds
+    /// the offer pending now.
+    code: Mutex<Option<String>>,
+    pending: AtomicBool,
+    pending_for: Mutex<Duration>,
 }
 
 impl Drop for ExposedInner {
@@ -217,8 +254,54 @@ impl Exposed {
                 state: watch::channel(DialState::Connecting).0,
                 task: Mutex::new(None),
                 counters: Arc::new(Counters::default()),
+                first: Mutex::new(None),
+                code: Mutex::new(None),
+                pending: AtomicBool::new(false),
+                pending_for: Mutex::new(Duration::from_secs(600)),
             }),
         }
+    }
+
+    /// NEST-25: first contact, ssh's way. With no [`DialOut::trust`], the
+    /// host's key is the one `known_hosts` pins for the URL; when none is,
+    /// the host proves a key at `_info` and nothing more is sent or served
+    /// until `ask` — shown that key, its fingerprint and the pairing code —
+    /// says yes, which pins it there. A host presenting another key than
+    /// the one pinned is refused, and `ask` is not asked. `trust` still wins
+    /// (the strict mode).
+    pub fn with_first_contact<F, Fut>(self, known_hosts: impl Into<PathBuf>, ask: F) -> Self
+    where
+        F: Fn(FirstContact) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = bool> + Send + 'static,
+    {
+        let ask: Ask = Arc::new(move |c| Box::pin(ask(c)));
+        *self.inner.first.lock().unwrap() = Some(First { hosts: KnownHosts::new(known_hosts), ask: Some(ask) });
+        self
+    }
+
+    /// NEST-25: trust what `known_hosts` pins for the URL, and refuse a host
+    /// with no key there (no first contact).
+    pub fn with_known_hosts(self, known_hosts: impl Into<PathBuf>) -> Self {
+        *self.inner.first.lock().unwrap() = Some(First { hosts: KnownHosts::new(known_hosts), ask: None });
+        self
+    }
+
+    /// NEST-25: how long an offer the host holds pending is waited for, on
+    /// the same socket (the pairing code is the connection's). Default 10 min.
+    pub fn with_pending_for(self, wait: Duration) -> Self {
+        *self.inner.pending_for.lock().unwrap() = wait;
+        self
+    }
+
+    /// NEST-25: the pairing code while the host holds this side's offer
+    /// pending, waiting for its operator.
+    pub fn pending(&self) -> Option<String> {
+        self.inner.pending.load(Ordering::Acquire).then(|| self.code()).flatten()
+    }
+
+    /// NEST-25: the pairing code of the connection now (or the last one).
+    pub fn code(&self) -> Option<String> {
+        self.inner.code.lock().unwrap().clone()
     }
 
     /// The options it dials with.
@@ -381,9 +464,20 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     }
     // KEEL-8: a relay is named by its key before it is dialed; the socket is
     // never a pipe, so nothing on it is believed without that key's proof.
-    let trusted = match trusted_key(opts.trust.as_deref()) {
-        Ok(k) => k,
-        Err(why) => return Outcome::Refused(why),
+    // NEST-25: or by the key a known-hosts file pins for it, or — first
+    // contact — by the one a person says yes to below.
+    let first = inner.first.lock().unwrap().clone();
+    let pinned: Option<String> = match (&opts.trust, &first) {
+        (Some(_), _) | (None, None) => match trusted_key(opts.trust.as_deref()) {
+            Ok(k) => Some(k),
+            Err(why) => return Outcome::Refused(why),
+        },
+        (None, Some(f)) => match f.hosts.get(&opts.url) {
+            Ok(Some(k)) => Some(k),
+            Ok(None) if f.ask.is_some() => None,
+            Ok(None) => return Outcome::Refused(format!("no key is known for {} in {} (and no first contact is asked): a dial-out names its relay by key", opts.url, f.hosts.path().display())),
+            Err(why) => return Outcome::Refused(format!("the known hosts: {why}")),
+        },
     };
     if opts.url.starts_with("wss://") && !cfg!(feature = "child-wss") {
         return Outcome::Refused("a wss:// relay needs plexus-core's `child-wss` feature (TLS)".into());
@@ -392,17 +486,16 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
         Ok(r) => r,
         Err(e) => return Outcome::Refused(format!("`{}`: {e}", opts.url)),
     };
-    let key = match read_seed(&opts.key) {
+    let signer = match read_seed(&opts.key) {
         Ok(k) => k,
         Err(e) => return Outcome::Refused(e),
     };
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     // A dial-out signs in to its relay (a service): the sign-in context.
-    let proof = key_proof(&key, super::ws::LOGIN_CONTEXT, opts.url.trim_end_matches('/'), &opts.agent, &nonce(), ts);
+    let proof = key_proof(&signer, super::ws::LOGIN_CONTEXT, opts.url.trim_end_matches('/'), &opts.agent, &nonce(), ts);
     // KEEL-19: who this dial-out proves to be — what the relay's `_info`
     // proof must be made for.
-    let me = principal_of(&key);
-    drop(key);
+    let me = principal_of(&signer);
     match HeaderValue::from_str(&format!("Bearer {proof}")) {
         Ok(v) => req.headers_mut().insert(AUTHORIZATION, v),
         Err(e) => return Outcome::Refused(e.to_string()),
@@ -446,7 +539,9 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     let host_lines = tokio::spawn(async move {
         let mut lines = BufReader::new(host_out).lines();
         while let Ok(Some(l)) = lines.next_line().await {
-            if out_host.send(l.into_bytes()).is_err() {
+            // NEST-25: a call back is a request of this side's too: its id
+            // is put in a space of its own (`h:<n>`), apart from the client's.
+            if out_host.send(host_request_out(l.into_bytes())).is_err() {
                 break;
             }
         }
@@ -475,11 +570,10 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
 
     // Reader: by the frame's shape (spec/14 rule 2) — a call into this side
     // to the host; the offer's answer to its waiter; the rest to the client.
-    let (offer_tx, offer_rx) = oneshot::channel::<Value>();
+    let (offer_tx, mut offer_rx) = mpsc::unbounded_channel::<Value>();
     let reader_conn = Arc::clone(&conn);
     let (reader_proven, refuse_out) = (Arc::clone(&proven), out.clone());
     let reader = tokio::spawn(async move {
-        let mut offer_tx = Some(offer_tx);
         let why = loop {
             let text = match stream.next().await {
                 Some(Ok(Message::Text(t))) => t.as_bytes().to_vec(),
@@ -494,7 +588,21 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
                 Err(_) => continue,
             };
             let (method, id) = (shape.get("method"), shape.get("id"));
-            if method.is_some() && id.is_some() {
+            let method_is = |m: &str| method.and_then(Value::as_str) == Some(m);
+            // NEST-25: the host's answers and items of this side's calls back.
+            let to_host = (method_is(HOST_CALL) && id.is_none()) || (method.is_none() && id.and_then(Value::as_str).is_some_and(|i| i.starts_with("h:")));
+            if to_host {
+                if !reader_proven.load(Ordering::Acquire) {
+                    continue;
+                }
+                let mut line = host_answer_in(shape);
+                line.push(b'\n');
+                if host_in.write_all(&line).await.is_err() {
+                    break "the host stopped".to_string();
+                }
+            } else if method_is(super::dial_in::OFFER_PENDING) && id.is_none() {
+                let _ = offer_tx.send(shape);
+            } else if method.is_some() && id.is_some() {
                 // KEEL-8: a call before the relay proved its key is answered
                 // refused, never served.
                 if !reader_proven.load(Ordering::Acquire) {
@@ -508,9 +616,7 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
                     break "the host stopped".to_string();
                 }
             } else if method.is_none() && id.and_then(Value::as_str) == Some(OFFER_ID) {
-                if let Some(tx) = offer_tx.take() {
-                    let _ = tx.send(shape);
-                }
+                let _ = offer_tx.send(shape);
             } else {
                 reader_conn.on_message(&text).await;
             }
@@ -532,20 +638,23 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     // The relay's namespace and its key, proved: its `_info` over a nonce
     // (DYNAUTH-5's proof, the one a mount asks of its child).
     let asked = crate::plexus::peer_token::random_nonce();
+    // NEST-25: a nonce of this side's for the pairing code, committed to
+    // now and revealed in the offer, after the host's is known.
+    let node_nonce = crate::plexus::peer_token::random_nonce();
     let info = async {
-        let (_, mut rx) = conn.open("_info", json!({ "nonce": asked }), opts.timeout).await.map_err(|e| format!("{e:?}"))?;
+        let (_, mut rx) = conn.open("_info", json!({ "nonce": asked, "commit": commitment(&node_nonce) }), opts.timeout).await.map_err(|e| format!("{e:?}"))?;
         while let Some(item) = rx.recv().await {
             if let PlexusStreamItem::Data { content, .. } = item {
                 let content = content.into_value();
                 if let Some(b) = content.get("backend").and_then(Value::as_str) {
                     let field = |k: &str| content.get(k).and_then(Value::as_str).map(str::to_string);
-                    return Ok((b.to_string(), field("key"), field("proof")));
+                    return Ok((b.to_string(), field("key"), field("proof"), field("host_nonce")));
                 }
             }
         }
         Err::<_, String>("its `_info` names no backend".into())
     };
-    let (service, key, key_proof) = match tokio::time::timeout(opts.timeout, info).await {
+    let (service, key, key_proof, host_nonce) = match tokio::time::timeout(opts.timeout, info).await {
         Ok(Ok(s)) => s,
         Ok(Err(why)) => {
             reader.abort();
@@ -556,11 +665,55 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
             return ended(host, format!("the relay did not answer `_info` in {:?}", opts.timeout), false);
         }
     };
+    // NEST-25: a key pinned in the known hosts that the host no longer
+    // presents is refused loudly, and nobody is asked.
+    let from_file = opts.trust.is_none() && pinned.is_some();
+    if let (true, Some(p), Some(k)) = (from_file, &pinned, &key) {
+        if p != k {
+            reader.abort();
+            ended(host, String::new(), false);
+            let file = first.as_ref().map(|f| f.hosts.path().display().to_string()).unwrap_or_default();
+            let why = format!("host_key_changed: {} presents the key {k} ({}), not the one pinned in {file} ({p}): refused — someone may be in the middle; remove that line by hand only if the host's key really changed", opts.url, key_fingerprint(k).unwrap_or_default());
+            tracing::error!(target: "plexus::audit", url = %opts.url, "dial-out refused: {why}");
+            return Outcome::Refused(why);
+        }
+    }
+    // First contact: the key it proves is checked as a pinned one would be.
+    let trusted = match pinned.clone().or_else(|| key.clone()) {
+        Some(t) => t,
+        None => {
+            reader.abort();
+            ended(host, String::new(), false);
+            return Outcome::Refused(format!("the relay at {} proved no key at `_info`: nothing to trust", opts.url));
+        }
+    };
     if let Err(why) = relay_proved(&trusted, &service, &asked, &me, key.as_deref(), key_proof.as_deref()) {
         reader.abort();
         ended(host, String::new(), false);
         tracing::warn!(target: "plexus::audit", url = %opts.url, "dial-out refused: {why}");
         return Outcome::Refused(why);
+    }
+    let code = host_nonce.as_deref().map(|h| pairing_code(&trusted, &me, &node_nonce, h));
+    *inner.code.lock().unwrap() = code.clone();
+    if pinned.is_none() {
+        // Nothing sent, nothing served, until a person says yes.
+        let f = first.as_ref().expect("first contact is asked only with a known-hosts file");
+        let shown = FirstContact { url: opts.url.clone(), key: trusted.clone(), fingerprint: key_fingerprint(&trusted).unwrap_or_default(), code: code.clone() };
+        let yes = match &f.ask {
+            Some(ask) => ask(shown).await,
+            None => false,
+        };
+        if !yes {
+            reader.abort();
+            ended(host, String::new(), false);
+            return Outcome::Refused(format!("first contact refused: the key {trusted} of {} was not accepted", opts.url));
+        }
+        if let Err(why) = f.hosts.add(&opts.url, &trusted) {
+            reader.abort();
+            ended(host, String::new(), false);
+            return Outcome::Refused(format!("first contact: the known hosts: {why}"));
+        }
+        tracing::warn!(target: "plexus::audit", url = %opts.url, key = %trusted, "first contact: the host's key pinned in the known hosts");
     }
     let _ = conn.ns.set(service.clone());
     let _ = conn.peer_key.set(trusted.clone());
@@ -574,18 +727,39 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     if let Some(m) = &opts.mount {
         params["mount"] = json!(m);
     }
+    // NEST-25: the nonce committed to, revealed; and this side's key over
+    // both nonces — its key, proven on this connection.
+    if let Some(h) = &host_nonce {
+        let mount = opts.mount.clone().unwrap_or_else(|| ns.clone());
+        let input = super::dial_in::possession_input(&trusted, &me, &node_nonce, h, &service, &mount);
+        params["pairing_nonce"] = json!(node_nonce);
+        params["possession"] = json!(base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, signer.sign(input.as_bytes()).to_bytes()));
+    }
+    drop(signer);
     let _ = out.send(serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": OFFER_ID, "method": format!("{service}.offer"), "params": params })).unwrap_or_default());
-    let answer = match tokio::time::timeout(opts.timeout * 2, offer_rx).await {
-        Ok(Ok(a)) => a,
-        Ok(Err(_)) => {
-            let why = reader.await.unwrap_or_else(|_| "the socket".into());
-            return ended(host, format!("before the offer was answered: {why}"), false);
-        }
-        Err(_) => {
-            reader.abort();
-            return ended(host, format!("the offer was not answered in {:?}", opts.timeout * 2), false);
+    let mut wait = opts.timeout * 2;
+    let answer = loop {
+        match tokio::time::timeout(wait, offer_rx.recv()).await {
+            Ok(Some(a)) if a.get("method").is_some() => {
+                // Held pending: the same socket, the same code, until its operator says.
+                inner.pending.store(true, Ordering::Release);
+                tracing::warn!(target: "plexus::dial", url = %opts.url, code = ?code, "the host holds the offer pending its operator");
+                wait = *inner.pending_for.lock().unwrap();
+            }
+            Ok(Some(a)) => break a,
+            Ok(None) => {
+                inner.pending.store(false, Ordering::Release);
+                let why = reader.await.unwrap_or_else(|_| "the socket".into());
+                return ended(host, format!("before the offer was answered: {why}"), false);
+            }
+            Err(_) => {
+                inner.pending.store(false, Ordering::Release);
+                reader.abort();
+                return ended(host, format!("the offer was not answered in {wait:?}"), false);
+            }
         }
     };
+    inner.pending.store(false, Ordering::Release);
     if let Some(e) = answer.get("error") {
         reader.abort();
         ended(host, String::new(), false);
@@ -616,6 +790,29 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
 
     let why = reader.await.unwrap_or_else(|_| "the socket".into());
     ended(host, why, true)
+}
+
+/// NEST-25: a request line of this side's host (a call back) as it goes on
+/// the socket: its numbered id put in the `h:<n>` space.
+fn host_request_out(line: Vec<u8>) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<Value>(&line) else { return line };
+    let is_host = v.get("method").and_then(Value::as_str).is_some_and(|m| m == HOST_CALL || m == HOST_CALL_UNSUB);
+    match (is_host, v.get("id").and_then(Value::as_u64)) {
+        (true, Some(n)) => {
+            v["id"] = json!(format!("h:{n}"));
+            serde_json::to_vec(&v).unwrap_or(line)
+        }
+        _ => line,
+    }
+}
+
+/// NEST-25: an answer to a call back as this side's host reads it (`h:<n>`
+/// back to `n`); an item as it came.
+fn host_answer_in(mut v: Value) -> Vec<u8> {
+    if let Some(n) = v.get("id").and_then(Value::as_str).and_then(|i| i.strip_prefix("h:")).and_then(|n| n.parse::<u64>().ok()) {
+        v["id"] = json!(n);
+    }
+    serde_json::to_vec(&v).unwrap_or_default()
 }
 
 /// KEEL-8: the relay's key a dial-out trusts — `key:<64 hex>` — or why the

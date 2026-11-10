@@ -62,8 +62,11 @@ pub const UPGRADE_LEDGER_MAX: usize = 4096;
 
 /// KEEL-19 (P2): the agent id a child dial's key proof is signed as. spec/00
 /// has one key-proof form for a dial and a sign-in; `agent` is in the signed
-/// bytes, so a child takes only a proof made as this agent, and a sign-in
-/// adapter (plexus-auth-core's `KeyProofAdapter`) refuses one.
+/// bytes, so a child takes only a proof made as this agent: a sign-in proof
+/// replayed to a child at the same URL is refused. A server's sign-in
+/// (plexus-auth-core's `KeyProofAdapter`) takes a dial proof as the dialing
+/// key's sign-in for its own URL, by design: that is how a service mounts a
+/// service behind key sign-in.
 pub const CHILD_DIAL_AGENT: &str = "plexus.child-dial";
 
 fn b64(b: &[u8]) -> String {

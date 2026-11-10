@@ -222,22 +222,23 @@ fn an_upgrade_proof_is_verified() {
 }
 
 /// P2, with no change to the wire: a child dial is signed as the reserved
-/// agent `plexus.child-dial` (in the signed bytes). A child takes nothing
-/// else — a sign-in proof is refused — and the sign-in adapter refuses a
-/// child dial.
+/// agent `plexus.child-dial` (in the signed bytes), and a child takes nothing
+/// else — a sign-in proof replayed to a child listing the same URL is
+/// refused. The other way is by design: a server's sign-in takes a dial
+/// proof as the dialing key's sign-in for its own URL (a service mounting a
+/// service behind key sign-in; `tests/dial.rs` mounts one).
 #[tokio::test]
-async fn a_sign_in_proof_and_a_child_dial_are_told_apart() {
+async fn a_sign_in_proof_is_not_a_child_dial() {
     use plexus_auth_core::identity::{Authenticator, Presentation};
     let aud = "ws://127.0.0.1:4481";
     let login = plexus_auth_core::adapters::sign_key_proof(&[5; 32], aud, "dyn", &[7; 32], now());
     assert!(KeyedUpgrade::new([aud]).verify(&login).unwrap_err().contains("not a child dial"), "a sign-in taken as a child dial");
-    let adapter = plexus_auth_core::adapters::KeyProofAdapter::new([aud]).unwrap();
-    let dial = dial_proof(&PeerKey::from_seed([5; 32]), aud);
-    assert!(adapter.authenticate(&Presentation::Bearer { token: dial }).await.is_err(), "a child dial taken as a sign-in");
-    // Each still takes its own.
     assert!(KeyedUpgrade::new([aud]).verify(&dial_proof(&PeerKey::from_seed([5; 32]), aud)).is_ok());
-    let login = plexus_auth_core::adapters::sign_key_proof(&[5; 32], aud, "dyn", &[9; 32], now());
-    assert!(adapter.authenticate(&Presentation::Bearer { token: login }).await.is_ok());
+    // A dial proof is the dialing key's sign-in at its audience.
+    let adapter = plexus_auth_core::adapters::KeyProofAdapter::new([aud]).unwrap();
+    let key = PeerKey::from_seed([5; 32]);
+    let signed_in = adapter.authenticate(&Presentation::Bearer { token: dial_proof(&key, aud) }).await.expect("a dial proof signs in");
+    assert_eq!(signed_in.principal().to_string(), key.kid());
 }
 
 /// P3a (repro4): a full ledger refuses new upgrades; it never forgets a

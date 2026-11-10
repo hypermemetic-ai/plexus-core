@@ -328,3 +328,45 @@ async fn the_relays_gate_decides_who_may_offer_and_who_may_call() {
     let items = collect(relay.service.route("peers.alice.hello", json!({ "name": "y" }), Some(&ctx)).await.unwrap()).await;
     assert_eq!(contents(&items)[0]["caller"], alice.as_str());
 }
+
+/// KEEL-19: a service mounts another full service behind key sign-in
+/// (`--child far=ws://…`, `dyn.connect`), signing in as its own key. Its dial
+/// proof is signed as the reserved agent `plexus.child-dial`; the far
+/// service's real `KeyProofAdapter` takes it as that key's sign-in for its
+/// own URL — by design: a dial proof is addressed to the dialed URL and
+/// usable only there. (A child's `KeyedUpgrade` takes only that agent, so a
+/// sign-in proof is never taken as a dial.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_behind_key_sign_in_is_mounted_with_the_dial_proof() {
+    use plexus_core::plexus::{ChildError, ChildOptions, ChildSpec, RemoteChild};
+    let dir = tempfile::tempdir().unwrap();
+    let (dial_key, principal) = key(dir.path(), "svc", 21);
+    let port = port();
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let far = Arc::new(DynamicHub::new("far").register(GreeterActivation { name: "far".into() }));
+    let keys = KeyProofAdapter::new([url.clone()].iter()).unwrap();
+    let server = TransportServer::builder(Arc::clone(&far), |h| Ok(DynamicHub::arc_into_rpc_module(h)?))
+        .without_registry()
+        .with_websocket(port)
+        .with_session_validator(Arc::new(Carriers::cookie_and_bearer(AuthenticatorChain::new().with(Arc::new(keys)))))
+        .reject_upgrade_on_auth_failure()
+        .with_allowed_hosts([format!("127.0.0.1:{port}")])
+        .build()
+        .await
+        .unwrap();
+    let serving = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    until("the far service listens", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+
+    let spec: ChildSpec = format!("far={url}").parse().unwrap();
+    let child = RemoteChild::connect(spec.clone(), ChildOptions { key: Some(dial_key.clone()), ..ChildOptions::default() }).await.expect("mounted, signed in by the dial proof");
+    assert_eq!(child.principal(), principal);
+    let host = Arc::new(DynamicHub::new("svc").register(child));
+    let items = collect(host.route("far.greeter.hello", json!({ "name": "x" }), None).await.unwrap()).await;
+    assert_eq!(contents(&items)[0]["text"], "hello x, from far", "{items:?}");
+    // With no key, the far service's sign-in refuses the upgrade.
+    let e = RemoteChild::connect(spec, ChildOptions::default()).await.unwrap_err();
+    assert!(matches!(&e, ChildError::Start(_, w) if w.contains("401")), "{e}");
+    serving.abort();
+}

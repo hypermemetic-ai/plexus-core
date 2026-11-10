@@ -126,13 +126,15 @@ Fifth pass:
   held and refused) at most once per 10 s. (Before, it evicted the
   earliest-expiring proof, which a flood of proofs by fresh keys could use
   to replay a captured one.) At most 4096 upgrades a minute per child.
-- **A child dial is not a sign-in, with no wire change.** A child dial's key
-  proof is signed as the reserved agent `plexus.child-dial`
+- **A sign-in is not a child dial, with no wire change.** A child dial's
+  key proof is signed as the reserved agent `plexus.child-dial`
   (`CHILD_DIAL_AGENT`; `ws::dial`, `dial_proof`); `KeyedUpgrade` takes
-  only that agent (`a key proof as agent `…`, not a child dial`), and
-  plexus-auth-core 0.3.2's `KeyProofAdapter`, which this release requires,
-  refuses it as a sign-in. So a captured dial is not a sign-in at a service
-  on the child's URL, and a captured sign-in is not a dial. The form and
+  only that agent (`a key proof as agent `…`, not a child dial`), so a
+  sign-in proof replayed to a child listing the same URL is refused. A
+  server's sign-in (plexus-auth-core's `KeyProofAdapter`, unchanged) takes
+  a dial proof as the dialing key's sign-in for its own URL, by design: a
+  service mounting a service behind key sign-in keeps working
+  (`tests/dial.rs` mounts one through the real adapter). The form and
   context stay spec/00's. A dial-out (KEEL-8) signs into its relay as its
   own agent, as before: that is a sign-in.
 - `Proven` is not `Clone`: the proof of one socket's upgrade, consumed by
@@ -144,9 +146,8 @@ Fifth pass:
 a key file that is a link, another user's or open to group or others is
 refused; a service with no dial key refuses a keyed peer at mount
 (`keyed_mount_needs_a_key`); `TokenIssuer::exchange` binds its token to the
-presenter and gives it once; a sign-in proof made as agent
-`plexus.child-dial` is refused (plexus-auth-core 0.3.2), and a child's
-upgrade is refused with a full ledger.
+presenter and gives it once; a keyed child's upgrade is refused unless
+its proof is made as agent `plexus.child-dial`, and with a full ledger.
 
 **Required upgrade of both sides (wire):** `KEY_PROOF_CONTEXT` is v2, so a
 0.11.1 service refuses the `_info` key proof of a 0.11.0 peer (it is not

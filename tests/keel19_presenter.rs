@@ -29,7 +29,7 @@
 
 use futures::Stream;
 use plexus_core::plexus::peer_token::{check_key_proof_for, prove, random_nonce, MintRequest, PeerKey, ProofCache, TokenError, TokenIssuer, Verifier, EXCHANGE};
-use plexus_core::plexus::remote_child::{serve_child_with, ChildPeer, ServeChild};
+use plexus_core::plexus::remote_child::{dial_proof, serve_child_proven, serve_child_with, ChildPeer, KeyedUpgrade, ServeChild};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -80,8 +80,8 @@ impl World {
     }
 
     /// B, verifying, serving one input whose sender is `peer`.
-    fn serve_b(&self, peer: ChildPeer) -> Input {
-        self.serve_b_with(peer, self.verifier())
+    fn serve_b(&self, by: &PeerKey, trusted: &PeerKey) -> Input {
+        self.serve_b_with(by, trusted, self.verifier())
     }
 
     fn verifier(&self) -> Arc<Verifier> {
@@ -101,11 +101,13 @@ impl World {
 
     /// B, serving one input whose sender is `peer`, with the verifier `v`
     /// (shared between inputs: one replay cache).
-    fn serve_b_with(&self, peer: ChildPeer, v: Arc<Verifier>) -> Input {
-        let opts = ServeChild { peer, key: Some(self.b.clone()), tokens: Some(v) };
+    fn serve_b_with(&self, by: &PeerKey, trusted: &PeerKey, v: Arc<Verifier>) -> Input {
+        // KEEL-19: B's input proven as `by` — by verifying `by`'s dial proof,
+        // as `serve_child_ws` does at the upgrade; never a written string.
+        let proven = KeyedUpgrade::new(["ws://b.test"]).verify(&dial_proof(by, "ws://b.test", "t")).unwrap();
         let (to_b, b_in) = tokio::io::duplex(1 << 16);
         let (b_out, from_b) = tokio::io::duplex(1 << 16);
-        tokio::spawn(serve_child_with(WeatherActivation, b_in, b_out, opts));
+        tokio::spawn(serve_child_proven(WeatherActivation, b_in, b_out, proven, vec![trusted.kid().to_string()], Some(self.b.clone()), Some(v)));
         Input { to_b, lines: BufReader::new(from_b).lines(), next: 1 }
     }
 }
@@ -158,7 +160,7 @@ async fn the_reviewers_attack_is_refused_at_the_audience() {
     let w = World::new();
     let (t_b, c_b) = w.exchanged_for_b("weather.forecast").unwrap();
     assert_eq!(c_b.cnf.as_ref().map(|c| c.jkt.as_str()), Some(w.a.thumbprint().as_str()), "the exchanged token names its presenter's key");
-    let mut b = w.serve_b(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]));
+    let mut b = w.serve_b(&w.a, &w.host);
     // Control: without a token, A's hop is refused (A is not trusted).
     refused(&b.call(hop(w.a.kid(), "x", None, None)).await, "no token");
     // The attack: the exchanged token in A's hop, no proof.
@@ -174,14 +176,14 @@ async fn the_reviewers_attack_is_refused_at_the_audience() {
 async fn a_forwarded_token_is_taken_only_from_the_service_with_its_proof() {
     let w = World::new();
     let b = w.b.kid().to_string();
-    let mut from_a = w.serve_b(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]));
+    let mut from_a = w.serve_b(&w.a, &w.host);
     let (t, p) = w.forwarded(&b, "f1");
     refused(&from_a.call(hop(w.a.kid(), "f1", Some(&t), Some(p))).await, "the service's own connection");
     // Even with a proof by A: the token is B's, not A's.
     let (t, _) = w.forwarded(&b, "f2");
     refused(&from_a.call(hop(w.a.kid(), "f2", Some(&t), Some(prove(&w.a, &t, "weather.forecast", "f2")))).await, "the service's own connection");
     // On the service's own connection, but with no proof, or another's.
-    let mut from_host = w.serve_b(ChildPeer::connection(w.host.kid(), [w.host.kid().to_string()]));
+    let mut from_host = w.serve_b(&w.host, &w.host);
     let (t, _) = w.forwarded(&b, "f3");
     refused(&from_host.call(hop(w.host.kid(), "f3", Some(&t), None)).await, "no proof of possession");
     let (t, _) = w.forwarded(&b, "f4");
@@ -202,7 +204,7 @@ async fn a_forwarded_token_is_taken_only_from_the_service_with_its_proof() {
 async fn b1_a_relayed_key_proof_is_refused_and_v_takes_nothing_from_m() {
     let w = World::new();
     let m = PeerKey::generate();
-    let mut b = w.serve_b(ChildPeer::connection(m.kid(), [w.host.kid().to_string()]));
+    let mut b = w.serve_b(&m, &w.host);
     let nonce = random_nonce();
     // M relays the service's nonce, naming the service as the asker.
     let frame = json!({ "jsonrpc": "2.0", "id": 9, "method": "_info", "params": { "nonce": nonce, "asker": w.host.kid() } });
@@ -269,14 +271,14 @@ async fn b2_a_pipe_proves_nobody() {
 async fn a_replay_without_its_proof_does_not_burn_the_token() {
     let w = World::new();
     let v = w.verifier();
-    let mut observer = w.serve_b_with(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]), Arc::clone(&v));
-    let mut from_host = w.serve_b_with(ChildPeer::connection(w.host.kid(), [w.host.kid().to_string()]), v);
+    let mut observer = w.serve_b_with(&w.a, &w.host, Arc::clone(&v));
+    let mut from_host = w.serve_b_with(&w.host, &w.host, v);
     let (t, p) = w.forwarded(w.b.kid(), "r1");
     refused(&observer.call(hop(w.a.kid(), "r1", Some(&t), None)).await, "the service's own connection");
     let got = from_host.call(hop(w.host.kid(), "r1", Some(&t), Some(p))).await;
     assert_eq!(got["content"]["ran_for"], CALLER, "the observer's replay spent the token: {got}");
     // An exchanged token replayed by an observer without its presenter's proof, too.
-    let mut from_a = w.serve_b_with(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]), w.verifier());
+    let mut from_a = w.serve_b_with(&w.a, &w.host, w.verifier());
     let (t, c) = w.exchanged_for_b("weather.forecast").unwrap();
     refused(&from_a.call(hop(w.a.kid(), &c.call, Some(&t), None)).await, "no proof of possession");
     let got = from_a.call(hop(w.a.kid(), &c.call, Some(&t), Some(prove(&w.a, &t, "weather.forecast", &c.call)))).await;
@@ -291,7 +293,7 @@ async fn a_replay_without_its_proof_does_not_burn_the_token() {
 async fn the_presenter_with_its_proof_is_taken() {
     let w = World::new();
     let mallory = PeerKey::generate();
-    let mut b = w.serve_b(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]));
+    let mut b = w.serve_b(&w.a, &w.host);
     let (t, c) = w.exchanged_for_b("weather.forecast").unwrap();
     refused(&b.call(hop(w.a.kid(), &c.call, Some(&t), Some(prove(&mallory, &t, "weather.forecast", &c.call)))).await, "another key");
     let (t, c) = w.exchanged_for_b("weather.forecast").unwrap();
@@ -300,7 +302,7 @@ async fn the_presenter_with_its_proof_is_taken() {
     let got = b.call(hop(w.a.kid(), &c.call, Some(&t), Some(prove(&w.a, &t, "weather.forecast", &c.call)))).await;
     assert_eq!(got["content"], json!({ "city": "lisbon", "ran_for": CALLER }), "{got}");
     // A's token and proof, carried by Mallory's connection.
-    let mut via_mallory = w.serve_b(ChildPeer::connection(mallory.kid(), [w.host.kid().to_string()]));
+    let mut via_mallory = w.serve_b(&mallory, &w.host);
     let (t, c) = w.exchanged_for_b("weather.forecast").unwrap();
     refused(&via_mallory.call(hop(mallory.kid(), &c.call, Some(&t), Some(prove(&w.a, &t, "weather.forecast", &c.call)))).await, "not as the presenter");
 }

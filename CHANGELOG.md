@@ -94,9 +94,33 @@ signed its proof for it whoever asked):
   signatures, deprecated: the first makes a v1 proof nothing accepts, the
   second refuses every proof, naming the new one.
 
+Fourth pass (the review re-attacked: `proven` was a string an operator
+could write as the service's key):
+
+- **A proven principal is a type** (`Proven`): no constructor from a
+  string, made only by `KeyedUpgrade::verify` (moved out of the `child-ws`
+  feature). A keyed or key-verifying child is served only by
+  `serve_child_proven(…, Proven, trusted, key, tokens)` (`serve_child_ws`
+  calls it); `serve_child_with` refuses one whatever `ChildPeer` it is
+  given. `ChildPeer::connection` stays for keyless children and says it
+  proves nothing. `dial_proof` signs a key proof for a client of a keyed
+  child.
+- **A revoke after the dial** (KEEL-22's first row): `mint` and the call
+  back's `open` ask `revoked` again, after `forward` awaited the dial;
+  `open` asks it under the lock `revoke` drains.
+- **Key files** (`PeerKey::load_or_create`, a child's `--child-key`) are
+  opened `O_NOFOLLOW`, must be the effective user's and 0600, and are made
+  `O_EXCL`; `ensure_private_dir` and `read_private_if_any` (new) do the same
+  for a directory (0700) and a private file.
+- `KeyedUpgrade` remembers at most 4096 proofs (`UPGRADE_LEDGER_MAX`).
+- `_info` is refused as the target of `{ns}.call`.
+- Not done: a child dial's own key-proof context (P2) — spec/00 has one
+  form for a dial and a sign-in, and the polyglot children (plexus-wire's
+  conformance stub) verify it; a second context is a plexus-wire change.
+
 **Behaviour changes for a security release (no signature changed):**
-`serve_child_with` refuses, at start, a keyed or key-verifying child on a
-`Pipe` or on an unproven principal; a service with no dial key refuses a
+`serve_child_with` refuses, at start, every keyed or key-verifying child;
+a key file that is a link, another user's or open to others is refused; a service with no dial key refuses a
 keyed peer at mount; `TokenIssuer::exchange` binds its token to the
 presenter and gives it once.
 

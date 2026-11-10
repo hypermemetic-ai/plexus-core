@@ -179,7 +179,9 @@ impl PeerKey {
     /// others is refused.
     pub fn load_or_create(path: &Path) -> Result<Self, String> {
         let shown = path.display();
-        if !path.exists() {
+        // KEEL-19 (P5): asked of the path itself, never what a link names.
+        let missing = matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        if missing {
             let key = Self::generate();
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -188,15 +190,7 @@ impl PeerKey {
             write_private(path, text.as_bytes()).map_err(|e| format!("the key file {shown}: {e}"))?;
             return Ok(key);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path).map_err(|e| format!("the key file {shown}: {e}"))?.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(format!("the key file {shown} is readable by others (mode {:o}); a key is kept 0600", mode & 0o777));
-            }
-        }
-        let raw = std::fs::read(path).map_err(|e| format!("the key file {shown}: {e}"))?;
+        let raw = read_private(path).map_err(|e| format!("the key file {e}"))?;
         let text: Vec<u8> = raw.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
         let engines = [
             &base64::engine::general_purpose::STANDARD,
@@ -230,6 +224,11 @@ impl PeerKey {
     /// Its public half.
     pub fn public(&self) -> VerifyingKey {
         self.signing.verifying_key()
+    }
+
+    /// Its signing half, inside the crate (KEEL-19: a child dial's proof).
+    pub(crate) fn signing(&self) -> &SigningKey {
+        &self.signing
     }
 
     /// Its RFC 7638 thumbprint.
@@ -297,13 +296,108 @@ pub fn check_key_proof_for(key: &str, proof: &str, nonce: &str, backend: &str, a
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
+    // `create_new` is O_CREAT|O_EXCL: it never opens what is there, a link
+    // included.
     o.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     o.open(path)?.write_all(bytes)
+}
+
+/// KEEL-19 (P5): a private file's bytes — opened without following a
+/// symbolic link (`O_NOFOLLOW`), a regular file, owned by this process's
+/// effective user, and neither group nor others with any access. The error
+/// names the path.
+pub(crate) fn read_private(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let shown = path.display();
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = o.open(path).map_err(|e| match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(libc::ELOOP) => format!("{shown} is a symbolic link: a private file is never read through one"),
+        _ => format!("{shown}: {e}"),
+    })?;
+    let md = f.metadata().map_err(|e| format!("{shown}: {e}"))?;
+    if !md.is_file() {
+        return Err(format!("{shown} is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if md.uid() != me {
+            return Err(format!("{shown} is owned by uid {}, not by this user ({me})", md.uid()));
+        }
+        if md.mode() & 0o077 != 0 {
+            return Err(format!("{shown} is readable by others (mode {:o}); a key is kept 0600", md.mode() & 0o777));
+        }
+    }
+    let mut out = Vec::new();
+    f.read_to_end(&mut out).map_err(|e| format!("{shown}: {e}"))?;
+    Ok(out)
+}
+
+/// KEEL-19 (P5, KEEL-25) · `dir` as a private directory: made (0700, its
+/// parents as the umask makes them) when missing; refused — naming it —
+/// when it is a symbolic link, not a directory, not this process's
+/// effective user's, or open to group or others in any way.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    let shown = dir.display();
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            let mut b = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                b.mode(0o700);
+            }
+            b.create(dir).map_err(|e| format!("{shown}: {e}"))?;
+            ensure_private_dir(dir)
+        }
+        Err(e) => Err(format!("{shown}: {e}")),
+        Ok(md) => {
+            if md.file_type().is_symlink() {
+                return Err(format!("{shown} is a symbolic link: a private directory is never one"));
+            }
+            if !md.is_dir() {
+                return Err(format!("{shown} is not a directory"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                let me = unsafe { libc::geteuid() };
+                if md.uid() != me {
+                    return Err(format!("{shown} is owned by uid {}, not by this user ({me})", md.uid()));
+                }
+                if md.mode() & 0o077 != 0 {
+                    return Err(format!("{shown} is open to others (mode {:o}); it is kept 0700", md.mode() & 0o777));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// KEEL-19 (P5): [`read_private`] for a file that may be missing (`None`).
+pub fn read_private_if_any(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => read_private(path).map(Some),
+    }
 }
 
 fn signature_of(s: &str) -> Result<Signature, TokenError> {
@@ -1609,6 +1703,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// KEEL-19 (P5): a key file is never read through a symbolic link, nor
+    /// one another user owns; a private directory is the user's, 0700.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_link_or_an_open_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A 0600 key of ours, and a link planted where the service's key goes.
+        let real = dir.path().join("real.key");
+        let planted = PeerKey::load_or_create(&real).unwrap();
+        let link = dir.path().join("dial.key");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = PeerKey::load_or_create(&link).unwrap_err();
+        assert!(e.contains("symbolic link"), "{e}");
+        assert!(read_private(&link).is_err());
+        assert_eq!(PeerKey::load_or_create(&real).unwrap().kid(), planted.kid());
+        // A dangling link is not "missing": nothing is made through it.
+        let dangling = dir.path().join("gone.key");
+        std::os::unix::fs::symlink(dir.path().join("nowhere.key"), &dangling).unwrap();
+        assert!(PeerKey::load_or_create(&dangling).is_err());
+        assert!(!dir.path().join("nowhere.key").exists(), "made through a link");
+        // A private directory: made 0700; a 0755 one or a link refused.
+        let made = dir.path().join("data");
+        ensure_private_dir(&made).unwrap();
+        assert_eq!(std::fs::metadata(&made).unwrap().permissions().mode() & 0o777, 0o700);
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_private_dir(&open).unwrap_err().contains("open to others"));
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&made, &linked).unwrap();
+        assert!(ensure_private_dir(&linked).unwrap_err().contains("symbolic link"));
     }
 
     #[test]

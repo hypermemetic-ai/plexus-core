@@ -98,15 +98,20 @@ pub enum ChildPeer {
     /// A pipe the parent owns (the child's stdin): every hop is the
     /// parent's.
     Pipe,
-    /// A connection the transport proved: `proven` is the principal it
-    /// proved (`key:<hex>`); a hop is taken only when `proven` is one of
-    /// `acts_for_others` and the hop names it as the acting service.
+    /// A connection whose sender is `proven`; a hop is taken only when
+    /// `proven` is one of `acts_for_others` and the hop names it as the
+    /// acting service. KEEL-19: `proven` is whatever string it is given —
+    /// nothing here checks it. For a keyless child whose embedder vouches
+    /// for it; a keyed child is served only with a [`super::Proven`]
+    /// ([`serve_child_proven`]).
     Connection { proven: String, acts_for_others: Vec<String> },
 }
 
 impl ChildPeer {
-    /// A connection proven as `proven`, the child trusting `acts_for_others`
-    /// (service principals) to act for others.
+    /// A connection said to be proven as `proven`, the child trusting
+    /// `acts_for_others` (service principals) to act for others. **It
+    /// proves nothing itself**: the string is believed as given — for a
+    /// keyless child only (`serve_child_with` refuses a keyed one).
     pub fn connection(proven: impl Into<String>, acts_for_others: impl IntoIterator<Item = String>) -> Self {
         ChildPeer::Connection { proven: proven.into(), acts_for_others: acts_for_others.into_iter().collect() }
     }
@@ -198,29 +203,60 @@ impl Default for ServeChild {
     }
 }
 
-/// [`serve_child_on`] with every option ([`ServeChild`]).
+/// [`serve_child_on`] with every option ([`ServeChild`]) — for a keyless
+/// child. KEEL-19: a child with a key, or verifying tokens addressed to a
+/// key, is refused (`InvalidInput`) whatever `ChildPeer` it is given: a
+/// principal written as a string proves nothing. Serve one with
+/// [`serve_child_proven`] (or `serve_child_ws`).
 pub async fn serve_child_with<A, R, W>(activation: A, r: R, w: W, opts: ServeChild) -> std::io::Result<()>
 where
     A: Activation + Clone,
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let ns = activation.namespace().to_string();
-    // KEEL-19: a pipe proves nobody, and nor does a name. A child that
-    // proves a key, or verifies tokens addressed to a key, is reached over
-    // a network, and its input is a connection proven as a key (`key:<hex>`,
-    // what a transport verifies: `serve_child_ws`) — never a `Pipe`, nor a
-    // `Connection` "proven" as a name like `service:dyn` no transport can
-    // prove, on which its `_info` proof could be asked for by anyone and a
-    // forwarded hop relayed by anyone.
-    let keyed = opts.key.is_some() || opts.tokens.as_ref().is_some_and(|v| v.audience().starts_with("key:"));
-    let proven_key = matches!(&opts.peer, ChildPeer::Connection { proven, .. } if crate::plexus::peer_token::key_of(proven).is_some());
-    if keyed && !proven_key {
+    if opts.key.is_some() || opts.tokens.as_ref().is_some_and(|v| v.audience().starts_with("key:")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "a child with a key, or verifying tokens addressed to a key, is served on a connection proven as a key (`key:<hex>`: serve_child_ws), never a pipe nor a principal no transport proves: there its key proof and its hops are anyone's",
+            "a child with a key, or verifying tokens addressed to a key, is served on a connection a verifier proved (serve_child_proven with a Proven, or serve_child_ws): a principal written as a string, or a pipe, proves nobody",
         ));
     }
+    serve(activation, r, w, opts).await
+}
+
+/// KEEL-19 · serve a keyed child (its `key`, its token verifier `tokens`) on
+/// an input whose sender a verifier proved (`proven`, from
+/// [`super::KeyedUpgrade::verify`]), trusting `trusted` (service principals,
+/// `key:<hex>`) to act for others: a hop is believed only when `proven` is
+/// one of them and the hop names it (see [`ServeChild::tokens`] for what a
+/// token adds). `serve_child_ws` takes a WebSocket upgrade this way; an
+/// embedder with its own transport verifies the upgrade's proof with a
+/// [`super::KeyedUpgrade`] and calls this.
+pub async fn serve_child_proven<A, R, W>(
+    activation: A,
+    r: R,
+    w: W,
+    proven: super::Proven,
+    trusted: Vec<String>,
+    key: Option<crate::plexus::peer_token::PeerKey>,
+    tokens: Option<Arc<crate::plexus::peer_token::Verifier>>,
+) -> std::io::Result<()>
+where
+    A: Activation + Clone,
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let peer = ChildPeer::Connection { proven: proven.principal().to_string(), acts_for_others: trusted };
+    serve(activation, r, w, ServeChild { peer, key, tokens }).await
+}
+
+/// The far side's loop, its options already admitted.
+async fn serve<A, R, W>(activation: A, r: R, w: W, opts: ServeChild) -> std::io::Result<()>
+where
+    A: Activation + Clone,
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let ns = activation.namespace().to_string();
     let key = opts.key.clone().map(Arc::new);
     let tokens = opts.tokens.clone();
     let peer = Arc::new(opts.peer);
@@ -271,6 +307,11 @@ where
                     send(&out, json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "Invalid params: method" } }));
                     continue;
                 };
+                // KEEL-19: `_info` is asked as itself, never through `{ns}.call`.
+                if target == "_info" {
+                    send(&out, json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "Invalid params: `_info` is not called through `{ns}.call`" } }));
+                    continue;
+                }
                 (target.to_string(), params.get("params").cloned().unwrap_or_else(|| json!({})), params.get("hop").cloned())
             };
             let sid = next_sid;

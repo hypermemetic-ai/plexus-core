@@ -18,7 +18,9 @@ use super::link::{gone, Conn, Shared};
 use super::spec::{check_ws_url, INSECURE_TRANSPORT};
 
 const PROOF_PREFIX: &str = "plexus-key.";
-const PROOF_CONTEXT: &str = "plexus-key-login/v1";
+/// spec/00's one key-proof context — a dial-out signing in to its relay and
+/// a mount dialing its child alike (plexus-wire spec/00 has no other).
+pub(super) const LOGIN_CONTEXT: &str = super::proven::KEY_PROOF_CONTEXT;
 
 fn b64url(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -29,15 +31,8 @@ fn b64url(b: &[u8]) -> String {
 /// may read it.
 pub(super) fn read_seed(path: &Path) -> Result<SigningKey, String> {
     let shown = path.display();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path).map_err(|e| format!("the key file {shown}: {e}"))?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(format!("the key file {shown} is readable by others (mode {:o}); a key is kept 0600", mode & 0o777));
-        }
-    }
-    let raw = std::fs::read(path).map_err(|e| format!("the key file {shown}: {e}"))?;
+    // KEEL-19 (P5): not through a link, the user's own, 0600.
+    let raw = crate::plexus::peer_token::read_private(path).map_err(|e| format!("the key file {e}"))?;
     let text: Vec<u8> = raw.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
     let engines = [
         &base64::engine::general_purpose::STANDARD,
@@ -61,10 +56,11 @@ pub(super) fn principal_of(key: &SigningKey) -> String {
 
 /// The bearer value `plexus-key.<base64url(JSON)>` (spec/00, IDENTITY-41):
 /// `{"v":1,"key","aud","agent","nonce","ts","sig"}` in that order, signed
-/// over `plexus-key-login/v1\n<aud>\n<agent>\n<nonce>\n<ts>`.
-pub(super) fn key_proof(key: &SigningKey, aud: &str, agent: &str, nonce: &[u8; 32], ts: i64) -> String {
+/// over `<context>\n<aud>\n<agent>\n<nonce>\n<ts>` — `context` spec/00's
+/// [`LOGIN_CONTEXT`].
+pub(super) fn key_proof(key: &SigningKey, context: &str, aud: &str, agent: &str, nonce: &[u8; 32], ts: i64) -> String {
     let nonce = b64url(nonce);
-    let sig = key.sign(format!("{PROOF_CONTEXT}\n{aud}\n{agent}\n{nonce}\n{ts}").as_bytes());
+    let sig = key.sign(format!("{context}\n{aud}\n{agent}\n{nonce}\n{ts}").as_bytes());
     let hex: String = key.verifying_key().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     let s = |v: &str| serde_json::to_string(v).unwrap_or_default();
     let body = format!(
@@ -134,7 +130,7 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     if let Some(path) = &shared.opts.key {
         let key = read_seed(path)?;
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-        let proof = key_proof(&key, url.trim_end_matches('/'), &shared.opts.agent, &nonce(), ts);
+        let proof = key_proof(&key, LOGIN_CONTEXT, url.trim_end_matches('/'), &shared.opts.agent, &nonce(), ts);
         let value = HeaderValue::from_str(&format!("Bearer {proof}")).map_err(|e| e.to_string())?;
         req.headers_mut().insert(AUTHORIZATION, value);
     }
@@ -227,66 +223,13 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
 
 // ------------------------------------------------------------------ KEEL-19
 
-/// KEEL-19 · the accepting side of a child's WebSocket: what verifies the
-/// key proof a service dials with (`Authorization: Bearer plexus-key.…`,
-/// spec/00 — [`key_proof`]'s form, plexus-auth-core's `KeyProofAdapter`'s)
-/// and so yields the principal a [`ChildPeer::connection`] is proven as.
-/// `aud` must be one of the URLs this child is dialed at, `ts` within 60 s
-/// past and 30 s ahead, each (key, nonce) once.
-///
-/// [`ChildPeer::connection`]: super::ChildPeer::connection
-pub struct KeyedUpgrade {
-    audiences: Vec<String>,
-    seen: std::sync::Mutex<std::collections::HashMap<(String, String), i64>>,
-}
-
-impl std::fmt::Debug for KeyedUpgrade {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeyedUpgrade").field("audiences", &self.audiences).finish()
-    }
-}
-
-impl KeyedUpgrade {
-    /// Proofs addressed to one of `audiences` (`ws://127.0.0.1:<port>`, …).
-    pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(audiences: I) -> Self {
-        Self { audiences: audiences.into_iter().map(|a| a.as_ref().trim().trim_end_matches('/').to_string()).collect(), seen: Default::default() }
-    }
-
-    /// The principal (`key:<hex>`) the bearer value `bearer` proves, or why not.
-    pub fn verify(&self, bearer: &str) -> Result<String, String> {
-        use ed25519_dalek::Signature;
-        let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let body = bearer.trim().strip_prefix(PROOF_PREFIX).ok_or("not a key proof (`plexus-key.…`)")?;
-        let p: serde_json::Value = b64.decode(body).ok().and_then(|j| serde_json::from_slice(&j).ok()).ok_or("a key proof that does not read")?;
-        let s = |k: &str| p.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-        let (key, aud, agent, nonce, sig) = (s("key"), s("aud"), s("agent"), s("nonce"), s("sig"));
-        let ts = p.get("ts").and_then(serde_json::Value::as_i64).ok_or("a key proof with no `ts`")?;
-        if p.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
-            return Err("a key proof whose `v` is not 1".into());
-        }
-        if !self.audiences.iter().any(|a| a == aud.trim_end_matches('/')) {
-            return Err(format!("a key proof for `{aud}`, not for this child"));
-        }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-        if ts + 60 < now || ts > now + 30 {
-            return Err("a key proof out of its time window".into());
-        }
-        let vk = crate::plexus::peer_token::key_of(&format!("key:{key}")).ok_or("a key proof whose `key` is not an Ed25519 key")?;
-        let sig: [u8; 64] = b64.decode(&sig).ok().and_then(|b| b.try_into().ok()).ok_or("a key proof whose `sig` does not read")?;
-        vk.verify_strict(format!("{PROOF_CONTEXT}\n{aud}\n{agent}\n{nonce}\n{ts}").as_bytes(), &Signature::from_bytes(&sig)).map_err(|_| "a key proof whose signature does not verify")?;
-        let mut seen = self.seen.lock().unwrap();
-        seen.retain(|_, until| *until >= now);
-        if seen.insert((key.clone(), nonce), ts + 60).is_some() {
-            return Err("a key proof used before".into());
-        }
-        Ok(format!("key:{key}"))
-    }
-}
+use super::proven::KeyedUpgrade;
 
 /// KEEL-19 · serve `activation` as a keyed child on one accepted socket
 /// (`stream`, a TCP connection or anything like it): the WebSocket upgrade
-/// is taken only with a key proof `upgrade` verifies, and the child is then
-/// served ([`super::serve_child_with`]) on a connection proven as that key,
+/// is taken only with a key proof `upgrade` verifies, and the
+/// child is then served ([`super::serve_child_proven`]) on a connection
+/// proven as that key,
 /// trusting `trusted` (service principals, `key:<hex>`) to act for others.
 /// The child's `key` and token verifier (`tokens`) as [`super::ServeChild`]
 /// has them. An upgrade without a valid proof is refused (401) and served
@@ -298,7 +241,7 @@ where
 {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-    let proven = std::sync::Mutex::new(None::<Result<String, String>>);
+    let proven = std::sync::Mutex::new(None::<Result<super::Proven, String>>);
     let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
         let bearer = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or_default();
         let verdict = upgrade.verify(bearer);
@@ -344,8 +287,7 @@ where
             }
         }
     };
-    let opts = super::ServeChild { peer: super::ChildPeer::connection(principal, trusted), key, tokens };
-    let (_, _, served) = tokio::join!(pump_in, pump_out, super::serve_child_with(activation, in_r, out_w, opts));
+    let (_, _, served) = tokio::join!(pump_in, pump_out, super::serve_child_proven(activation, in_r, out_w, principal, trusted, key, tokens));
     served
 }
 
@@ -356,7 +298,7 @@ mod tests {
     #[test]
     fn the_proof_reads_as_spec_00_says() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        let p = key_proof(&key, "ws://127.0.0.1:4480", "menger", &[1u8; 32], 1_793_000_000);
+        let p = key_proof(&key, LOGIN_CONTEXT, "ws://127.0.0.1:4480", "menger", &[1u8; 32], 1_793_000_000);
         let body = p.strip_prefix(PROOF_PREFIX).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).unwrap()).unwrap();
         let text = String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).unwrap()).unwrap();

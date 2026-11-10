@@ -91,6 +91,10 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.11.0", f
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
 plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1" }
 
+# KEEL-19 (P5): a key file opened O_NOFOLLOW, its owner the effective user.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # PLEXUS-45: natively, every dependency exactly as before PLEXUS-45.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"] }

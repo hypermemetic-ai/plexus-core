@@ -397,7 +397,8 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
         Err(e) => return Outcome::Refused(e),
     };
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let proof = key_proof(&key, opts.url.trim_end_matches('/'), &opts.agent, &nonce(), ts);
+    // A dial-out signs in to its relay (a service): the sign-in context.
+    let proof = key_proof(&key, super::ws::LOGIN_CONTEXT, opts.url.trim_end_matches('/'), &opts.agent, &nonce(), ts);
     // KEEL-19: who this dial-out proves to be — what the relay's `_info`
     // proof must be made for.
     let me = principal_of(&key);

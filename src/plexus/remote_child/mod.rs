@@ -70,6 +70,8 @@ mod peer;
 mod spec;
 // NEST-11: a child calls its service back, under a call it serves.
 mod upcall;
+// KEEL-19: a principal a verifier proved, as a type.
+mod proven;
 #[cfg(feature = "child-ws")]
 mod ws;
 #[cfg(feature = "clap")]
@@ -92,7 +94,7 @@ use plexus_auth_core::grants::{GrantsGeneration, Reach};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-pub use host::{host, serve_child, serve_child_on, serve_child_stdio, serve_child_with, ChildPeer, HostTransport, ServeChild};
+pub use host::{host, serve_child, serve_child_on, serve_child_proven, serve_child_stdio, serve_child_with, ChildPeer, HostTransport, ServeChild};
 pub use upcall::{Consented, HOST_CALL, HOST_CALL_UNSUB};
 pub use link::{MountTimings, KEYED_MOUNT_NEEDS_A_KEY};
 pub use spec::{check_ws_url, is_insecure_ws, is_loopback_host, parse_duration, Backoff, ChildError, ChildOptions, ChildSpec, INSECURE_TRANSPORT};
@@ -102,7 +104,8 @@ pub use dial_in::{PeerEvent, PeerInfo, PeerRoles, PeerSocket, Peers, PeersMethod
 #[cfg(feature = "child-ws")]
 pub use dial_out::{key_principal, DialOut, DialState, Exposed};
 #[cfg(feature = "child-ws")]
-pub use ws::{serve_child_ws, KeyedUpgrade};
+pub use ws::serve_child_ws;
+pub use proven::{dial_proof, KeyedUpgrade, Proven, UPGRADE_LEDGER_MAX};
 
 use link::{meta, too_many, unavailable, Conn, Counters, Shared, SubKey};
 
@@ -529,6 +532,11 @@ impl RemoteChild {
     fn mint(&self, auth: Option<&AuthContext>, reach: &Reach, hop: &Value, path: &str, call: &str) -> Result<Option<upcall::Minted>, String> {
         use crate::plexus::peer_token::{mint_scope, onward_scope, MintRequest};
         let Some(issuer) = self.inner.shared.opts.tokens.as_ref() else { return Ok(None) };
+        // KEEL-19 (KEEL-22's first row): asked again here, after the dial
+        // `forward` awaited — a revoke meanwhile mints nothing.
+        if let Some(why) = self.inner.shared.upcalls.revoked() {
+            return Err(format!("`{}` is revoked ({why})", self.name()));
+        }
         let Some(sub) = auth.and_then(|a| a.principal()).map(|p| p.to_string()) else { return Ok(None) };
         let peer_key = self.peer_key().map(str::to_string);
         if peer_key.is_none() && !matches!(self.spec(), ChildSpec::Stdio { .. }) {
@@ -701,6 +709,13 @@ impl RemoteChild {
         }
         // NEST-11: the child may call back under this call while it is open.
         let under = shared.upcalls.open(&call_id, auth, &reach, minted);
+        // KEEL-19: a revoke since the top of `forward` (the dial awaited)
+        // opens nothing.
+        if let Some(why) = shared.upcalls.revoked() {
+            drop(under);
+            let e = PlexusError::Unauthenticated(format!("`{}` is revoked ({why}): no call is forwarded to it", self.name()));
+            return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false));
+        }
         let call = json!({ "method": path, "params": params, "hop": hop });
         match conn.open(&format!("{}.call", conn.ns()), call, shared.opts.timeout).await {
             Ok((sid, rx)) => {

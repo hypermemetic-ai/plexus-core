@@ -15,7 +15,10 @@
 
 use futures::{SinkExt, Stream, StreamExt};
 use plexus_core::plexus::peer_token::{check_key_proof_for, random_nonce, MintRequest, PeerKey, TokenIssuer, Verifier};
-use plexus_core::plexus::remote_child::{serve_child_with, serve_child_ws, ChildOptions, ChildPeer, ChildSpec, KeyedUpgrade, RemoteChild, ServeChild, KEYED_MOUNT_NEEDS_A_KEY};
+use plexus_core::plexus::remote_child::{dial_proof, serve_child_with, serve_child_ws, ChildOptions, ChildPeer, ChildSpec, KeyedUpgrade, RemoteChild, ServeChild, KEYED_MOUNT_NEEDS_A_KEY};
+
+/// spec/00's key-proof context (the one form for a child dial and a sign-in).
+const CONTEXT: &str = "plexus-key-login/v1";
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,14 +70,28 @@ async fn serve_v(v: &PeerKey, issuer: &TokenIssuer, trusted: &str) -> u16 {
     port
 }
 
+/// A `plexus-key.` proof by the key of `seed` in `context`, made by hand
+/// (the stale, the forged and the sign-in ones the dial never makes).
+fn proof_in(context: &str, seed: u8, aud: &str, nonce: u8, ts: i64) -> String {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let n = b64.encode([nonce; 32]);
+    let sig = key.sign(format!("{context}\n{aud}\nt\n{n}\n{ts}").as_bytes());
+    let hex: String = key.verifying_key().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let body = json!({ "v": 1, "key": hex, "aud": aud, "agent": "t", "nonce": n, "ts": ts, "sig": b64.encode(sig.to_bytes()) });
+    format!("plexus-key.{}", b64.encode(body.to_string()))
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
 /// M's own socket to V: dialed with M's key proof.
 async fn dial_as(seed: u8, port: u16) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://127.0.0.1:{port}");
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    let mut nonce = [0u8; 32];
-    nonce[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    nonce[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    let proof = plexus_auth_core::adapters::sign_key_proof(&[seed; 32], &url, "m", &nonce, ts);
+    let proof = dial_proof(&PeerKey::from_seed([seed; 32]), &url, "m");
     let mut req = url.into_client_request().unwrap();
     req.headers_mut().insert("authorization", HeaderValue::from_str(&format!("Bearer {proof}")).unwrap());
     tokio_tungstenite::connect_async(req).await.unwrap().0
@@ -179,26 +196,54 @@ async fn repro3_a_principal_no_transport_proves_is_no_asker() {
     assert_eq!(child.principal(), host.kid());
 }
 
-/// `KeyedUpgrade` takes exactly what plexus-auth-core's key adapter takes:
-/// the audience, the window, the signature, each proof once.
+/// `KeyedUpgrade` takes a child dial's proof — the audience, the window, the
+/// signature, each proof once — and nothing else.
 #[test]
 fn an_upgrade_proof_is_verified() {
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    let up = KeyedUpgrade::new(["ws://127.0.0.1:4480"]);
-    let p = plexus_auth_core::adapters::sign_key_proof(&[5; 32], "ws://127.0.0.1:4480/", "dyn", &[2; 32], ts);
-    assert_eq!(up.verify(&p).unwrap(), PeerKey::from_seed([5; 32]).kid());
+    let (ts, aud) = (now(), "ws://127.0.0.1:4480");
+    let up = KeyedUpgrade::new([aud]);
+    let p = proof_in(CONTEXT, 5, "ws://127.0.0.1:4480/", 2, ts);
+    assert_eq!(up.verify(&p).unwrap().principal(), PeerKey::from_seed([5; 32]).kid());
     assert!(up.verify(&p).unwrap_err().contains("used before"));
-    let other = plexus_auth_core::adapters::sign_key_proof(&[5; 32], "ws://127.0.0.1:9999", "dyn", &[3; 32], ts);
-    assert!(up.verify(&other).unwrap_err().contains("not for this child"));
-    let stale = plexus_auth_core::adapters::sign_key_proof(&[5; 32], "ws://127.0.0.1:4480", "dyn", &[4; 32], ts - 600);
-    assert!(up.verify(&stale).unwrap_err().contains("time window"));
+    assert!(up.verify(&proof_in(CONTEXT, 5, "ws://127.0.0.1:9999", 3, ts)).unwrap_err().contains("not for this child"));
+    assert!(up.verify(&proof_in(CONTEXT, 5, aud, 4, ts - 600)).unwrap_err().contains("time window"));
     // Another's proof, its `key` swapped for key 5's: the signature is not key 5's.
     use base64::Engine;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let theirs = plexus_auth_core::adapters::sign_key_proof(&[8; 32], "ws://127.0.0.1:4480", "dyn", &[6; 32], ts);
+    let theirs = proof_in(CONTEXT, 8, aud, 6, ts);
     let mut body: Value = serde_json::from_slice(&b64.decode(theirs.strip_prefix("plexus-key.").unwrap()).unwrap()).unwrap();
     body["key"] = json!(PeerKey::from_seed([5; 32]).kid().trim_start_matches("key:"));
     let forged = format!("plexus-key.{}", b64.encode(body.to_string()));
     assert!(up.verify(&forged).unwrap_err().contains("signature"), "a proof signed by another key");
     assert!(up.verify("Bearer nothing").is_err());
+    // `dial_proof` is what it takes.
+    assert!(up.verify(&dial_proof(&PeerKey::from_seed([5; 32]), aud, "dyn")).is_ok());
+}
+
+/// spec/00: `dial_proof` is the proof plexus-auth-core's sign-in adapter
+/// takes too — one form (P2's separate context is a plexus-wire change).
+#[tokio::test]
+async fn a_dial_proof_is_spec_00_s() {
+    use plexus_auth_core::identity::{Authenticator, Presentation};
+    let aud = "ws://127.0.0.1:4481";
+    let adapter = plexus_auth_core::adapters::KeyProofAdapter::new([aud]).unwrap();
+    let dial = dial_proof(&PeerKey::from_seed([5; 32]), aud, "dyn");
+    assert!(adapter.authenticate(&Presentation::Bearer { token: dial }).await.is_ok());
+}
+
+/// P1: a keyed child cannot be served on a string — not on the service's
+/// dial key written as `proven` (the updated repro3's step 0), not on any
+/// `ChildPeer`; only on a `Proven` a verifier made (`serve_child_proven`).
+#[tokio::test]
+async fn a_keyed_child_is_never_served_on_a_string() {
+    let (v, dial) = (PeerKey::generate(), PeerKey::generate());
+    let issuer = TokenIssuer::new(PeerKey::generate());
+    for peer in [ChildPeer::connection(dial.kid(), [dial.kid().to_string()]), ChildPeer::connection(DYN, [DYN.to_string()]), ChildPeer::Pipe] {
+        for (key, tokens) in [(Some(v.clone()), None), (None, Some(Arc::new(Verifier::new(v.kid(), &issuer.jwks()).unwrap())))] {
+            let (_to, v_in) = tokio::io::duplex(1 << 10);
+            let (v_out, _from) = tokio::io::duplex(1 << 10);
+            let served = tokio::time::timeout(Duration::from_secs(2), serve_child_with(WeatherActivation, v_in, v_out, ServeChild { peer: peer.clone(), key, tokens })).await.expect("refused at once");
+            assert_eq!(served.unwrap_err().kind(), std::io::ErrorKind::InvalidInput, "{peer:?}");
+        }
+    }
 }

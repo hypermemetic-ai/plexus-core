@@ -246,7 +246,16 @@ impl Upcalls {
         let service = service_scope::current().or_else(|| self.host())?;
         let (ended, _) = watch::channel(None);
         let under = Arc::new(Under { auth: auth.cloned(), reach: reach.clone(), service, ended, minted });
-        self.under.lock().unwrap().insert(id.to_string(), Arc::clone(&under));
+        {
+            // KEEL-19: a revoked child is opened nothing to call back under —
+            // asked under the lock `revoke`'s `end_all` drains, after the
+            // mark is set, so an open either sees the mark or is drained.
+            let mut open = self.under.lock().unwrap();
+            if self.revoked().is_some() {
+                return None;
+            }
+            open.insert(id.to_string(), Arc::clone(&under));
+        }
         Some(UnderGuard { up: Arc::clone(self), id: id.to_string(), under })
     }
 
@@ -748,6 +757,20 @@ mod tests {
         let (_, said) = up.decide("dyn.peer.b.forecast", None).unwrap_err();
         assert!(said.contains("revoked (compromised)"), "{said}");
         assert_eq!(up.decide(parent::HOST_WHOAMI, None).unwrap(), None, "the standard interface is not this ticket's");
+    }
+
+    /// KEEL-19 (KEEL-22's first row): once revoked, nothing is opened to call
+    /// back under — whatever `forward` awaited before it asked.
+    #[tokio::test]
+    async fn a_revoked_child_is_opened_nothing() {
+        let up = Upcalls::new(None, false);
+        let svc = crate::plexus::DynamicHub::new("svc");
+        let reach = plexus_auth_core::grants::Reach::everywhere();
+        let open = |id: &'static str| crate::plexus::service_scope::scope(svc.downgrade(), { let up = Arc::clone(&up); let reach = reach.clone(); async move { up.open(id, None, &reach, None) } });
+        assert!(open("c1").await.is_some());
+        up.revoke("compromised");
+        assert!(open("c2").await.is_none(), "opened after the revoke");
+        assert_eq!(up.open_now(), 0);
     }
 
     /// DYNAUTH-7: a revoked child's calls back end, each saying why.

@@ -206,6 +206,10 @@ harness = false
 name = "nest16_graft"
 harness = false
 
+[[test]]
+name = "keel51_ceiling"
+harness = false
+
 [dev-dependencies]
 # RETURNS-47: this crate's own tests use `call::test::in_call`.
 plexus-core = { path = ".", features = ["test-util"] }

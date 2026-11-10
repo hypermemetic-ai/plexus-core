@@ -685,7 +685,9 @@ pub trait ChildRouter: Send + Sync {
 /// 4. *(deferred — PRIVACY-1)* Emit one `AuditRecord` with
 ///    `kind: ForwardPolicyApplied` to the configured `AuditSink`.
 /// 5. Mint the callee `AuthContext` via the framework-only constructor
-///    [`plexus_auth_core::AuthContext::derive_callee_context`].
+///    [`plexus_auth_core::AuthContext::derive_callee_context`]; when it
+///    keeps the caller's identity, it keeps the caller's ceiling and
+///    sign-in end too, whatever the policy (KEEL-51, [`keep_bounds`]).
 /// 6. Dispatch to `child.router_call(...)` with the derived context.
 ///
 /// The policy step is invisible to activation authors per AUTHZ-0
@@ -804,6 +806,7 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
                 Some(caller_ctx) => {
                     caller_ctx
                         .with_callee_context(&derivation, &site.caller, |callee_ctx| async move {
+                            let callee_ctx = keep_bounds(callee_ctx, caller_ctx, keeps_identity);
                             let ctx = outer.map(|o| o.for_child(Some(&callee_ctx), keeps_identity));
                             in_child(ctx, child.router_call(rest, params, Some(&callee_ctx), raw_ctx)).await
                         })
@@ -823,6 +826,37 @@ pub async fn route_to_child<T: ChildRouter + ?Sized>(
         activation: parent.router_namespace().to_string(),
         method: method.to_string(),
     })
+}
+
+/// KEEL-51: a context a forward policy derived keeps its caller's bounds —
+/// the session's ceiling ([`CEILING_KEY`](plexus_auth_core::grants::CEILING_KEY))
+/// and the end of its sign-in
+/// ([`EXPIRES_AT_KEY`](plexus_auth_core::auth::EXPIRES_AT_KEY), AUTH-11) —
+/// whenever it keeps the caller's identity, whatever else the policy drops.
+/// They are bounds, not credentials (BIDIR-1's `hop_identity` keeps them for
+/// the same reason): without them a child, and every call back a peer makes
+/// on the call (its upcalls are decided on this context), would act as the
+/// whole principal, past the ceiling its session was minted under and past
+/// its sign-in's end. They are the caller's exactly: a policy can drop
+/// metadata, never add to it, so this neither widens nor drops a bound. A
+/// context that names nobody (`anonymous`) has no bound to keep.
+fn keep_bounds(
+    mut callee: super::auth::AuthContext,
+    caller: &super::auth::AuthContext,
+    keeps_identity: bool,
+) -> super::auth::AuthContext {
+    if !keeps_identity {
+        return callee;
+    }
+    for key in [plexus_auth_core::grants::CEILING_KEY, plexus_auth_core::auth::EXPIRES_AT_KEY] {
+        if let Some(bound) = caller.metadata.get(key) {
+            if !callee.metadata.is_object() {
+                callee.metadata = Value::Object(serde_json::Map::new());
+            }
+            callee.metadata[key] = bound.clone();
+        }
+    }
+    callee
 }
 
 /// Wrapper to implement ChildRouter for Arc<dyn ChildRouter>

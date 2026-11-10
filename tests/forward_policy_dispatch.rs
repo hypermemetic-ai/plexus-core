@@ -384,3 +384,46 @@ fn dynamic_hub_forward_policy_registry_round_trip() {
     );
     assert!(trait_view.forward_policy_for("unregistered").is_none());
 }
+
+/// KEEL-51: every derivation that keeps the caller's identity keeps its
+/// bounds — the session's ceiling and the end of its sign-in — exactly as
+/// the caller's, whatever else it drops; one that names nobody keeps none.
+/// A ceiling only narrows: no policy drops it, none widens it.
+#[tokio::test]
+async fn every_derivation_that_keeps_the_caller_keeps_its_bounds() {
+    use plexus_auth_core::auth::EXPIRES_AT_KEY;
+    use plexus_auth_core::grants::CEILING_KEY;
+    let bounds = serde_json::json!({ CEILING_KEY: [["viewer@*"], ["shop.items@MENGER"]], EXPIRES_AT_KEY: 4_102_444_800i64 });
+    let mut meta = bounds.clone();
+    meta["session_key"] = serde_json::json!("plexus-key.SECRET");
+    let caller = AuthContext::for_principal(&"key:adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad".parse().unwrap(), "sess-7", vec!["admin".into()], meta.clone());
+    let policies: [(Option<Arc<dyn ForwardPolicy>>, bool); 5] = [
+        (None, true),
+        (Some(Arc::new(IdentityOnly)), true),
+        (Some(Arc::new(plexus_core::plexus::SameService)), true),
+        (Some(Arc::new(PassThrough)), true),
+        (Some(Arc::new(Anonymous)), false),
+    ];
+    for (policy, keeps) in policies {
+        let name = policy.as_ref().map_or("identity_only (default)".to_string(), |p| p.name().as_str().to_string());
+        let echo = EchoCallee::new("solar");
+        let parent = match policy {
+            Some(p) => TestParent::new(echo.clone()).with_policy(p),
+            None => TestParent::new(echo.clone()),
+        };
+        let _ = parent.router_call("solar.info", Value::Null, Some(&caller), None).await.expect("dispatch succeeded");
+        let derived = echo.captured().expect("a context");
+        if keeps {
+            assert_eq!(derived.principal(), caller.principal(), "{name}");
+            for key in [CEILING_KEY, EXPIRES_AT_KEY] {
+                assert_eq!(derived.metadata.get(key), bounds.get(key), "{name}: `{key}` kept, the caller's exactly");
+            }
+        } else {
+            assert_eq!(derived.principal(), None, "{name}");
+            assert_eq!(derived.metadata, Value::Null, "{name}: nobody, and no bound");
+        }
+        // What the policy drops stays dropped.
+        let pass = name == "pass_through" || name == "same_service";
+        assert_eq!(derived.metadata.get("session_key").is_some(), pass, "{name}: {:?}", derived.metadata);
+    }
+}

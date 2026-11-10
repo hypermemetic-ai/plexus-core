@@ -5,6 +5,35 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+KEEL-51 (security, High): **a session's ceiling holds on a peer's call
+back.** A call routed into a child or a peer (`route_to_child`: a peer slot,
+`dyn.peer.<name>`, `Peers`, a static child) runs on the context its forward
+policy derives, and `identity_only` — the default — kept the principal and
+dropped the metadata, the session's ceiling with it. So an admin whose
+session was capped to `viewer@*` was refused a method itself, yet reached it
+through any peer it could call: the peer's calls back were decided on that
+derived context, as the whole admin, under the peer's consent layer alone
+(and an in-process peer, or a child's own calls on its context, the same).
+The end of the sign-in (`expires_at`, AUTH-11) was dropped the same way, so
+a call back made after the session ended still ran.
+
+- **A derivation that keeps the caller's identity keeps its bounds** — the
+  ceiling (`CEILING_KEY`) and `expires_at`, the caller's exactly — under
+  every policy: `identity_only`, `same_service`, `pass_through`, a custom
+  one. They are bounds, not credentials (as BIDIR-1's `hop_identity` keeps
+  them): a ceiling only narrows, and nothing can now drop or widen it. What
+  else a policy drops (a session key, a token) stays dropped; `anonymous`
+  names nobody and keeps nothing.
+- Behaviour visible to a child: an `identity_only` child (`#[child(forward =
+  "identity_only")]`) now sees its caller's ceiling and `expires_at` in its
+  context's metadata.
+- Tests: `keel51_ceiling` (a peer behind a mount and one in process: a capped
+  admin refused through the call back, the uncapped admin and an `admin@*`
+  ceiling admitted, a call back after the sign-in ended refused);
+  `forward_policy_dispatch` checks every policy keeps the bounds.
+
 ## [0.11.2] — 2026-11-10
 
 Performance (PERF.115-49), no behaviour changed: a call's context is built

@@ -141,3 +141,48 @@ async fn a_revoked_child_is_answered_no_schema() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(asked.lock().unwrap().len(), before, "a revoked child's schema ask was routed");
 }
+
+/// R3-1: mounted by hand and held between its handshake and any consent —
+/// the gap dyn's `vet`, key and pin checks open before `hold`. The vault is
+/// the child's service from the start (`with_host`); the child is never
+/// registered. Once `connect` has returned (its needs are known), the test
+/// lets it ask `ask` on its own, outside any call, and reads what it got.
+async fn held_ask(opts: impl FnOnce(ChildOptions) -> ChildOptions, ask: &str) -> (RemoteChild, Value, Asked) {
+    let asked: Asked = Arc::default();
+    let service = Arc::new(plexus_core::DynamicHub::new("svc").register(VaultActivation { asked: asked.clone() }));
+    let dir = tempfile::tempdir().unwrap();
+    let (when, out) = (dir.path().join("when"), dir.path().join("out"));
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema_asker.py");
+    let argv = vec!["python3".into(), "-I".into(), fixture.to_string_lossy().into_owned(), when.to_string_lossy().into_owned(), ask.into(), out.to_string_lossy().into_owned()];
+    let spec = ChildSpec::Stdio { name: "py".into(), argv };
+    let child = RemoteChild::connect(spec, opts(ChildOptions::for_service("svc").with_host(&service))).await.expect("the asker mounts");
+    std::fs::write(&when, "").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !out.exists() {
+        assert!(std::time::Instant::now() < deadline, "the child's ask was never answered");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let got = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    (child, got, asked)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_need_counts_for_nothing_until_consent_is_applied() {
+    let (child, got, asked) = held_ask(|o| o.with_consent_required(true), "vault.box1.schema").await;
+    assert!(refused(&got), "a declared, unconsented need was answered: {got}");
+    assert_eq!(*asked.lock().unwrap(), Vec::<String>::new(), "a lookup ran before consent was applied");
+    drop(child);
+    // The control: a plain mount (no consent kept, R3-2 as it was) answers
+    // the same ask, so the refusal above is the held consent's.
+    let (_child, got, _) = held_ask(|o| o, "vault.box1.schema").await;
+    assert_eq!(got["answered"]["namespace"], "leaf", "{got}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_mounted_revoked_looks_nothing_up_from_its_first_ask() {
+    // A plain mount (no consent kept: its declared need would count), but
+    // mounted revoked — dyn's remount of a revoked peer.
+    let (_child, got, asked) = held_ask(|o| o.with_revoked(Some("an admin revoked it".into())), "vault.box1.schema").await;
+    assert!(refused(&got), "a revoked child was answered: {got}");
+    assert_eq!(*asked.lock().unwrap(), Vec::<String>::new(), "a revoked child's ask was routed");
+}

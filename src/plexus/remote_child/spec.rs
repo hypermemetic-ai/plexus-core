@@ -246,6 +246,15 @@ pub struct ChildOptions {
     /// targets, `dyn.peer.<target>`). A path at, above or below one of these
     /// is answered; any other only as the child's consented needs allow.
     pub schemas: Vec<String>,
+    /// KEEL-32 (R3-1): the mount keeps a consent — nothing the child
+    /// declares counts as consented until the mount applies it
+    /// ([`RemoteChild::set_consent`](super::RemoteChild::set_consent)), from
+    /// the handshake on. `false` (a plain mount, no consent kept): every
+    /// declared need counts, as before.
+    pub consent_required: bool,
+    /// KEEL-32 (R3-1): the child is mounted revoked, and why — a remount of
+    /// a revoked peer is revoked from its first byte, not once it is held.
+    pub revoked: Option<String>,
 }
 
 impl Default for ChildOptions {
@@ -268,6 +277,8 @@ impl Default for ChildOptions {
             insecure_ws: false,
             tokens: None,
             schemas: Vec::new(),
+            consent_required: false,
+            revoked: None,
         }
     }
 }
@@ -292,6 +303,19 @@ impl ChildOptions {
     /// call before its needs are known ([`ChildOptions::schemas`]).
     pub fn with_schemas<I: IntoIterator<Item = S>, S: Into<String>>(mut self, paths: I) -> Self {
         self.schemas = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// KEEL-32 (R3-1): nothing counts as consented until the mount applies
+    /// its consent ([`ChildOptions::consent_required`]).
+    pub fn with_consent_required(mut self, on: bool) -> Self {
+        self.consent_required = on;
+        self
+    }
+
+    /// KEEL-32 (R3-1): mounted revoked ([`ChildOptions::revoked`]).
+    pub fn with_revoked(mut self, why: Option<String>) -> Self {
+        self.revoked = why;
         self
     }
 

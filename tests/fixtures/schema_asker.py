@@ -5,8 +5,14 @@ with no `under`, and answer whatever came back: the first data item's
 content, or the refusal. `py.later {ask, ms}` answers at once and asks
 `ask` the same way `ms` later, on its own (as a revoked child still could).
 Its schema declares one need, `vault.box1.wipe`.
+
+Run as `schema_asker.py WHEN ASK OUT` it also asks on its own: once the
+file WHEN exists (the test makes it once the mount is held, between its
+handshake and any consent) it asks ASK and writes what came back to OUT,
+as JSON.
 """
 import json
+import os
 import sys
 import threading
 import time
@@ -51,10 +57,25 @@ def ask(target, probe_sid):
 
 
 def answer(probe_sid, v):
-    if probe_sid is not None:
+    if probe_sid == "file":
+        tmp = OUT + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(v, f)
+        os.rename(tmp, OUT)
+    elif probe_sid is not None:
         item(probe_sid, {"type": "data", "metadata": META, "content_type": "py.probe", "content": v})
         done(probe_sid)
 
+
+def ask_when():
+    while not os.path.exists(WHEN):
+        time.sleep(0.01)
+    ask(ASK, "file")
+
+
+WHEN, ASK, OUT = (sys.argv[1:4] + [None, None, None])[:3]
+if WHEN:
+    threading.Thread(target=ask_when, daemon=True).start()
 
 sid = 0
 for line in sys.stdin:

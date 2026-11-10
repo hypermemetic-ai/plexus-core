@@ -4,14 +4,14 @@
 //! a gate answers exactly as before.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
-use plexus_core::plexus::{
-    AuthContext, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem, Resolve, RoleTable, ScopeRef, ViewKind,
-};
+use plexus_core::plexus::{AuthContext, PlexusStream, PlexusStreamItem, ViewKind};
 use plexus_core::{DynamicHub, PlexusError};
+use plexus_testkit::parts::{who, Members, Shortcodes};
+use plexus_testkit::World;
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -72,50 +72,23 @@ const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const CAT: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const ROOT: &str = "key:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-#[derive(Default)]
-struct Rows(Mutex<Vec<Membership>>);
-impl Rows {
-    fn add(&self, who: &str, role: &str, scope: &str) {
-        self.0.lock().unwrap().push(Membership {
-            principal: who.parse().unwrap(),
-            role: plexus_auth_core::RoleName::new(role),
-            scope: ScopeRef::parse(scope),
-        });
-    }
-}
-impl Memberships for Rows {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
-
-fn hub() -> (Arc<DynamicHub>, Arc<Rows>) {
-    let rows = Arc::new(Rows::default());
-    rows.add(ADA, "editor", "MENGER");
-    rows.add(BOB, "editor", "MENGER");
-    rows.add(CAT, "viewer", "MENGER");
-    rows.add(ROOT, "admin", "*");
-    let declared = DynamicHub::new("x").register(TicketsActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let gate = Gate::new(rows.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    let hub = DynamicHub::new("menger")
-        .register(TicketsActivation)
-        .register(MembersActivation)
-        .with_gate(Arc::new(gate))
-        .with_resource_metadata("http://127.0.0.1:4455/.well-known/oauth-protected-resource");
-    (Arc::new(hub), rows)
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
+/// The gated service and its memberships: ADA and BOB edit MENGER, CAT
+/// views it, ROOT is admin; a ticket lives in its shortcode.
+async fn served() -> (Arc<DynamicHub>, Arc<Members>) {
+    let host = World::new()
+        .host()
+        .named("menger")
+        .with(TicketsActivation)
+        .with(MembersActivation)
+        .configure(|s| s.with_resource_metadata("http://127.0.0.1:4455/.well-known/oauth-protected-resource"))
+        .resolving(Shortcodes)
+        .without_named_callers()
+        .member_at(ADA, "editor", "MENGER")
+        .member_at(BOB, "editor", "MENGER")
+        .member_at(CAT, "viewer", "MENGER")
+        .member(ROOT, "admin")
+        .await;
+    (host.service().clone(), host.members().clone())
 }
 
 async fn data(stream: PlexusStream) -> Vec<Value> {
@@ -166,7 +139,7 @@ async fn over_module(module: &jsonrpsee::RpcModule<()>, req: Value) -> Vec<Value
 
 #[tokio::test]
 async fn anonymous_sees_the_public_methods_only() {
-    let (hub, _) = hub();
+    let (hub, _) = served().await;
     let view = hub.view(None);
     assert_eq!(view.kind, ViewKind::Anonymous);
     assert_eq!(shape(&view), BTreeMap::from([("tickets".to_string(), vec!["door".to_string()])]));
@@ -187,7 +160,7 @@ async fn anonymous_sees_the_public_methods_only() {
 
 #[tokio::test]
 async fn a_caller_sees_what_it_holds_with_held_on() {
-    let (hub, rows) = hub();
+    let (hub, rows) = served().await;
     let ada = who(ADA);
     let view = hub.view(Some(&ada));
     assert_eq!(view.kind, ViewKind::Caller);
@@ -209,14 +182,14 @@ async fn a_caller_sees_what_it_holds_with_held_on() {
     assert!(all["tickets"].contains(&"delete @*".to_string()));
     // A membership added reaches the next view.
     let before = hub.view(Some(&who(CAT))).hash;
-    rows.add(CAT, "editor", "MENGER");
+    rows.hold_at(CAT, "editor", "MENGER");
     assert_ne!(hub.view(Some(&who(CAT))).hash, before);
     assert_eq!(hub.view(Some(&who(CAT))).hash, view.hash, "now holding what ADA holds, CAT sees ADA's view");
 }
 
 #[tokio::test]
 async fn hashes_follow_holdings() {
-    let (hub, _) = hub();
+    let (hub, _) = served().await;
     let (a, b, c) = (hub.view(Some(&who(ADA))), hub.view(Some(&who(BOB))), hub.view(Some(&who(CAT))));
     assert_eq!(a.hash, b.hash);
     assert_ne!(a.hash, c.hash);
@@ -227,7 +200,7 @@ async fn hashes_follow_holdings() {
 
 #[tokio::test]
 async fn the_rpc_module_reads_the_connection() {
-    let (hub, _) = hub();
+    let (hub, _) = served().await;
     let mut module = DynamicHub::arc_into_rpc_module(hub.clone()).unwrap();
     let anon = over_module(&module, json!({"jsonrpc": "2.0", "id": 1, "method": "_info", "params": {}})).await;
     assert_eq!(anon[0]["content"]["view"], "anonymous");
@@ -273,7 +246,7 @@ async fn without_a_gate_nothing_changes() {
 /// answered, so it is equal to what synapse builds from them. Kept per view.
 #[tokio::test]
 async fn ir_is_introspection_and_answers_the_callers_view() {
-    let (hub, _) = hub();
+    let (hub, _) = served().await;
     let ir_of = |auth: Option<AuthContext>| {
         let hub = hub.clone();
         async move {

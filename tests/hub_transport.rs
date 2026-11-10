@@ -9,12 +9,14 @@ use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use plexus_client::ClientError;
-use plexus_core::plexus::{AuthContext, Gate, HubTransport, Membership, Memberships, Resolve, RoleTable, ScopeRef};
+use plexus_core::plexus::{AuthContext, HubTransport};
 use plexus_core::DynamicHub;
+use plexus_testkit::parts::{who, Shortcodes};
+use plexus_testkit::World;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -130,53 +132,25 @@ impl ClockActivation {
 const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Members {
-    fn add(&self, who: &str, role: &str, scope: &str) {
-        self.0.lock().unwrap().push(Membership {
-            principal: who.parse().unwrap(),
-            role: plexus_auth_core::RoleName::new(role),
-            scope: ScopeRef::parse(scope),
-        });
-    }
-}
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-/// `CODE-n` → `[CODE, *]`.
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        if code.is_empty() || !code.chars().all(|c| c.is_ascii_uppercase()) {
-            return None;
-        }
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
-
 fn plain_hub() -> DynamicHub {
     DynamicHub::new("local").register(TicketsActivation).register(ClockActivation)
 }
 
-/// ADA: editor on MENGER (viewer below it); BOB: viewer everywhere.
-fn gated_hub() -> Arc<DynamicHub> {
-    let members = Arc::new(Members::default());
-    members.add(ADA, "editor", "MENGER");
-    members.add(ADA, "viewer", "MENGER");
-    members.add(BOB, "viewer", "*");
-    let declared = plain_hub().declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let gate = Gate::new(members, Arc::new(roles), Arc::new(Shortcodes));
-    Arc::new(plain_hub().with_gate(Arc::new(gate)))
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], serde_json::json!({"session_key": "k1"}))
+/// ADA: editor on MENGER (viewer below it); BOB: viewer everywhere. A
+/// ticket lives in its shortcode.
+async fn gated() -> Arc<DynamicHub> {
+    let host = World::new()
+        .host()
+        .named("local")
+        .with(TicketsActivation)
+        .with(ClockActivation)
+        .resolving(Shortcodes)
+        .without_named_callers()
+        .member_at(ADA, "editor", "MENGER")
+        .member_at(ADA, "viewer", "MENGER")
+        .member(BOB, "viewer")
+        .await;
+    host.service().clone()
 }
 
 /// A refusal as the client sees it: the wire's in-band `error`, with the
@@ -220,7 +194,7 @@ async fn a_generated_client_reaches_both_activations_and_the_nested_child() {
 
 #[tokio::test]
 async fn the_gate_refuses_without_the_grant_and_answers_with_it() {
-    let hub = gated_hub();
+    let hub = gated().await;
 
     // Anonymous: nothing but the hub's anonymous view.
     let anon = TicketsClient::new(HubTransport::anonymous(hub.clone()));
@@ -258,7 +232,7 @@ async fn an_unknown_method_is_answered_in_band_as_the_wire_does() {
 
 #[tokio::test]
 async fn a_long_stream_streams_through_and_dropping_it_drops_the_hubs() {
-    let clock = ClockClient::new(HubTransport::as_(gated_hub(), who(BOB)));
+    let clock = ClockClient::new(HubTransport::as_(gated().await, who(BOB)));
     let mut ticks = clock.ticks();
     for want in 0..3u64 {
         match ticks.next().await {

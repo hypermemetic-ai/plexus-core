@@ -6,18 +6,15 @@
 //! stdio — a Rust child served by `remote_child::serve_child_stdio`, whose
 //! stdout carries the protocol alone.
 
-use futures::StreamExt;
 use plexus_core::call;
-use plexus_core::plexus::{
-    AuthContext, ChildOptions, ChildSpec, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem, RemoteChild,
-    Resolve, RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{AuthContext, ChildOptions, ChildSpec, PlexusStreamItem, RemoteChild, ScopeRef};
 use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
+use plexus_testkit::parts::who;
+use plexus_testkit::{Caller, Forbidden, Host, Outcome, Unauthenticated, World};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
 
 const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -109,34 +106,6 @@ impl forge::Forge for Plugin {
     }
 }
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
-async fn items(stream: PlexusStream) -> Vec<Value> {
-    stream
-        .map(|i| match i {
-            PlexusStreamItem::Data { content, .. } => content.into_value(),
-            other => serde_json::to_value(other).unwrap(),
-        })
-        .collect()
-        .await
-}
-
 async fn mounted() -> RemoteChild {
     let exe = std::env::current_exe().unwrap();
     let spec: ChildSpec = format!("forge=stdio:{}", exe.display()).parse().unwrap();
@@ -144,40 +113,30 @@ async fn mounted() -> RemoteChild {
 }
 
 /// ADA views MENGER; BOB holds nothing.
-fn gated(child: &RemoteChild) -> DynamicHub {
-    let plain = DynamicHub::new("menger").register(child.clone());
-    let members = Arc::new(Members::default());
-    members.0.lock().unwrap().push(Membership {
-        principal: ADA.parse().unwrap(),
-        role: plexus_auth_core::RoleName::new("viewer"),
-        scope: ScopeRef::parse("MENGER"),
-    });
-    let declared = plain.declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    DynamicHub::new("menger").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere))))
+async fn gated(child: &RemoteChild) -> Host {
+    World::new().host().named("menger").with(child.clone()).without_named_callers().member_at(ADA, "viewer", "MENGER").await
 }
 
 async fn the_plugins_hop_names_the_caller_and_the_ceiling() {
     let child = mounted().await;
-    let service = gated(&child);
-    let got = items(service.route("forge.whoami", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let host = gated(&child).await;
+    let got = host.as_(ADA).call("forge.whoami", json!({})).await;
     assert_eq!(
-        got[0],
+        got.answer::<Value>(),
         json!({ "principal": "service:menger", "caller": ADA, "grant": "forge.whoami", "held_on": ["MENGER"], "caller_principal": ADA, "reach": ["MENGER"] }),
-        "the caller is the hop's, its reach the hop's ceiling: {got:?}"
+        "the caller is the hop's, its reach the hop's ceiling"
     );
-    let verified = items(service.route("forge.verified", json!({}), Some(&who(ADA))).await.unwrap()).await;
-    assert_eq!(verified[0], json!(format!("{ADA}@MENGER")), "the child's own verifier, on the hop's caller: {verified:?}");
+    let verified = host.as_(ADA).call("forge.verified", json!({})).await.answer::<String>();
+    assert_eq!(verified, format!("{ADA}@MENGER"), "the child's own verifier, on the hop's caller");
 }
 
 async fn the_plugins_reads_are_bounded_by_the_ceiling() {
     let child = mounted().await;
-    let service = gated(&child);
-    let got = items(service.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
-    assert_eq!(got[0], json!(["menger", "menger-skills"]), "{got:?}");
-    // Refused at the gate: the plugin never hears of it.
-    let refused = service.route("forge.repos", json!({}), Some(&who(BOB))).await;
-    assert!(refused.is_err(), "BOB holds nothing");
+    let host = gated(&child).await;
+    assert_eq!(host.as_(ADA).call("forge.repos", json!({})).await.answer::<Vec<String>>(), ["menger", "menger-skills"]);
+    // Refused at the gate, before the call opened: the plugin never hears of
+    // it. BOB holds nothing.
+    host.as_(BOB).call("forge.repos", json!({})).await.refused(Forbidden).naming("forge.repos").held_on([]);
 }
 
 async fn with_no_gate_deciding_the_plugin_refuses_before_the_method() {
@@ -186,74 +145,80 @@ async fn with_no_gate_deciding_the_plugin_refuses_before_the_method() {
     // schema, asked at the mount with no limit either, was answered.
     let child = mounted().await;
     let service = DynamicHub::new("menger").register(child.clone());
-    let got = items(service.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0]["type"], "error", "{got:?}");
-    assert_eq!(got[0]["error_kind"], "forbidden", "{got:?}");
+    Caller::new(service, Some(who(ADA))).call("forge.repos", json!({})).await.refused_in_band(Forbidden);
 }
 
-/// One raw `forge.call` to a plugin served on a pipe, its first item back.
-async fn raw(call: Value) -> Value {
+/// One raw `forge.call` to a plugin served on a pipe, by `caller`: every
+/// item back, to its last (`done`, or an error).
+async fn raw(caller: &str, call: Value) -> Outcome {
     let (mut ours, theirs) = tokio::io::duplex(1 << 16);
     let (r, w) = tokio::io::split(theirs);
     let served = tokio::spawn(plexus_core::plexus::remote_child::serve_child(Plugin::default(), r, w));
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let method = call["method"].as_str().unwrap_or_default().to_string();
     let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "forge.call", "params": call });
     ours.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
     let mut lines = BufReader::new(&mut ours).lines();
     let opened: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert_eq!(opened["id"], 1, "{opened}");
-    let item: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let items = heard(&mut lines).await;
     drop(lines);
     drop(ours);
     served.await.unwrap().unwrap();
-    item["params"]["result"].clone()
+    Outcome::of(&method, caller, items)
+}
+
+/// The items a call's notifications carry, to its last (`done`, or an
+/// error).
+async fn heard<R: tokio::io::AsyncBufRead + Unpin>(lines: &mut tokio::io::Lines<R>) -> Vec<PlexusStreamItem> {
+    let mut items = Vec::new();
+    while let Some(line) = lines.next_line().await.unwrap() {
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        let item: PlexusStreamItem = serde_json::from_value(frame["params"]["result"].clone()).unwrap();
+        let last = matches!(item, PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. });
+        items.push(item);
+        if last {
+            break;
+        }
+    }
+    items
 }
 
 async fn a_hop_for_another_grant_is_forbidden() {
     let hop = json!({ "principal": "service:menger", "for": [ADA], "limit": { "grant": "forge.whoami", "held_on": ["*"] }, "call": "c1" });
-    let got = raw(json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
-    assert_eq!(got["type"], "error", "{got}");
-    assert_eq!(got["error_kind"], "forbidden", "{got}");
-    assert_eq!(got["grant"], "forge.repos", "{got}");
+    let got = raw("ADA, by a hop for forge.whoami", json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
+    got.refused_in_band(Forbidden).naming("forge.repos");
 }
 
 async fn a_hop_with_no_limit_is_refused_before_the_method() {
     let hop = json!({ "principal": "service:menger", "for": [ADA], "limit": null, "call": "c2" });
-    let got = raw(json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
-    assert_eq!(got["type"], "error", "{got}");
-    assert_eq!(got["error_kind"], "forbidden", "{got}");
+    raw("ADA, by a hop with no limit", json!({ "method": "forge.repos", "params": {}, "hop": hop })).await.refused_in_band(Forbidden);
 }
 
 async fn a_schema_call_runs_in_the_hops_context() {
     let hop = json!({ "principal": "service:menger", "for": [], "limit": null, "call": "c3" });
-    let got = raw(json!({ "method": "forge.schema", "params": {}, "hop": hop })).await;
-    assert_eq!(got["type"], "data", "{got}");
+    raw("no one, by a hop", json!({ "method": "forge.schema", "params": {}, "hop": hop })).await.answers(1);
 }
 
 async fn a_call_with_no_hop_is_refused_by_the_plugin() {
     // The far side decides again (spec/12 rule 2): no hop, nobody.
-    let got = raw(json!({ "method": "forge.repos", "params": {} })).await;
-    assert_eq!(got["type"], "error", "{got}");
-    assert_eq!(got["error_kind"], "unauthenticated", "{got}");
+    raw("no hop", json!({ "method": "forge.repos", "params": {} })).await.refused_in_band(Unauthenticated);
 }
 
 async fn an_anonymous_hop_is_refused_by_required() {
     let hop = json!({ "principal": "service:menger", "for": [], "limit": { "grant": "forge.repos", "held_on": ["*"] }, "call": "c4" });
-    let got = raw(json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
-    assert_eq!(got["type"], "error", "{got}");
-    assert_eq!(got["error_kind"], "unauthenticated", "{got}");
+    raw("no one, by a hop", json!({ "method": "forge.repos", "params": {}, "hop": hop })).await.refused_in_band(Unauthenticated);
 }
 
 async fn the_child_sees_no_wider_than_the_ceiling() {
     let hop = json!({ "principal": "service:menger", "for": [ADA], "limit": { "grant": "forge.repos", "held_on": ["MENGER"] }, "call": "c5" });
-    let got = raw(json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
-    assert_eq!(got["content"], json!(["menger", "menger-skills"]), "{got}");
+    let got = raw("ADA, by a hop", json!({ "method": "forge.repos", "params": {}, "hop": hop })).await;
+    assert_eq!(got.answer::<Vec<String>>(), ["menger", "menger-skills"]);
 }
 
 /// One raw call over a connection proven as `proven`, the child trusting
-/// `trusted` to act for others.
-async fn over_a_connection(proven: &str, trusted: &[&str], hop_principal: &str) -> Value {
+/// `trusted` to act for others: every item back, to its last.
+async fn over_a_connection(proven: &str, trusted: &[&str], hop_principal: &str) -> Outcome {
     use plexus_core::plexus::remote_child::{serve_child_on, ChildPeer};
     let (mut ours, theirs) = tokio::io::duplex(1 << 16);
     let (r, w) = tokio::io::split(theirs);
@@ -265,19 +230,20 @@ async fn over_a_connection(proven: &str, trusted: &[&str], hop_principal: &str) 
     ours.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
     let mut lines = BufReader::new(&mut ours).lines();
     let _opened = lines.next_line().await.unwrap().unwrap();
-    let item: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let items = heard(&mut lines).await;
     drop(lines);
     drop(ours);
     served.await.unwrap().unwrap();
-    item["params"]["result"].clone()
+    Outcome::of("forge.repos", &format!("ADA, by a hop from {hop_principal} over a connection proven as {proven}"), items)
 }
 
 async fn an_unreadable_caller_reaches_nowhere() {
     // `for` names no principal it can read: anonymous, and no ceiling either.
     let hop = json!({ "principal": "service:menger", "for": ["not a principal"], "limit": { "grant": "forge.whoami", "held_on": ["MENGER"] }, "call": "c7" });
-    let got = raw(json!({ "method": "forge.whoami", "params": {}, "hop": hop })).await;
-    assert_eq!(got["content"]["caller_principal"], Value::Null, "{got}");
-    assert_eq!(got["content"]["reach"], json!([]), "{got}");
+    let got = raw("an unreadable caller, by a hop", json!({ "method": "forge.whoami", "params": {}, "hop": hop })).await;
+    let seen = got.answer::<Option<Seen>>().expect("the plugin read the hop");
+    assert_eq!(seen.caller_principal, None, "{got}");
+    assert!(seen.reach.is_empty(), "{got}");
 }
 
 const PARENT: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -286,13 +252,11 @@ const MALLORY: &str = "key:ddddddddddddddddddddddddddddddddddddddddddddddddddddd
 async fn a_hop_over_a_connection_is_taken_only_from_a_trusted_service() {
     // Trusted to act for others, and the hop names it: taken.
     let got = over_a_connection(PARENT, &[PARENT], PARENT).await;
-    assert_eq!(got["content"], json!(["menger", "menger-skills", "secret"]), "{got}");
+    assert_eq!(got.answer::<Vec<String>>(), ["menger", "menger-skills", "secret"]);
     // A connection proven as someone not trusted to act for others: refused.
-    let got = over_a_connection(MALLORY, &[PARENT], MALLORY).await;
-    assert_eq!(got["error_kind"], "forbidden", "{got}");
+    over_a_connection(MALLORY, &[PARENT], MALLORY).await.refused_in_band(Forbidden);
     // Trusted, but the hop names another acting service: refused.
-    let got = over_a_connection(PARENT, &[PARENT], MALLORY).await;
-    assert_eq!(got["error_kind"], "forbidden", "{got}");
+    over_a_connection(PARENT, &[PARENT], MALLORY).await.refused_in_band(Forbidden);
 }
 
 fn main() {

@@ -1,17 +1,17 @@
 //! AUTH-2 — the grant gate in [`DynamicHub`] dispatch, end to end: a small
 //! activation declaring `target` and `roles(...)` (AUTH-3), a fake service
 //! (memberships, roles from the schema's defaults, a shortcode resolver),
-//! and calls through `route` showing allow, deny, the reach a method
+//! and calls through the gate showing allow, deny, the reach a method
 //! receives, and the refusal as it goes on the wire.
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
-use plexus_core::plexus::{
-    error_item, AuthContext, ForbiddenItem, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem,
-    Reach, Resolve, RoleTable, ScopeRef,
-};
-use plexus_core::{AuthzDenyReason, DynamicHub, PlexusError};
-use std::sync::{Arc, Mutex};
+use plexus_core::plexus::{error_item, AuthContext, ForbiddenItem, PlexusStreamItem, Reach, Resolve, RoleTable, ScopeRef};
+use plexus_core::DynamicHub;
+use plexus_testkit::parts::{who, Shortcodes};
+use plexus_testkit::{Caller, Forbidden, HostBuilder, Outcome, Unauthenticated, World};
+use serde_json::json;
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct TicketsActivation;
@@ -71,60 +71,10 @@ const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ROOT: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Members {
-    fn add(&self, who: &str, role: &str, scope: &str) {
-        self.0.lock().unwrap().push(Membership {
-            principal: who.parse().unwrap(),
-            role: plexus_auth_core::RoleName::new(role),
-            scope: ScopeRef::parse(scope),
-        });
-    }
-    fn clear(&self) {
-        self.0.lock().unwrap().clear();
-    }
-}
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-/// `CODE-n` → `[CODE, *]`; a bare shortcode → `[CODE, *]`.
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        if code.is_empty() || !code.chars().all(|c| c.is_ascii_uppercase()) {
-            return None;
-        }
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
-
-fn hub(members: &Arc<Members>) -> DynamicHub {
-    // Roles seeded from the activation's declared defaults.
-    let declared = DynamicHub::new("menger").register(TicketsActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let gate = Gate::new(members.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate))
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], serde_json::Value::Null)
-}
-
-async fn data(stream: PlexusStream) -> Vec<serde_json::Value> {
-    stream
-        .filter_map(|i| async move {
-            match i {
-                PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
-                _ => None,
-            }
-        })
-        .collect()
-        .await
+/// The service `menger`, its roles seeded from the activation's declared
+/// defaults, a ticket living in its shortcode (`CODE-n` → `[CODE, *]`).
+fn menger() -> HostBuilder {
+    World::new().host().named("menger").with(TicketsActivation).resolving(Shortcodes).without_named_callers()
 }
 
 /// `<ns>.call`'s params object.
@@ -135,61 +85,54 @@ fn call(method: &str, params: serde_json::Value) -> jsonrpsee::core::params::Obj
     p
 }
 
-fn members() -> Arc<Members> {
-    let m = Arc::new(Members::default());
-    m.add(ADA, "editor", "MENGER");
-    m.add(BOB, "viewer", "*");
-    m.add(ROOT, "admin", "*");
-    m
+/// ADA edits MENGER, BOB views everywhere, ROOT is admin.
+fn members() -> HostBuilder {
+    menger().member_at(ADA, "editor", "MENGER").member(BOB, "viewer").member(ROOT, "admin")
+}
+
+/// What a `<ns>.call` subscription sent, to its last item (`done`, or an
+/// error), as an outcome of `method` called by no one signed in.
+async fn heard(mut sub: jsonrpsee::core::server::Subscription, method: &str) -> Outcome {
+    let mut items = Vec::new();
+    while let Some(Ok((item, _))) = sub.next::<PlexusStreamItem>().await {
+        let last = matches!(item, PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. });
+        items.push(item);
+        if last {
+            break;
+        }
+    }
+    Outcome::of(method, "anonymous", items)
 }
 
 #[tokio::test]
 async fn a_hub_without_a_gate_dispatches_as_before() {
-    let hub = DynamicHub::new("menger").register(TicketsActivation);
-    let out = data(hub.route("tickets.set_status", serde_json::json!({"id": "X-1", "status": "Ready"}), Some(&who(ADA))).await.unwrap()).await;
-    assert_eq!(out, vec![serde_json::json!(format!("{}: X-1 -> Ready", who(ADA).user_id))]);
+    let hub = Arc::new(DynamicHub::new("menger").register(TicketsActivation));
+    let ada = Caller::new(hub.clone(), Some(who(ADA)));
+    let out = ada.call("tickets.set_status", json!({"id": "X-1", "status": "Ready"})).await.answer::<String>();
+    assert_eq!(out, format!("{}: X-1 -> Ready", who(ADA).user_id));
     // Anonymous, too — and `reach` is everywhere.
-    let out = data(hub.route("tickets.list", serde_json::json!({}), None).await.unwrap()).await;
-    assert_eq!(out, vec![serde_json::json!("*")]);
+    assert_eq!(Caller::new(hub, None).call("tickets.list", json!({})).await.answer::<String>(), "*");
 }
 
 #[tokio::test]
 async fn held_on_menger_allows_a_menger_target_not_an_identity_one() {
-    let m = members();
-    let hub = hub(&m);
-    let ok = hub.route("tickets.set_status", serde_json::json!({"id": "MENGER-12", "status": "Ready"}), Some(&who(ADA))).await;
-    assert!(ok.is_ok());
-    let err = hub
-        .route("tickets.set_status", serde_json::json!({"id": "IDENTITY-1", "status": "Ready"}), Some(&who(ADA)))
-        .await
-        .err()
-        .unwrap();
-    match &err {
-        PlexusError::Forbidden { reason: AuthzDenyReason::MissingGrant { grant, scope, roles, held_on } } => {
-            assert_eq!(grant.as_str(), "tickets.set_status");
-            assert_eq!(scope, &ScopeRef::named("IDENTITY"));
-            assert_eq!(roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(), vec!["editor", "admin"]);
-            assert_eq!(held_on, &vec![ScopeRef::named("MENGER")]);
-        }
-        other => panic!("expected MissingGrant, got {other:?}"),
-    }
-    assert_eq!(err.to_string(), "needs tickets.set_status on IDENTITY");
+    let host = members().await;
+    host.as_(ADA).call("tickets.set_status", json!({"id": "MENGER-12", "status": "Ready"})).await.answers(1);
+    let refusal = host.as_(ADA).call("tickets.set_status", json!({"id": "IDENTITY-1", "status": "Ready"})).await.refused(Forbidden);
+    let refusal = refusal.naming("tickets.set_status").at("IDENTITY").listed_by(["editor", "admin"]).held_on(["MENGER"]);
+    assert_eq!(refusal.message(), "needs tickets.set_status on IDENTITY");
 }
 
 #[tokio::test]
 async fn the_refusal_on_the_wire() {
-    let m = members();
-    let hub = hub(&m);
-    let err = hub
-        .route("tickets.set_status", serde_json::json!({"id": "IDENTITY-1", "status": "Ready"}), Some(&who(ADA)))
-        .await
-        .err()
-        .unwrap();
-    let mut item = error_item("menger", &err);
+    let host = members().await;
+    let refusal = host.as_(ADA).call("tickets.set_status", json!({"id": "IDENTITY-1", "status": "Ready"})).await.refused(Forbidden);
+    let err = refusal.plexus_error().expect("refused before it opened");
+    let mut item = error_item("menger", err);
     item.as_object_mut().unwrap().remove("metadata");
     assert_eq!(
         item,
-        serde_json::json!({
+        json!({
             "type": "error",
             "error_kind": "forbidden",
             "grant": "tickets.set_status",
@@ -211,7 +154,7 @@ async fn the_refusal_on_the_wire() {
         })
     );
     // A client reads it back typed, and an old client still parses the item.
-    let item = error_item("menger", &err);
+    let item = error_item("menger", err);
     let typed = ForbiddenItem::from_item(&item).unwrap();
     assert_eq!(typed.grant, "tickets.set_status");
     assert_eq!(typed.held_on, vec!["MENGER"]);
@@ -222,78 +165,58 @@ async fn the_refusal_on_the_wire() {
 async fn the_wire_through_the_rpc_module_anonymous() {
     // into_rpc_module dispatches `<ns>.call` without a connection identity:
     // anonymous, so a non-public method is refused as unauthenticated…
-    let m = members();
-    let module = hub(&m).into_rpc_module().unwrap();
-    let mut sub = module
-        .subscribe_unbounded("menger.call", call("tickets.get", serde_json::json!({"id": "MENGER-1"})))
-        .await
-        .unwrap();
-    let (item, _) = sub.next::<serde_json::Value>().await.unwrap().unwrap();
-    assert_eq!(item["type"], "error");
-    assert_eq!(item["error_kind"], "unauthenticated");
-    assert_eq!(item["code"], "-32001");
+    let host = members().await;
+    let module = host.service().as_ref().clone().into_rpc_module().unwrap();
+    let sub = module.subscribe_unbounded("menger.call", call("tickets.get", json!({"id": "MENGER-1"}))).await.unwrap();
+    let got = heard(sub, "tickets.get").await;
+    got.refused_in_band(Unauthenticated);
+    assert_eq!(got.raw()[0]["code"], "-32001");
     // …and a public one runs. The activations' direct methods are not
     // merged under a gate: `tickets.providers` is reached only via call.
-    let mut sub = module
-        .subscribe_unbounded("menger.call", call("tickets.providers", serde_json::json!({})))
-        .await
-        .unwrap();
-    let (item, _) = sub.next::<serde_json::Value>().await.unwrap().unwrap();
-    assert_eq!(item["content"], "key empty=true");
+    let sub = module.subscribe_unbounded("menger.call", call("tickets.providers", json!({}))).await.unwrap();
+    assert_eq!(heard(sub, "tickets.providers").await.answer::<String>(), "key empty=true");
     assert!(!module.method_names().any(|n| n.starts_with("tickets.")));
 }
 
 #[tokio::test]
 async fn no_role_lists_it_refused_except_admin() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
     // `close` is listed by no role.
-    let err = hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1"]}), Some(&who(ADA))).await.err().unwrap();
-    assert!(matches!(
-        err,
-        PlexusError::Forbidden { reason: AuthzDenyReason::MissingGrant { ref roles, .. } } if roles.len() == 1 && roles[0].as_str() == "admin"
-    ));
-    assert!(hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1", "IDENTITY-2"]}), Some(&who(ROOT))).await.is_ok());
+    host.as_(ADA).call("tickets.close", json!({"ids": ["MENGER-1"]})).await.refused(Forbidden).listed_by(["admin"]);
+    host.as_(ROOT).call("tickets.close", json!({"ids": ["MENGER-1", "IDENTITY-2"]})).await.answers(1);
 }
 
 #[tokio::test]
 async fn a_list_target_needs_every_element() {
-    let m = members();
-    m.add(ADA, "closer", "MENGER");
-    let roles = RoleTable::new().define("closer", ["tickets.close"]).unwrap();
-    let gate = Gate::new(m.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    let hub = DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate));
-    assert!(hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1", "MENGER-2"]}), Some(&who(ADA))).await.is_ok());
-    assert!(hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1", "IDENTITY-2"]}), Some(&who(ADA))).await.is_err());
+    // The gate reads one role alone, `closer`: none of the declared ones.
+    let closer = RoleTable::new().define("closer", ["tickets.close"]).unwrap();
+    let host = members().member_at(ADA, "closer", "MENGER").roles_through(move |_declared| Arc::new(closer)).await;
+    host.as_(ADA).call("tickets.close", json!({"ids": ["MENGER-1", "MENGER-2"]})).await.answers(1);
+    host.as_(ADA).call("tickets.close", json!({"ids": ["MENGER-1", "IDENTITY-2"]})).await.refused(Forbidden).at("IDENTITY");
 }
 
 #[tokio::test]
 async fn anonymous_is_unauthenticated_public_passes() {
-    let m = members();
-    let hub = hub(&m);
-    let err = hub.route("tickets.get", serde_json::json!({"id": "MENGER-1"}), None).await.err().unwrap();
-    assert!(matches!(err, PlexusError::Unauthenticated(_)));
-    let out = data(hub.route("tickets.providers", serde_json::json!({}), None).await.unwrap()).await;
-    assert_eq!(out, vec![serde_json::json!("key empty=true")]);
+    let host = members().await;
+    let anonymous = host.anonymous();
+    anonymous.call("tickets.get", json!({"id": "MENGER-1"})).await.refused(Unauthenticated);
+    assert_eq!(anonymous.call("tickets.providers", json!({})).await.answer::<String>(), "key empty=true");
     // Introspection stays open (per-caller views are AUTH-4's).
-    assert!(hub.route("tickets.schema", serde_json::json!({}), None).await.is_ok());
-    assert!(hub.route("menger.hash", serde_json::json!({}), None).await.is_ok());
+    anonymous.call("tickets.schema", json!({})).await.answers(1);
+    anonymous.call("menger.hash", json!({})).await.answers(1);
 }
 
 #[tokio::test]
 async fn a_method_receives_its_reach() {
-    let m = members();
-    let hub = hub(&m);
-    let out = data(hub.route("tickets.list", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
-    assert_eq!(out, vec![serde_json::json!("MENGER")]);
-    let out = data(hub.route("tickets.list", serde_json::json!({}), Some(&who(BOB))).await.unwrap()).await;
-    assert_eq!(out, vec![serde_json::json!("*")]);
+    let host = members().await;
+    assert_eq!(host.as_(ADA).call("tickets.list", json!({})).await.answer::<String>(), "MENGER");
+    assert_eq!(host.as_(BOB).call("tickets.list", json!({})).await.answer::<String>(), "*");
     // A ceiling narrows it: ADA's session within MENGER-12.
     let narrowed = AuthContext::for_principal(
         &ADA.parse().unwrap(),
         "s2",
         vec![],
-        serde_json::json!({ "ceiling": ["editor@MENGER-12"] }),
+        json!({ "ceiling": ["editor@MENGER-12"] }),
     );
     struct Tickety;
     impl Resolve for Tickety {
@@ -308,27 +231,21 @@ async fn a_method_receives_its_reach() {
             Some(v)
         }
     }
-    let declared = DynamicHub::new("x").register(TicketsActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let hub2 = DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(Gate::new(m.clone(), Arc::new(roles), Arc::new(Tickety))));
-    let out = data(hub2.route("tickets.list", serde_json::json!({}), Some(&narrowed)).await.unwrap()).await;
-    assert_eq!(out, vec![serde_json::json!("MENGER-12")]);
-    assert!(hub2.route("tickets.set_status", serde_json::json!({"id": "MENGER-12", "status": "x"}), Some(&narrowed)).await.is_ok());
-    assert!(hub2.route("tickets.set_status", serde_json::json!({"id": "MENGER-13", "status": "x"}), Some(&narrowed)).await.is_err());
+    let host2 = members().resolving(Tickety).await;
+    let narrowed = Caller::new(host2.service().clone(), Some(narrowed));
+    assert_eq!(narrowed.call("tickets.list", json!({})).await.answer::<String>(), "MENGER-12");
+    narrowed.call("tickets.set_status", json!({"id": "MENGER-12", "status": "x"})).await.answers(1);
+    narrowed.call("tickets.set_status", json!({"id": "MENGER-13", "status": "x"})).await.refused(Forbidden).at("MENGER-13");
     // Unknown methods are denied (default deny), even to a viewer everywhere.
-    assert!(hub.route("tickets.nope", serde_json::json!({}), Some(&who(BOB))).await.is_err());
+    host.as_(BOB).call("tickets.nope", json!({})).await.refused(Forbidden).naming("tickets.nope");
 }
 
 #[tokio::test]
 async fn a_stream_follows_grants_as_they_stand() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
     // `watch` is listed by no role: admin holds it; its membership is then
     // revoked mid-stream.
-    let mut stream = hub
-        .route("tickets.watch", serde_json::json!({"ids": ["MENGER-1", "IDENTITY-1"]}), Some(&who(ROOT)))
-        .await
-        .unwrap();
+    let mut stream = host.as_(ROOT).stream("tickets.watch", json!({"ids": ["MENGER-1", "IDENTITY-1"]})).await.unwrap();
     // The first event is checked against the memberships as they stand…
     let first = loop {
         match stream.next().await.unwrap() {
@@ -338,9 +255,8 @@ async fn a_stream_follows_grants_as_they_stand() {
     };
     assert_eq!(first, "MENGER-1");
     // …the membership goes, and the next event is dropped.
-    m.clear();
-    let rest: Vec<_> = data(stream).await;
-    assert!(rest.is_empty(), "{rest:?}");
+    host.members().0.lock().unwrap().clear();
+    Outcome::of("tickets.watch", "ROOT, its membership gone", stream.collect().await).answers(0);
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //!
 //! ```
 //! use futures::stream::Stream;
-//! use plexus_testkit::{World, NOBODY, VIEWER};
+//! use plexus_testkit::{Forbidden, Unauthenticated, World, NOBODY, VIEWER};
 //! use serde_json::json;
 //!
 //! #[derive(Clone)]
@@ -32,17 +32,29 @@
 //! let world = World::new();
 //! let host = world.host().with(ShopActivation).role("clerk", ["shop.till"]).member(CLERK, "clerk").await;
 //!
-//! assert_eq!(host.as_(VIEWER).call("shop.items", json!({})).await, [json!("flour")]);
-//! assert_eq!(host.as_(CLERK).call("shop.till", json!({})).await, [json!(42)]);
-//! let refused = host.as_(VIEWER).call("shop.till", json!({})).await;
-//! assert!(refused[0]["route_error"].as_str().unwrap().contains("shop.till"), "{refused:?}");
-//! assert!(host.as_(NOBODY).call("shop.items", json!({})).await[0]["route_error"].is_string());
+//! assert_eq!(host.as_(VIEWER).call("shop.items", json!({})).await.answers(1), [json!("flour")]);
+//! assert_eq!(host.as_(CLERK).call("shop.till", json!({})).await.answer::<u64>(), 42);
+//! host.as_(VIEWER).call("shop.till", json!({})).await.refused(Forbidden).naming("shop.till").listed_by(["clerk", "admin"]);
+//! host.as_(NOBODY).call("shop.items", json!({})).await.refused(Forbidden).naming("shop.items");
+//! host.anonymous().call("shop.items", json!({})).await.refused(Unauthenticated);
 //! # }
 //! ```
 //!
+//! A call's [`Outcome`] is what it did, in the domain's words: it
+//! **answered** ([`answers`](Outcome::answers), [`answer`](Outcome::answer),
+//! [`items`](Outcome::items)), it was **refused** — by the gate or router
+//! before it opened ([`refused`](Outcome::refused)), or in band by a child
+//! past it ([`refused_in_band`](Outcome::refused_in_band)) — or it
+//! **failed** ([`failed`](Outcome::failed)). A failed assertion says the
+//! method, the caller and the whole outcome. [`Outcome::raw`] has every
+//! item as a value; [`Caller::stream`] is the call's stream itself.
+//!
 //! The parts a host is made of — [`parts::Members`], [`parts::Everywhere`],
-//! [`parts::who`], [`parts::items`] — are public for a test that builds
-//! something the host does not (a second gate, a transport as a caller).
+//! [`parts::Shortcodes`], [`parts::who`] (each caller in a session of its
+//! own, [`parts::session_of`]), [`parts::items`] (or
+//! [`parts::every_item`], the closing `done` kept) — are public for
+//! a test that builds something the host does not (a second gate, a
+//! transport as a caller).
 //!
 //! This is the kit's root (KEEL-9); there is no `#[plexus_test]` attribute
 //! yet: a test makes its world with [`World::new`], which works the same in
@@ -52,15 +64,20 @@ use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use plexus_core::plexus::{
-    Activation, AuthSetup, ChildRouter, Gate, MemoryAuthBackend, MemoryRoles, PlexusStream, RoleTable, Roles,
+    Activation, AuthContext, AuthSetup, ChildRouter, Gate, MemoryAuthBackend, MemoryRoles, PlexusStream, Resolve, RoleTable,
+    Roles,
 };
 use plexus_core::{DynamicHub, PlexusError};
 use serde_json::Value;
 
+pub mod outcome;
 pub mod parts;
 
-use parts::{items, Everywhere, Members};
+pub use outcome::RefusalKind::{Forbidden, InvalidParams, NotFound, Unauthenticated};
+pub use outcome::{Failure, Outcome, Refusal, RefusalKind};
+use parts::{Everywhere, Members};
 
 /// The viewer: holds the role `viewer` everywhere.
 pub const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -76,6 +93,8 @@ pub const NOBODY: &str = "key:00000000000000000000000000000000000000000000000000
 
 /// Each named caller and the role it holds in every host.
 const NAMED: [(&str, &str); 4] = [(VIEWER, "viewer"), (EDITOR, "editor"), (ADMIN, "admin"), (USER, "user")];
+/// Each named caller by its name, for a failure's message.
+const NAMES: [(&str, &str); 5] = [(VIEWER, "VIEWER"), (EDITOR, "EDITOR"), (ADMIN, "ADMIN"), (USER, "USER"), (NOBODY, "NOBODY")];
 
 /// Where a test's services live. One per test; every host is made from it.
 #[derive(Clone, Default)]
@@ -97,9 +116,11 @@ impl World {
             name: "host".into(),
             steps: Vec::new(),
             roles: Vec::new(),
-            members: NAMED.iter().map(|(p, r)| (p.to_string(), r.to_string())).collect(),
+            members: Vec::new(),
+            named: true,
             through: None,
             auth: false,
+            resolve: Arc::new(Everywhere),
         }
     }
 }
@@ -115,9 +136,11 @@ pub struct HostBuilder {
     name: String,
     steps: Vec<Step>,
     roles: Vec<(String, Vec<String>)>,
-    members: Vec<(String, String)>,
+    members: Vec<(String, String, String)>,
+    named: bool,
     through: Option<Through>,
     auth: bool,
+    resolve: Arc<dyn Resolve>,
 }
 
 impl HostBuilder {
@@ -164,8 +187,30 @@ impl HostBuilder {
 
     /// `who` holds `role` everywhere — a caller the test names itself, or a
     /// named one given another role besides its own.
-    pub fn member(mut self, who: &str, role: &str) -> Self {
-        self.members.push((who.to_string(), role.to_string()));
+    pub fn member(self, who: &str, role: &str) -> Self {
+        self.member_at(who, role, "*")
+    }
+
+    /// `who` holds `role` on `scope` alone — `*`, or a scope's name
+    /// (`MENGER`), which [`resolving`](Self::resolving) says what lives in.
+    pub fn member_at(mut self, who: &str, role: &str, scope: &str) -> Self {
+        self.members.push((who.to_string(), role.to_string(), scope.to_string()));
+        self
+    }
+
+    /// No caller holds anything unless the test says so: the named callers
+    /// ([`VIEWER`], [`EDITOR`], [`ADMIN`], [`USER`]) are not seated — for a
+    /// test whose own principals share their keys, or that counts who holds
+    /// what.
+    pub fn without_named_callers(mut self) -> Self {
+        self.named = false;
+        self
+    }
+
+    /// Where a target lives, the gate asks `resolve` — [`parts::Shortcodes`],
+    /// or the test's own; [`parts::Everywhere`] unless said.
+    pub fn resolving(mut self, resolve: impl Resolve + 'static) -> Self {
+        self.resolve = Arc::new(resolve);
         self
     }
 
@@ -191,14 +236,19 @@ impl HostBuilder {
             service = step(service);
         }
         let members = Arc::new(Members::default());
-        for (who, role) in &self.members {
-            members.hold(who, role);
+        if self.named {
+            for (who, role) in NAMED {
+                members.hold(who, role);
+            }
+        }
+        for (who, role, scope) in &self.members {
+            members.hold_at(who, role, scope);
         }
         let service = if self.auth {
             assert!(self.through.is_none(), "roles_through is not for a host with_auth: its roles are the auth store's");
             let roles = Arc::new(MemoryRoles::default());
             let backend = Arc::new(MemoryAuthBackend::new("http://x/login"));
-            let service = service.with_auth(AuthSetup::new(backend, roles.clone(), members.clone(), Arc::new(Everywhere)));
+            let service = service.with_auth(AuthSetup::new(backend, roles.clone(), members.clone(), self.resolve));
             roles.seed(&merged(service.declared_roles(), self.roles));
             service
         } else {
@@ -208,9 +258,9 @@ impl HostBuilder {
                 Some(f) => f(table),
                 None => table,
             };
-            service.with_gate(Arc::new(Gate::new(members.clone(), roles, Arc::new(Everywhere))))
+            service.with_gate(Arc::new(Gate::new(members.clone(), roles, self.resolve)))
         };
-        Host { _world: self.world, service: Arc::new(service), members }
+        Host { _world: self.world, service: Arc::new(service), members, named: self.named }
     }
 }
 
@@ -246,17 +296,24 @@ pub struct Host {
     _world: World,
     service: Arc<DynamicHub>,
     members: Arc<Members>,
+    named: bool,
 }
 
 impl Host {
     /// The caller `who` (a principal: [`VIEWER`], or one the test names).
     pub fn as_(&self, who: &str) -> Caller {
-        Caller { service: self.service.clone(), auth: Some(parts::who(who)) }
+        let caller = Caller::new(self.service.clone(), Some(parts::who(who)));
+        // A named caller by its name — only where the named callers are
+        // seated: elsewhere a test's principal may share its key.
+        match NAMES.iter().find(|(p, _)| *p == who) {
+            Some((_, name)) if self.named => Caller { name: name.to_string(), ..caller },
+            _ => caller,
+        }
     }
 
     /// A caller who has not signed in.
     pub fn anonymous(&self) -> Caller {
-        Caller { service: self.service.clone(), auth: None }
+        Caller::new(self.service.clone(), None)
     }
 
     /// The service itself, for what the kit does not say yet (its root, its
@@ -277,24 +334,37 @@ impl Host {
     }
 }
 
-/// Someone calling a host: a principal, or no one signed in.
+/// Someone calling a service: a principal, or no one signed in.
 #[derive(Clone)]
 pub struct Caller {
     service: Arc<DynamicHub>,
-    auth: Option<plexus_core::plexus::AuthContext>,
+    auth: Option<AuthContext>,
+    name: String,
 }
 
 impl Caller {
-    /// Call `method` with `params` through the host's gate: what it
-    /// answers, as [`parts::items`] gives it — a routing refusal one item,
-    /// `{"route_error": "<the error, Debug>"}`.
-    pub async fn call(&self, method: &str, params: Value) -> Vec<Value> {
-        items(self.route(method, params).await).await
+    /// `auth` calling `service` — for a service the kit did not build (one
+    /// with no gate) or a context it does not make (a session with a
+    /// ceiling); a host's callers are [`Host::as_`] and [`Host::anonymous`].
+    pub fn new(service: impl Into<Arc<DynamicHub>>, auth: Option<AuthContext>) -> Self {
+        let name = auth.as_ref().map_or_else(|| "anonymous".to_string(), |a| a.user_id.clone());
+        Self { service: service.into(), auth, name }
     }
 
-    /// The call, as the service answers it: its stream, or why it was not
-    /// routed.
-    pub async fn route(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
+    /// Call `method` with `params` through the service's gate, and read
+    /// the whole of what it did: an [`Outcome`].
+    pub async fn call(&self, method: &str, params: Value) -> Outcome {
+        let opened = match self.stream(method, params).await {
+            Ok(stream) => Ok(stream.collect().await),
+            Err(e) => Err(e),
+        };
+        Outcome::new(method, self.name.clone(), opened)
+    }
+
+    /// The call's stream itself, as the service opens it — for a test that
+    /// reads it as it comes (a watch, a change mid-stream) — or why it was
+    /// not opened. [`Outcome::of`] reads what is left of it.
+    pub async fn stream(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
         self.service.route(method, params, self.auth.as_ref()).await
     }
 }

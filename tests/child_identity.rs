@@ -7,13 +7,11 @@
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
-use plexus_core::plexus::{
-    AuthContext, Gate, Membership, Memberships, MethodRole, PlexusStream, PlexusStreamItem, Resolve, RoleTable,
-    ScopeRef,
-};
+use plexus_core::plexus::{AuthContext, MethodRole, PlexusStream, PlexusStreamItem};
 use plexus_core::{AuthzDenyReason, DynamicHub, PlexusError};
+use plexus_testkit::parts::{who, Shortcodes};
+use plexus_testkit::{HostBuilder, World, NOBODY};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
 
 /// What a child's method saw of its caller — on the wire, the JSON object
 /// itself (MACRO-22: a newtype so the emitted client can carry a failure).
@@ -126,57 +124,28 @@ impl MirrorActivation {
 const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ROOT: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const NOBODY: &str = "key:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Members {
-    fn add(&self, who: &str, role: &str, scope: &str) {
-        self.0.lock().unwrap().push(Membership {
-            principal: who.parse().unwrap(),
-            role: plexus_auth_core::RoleName::new(role),
-            scope: ScopeRef::parse(scope),
-        });
-    }
-}
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-/// `CODE-n` → `[CODE, *]`.
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        if code.is_empty() || !code.chars().all(|c| c.is_ascii_uppercase()) {
-            return None;
-        }
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
-
-fn members() -> Arc<Members> {
-    let m = Arc::new(Members::default());
-    m.add(ADA, "editor", "MENGER");
-    m.add(ADA, "viewer", "MENGER");
-    m.add(BOB, "viewer", "*");
-    m.add(ROOT, "admin", "*");
-    m
-}
 
 /// A gated hub whose roles are seeded from `declared_roles` alone — no
-/// child's roles added by hand.
-fn hub(members: &Arc<Members>) -> DynamicHub {
-    let declared = DynamicHub::new("menger").register(TicketsActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let gate = Gate::new(members.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate))
+/// child's roles added by hand; a ticket lives in its shortcode. ADA edits
+/// and views MENGER, BOB views everywhere, ROOT is admin.
+fn members() -> HostBuilder {
+    World::new()
+        .host()
+        .named("menger")
+        .with(TicketsActivation)
+        .resolving(Shortcodes)
+        .without_named_callers()
+        .member_at(ADA, "editor", "MENGER")
+        .member_at(ADA, "viewer", "MENGER")
+        .member(BOB, "viewer")
+        .member(ROOT, "admin")
 }
 
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], json!({"session_key": "k1", "expires": 99}))
+/// `p` signed in as session `s1`: the session the editor's test checks
+/// the child sees intact, by that literal (the kit's `who` gives each
+/// principal a session of its own, `sess-<p>`).
+fn in_session_s1(p: &str) -> AuthContext {
+    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
 }
 
 fn ceilinged(p: &str, ceiling: Value) -> AuthContext {
@@ -232,9 +201,9 @@ fn static_children_are_listed_by_path_with_qualified_grants() {
 
 #[tokio::test]
 async fn an_editor_calls_a_child_with_principal_session_and_ceiling_intact() {
-    let m = members();
-    let hub = hub(&m);
-    let out = data(hub.route("tickets.commits.link", json!({"id": "MENGER-2"}), Some(&who(ADA))).await.unwrap()).await;
+    let host = members().await;
+    let hub = host.service();
+    let out = data(hub.route("tickets.commits.link", json!({"id": "MENGER-2"}), Some(&in_session_s1(ADA))).await.unwrap()).await;
     assert_eq!(out.len(), 1);
     assert_eq!(out[0]["principal"], json!(ADA));
     assert_eq!(out[0]["session"], json!("s1"));
@@ -248,8 +217,8 @@ async fn an_editor_calls_a_child_with_principal_session_and_ceiling_intact() {
 
 #[tokio::test]
 async fn a_child_s_write_is_gated_on_its_target() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     // Editor on MENGER is not editor on IDENTITY.
     let err = hub.route("tickets.commits.link", json!({"id": "IDENTITY-1"}), Some(&who(ADA))).await.err().unwrap();
     let (grant, scope, roles) = missing_grant(err);
@@ -260,8 +229,8 @@ async fn a_child_s_write_is_gated_on_its_target() {
 
 #[tokio::test]
 async fn a_viewer_is_refused_naming_the_full_grant() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     let err = hub.route("tickets.commits.link", json!({"id": "MENGER-2"}), Some(&who(BOB))).await.err().unwrap();
     let (grant, _, roles) = missing_grant(err);
     assert_eq!(grant, "tickets.commits.link");
@@ -277,8 +246,8 @@ async fn a_viewer_is_refused_naming_the_full_grant() {
 
 #[tokio::test]
 async fn a_ceiling_holds_inside_the_child() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     let viewer_only = ceilinged(ADA, json!(["viewer@MENGER"]));
     // The ceiling narrows an editor to a viewer: the write is refused …
     let err = hub.route("tickets.commits.link", json!({"id": "MENGER-2"}), Some(&viewer_only)).await.err().unwrap();
@@ -295,8 +264,8 @@ async fn a_ceiling_holds_inside_the_child() {
 
 #[tokio::test]
 async fn identity_only_when_chosen_drops_the_session_and_ceiling() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     let viewer_only = ceilinged(BOB, json!(["viewer@*"]));
     let out = data(hub.route("tickets.mirror.whoami", json!({}), Some(&viewer_only)).await.unwrap()).await;
     // The verified user id and session id are kept, and (RETURNS-47) the
@@ -330,9 +299,8 @@ fn the_parent_says_how_each_child_inherits() {
 
 #[tokio::test]
 async fn the_view_keeps_a_child_s_entry_for_who_can_use_something_below_it() {
-    let m = members();
-    m.add(NOBODY, "nobody-role", "*");
-    let hub = hub(&m);
+    let host = members().member(NOBODY, "nobody-role").await;
+    let hub = host.service();
     let methods = |ctx: &AuthContext| -> Vec<String> {
         let view = hub.view(Some(ctx));
         view.schema_of("tickets")

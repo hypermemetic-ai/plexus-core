@@ -27,8 +27,10 @@ use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
 use plexus_auth_core::grants::GrantsGeneration;
 use plexus_auth_core::ScopeRegistry;
-use plexus_core::plexus::{ir, Activation, AuthContext, Gate, Membership, Memberships, PlexusStreamItem, Resolve, RoleTable, ScopeRef};
+use plexus_core::plexus::{ir, Activation, AuthContext, Gate, Membership, Memberships, PlexusStreamItem, RoleTable, ScopeRef};
 use plexus_core::DynamicHub;
+use plexus_testkit::parts::{who, Everywhere};
+use plexus_testkit::World;
 use serde_json::{json, Value};
 
 async fn call(service: &DynamicHub, method: &str, params: Value, auth: Option<&AuthContext>) -> Vec<Value> {
@@ -138,16 +140,9 @@ async fn dos_forty_thousand_names_are_refused_at_once() {
 /// caller's view shows, never how big the service behind it is.
 #[tokio::test]
 async fn dos_too_many_names_is_counted_in_the_callers_view() {
-    let declared = DynamicHub::new("x").register(TicketsActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let rows = Arc::new(Rows { calls: AtomicUsize::new(0), flip_at: usize::MAX, promoted: Mutex::new(false), generation: GrantsGeneration::new() });
-    let gate = Gate::new(rows, Arc::new(roles), Arc::new(Everywhere));
     // the whole service: menger, tickets, alpha, alpha.inner, beta — five; a stranger sees only menger
-    let service = DynamicHub::new("menger")
-        .register(TicketsActivation)
-        .register(ir_hard_service::Alpha)
-        .register(ir_hard_service::Beta)
-        .with_gate(Arc::new(gate));
+    let host = World::new().host().named("menger").with(TicketsActivation).with(ir_hard_service::Alpha).with(ir_hard_service::Beta).await;
+    let service = host.service().clone();
     for asked in [json!(["menger", "tickets"]), json!(["a", "b", "c", "d", "e", "f"])] {
         let err = ir_of(&service, json!({ "namespaces": asked }), None).await.expect_err("more than the view shows");
         let msg = err["message"].as_str().unwrap();
@@ -232,20 +227,10 @@ impl Memberships for Rows {
     }
 }
 
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _t: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
 /// Whatever moment the grant lands at, each answer is one view: DAN (a
 /// viewer) never sees CAT's promotion, and CAT's IR is the view its own
-/// hash names.
+/// hash names. (Its gate is built here: its memberships, `Rows`, move a
+/// grant from inside the gate's own ask, which no host's members do.)
 #[tokio::test]
 async fn race_a_grant_that_moves_mid_build_never_crosses_views() {
     for flip_at in 1..=6 {

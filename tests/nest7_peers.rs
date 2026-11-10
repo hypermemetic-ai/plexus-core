@@ -16,8 +16,10 @@ use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
 use plexus_client::BoxFuture;
 use plexus_core::plexus::peer::{Contract, Interface, Peer, PeerError, PeerTransport};
-use plexus_core::plexus::{Activation, ChildOptions, InProcessTransport, MethodRole, PlexusStream, PlexusStreamItem, RemoteChild};
+use plexus_core::plexus::{Activation, ChildOptions, InProcessTransport, MethodRole, PlexusStreamItem, RemoteChild};
 use plexus_core::DynamicHub;
+use plexus_testkit::parts::{items, who};
+use plexus_testkit::{World, VIEWER};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -246,22 +248,9 @@ async fn service() -> DynamicHub {
     DynamicHub::new("svc").register(host().await).register(GardenActivation)
 }
 
-async fn items(stream: PlexusStream) -> Vec<Value> {
-    stream
-        .filter_map(|i| async move {
-            match i {
-                PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
-                e @ PlexusStreamItem::Error { .. } => Some(serde_json::to_value(&e).unwrap()),
-                _ => None,
-            }
-        })
-        .collect()
-        .await
-}
-
 async fn call(hub: &DynamicHub, method: &str, params: Value) -> Vec<Value> {
     match hub.route(method, params, None).await {
-        Ok(s) => items(s).await,
+        Ok(s) => items(Ok(s)).await,
         Err(e) => vec![json!({ "dispatch_error": e.to_string() })],
     }
 }
@@ -386,9 +375,9 @@ async fn a_remote_child_is_a_peer() {
     let dir = tempfile::tempdir().unwrap();
     let spec = child_support::stdio_spec("echo", &dir.path().join("l"), "");
     let child = RemoteChild::connect(spec, ChildOptions::default()).await.expect("the stub mounts");
-    let direct = items(Activation::call(&child, "echo", json!({ "text": "hi" }), None, None).await.unwrap()).await;
+    let direct = items(Ok(Activation::call(&child, "echo", json!({ "text": "hi" }), None, None).await.unwrap())).await;
     let peer: Box<dyn Peer> = Box::new(child);
-    let through = items(peer.call("echo", json!({ "text": "hi" }), None).await.unwrap()).await;
+    let through = items(Ok(peer.call("echo", json!({ "text": "hi" }), None).await.unwrap())).await;
     assert_eq!(through, direct);
     assert!(!through.is_empty());
     assert_eq!(peer.interface().name, "echo");
@@ -483,38 +472,28 @@ async fn the_client_checks_its_stamp() {
 
 // ------------------------------------------------------------------ the slot grant
 
-struct Everywhere;
-impl plexus_core::plexus::Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<plexus_core::plexus::ScopeRef>> {
-        Some(vec![plexus_core::plexus::ScopeRef::Everywhere])
-    }
-}
-
-const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
 /// NEST-5's slot grant on a peer slot: `host.{integration}.repos` is
 /// `repos` on every peer in the slot; an untyped slot is granted whole,
 /// `garden.{dendrite}`; `auth.requires` answers them.
 #[tokio::test]
 async fn a_peer_slot_is_granted_once() {
-    use plexus_core::plexus::{AuthContext, AuthSetup, MemoryAuthBackend, MemoryMemberships, MemoryRoles};
-    let roles = Arc::new(MemoryRoles::default());
-    let hub = DynamicHub::new("svc").register(host().await).register(GardenActivation).with_auth(AuthSetup::new(
-        Arc::new(MemoryAuthBackend::new("http://x/login")),
-        roles.clone(),
-        Arc::new(MemoryMemberships::new().with(VIEWER, "viewer", "*")),
-        Arc::new(Everywhere),
-    ));
-    let mut declared = hub.declared_roles();
-    declared.insert("viewer".into(), vec!["host.{integration}.repos".into(), "garden.{dendrite}".into()]);
-    roles.seed(&declared);
-    let viewer = AuthContext::for_principal(&VIEWER.parse().unwrap(), "s1", vec![], json!({}));
+    // VIEWER holds viewer, which lists the two slot grants and nothing else.
+    let served = World::new()
+        .host()
+        .named("svc")
+        .with(host().await)
+        .with(GardenActivation)
+        .role("viewer", ["host.{integration}.repos", "garden.{dendrite}"])
+        .with_auth()
+        .await;
+    let hub = served.service().clone();
+    let viewer = who(VIEWER);
     let as_viewer = |m: &'static str, p: Value| {
         let hub = &hub;
         let viewer = viewer.clone();
         async move {
             match hub.route(m, p, Some(&viewer)).await {
-                Ok(s) => format!("ok:{}", items(s).await.first().cloned().unwrap_or_default()),
+                Ok(s) => format!("ok:{}", items(Ok(s)).await.first().cloned().unwrap_or_default()),
                 Err(e) => format!("refused:{e}"),
             }
         }
@@ -528,7 +507,7 @@ async fn a_peer_slot_is_granted_once() {
     let req = |m: &'static str| {
         let hub = &hub;
         let viewer = viewer.clone();
-        async move { items(hub.route("auth.requires", json!({ "method": m }), Some(&viewer)).await.unwrap()).await[0]["grant"].clone() }
+        async move { items(Ok(hub.route("auth.requires", json!({ "method": m }), Some(&viewer)).await.unwrap())).await[0]["grant"].clone() }
     };
     assert_eq!(req("host.integration.github.repos").await, "host.{integration}.repos");
     assert_eq!(req("garden.dendrite.greeter.hello").await, "garden.{dendrite}");

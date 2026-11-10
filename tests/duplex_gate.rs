@@ -16,10 +16,12 @@ use plexus_auth_core::duplex::{hop_identity, Answerer, CallCeiling, CallRef, Dup
 use plexus_auth_core::grants::{GrantsMove, Liveness};
 use plexus_core::plexus::duplex_gate::{CallCounter, CallPlace, ConnId, DuplexGate, DuplexRefusal, InputFrame};
 use plexus_core::plexus::{
-    error_item, AuthContext, ForbiddenItem, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem, Resolve,
-    RoleTable, ScopeRef,
+    error_item, AuthContext, ForbiddenItem, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem, RoleTable,
+    ScopeRef,
 };
-use plexus_core::{DynamicHub, PlexusError};
+use plexus_core::PlexusError;
+use plexus_testkit::parts::{who, Members, Shortcodes};
+use plexus_testkit::{Host, World};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,28 +37,7 @@ const OWNER: &str = "idp:0b6f4c2e-8f7a-4d3b-9c1e-2a5d7e9f1b3c";
 
 // ---------------------------------------------------------------- fixture
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Members {
-    fn add(&self, who: &str, role: &str, scope: &str) {
-        self.0.lock().unwrap().push(Membership {
-            principal: who.parse().unwrap(),
-            role: plexus_auth_core::RoleName::new(role),
-            scope: ScopeRef::parse(scope),
-        });
-    }
-    fn revoke(&self, who: &str) {
-        let p: plexus_auth_core::identity::Principal = who.parse().unwrap();
-        self.0.lock().unwrap().retain(|m| m.principal != p);
-    }
-}
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-/// The same table indexed by principal, as a service keeps it (the perf
+/// The kit's `Members`, indexed by principal, as a service keeps it (the perf
 /// tests: a linear scan of 3,000 rows would measure the fixture).
 #[derive(Default)]
 struct Indexed(Mutex<std::collections::HashMap<String, Vec<Membership>>>);
@@ -78,18 +59,6 @@ impl Memberships for Indexed {
     }
 }
 
-/// `CODE-n` → `[CODE, *]`.
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        if code.is_empty() || !code.chars().all(|c| c.is_ascii_uppercase()) {
-            return None;
-        }
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
-
 fn roles() -> RoleTable {
     RoleTable::new()
         .define("viewer", ["runs.get"])
@@ -100,12 +69,10 @@ fn roles() -> RoleTable {
         .unwrap()
 }
 
+/// The gate under test, bare, as a `DuplexGate` takes it: the roles above
+/// (no service declares them), `CODE-n` → `[CODE, *]`.
 fn gate(m: &Arc<Members>) -> Gate {
     Gate::new(m.clone(), Arc::new(roles()), Arc::new(Shortcodes))
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), format!("sess-{}", &p[..6]), vec![], Value::Null)
 }
 
 /// The caller a call holds: shared, as the connection holds it.
@@ -151,9 +118,9 @@ impl CallCounter for Calls {
 /// Ada edits MENGER, Bob views it, the owner approves there.
 fn members() -> Arc<Members> {
     let m = Arc::new(Members::default());
-    m.add(ADA, "editor", "MENGER");
-    m.add(BOB, "viewer", "MENGER");
-    m.add(OWNER, "approver", "MENGER");
+    m.hold_at(ADA, "editor", "MENGER");
+    m.hold_at(BOB, "viewer", "MENGER");
+    m.hold_at(OWNER, "approver", "MENGER");
     m
 }
 
@@ -242,7 +209,7 @@ async fn b_a_revoke_mid_stream_ends_the_input_with_forbidden_and_drops_what_foll
         tx.send(frame(1, seq)).unwrap();
         got_rx.recv().await.unwrap();
     }
-    m.revoke(ADA);
+    m.forget(ADA);
     generation.moved(GrantsMove::Revoke);
     let (ok, end) = handler.await.unwrap();
     assert_eq!(ok.len(), 3);
@@ -268,7 +235,7 @@ async fn b_a_quiet_call_ends_at_the_revoke_not_at_its_next_item() {
     let (refused_tx, _r) = mpsc::unbounded_channel();
     let handler = tokio::spawn(drain(call.input(UnboundedReceiverStream::new(rx), refused_tx)));
     tokio::time::sleep(Duration::from_millis(10)).await;
-    m.revoke(ADA);
+    m.forget(ADA);
     let at = Instant::now();
     generation.moved(GrantsMove::Revoke);
     let (ok, end) = tokio::time::timeout(Duration::from_millis(50), handler).await.expect("ends within a tick").unwrap();
@@ -492,7 +459,7 @@ async fn b_a_call_the_dispatch_decided_is_asked_once_a_move_comes() {
     call.admit(&frame(1, 0)).unwrap();
     assert_eq!(dg.gate_checks(), 0);
     // A move between the dispatch's check and the open is not missed.
-    m.revoke(ADA);
+    m.forget(ADA);
     dg.gate().moved(GrantsMove::Revoke);
     let mut late = open(vec!["MENGER-1"], seen, true);
     assert_eq!(late.admit(&frame(1, 0)).unwrap_err().kind(), "forbidden");
@@ -532,7 +499,7 @@ async fn d_an_item_from_another_connection_is_refused_and_the_call_runs_on() {
 #[tokio::test]
 async fn d_a_question_that_requires_a_person_refuses_an_agents_answer() {
     let m = members();
-    m.add(OWNER, "editor", "MENGER");
+    m.hold_at(OWNER, "editor", "MENGER");
     let dg = DuplexGate::new(gate(&m));
     let conn = Calls::new(4);
     let agent_call = dg.open(C1, &conn, as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling::default(), Answerer::Person).unwrap();
@@ -649,13 +616,15 @@ fn refusal(r: Result<PlexusStream, PlexusError>) -> PlexusError {
 #[tokio::test]
 async fn e_a_call_into_a_client_is_gated_by_the_clients_gate_as_the_peer() {
     // The client's own service and gate: the server it connected to holds `peer`.
-    let m = Arc::new(Members::default());
-    m.add(SERVER, "peer", "*");
-    let declared = DynamicHub::new("client").register(LocalActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let client = DynamicHub::new("client")
-        .register(LocalActivation)
-        .with_gate(Arc::new(Gate::new(m.clone(), Arc::new(roles), Arc::new(Shortcodes))));
+    let host = World::new()
+        .host()
+        .named("client")
+        .with(LocalActivation)
+        .resolving(Shortcodes)
+        .without_named_callers()
+        .member(SERVER, "peer")
+        .await;
+    let (client, m) = (host.service(), host.members());
     // The server's call, on behalf of Ada, into the client: the peer on that
     // connection is the server's key; Ada is named, and grants nothing.
     let ctx = hop_identity(&who(SERVER), &who(ADA), &[ScopeRef::Everywhere]);
@@ -668,7 +637,7 @@ async fn e_a_call_into_a_client_is_gated_by_the_clients_gate_as_the_peer() {
     let item = serde_json::to_value(error_item("client", &err)).unwrap();
     assert_eq!(ForbiddenItem::from_item(&item).expect("typed").grant, "local.read_file");
     // Ada herself holds nothing on the client: naming her does not lend it.
-    m.add(ADA, "owner", "*");
+    m.hold_at(ADA, "owner", "*");
     let err = refusal(client.route("local.read_file", json!({ "path": "/etc/passwd" }), Some(&ctx)).await);
     assert!(matches!(err, PlexusError::Forbidden { .. }));
     // A peer nobody proved is anonymous: nothing.
@@ -700,20 +669,21 @@ fn seen_by_b(v: Value) -> Value {
     serde_json::from_str(v.as_str().expect("a line")).unwrap()
 }
 
-fn service_b(m: &Arc<Members>) -> DynamicHub {
-    let declared = DynamicHub::new("b").register(CiActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    DynamicHub::new("b").register(CiActivation).with_gate(Arc::new(Gate::new(m.clone(), Arc::new(roles), Arc::new(Shortcodes))))
+/// Service B: `ci` and its declared roles, `CODE-n` → `[CODE, *]`; who holds
+/// what there is the test's.
+async fn service_b() -> Host {
+    World::new().host().named("b").with(CiActivation).resolving(Shortcodes).without_named_callers().await
 }
 
 #[tokio::test]
 async fn f_a_hop_carries_the_hop_and_whom_it_acts_for_and_b_redecides() {
     // On B: service A's key runs jobs on MENGER and PLEXUS; Ada runs them everywhere.
-    let m = Arc::new(Members::default());
-    m.add(SERVICE_A, "runner", "MENGER");
-    m.add(SERVICE_A, "runner", "PLEXUS");
-    m.add(ADA, "runner", "*");
-    let b = service_b(&m);
+    let host = service_b().await;
+    let m = host.members();
+    m.hold_at(SERVICE_A, "runner", "MENGER");
+    m.hold_at(SERVICE_A, "runner", "PLEXUS");
+    m.hold_at(ADA, "runner", "*");
+    let b = host.service();
     // A admitted Ada on MENGER (A's verdict), and forwards.
     let hop = hop_identity(&who(SERVICE_A), &who(ADA), &[ScopeRef::named("MENGER")]);
     let seen = seen_by_b(first(b.route("ci.run", json!({ "id": "MENGER-1" }), Some(&hop)).await.unwrap()).await);
@@ -723,13 +693,13 @@ async fn f_a_hop_carries_the_hop_and_whom_it_acts_for_and_b_redecides() {
     let err = refusal(b.route("ci.run", json!({ "id": "PLEXUS-1" }), Some(&hop)).await);
     assert!(matches!(err, PlexusError::Forbidden { .. }), "the verdict is a ceiling: {err:?}");
     // A's key without the grant on B: refused, though Ada holds it there.
-    m.revoke(SERVICE_A);
+    m.forget(SERVICE_A);
     let err = refusal(b.route("ci.run", json!({ "id": "MENGER-1" }), Some(&hop)).await);
     assert!(matches!(err, PlexusError::Forbidden { .. }), "no confused deputy: {err:?}");
     // Two hops: the chain names both, nearest first.
-    m.add(SERVICE_A, "runner", "*");
+    m.hold_at(SERVICE_A, "runner", "*");
     let hop2 = hop_identity(&who(SERVER), &hop, &[ScopeRef::Everywhere]);
-    m.add(SERVER, "runner", "*");
+    m.hold_at(SERVER, "runner", "*");
     let seen = seen_by_b(first(b.route("ci.run", json!({ "id": "MENGER-1" }), Some(&hop2)).await.unwrap()).await);
     assert_eq!(seen["for"], json!([SERVICE_A, ADA]));
     // A ceiling the hop carried is kept: the second hop is no wider than MENGER.
@@ -805,7 +775,7 @@ async fn g_every_typed_refusal_is_one_audit_record() {
     want.push((sub(6), DuplexRefusalCode::PersonRequired));
     // A revoke, found at the next frame.
     let mut revoked = dg.open(sub(7), &Calls::new(1), as_(ADA), "runs.append_log", Some("MENGER-1"), CallCeiling::default(), Answerer::Caller).unwrap();
-    m.revoke(ADA);
+    m.forget(ADA);
     dg.gate().moved(GrantsMove::Revoke);
     assert!(revoked.admit(&frame(1, 0)).is_err());
     want.push((sub(7), DuplexRefusalCode::Forbidden));

@@ -42,7 +42,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::host::{serve_child_on, ChildPeer};
+use super::host::ChildPeer;
 use super::link::{unavailable, Conn, Counters, SubKey};
 use super::pairing::{commitment, key_fingerprint, pairing_code, KnownHosts};
 use super::spec::{check_ws_url, is_insecure_ws, INSECURE_TRANSPORT};
@@ -717,7 +717,11 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     }
     let _ = conn.ns.set(service.clone());
     let _ = conn.peer_key.set(trusted.clone());
-    host = Some(tokio::spawn(serve_child_on(activation.clone(), host_r, host_w, ChildPeer::connection(trusted.clone(), [trusted.clone()]))));
+    // NEST-25: served with this side's key, so a call back under a token
+    // the relay minted for it carries this key's proof of possession.
+    let own = crate::plexus::peer_token::PeerKey::from_seed(signer.to_bytes());
+    let serving = super::host::ServeChild { peer: ChildPeer::connection(trusted.clone(), [trusted.clone()]), key: Some(own), tokens: None };
+    host = Some(tokio::spawn(super::host::serve(activation.clone(), host_r, host_w, serving)));
     proven.store(true, Ordering::Release);
 
     // The offer (spec/14), answered once the relay has mounted this side.

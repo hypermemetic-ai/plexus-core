@@ -102,7 +102,7 @@ pub use link::{MountTimings, KEYED_MOUNT_NEEDS_A_KEY};
 pub use spec::{check_ws_url, is_insecure_ws, is_loopback_host, parse_duration, Backoff, ChildError, ChildOptions, ChildSpec, INSECURE_TRANSPORT};
 #[cfg(feature = "clap")]
 pub use args::ChildArgs;
-pub use dial_in::{Admission, Decision, Offer, OfferRefused, PeerEvent, PeerInfo, PeerRoles, PeerSocket, Peers, PeersMethods, OFFER_PENDING};
+pub use dial_in::{possession_input, Admission, Decision, Offer, OfferRefused, PeerEvent, PeerInfo, PeerRoles, PeerSocket, Peers, PeersMethods, OFFER_PENDING};
 #[cfg(feature = "child-ws")]
 pub use dial_out::{key_principal, DialOut, DialState, Exposed, FirstContact};
 #[cfg(feature = "child-ws")]

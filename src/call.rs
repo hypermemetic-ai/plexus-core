@@ -75,7 +75,9 @@ pub struct CallContext(Arc<Inner>);
 struct Inner {
     auth: Option<AuthContext>,
     reach: ReachCell,
-    hop: Option<Hop>,
+    /// Boxed (PERF.115-49): only a call through the child seam has one, and
+    /// inline it was 144 of every context's bytes.
+    hop: Option<Box<Hop>>,
     /// What a trait-impl method's verifier answered for this call
     /// (`#[plexus_macros::from_auth(…)]` on the method): [`verified`]. Shared
     /// by a context narrowed from this one (`with_reach`: the same call);
@@ -98,7 +100,7 @@ enum ReachCell {
 }
 
 impl Inner {
-    fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Hop>) -> Self {
+    fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Box<Hop>>) -> Self {
         Inner { auth, reach, hop, verified: OnceLock::new(), host: None }
     }
 
@@ -155,7 +157,7 @@ impl CallContext {
             Some(l) if !unreadable => ceiling_reach(auth.as_ref(), &l.grant, &hop.held_on()),
             _ => Reach::nowhere(),
         };
-        Self(Arc::new(Inner::with(auth, ReachCell::Known(reach), Some(hop))))
+        Self(Arc::new(Inner::with(auth, ReachCell::Known(reach), Some(Box::new(hop)))))
     }
 
     /// NEST-11: [`CallContext::through_hop`], with the link back to the
@@ -236,7 +238,7 @@ impl CallContext {
 
     /// The hop the call came through, in a child.
     pub fn hop(&self) -> Option<&Hop> {
-        self.0.hop.as_ref()
+        self.0.hop.as_deref()
     }
 
     /// The caller this context names: an error for a call that came

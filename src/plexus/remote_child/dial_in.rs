@@ -120,8 +120,10 @@ pub trait Admission: Send + Sync + 'static {
     fn decide(&self, offer: &Offer) -> Decision;
     /// Its schema read, before it is mounted: the last word.
     fn vet(&self, offer: &Offer, child: &RemoteChild) -> Result<(), OfferRefused>;
-    /// Mounted (the offer about to be answered).
-    fn mounted(&self, offer: &Offer, child: &RemoteChild, socket: &Arc<PeerSocket>);
+    /// Mounted here (the offer about to be answered): put it in the
+    /// embedder's table, or refuse it — then it is taken out of this table
+    /// again and the offer is refused (review L1: a refusal racing the mount).
+    fn mounted(&self, offer: &Offer, child: &RemoteChild, socket: &Arc<PeerSocket>) -> Result<(), OfferRefused>;
     /// The socket is gone (once): `mount` the name it held, if it held one.
     fn closed(&self, socket: u64, mount: Option<&str>, why: &str);
 }
@@ -838,7 +840,24 @@ impl PeerSocket {
             replaced
         };
         if let Some(a) = &admission {
-            a.mounted(&offer, &child, self);
+            if let Err(r) = a.mounted(&offer, &child, self) {
+                // Out of this table again, as it was before the offer.
+                self.mount.lock().unwrap().take();
+                if let Some((conn, shared)) = self.link.lock().unwrap().take() {
+                    gone(&Arc::downgrade(&shared), &conn, &r.message);
+                }
+                {
+                    let mut t = peers.inner.table.write().unwrap();
+                    if t.get(&name).is_some_and(|e| e.socket == self.id) {
+                        t.remove(&name);
+                    }
+                    if let Some(old) = replaced {
+                        t.entry(name.clone()).or_insert(old);
+                    }
+                }
+                tracing::warn!(target: "plexus::audit", peer = %name, %principal, kind = %r.kind, "dial-in offer refused as it was mounted: {}", r.message);
+                return refusal(id, -32003, &r.kind, &r.message);
+            }
         }
         if replaced.is_some() {
             let _ = peers.inner.events.send(PeerEvent::Unmounted { name: name.clone(), why: "a new connection of the same principal took the name".into() });

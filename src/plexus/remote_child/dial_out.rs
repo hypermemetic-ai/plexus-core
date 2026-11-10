@@ -695,6 +695,17 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     }
     let code = host_nonce.as_deref().map(|h| pairing_code(&trusted, &me, &node_nonce, h));
     *inner.code.lock().unwrap() = code.clone();
+    // Review M2: this side committed to a nonce; at first contact a host
+    // that answers no nonce of its own gives no pairing code — refused, never
+    // asked about with a fingerprint alone (a relay stripping it would
+    // otherwise pass unseen). A host already trusted or pinned may be older.
+    if pinned.is_none() && code.is_none() {
+        reader.abort();
+        ended(host, String::new(), false);
+        let why = format!("no_pairing_code: {} answered `_info` with no `host_nonce`, so first contact has no pairing code to compare: refused (a host trusted by `--trust`, or pinned already, is reached without one)", opts.url);
+        tracing::warn!(target: "plexus::audit", url = %opts.url, "dial-out refused: {why}");
+        return Outcome::Refused(why);
+    }
     if pinned.is_none() {
         // Nothing sent, nothing served, until a person says yes.
         let f = first.as_ref().expect("first contact is asked only with a known-hosts file");

@@ -83,9 +83,80 @@ pub struct KnownHosts {
     path: PathBuf,
 }
 
-/// A URL as the known-hosts file keys it (no trailing `/`).
-fn host_of(url: &str) -> &str {
-    url.trim().trim_end_matches('/')
+/// Review L2: a URL as the known-hosts file keys it — the scheme and host
+/// lower-cased, the host's trailing dot dropped, the scheme's default port
+/// (80 for `ws`, 443 for `wss`) dropped, trailing `/`s dropped, the path kept.
+/// One host, however it is spelled, is one entry.
+pub fn canonical_url(url: &str) -> String {
+    let url = url.trim();
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s.to_ascii_lowercase(), r),
+        None => return url.trim_end_matches('/').to_string(),
+    };
+    let cut = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(cut);
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    let (host, port) = if let Some(end) = hostport.strip_prefix('[').and_then(|h| h.find(']')) {
+        let host = &hostport[..end + 2];
+        (host.to_string(), hostport[end + 2..].strip_prefix(':').map(str::to_string))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h.to_string(), Some(p.to_string())),
+            _ => (hostport.to_string(), None),
+        }
+    };
+    let host = host.to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
+    let default = match scheme.as_str() {
+        "ws" | "http" => Some("80"),
+        "wss" | "https" => Some("443"),
+        _ => None,
+    };
+    let port = port.map(|p| p.trim_start_matches('0').to_string()).filter(|p| Some(p.as_str()) != default && !p.is_empty());
+    let mut out = format!("{scheme}://");
+    if let Some(u) = userinfo {
+        out.push_str(u);
+        out.push('@');
+    }
+    out.push_str(host);
+    if let Some(p) = port {
+        out.push(':');
+        out.push_str(&p);
+    }
+    out.push_str(path.trim_end_matches('/'));
+    out
+}
+
+fn host_of(url: &str) -> String {
+    canonical_url(url)
+}
+
+/// Review L2: the file's lock, held while it is read, changed and written
+/// (`<file>.lock`, 0600, never through a link): two pins at once both kept.
+struct Locked(#[allow(dead_code)] std::fs::File);
+
+fn lock(path: &Path) -> Result<Locked, String> {
+    let lock_path = path.with_extension("lock");
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = o.open(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: a valid descriptor this function owns; flock has no other preconditions.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!("{}: {}", lock_path.display(), std::io::Error::last_os_error()));
+        }
+    }
+    Ok(Locked(f))
 }
 
 impl KnownHosts {
@@ -115,7 +186,7 @@ impl KnownHosts {
                 continue;
             }
             match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                [url, key] if crate::plexus::peer_token::key_of(key).is_some() => out.push((host_of(url).to_string(), key.to_string())),
+                [url, key] if crate::plexus::peer_token::key_of(key).is_some() => out.push((host_of(url), key.to_string())),
                 _ => return Err(format!("{}:{}: not `<url> key:<64 hex>`", self.path.display(), n + 1)),
             }
         }
@@ -124,7 +195,8 @@ impl KnownHosts {
 
     /// The key pinned for `url`, if one is.
     pub fn get(&self, url: &str) -> Result<Option<String>, String> {
-        Ok(self.entries()?.into_iter().find(|(u, _)| u == host_of(url)).map(|(_, k)| k))
+        let want = host_of(url);
+        Ok(self.entries()?.into_iter().find(|(u, _)| *u == want).map(|(_, k)| k))
     }
 
     /// Pin `key` for `url`. Refused when another key is pinned for it: a
@@ -133,12 +205,6 @@ impl KnownHosts {
     pub fn add(&self, url: &str, key: &str) -> Result<(), String> {
         if crate::plexus::peer_token::key_of(key).is_none() {
             return Err(format!("`{key}` is not a key (`key:<64 hex>`)"));
-        }
-        let mut entries = self.entries()?;
-        match entries.iter().find(|(u, _)| u == host_of(url)) {
-            Some((_, k)) if k == key => return Ok(()),
-            Some((_, k)) => return Err(format!("{} pins another key for {url} ({k}): remove that line by hand to trust a new one", self.path.display())),
-            None => entries.push((host_of(url).to_string(), key.to_string())),
         }
         if let Some(dir) = self.path.parent() {
             if !dir.exists() {
@@ -149,6 +215,13 @@ impl KnownHosts {
                     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
                 }
             }
+        }
+        let _held = lock(&self.path)?;
+        let mut entries = self.entries()?;
+        match entries.iter().find(|(u, _)| *u == host_of(url)) {
+            Some((_, k)) if k == key => return Ok(()),
+            Some((_, k)) => return Err(format!("{} pins another key for {url} ({k}): remove that line by hand to trust a new one", self.path.display())),
+            None => entries.push((host_of(url), key.to_string())),
         }
         let text: String = entries.iter().map(|(u, k)| format!("{u} {k}\n")).collect();
         let tmp = self.path.with_extension("tmp");
@@ -179,6 +252,51 @@ mod tests {
     fn a_commitment_binds_its_nonce() {
         assert!(commits_to(&commitment("x"), "x"));
         assert!(!commits_to(&commitment("x"), "y"));
+    }
+
+    /// Review L2: a pinned host respelled is the same entry — scheme and host
+    /// in any case, its default port said or not, a trailing dot or slash.
+    #[test]
+    fn a_respelled_url_of_a_pinned_host_is_the_same_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = KnownHosts::new(dir.path().join("known_hosts"));
+        k.add("ws://Host.Example./ws/", A).unwrap();
+        for same in ["ws://host.example/ws", "WS://HOST.EXAMPLE:80/ws", "ws://host.example.:80/ws//"] {
+            assert_eq!(k.get(same).unwrap().as_deref(), Some(A), "{same}");
+            assert!(k.add(same, B).unwrap_err().contains("another key"), "{same}: re-pinned under another spelling");
+        }
+        for other in ["ws://host.example/other", "ws://host.example:8080/ws", "wss://host.example/ws"] {
+            assert_eq!(k.get(other).unwrap(), None, "{other}");
+        }
+        k.add("wss://h.example:443", B).unwrap();
+        assert_eq!(k.get("wss://H.EXAMPLE/").unwrap().as_deref(), Some(B));
+    }
+
+    /// Review L2: pins written at once by many are all kept.
+    #[test]
+    fn pins_written_at_once_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let k = KnownHosts::new(path);
+                    for i in 0..8 {
+                        k.add(&format!("ws://h{t}-{i}.example/ws"), A).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let k = KnownHosts::new(path);
+        for t in 0..8 {
+            for i in 0..8 {
+                assert_eq!(k.get(&format!("ws://h{t}-{i}.example/ws")).unwrap().as_deref(), Some(A), "h{t}-{i} lost");
+            }
+        }
     }
 
     #[test]

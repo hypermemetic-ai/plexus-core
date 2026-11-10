@@ -82,7 +82,9 @@ impl Admission for Recording {
     fn vet(&self, _: &Offer, _: &RemoteChild) -> Result<(), OfferRefused> {
         Ok(())
     }
-    fn mounted(&self, _: &Offer, _: &RemoteChild, _: &Arc<PeerSocket>) {}
+    fn mounted(&self, _: &Offer, _: &RemoteChild, _: &Arc<PeerSocket>) -> Result<(), OfferRefused> {
+        Ok(())
+    }
     fn closed(&self, _: u64, _: Option<&str>, _: &str) {}
 }
 
@@ -102,6 +104,11 @@ impl Drop for Relay {
 
 /// A relay proving a key of `seed`, its offers decided by a recording admission.
 async fn relay(seed: u8) -> Relay {
+    relay_for(seed, None).await
+}
+
+/// [`relay`], also taking sign-ins addressed to `also` (a proxy's URL).
+async fn relay_for(seed: u8, also: Option<String>) -> Relay {
     let port = port();
     let key = plexus_core::plexus::peer_token::PeerKey::from_seed([seed; 32]);
     let principal = key.kid().to_string();
@@ -109,7 +116,7 @@ async fn relay(seed: u8) -> Relay {
     let peers = Peers::new("peers", "relay", "service:relay").with_timeout(Duration::from_secs(5)).with_key(key).with_admission(Arc::new(Recording(seen.clone())));
     let service = Arc::new(DynamicHub::new("relay"));
     let url = format!("ws://127.0.0.1:{port}/ws");
-    let keys = KeyProofAdapter::new([url.clone()].iter()).unwrap();
+    let keys = KeyProofAdapter::new([Some(url.clone()), also].into_iter().flatten()).unwrap();
     let chain = Carriers::cookie_and_bearer(AuthenticatorChain::new().with(Arc::new(keys)));
     let for_hook = peers.clone();
     let hooks = Hooks::new(move |conn, ext| {
@@ -269,4 +276,98 @@ async fn a_relay_swapping_keys_shows_each_side_another_code() {
     let host_code = host.seen.offers.lock().unwrap()[0].code.clone().unwrap();
     assert_ne!(node_code, host_code, "a key swapped in the middle shows in the code");
     assert_ne!(shown.lock().unwrap()[0].key, host.principal, "and in the key shown");
+}
+
+/// Review M2: a relay in the middle that passes everything on but takes
+/// `host_nonce` out of what the host says — so first contact would have no
+/// pairing code to compare.
+async fn stripping_proxy(port: u16, to: String) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else { break };
+            let to = to.clone();
+            tokio::spawn(async move {
+                let bearer = Arc::new(Mutex::new(None::<String>));
+                let seen = bearer.clone();
+                let down = tokio_tungstenite::accept_hdr_async(tcp, move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                    *seen.lock().unwrap() = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+                let mut req = to.as_str().into_client_request().unwrap();
+                if let Some(b) = bearer.lock().unwrap().clone() {
+                    req.headers_mut().insert("authorization", b.parse().unwrap());
+                }
+                let (up, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+                let (mut down_tx, mut down_rx) = down.split();
+                let (mut up_tx, mut up_rx) = up.split();
+                let to_host = async move {
+                    while let Some(Ok(m)) = down_rx.next().await {
+                        if up_tx.send(m).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let to_node = async move {
+                    while let Some(Ok(m)) = up_rx.next().await {
+                        let m = match m {
+                            Message::Text(t) => {
+                                let mut v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                                strip(&mut v);
+                                Message::text(v.to_string())
+                            }
+                            other => other,
+                        };
+                        if down_tx.send(m).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                tokio::join!(to_host, to_node);
+            });
+        }
+    });
+}
+
+fn strip(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(o) => {
+            o.remove("host_nonce");
+            o.values_mut().for_each(strip);
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(strip),
+        _ => {}
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_contact_with_no_pairing_code_is_refused_unasked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (k, _) = key(dir.path(), "node", 7);
+    let hosts = dir.path().join("known_hosts");
+    let pp = port();
+    let proxy_url = format!("ws://127.0.0.1:{pp}/ws");
+    let relay = relay_for(38, Some(proxy_url.clone())).await;
+    stripping_proxy(pp, relay.url.clone()).await;
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let said = shown.clone();
+    let a = Exposed::new(DialOut::new(proxy_url.clone(), &k).mount("alice")).with_first_contact(&hosts, move |c| {
+        said.lock().unwrap().push(c);
+        async move { true }
+    });
+    a.serve(GreeterActivation);
+    let refused = a.mounted(Duration::from_secs(10)).await.unwrap_err();
+    assert!(refused.contains("no_pairing_code"), "{refused}");
+    assert!(shown.lock().unwrap().is_empty(), "asked with no code to compare: {:?}", shown.lock().unwrap());
+    assert!(!hosts.exists(), "pinned with no code");
+    assert!(relay.peers.names().is_empty() && relay.seen.offers.lock().unwrap().is_empty());
+    // A host already trusted is reached through it (an older host has no pairing).
+    let b = Exposed::new(DialOut::new(proxy_url, &k).trust(relay.principal.clone()).mount("bob"));
+    b.serve(GreeterActivation);
+    assert_eq!(b.mounted(Duration::from_secs(10)).await.unwrap(), "peers.bob");
+    assert_eq!(b.code(), None);
 }

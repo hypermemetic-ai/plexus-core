@@ -5,6 +5,161 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1]
+
+KEEL-19 (security, High): **a peer token is taken only from whoever it
+names, and an exchange is the service's decision.** In 0.11.0 a verifying
+peer (`ServeChild::tokens`) believed a hop whose token verified whoever
+sent it, and `TokenIssuer::exchange` asked nothing of the presenter — so a
+peer handed a caller's token could exchange it for one addressed to another
+peer and call that peer directly as the caller.
+
+- **The audience knows who presents.** A token's `cnf` names the key that
+  must present it. A token the service forwards is bound to the audience's
+  own key, as before, and a verifying child takes it only from a sender
+  `ChildPeer` takes (the service's own connection, or its pipe): it narrows
+  what that sender says and no longer overrides `takes`. A token bound to
+  another key — an exchanged one, bound now to its presenter's key — is
+  taken only with that key's proof of possession in the hop (`hop.proof`:
+  `prove(key, token, <method>, <hop.call>)`), over a connection proven as
+  that key when the input is one.
+- **An exchange is decided.** `TokenIssuer::exchange_decided` (new) checks
+  the subject token and its proof, then hands its claims to the service's
+  decision (`decide`, answering an `Onward` — audience and scope — or an
+  `ExchangeRefusal` and why), and mints the token bound to the presenter.
+  `RemoteChild::may_exchange` (new) is that decision for a mounted child: it
+  asks the one function its calls back are asked by (`Upcalls::decide`: not
+  revoked, the need declared and consented, held by the token) and answers
+  the scope. `TokenIssuer::exchange` stays the undecided primitive, now bound
+  to the presenter too.
+- **Once.** A subject token is exchanged once per (`jti`, audience,
+  method); a second ask is refused.
+- **Audited.** Every refused exchange is a `plexus::audit` warning and goes
+  to `TokenAudit::refused` (new, a default no-op): `ExchangeRefused` names
+  the presenter, subject, audience, method, the subject's call and `jti`,
+  the reason and why — never a token or a proof.
+- A revoked child is decided nothing but the standard interface: its
+  exchange is refused at once (`RemoteChild::revoke` keeps the mark with its
+  calls back now).
+
+Second pass (the review re-attacked: a peer that relayed another's `_info`
+key proof was registered under its key, and sent that peer the tokens
+minted for calls into itself):
+
+- **A forwarded hop proves its sender.** The service signs each forwarded
+  hop's proof with the key that signed its token
+  (`TokenIssuer::prove_forward`: over the token, its method and call), sent
+  as `hop.proof`; a verifying child takes a token bound to its own key only
+  with that proof, checked against the JWKS it trusts — on a pipe and a
+  connection alike — and on a connection only from a sender `takes`.
+- **A pipe proves nobody.** `serve_child_with` refuses (`InvalidInput`) a
+  `ChildPeer::Pipe` with a key, or with a verifier addressed to a key: a
+  keyed child is served on `ChildPeer::connection` only.
+- **The `_info` key proof is bound to its asker** (KEEL-21's core, folded
+  in): `plexus-peer-key/v2\n<nonce>\n<backend>\n<asker>`, the asker the
+  principal the prover's connection proved (on a pipe, the one its parent
+  names). A mount checks it was made for its own principal; a dial-out
+  checks its relay's was made for its own key (KEEL-8's `relay_proved`, the
+  relay's `Peers::with_key` answer): one form, `PeerKey::key_proof_for(nonce,
+  backend, asker)` / `check_key_proof_for(key, proof, nonce, backend, asker)`
+  (third pass's names).
+  Not bound: the URL dialed, or a TLS exporter on `wss`.
+- **The consent of now** (KEEL-20's first row): `Upcalls::decide` answers
+  the scopes both the token holds and consent allows now; a call back and
+  an exchange both take that.
+- **A replay does not burn a token**: a child spends a token's `jti` only
+  once its sender is proven.
+- `TokenIssuer::exchange` is deprecated and hidden (undecided; a service
+  uses `exchange_decided`).
+
+Third pass (the review re-attacked: a service with no dial key acts as the
+name `service:dyn`, which no transport proves; a peer "trusting" that name
+signed its proof for it whoever asked):
+
+- **The asker is a proven key, on both sides.** `serve_child_with` refuses
+  (`InvalidInput`) a key, or a key-addressed verifier, on a `Pipe` or on a
+  `Connection` whose `proven` is not a `key:` principal. A service whose
+  own principal is not a key mounts no keyed peer — its mount is refused
+  `keyed_mount_needs_a_key` (`KEYED_MOUNT_NEEDS_A_KEY`), saying to give it
+  a dial key — and mints no key-addressed token.
+- **The accepting side, built** (`serve_child_ws`, `KeyedUpgrade`, beside
+  `ws.rs`): nothing in the tree verified the upgrade's `plexus-key.` proof
+  for a child and handed `ChildPeer::connection` the principal it proved
+  (plexus-transport verifies it for a service's callers, through
+  plexus-auth-core's `KeyProofAdapter`, but no child is served through it).
+  `serve_child_ws` takes the upgrade only with a key proof addressed to one
+  of the child's URLs, fresh and unseen, and serves the child on a
+  connection proven as that key.
+- `PeerKey::key_proof_for` / `check_key_proof_for` are the asker-bound
+  forms. `PeerKey::key_proof` and `check_key_proof` keep their 0.11.0
+  signatures, deprecated: the first makes a v1 proof nothing accepts, the
+  second refuses every proof, naming the new one.
+
+Fourth pass (the review re-attacked: `proven` was a string an operator
+could write as the service's key):
+
+- **A proven principal is a type** (`Proven`): no constructor from a
+  string, made only by `KeyedUpgrade::verify` (moved out of the `child-ws`
+  feature). A keyed or key-verifying child is served only by
+  `serve_child_proven(…, Proven, trusted, key, tokens)` (`serve_child_ws`
+  calls it); `serve_child_with` refuses one whatever `ChildPeer` it is
+  given. `ChildPeer::connection` stays for keyless children and says it
+  proves nothing. `dial_proof` signs a key proof for a client of a keyed
+  child.
+- **A revoke after the dial** (KEEL-22's first row): `mint` and the call
+  back's `open` ask `revoked` again, after `forward` awaited the dial;
+  `open` asks it under the lock `revoke` drains.
+- **Key files** (`PeerKey::load_or_create`, a child's `--child-key`) are
+  opened `O_NOFOLLOW`, must be the effective user's and 0600, and are made
+  `O_EXCL`; `ensure_private_dir` and `read_private_if_any` (new) do the same
+  for a directory (0700) and a private file.
+- `_info` is refused as the target of `{ns}.call`.
+
+Fifth pass:
+
+- **A full upgrade ledger refuses; it never forgets early.** `KeyedUpgrade`
+  holds at most 4096 proofs (`UPGRADE_LEDGER_MAX`), each until its 60 s
+  window ends (expired ones are dropped at every upgrade). Full, it refuses
+  the upgrade — HTTP 401 at `serve_child_ws`, `this child holds 4096 key
+  proofs in their 60 s window: a new upgrade is refused until some expire`
+  — and warns on `plexus::audit` (`child upgrade ledger full`, the count
+  held and refused) at most once per 10 s. (Before, it evicted the
+  earliest-expiring proof, which a flood of proofs by fresh keys could use
+  to replay a captured one.) At most 4096 upgrades a minute per child.
+- **A sign-in is not a child dial, with no wire change.** A child dial's
+  key proof is signed as the reserved agent `plexus.child-dial`
+  (`CHILD_DIAL_AGENT`; `ws::dial`, `dial_proof`); `KeyedUpgrade` takes
+  only that agent (`a key proof as agent `…`, not a child dial`), so a
+  sign-in proof replayed to a child listing the same URL is refused. A
+  server's sign-in (plexus-auth-core's `KeyProofAdapter`, unchanged) takes
+  a dial proof as the dialing key's sign-in for its own URL, by design: a
+  service mounting a service behind key sign-in keeps working
+  (`tests/dial.rs` mounts one through the real adapter). The form and
+  context stay spec/00's. A dial-out (KEEL-8) signs into its relay as its
+  own agent, as before: that is a sign-in.
+- `Proven` is not `Clone`: the proof of one socket's upgrade, consumed by
+  serving it. `dial_proof(key, aud)`.
+
+**Behaviour changes for a security release (no signature changed):**
+`serve_child_with` refuses, at start, every keyed or key-verifying child
+(`InvalidInput`: serve it with `serve_child_ws` / `serve_child_proven`);
+a key file that is a link, another user's or open to group or others is
+refused; a service with no dial key refuses a keyed peer at mount
+(`keyed_mount_needs_a_key`); `TokenIssuer::exchange` binds its token to the
+presenter and gives it once; a keyed child's upgrade is refused unless
+its proof is made as agent `plexus.child-dial`, and with a full ledger.
+
+**Required upgrade of both sides (wire):** `KEY_PROOF_CONTEXT` is v2, so a
+0.11.1 service refuses the `_info` key proof of a 0.11.0 peer (it is not
+mounted until upgraded), and a 0.11.1 dial-out refuses a 0.11.0 relay's.
+A 0.11.1 verifying peer refuses a 0.11.0 service's forwarded hops (no
+`hop.proof`) and the token of a 0.11.0 `dyn.exchange` sent by its presenter.
+A 0.11.0 verifying peer ignores `hop.proof` and still believes any verified
+token whoever sends it — upgrade the peers. A 0.11.0 service's dial (agent
+not `plexus.child-dial`) is refused at a 0.11.1 keyed child's upgrade; a
+0.11.1 dial reaches a 0.11.0 child, which checks no upgrade proof. So
+upgrade the service and its keyed peers together.
+
 ## [Unreleased] — 0.11.0
 
 KEEL-8 (breaking: a dial-out without `DialOut::trust` is refused;

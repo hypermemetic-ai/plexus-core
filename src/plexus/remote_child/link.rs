@@ -517,6 +517,10 @@ struct LinkState {
 }
 
 /// The child across its connections.
+/// KEEL-19: the word a mount's refusal starts with when a keyed peer meets
+/// a service with no dial key.
+pub const KEYED_MOUNT_NEEDS_A_KEY: &str = "keyed_mount_needs_a_key";
+
 pub(super) struct Shared {
     pub spec: ChildSpec,
     pub opts: ChildOptions,
@@ -534,8 +538,6 @@ pub(super) struct Shared {
     /// a restart that proves another is refused, as one that publishes
     /// another schema is.
     pub identity: OnceLock<super::PeerIdentity>,
-    /// DYNAUTH-7: revoked, and why: no call is forwarded, no token minted.
-    pub revoked: Mutex<Option<String>>,
 }
 
 impl Drop for Shared {
@@ -612,7 +614,6 @@ impl Shared {
             dial: tokio::sync::Mutex::new(()),
             mounted_hash: OnceLock::new(),
             identity: OnceLock::new(),
-            revoked: Mutex::new(None),
         })
     }
 
@@ -642,12 +643,27 @@ impl Shared {
             // its own answers it signed (`key`, `proof`), and that key is
             // registered and pinned with the mount. One that answers a key
             // it cannot prove is refused; one that names none has none.
+            // KEEL-19: the proof is made for this service — the principal its
+            // connection proved (`asker` on a pipe, where nothing is proved):
+            // one made for another asker, relayed, is refused.
             let nonce = crate::plexus::peer_token::random_nonce();
-            let info = ask(&conn, "_info", json!({ "nonce": nonce }), self.opts.timeout).await.map_err(|e| format!("`_info`: {e}"))?;
+            let info = ask(&conn, "_info", json!({ "nonce": nonce, "asker": self.principal }), self.opts.timeout).await.map_err(|e| format!("`_info`: {e}"))?;
             let ns = info.get("backend").and_then(Value::as_str).ok_or("its `_info` names no backend")?.to_string();
             if let Some(key) = info.get("key").and_then(Value::as_str) {
+                // KEEL-19: the asker a key proof is made for is this
+                // service's key, which its dial proved; a principal no
+                // transport proves (`service:dyn`) is every service's.
+                if crate::plexus::peer_token::key_of(&self.principal).is_none() {
+                    return Err(format!(
+                        "{KEYED_MOUNT_NEEDS_A_KEY}: its `_info` proves the key {key}, and this service dials as `{}`, which no transport proves: give the service a dial key (ChildOptions::key) to mount a keyed peer",
+                        self.principal
+                    ));
+                }
                 let proof = info.get("proof").and_then(Value::as_str).unwrap_or_default();
-                crate::plexus::peer_token::check_key_proof(key, proof, &nonce, &ns).map_err(|e| format!("its `_info` names the key {key} without proving it: {e}"))?;
+                crate::plexus::peer_token::check_key_proof_for(key, proof, &nonce, &ns, &self.principal).map_err(|e| {
+                    let made_for = info.get("asker").and_then(Value::as_str).filter(|a| *a != self.principal).map(|a| format!(" (it was made for {a}, not for {})", self.principal)).unwrap_or_default();
+                    format!("its `_info` names the key {key} without proving it to this service: {e}{made_for}")
+                })?;
                 let _ = conn.peer_key.set(key.to_string());
             }
             let _ = conn.ns.set(ns.clone());

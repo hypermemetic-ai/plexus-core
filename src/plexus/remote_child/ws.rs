@@ -18,7 +18,9 @@ use super::link::{gone, Conn, Shared};
 use super::spec::{check_ws_url, INSECURE_TRANSPORT};
 
 const PROOF_PREFIX: &str = "plexus-key.";
-const PROOF_CONTEXT: &str = "plexus-key-login/v1";
+/// spec/00's one key-proof context — a dial-out signing in to its relay and
+/// a mount dialing its child alike (plexus-wire spec/00 has no other).
+pub(super) const LOGIN_CONTEXT: &str = super::proven::KEY_PROOF_CONTEXT;
 
 fn b64url(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -29,15 +31,8 @@ fn b64url(b: &[u8]) -> String {
 /// may read it.
 pub(super) fn read_seed(path: &Path) -> Result<SigningKey, String> {
     let shown = path.display();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path).map_err(|e| format!("the key file {shown}: {e}"))?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(format!("the key file {shown} is readable by others (mode {:o}); a key is kept 0600", mode & 0o777));
-        }
-    }
-    let raw = std::fs::read(path).map_err(|e| format!("the key file {shown}: {e}"))?;
+    // KEEL-19 (P5): not through a link, the user's own, 0600.
+    let raw = crate::plexus::peer_token::read_private(path).map_err(|e| format!("the key file {e}"))?;
     let text: Vec<u8> = raw.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
     let engines = [
         &base64::engine::general_purpose::STANDARD,
@@ -61,10 +56,11 @@ pub(super) fn principal_of(key: &SigningKey) -> String {
 
 /// The bearer value `plexus-key.<base64url(JSON)>` (spec/00, IDENTITY-41):
 /// `{"v":1,"key","aud","agent","nonce","ts","sig"}` in that order, signed
-/// over `plexus-key-login/v1\n<aud>\n<agent>\n<nonce>\n<ts>`.
-pub(super) fn key_proof(key: &SigningKey, aud: &str, agent: &str, nonce: &[u8; 32], ts: i64) -> String {
+/// over `<context>\n<aud>\n<agent>\n<nonce>\n<ts>` — `context` spec/00's
+/// [`LOGIN_CONTEXT`].
+pub(super) fn key_proof(key: &SigningKey, context: &str, aud: &str, agent: &str, nonce: &[u8; 32], ts: i64) -> String {
     let nonce = b64url(nonce);
-    let sig = key.sign(format!("{PROOF_CONTEXT}\n{aud}\n{agent}\n{nonce}\n{ts}").as_bytes());
+    let sig = key.sign(format!("{context}\n{aud}\n{agent}\n{nonce}\n{ts}").as_bytes());
     let hex: String = key.verifying_key().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     let s = |v: &str| serde_json::to_string(v).unwrap_or_default();
     let body = format!(
@@ -134,7 +130,9 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     if let Some(path) = &shared.opts.key {
         let key = read_seed(path)?;
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-        let proof = key_proof(&key, url.trim_end_matches('/'), &shared.opts.agent, &nonce(), ts);
+        // KEEL-19 (P2): a child dial is signed as the reserved agent, never as
+        // a sign-in (spec/00's one form; `agent` is in the signed bytes).
+        let proof = key_proof(&key, LOGIN_CONTEXT, url.trim_end_matches('/'), super::proven::CHILD_DIAL_AGENT, &nonce(), ts);
         let value = HeaderValue::from_str(&format!("Bearer {proof}")).map_err(|e| e.to_string())?;
         req.headers_mut().insert(AUTHORIZATION, value);
     }
@@ -225,6 +223,77 @@ pub(super) async fn dial(shared: &Arc<Shared>, url: &str) -> Result<Arc<Conn>, S
     Ok(conn)
 }
 
+// ------------------------------------------------------------------ KEEL-19
+
+use super::proven::KeyedUpgrade;
+
+/// KEEL-19 · serve `activation` as a keyed child on one accepted socket
+/// (`stream`, a TCP connection or anything like it): the WebSocket upgrade
+/// is taken only with a key proof `upgrade` verifies, and the
+/// child is then served ([`super::serve_child_proven`]) on a connection
+/// proven as that key,
+/// trusting `trusted` (service principals, `key:<hex>`) to act for others.
+/// The child's `key` and token verifier (`tokens`) as [`super::ServeChild`]
+/// has them. An upgrade without a valid proof is refused (401) and served
+/// nothing.
+pub async fn serve_child_ws<A, S>(activation: A, stream: S, upgrade: &KeyedUpgrade, trusted: Vec<String>, key: Option<crate::plexus::peer_token::PeerKey>, tokens: Option<Arc<crate::plexus::peer_token::Verifier>>) -> std::io::Result<()>
+where
+    A: crate::plexus::plexus::Activation + Clone,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    let proven = std::sync::Mutex::new(None::<Result<super::Proven, String>>);
+    #[allow(clippy::result_large_err)] // tungstenite's handshake callback's own signature
+    let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+        let bearer = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or_default();
+        let verdict = upgrade.verify(bearer);
+        let ok = verdict.is_ok();
+        *proven.lock().unwrap() = Some(verdict);
+        if ok {
+            Ok(resp)
+        } else {
+            let mut refused = ErrorResponse::new(Some("a child is dialed with a key proof".into()));
+            *refused.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+            Err(refused)
+        }
+    };
+    let ws = tokio_tungstenite::accept_hdr_async(stream, check).await;
+    let proven = match (proven.lock().unwrap().take(), ws) {
+        (Some(Ok(p)), Ok(ws)) => (p, ws),
+        (Some(Err(why)), _) => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, why)),
+        (_, Err(e)) => return Err(std::io::Error::other(e.to_string())),
+        (None, Ok(_)) => return Err(std::io::Error::other("no upgrade was checked")),
+    };
+    let (principal, ws) = proven;
+    let (mut sink, mut source) = ws.split();
+    let (mut in_w, in_r) = tokio::io::duplex(1 << 20);
+    let (out_w, out_r) = tokio::io::duplex(1 << 20);
+    let pump_in = async move {
+        while let Some(Ok(m)) = source.next().await {
+            match m {
+                Message::Text(t) => {
+                    if in_w.write_all(t.as_bytes()).await.is_err() || in_w.write_all(b"\n").await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    };
+    let pump_out = async move {
+        let mut lines = tokio::io::BufReader::new(out_r).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if sink.send(Message::text(l)).await.is_err() {
+                break;
+            }
+        }
+    };
+    let (_, _, served) = tokio::join!(pump_in, pump_out, super::serve_child_proven(activation, in_r, out_w, principal, trusted, key, tokens));
+    served
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,7 +301,7 @@ mod tests {
     #[test]
     fn the_proof_reads_as_spec_00_says() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        let p = key_proof(&key, "ws://127.0.0.1:4480", "menger", &[1u8; 32], 1_793_000_000);
+        let p = key_proof(&key, LOGIN_CONTEXT, "ws://127.0.0.1:4480", "menger", &[1u8; 32], 1_793_000_000);
         let body = p.strip_prefix(PROOF_PREFIX).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).unwrap()).unwrap();
         let text = String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).unwrap()).unwrap();

@@ -166,6 +166,92 @@ plexus-core includes two minimal example activations:
 
 See `src/activations/` for implementation examples.
 
+## The rules a keyed peer and its service apply (KEEL-19)
+
+What the code checks, in order — the text a change to `remote_child` or
+`peer_token` is checked against.
+
+**Before a peer runs a hop** (`{ns}.call` for method M; a schema call needs
+none of this):
+
+1. A child with a key, or verifying tokens addressed to a key, is served
+   only by `serve_child_proven`, which takes a `Proven` — a type with no
+   constructor from a string, made only by `KeyedUpgrade::verify` checking
+   the upgrade's `plexus-key.` proof (`serve_child_ws` does it) — and is
+   believed from that principal alone. `serve_child_with` refuses one,
+   whatever `ChildPeer` it is given.
+2. A keyless, non-verifying child (`serve_child_with`) believes every
+   sender its `ChildPeer` takes. Served as `ChildPeer::Pipe` on a
+   WebSocket, it believes every sender who can reach that socket, as
+   whoever the frame claims to be. **Do not do this**: a keyless child
+   belongs on its parent's stdin/stdout or a socket only that parent can
+   open; a child reachable over a network has a key and is served with
+   `serve_child_ws`. On `ChildPeer::connection` the sender is the string it
+   was given, which proves nothing by itself.
+3. With a verifier, the hop's token must verify: an EdDSA JWS signed by a trusted
+   JWKS key (`iss` = `kid`), `aud` this child, within its times, naming
+   `hop.call` and M, its `sub` the hop's caller, its scope holding the
+   hop's grant on every scope the hop says.
+4. And its sender must be proven by `hop.proof` over (token, M, `hop.call`):
+   a token bound to this child's own key (or, to a pipe, to none) is the
+   service's forward — the proof by its issuer key, and on a connection a
+   sender `ChildPeer` takes; a token bound to another key is an exchanged
+   one — the proof by that key, over a connection proven as it, which the
+   hop names. Only then is the token's `jti` spent (once).
+5. Then the far side's own check (the hop's grant is M or M's slot) and M
+   runs as the hop's caller, within the scopes the hop says.
+
+**Before a service mounts a keyed peer** (`RemoteChild::connect`):
+
+1. It dials with its own key proof on the upgrade (`ChildOptions::key`;
+   plexus-dyn: `<data_dir>/dial.key` by default), so its principal is the
+   `key:` the peer's transport proves.
+2. It asks `_info {nonce, asker}`; a peer that names a key must prove it
+   with `plexus-peer-key/v2` over (nonce, backend, the asker its connection
+   proved), checked against the service's own principal — refused when
+   that principal is not a key (`keyed_mount_needs_a_key`) or the proof was
+   made for anyone else.
+3. The key is pinned with the peer's identity: a remount proving another
+   is refused (`identity_changed`); plexus-dyn refuses a key another peer
+   holds, mounted or pinned (`identity_changed`, `key_in_use:`), checked
+   where the entry is reserved.
+4. Tokens are minted for that key only while it is mounted and not
+   revoked — asked at the top of each forward and again, after the dial
+   it may await, where the token is minted and where its call back is
+   opened — by a service whose principal is a key; each forwarded hop
+   carries the service's proof (`TokenIssuer::prove_forward`).
+5. An exchange (`dyn.exchange`) is decided as a call back is: the presenter
+   mounted, not revoked, holding a consented need for the audience and the
+   method, within the consent of now; once per (`jti`, audience, method);
+   the token bound to the presenter's key.
+
+Replay: an upgrade's key proof is taken once while its 60 s window lasts,
+and a token's `jti` once while it lives. `KeyedUpgrade` holds at most 4096
+proofs (`UPGRADE_LEDGER_MAX`); full, it **refuses** a new upgrade — never
+forgets a proof early — until proofs leave their window: the dialer gets
+HTTP 401 with `this child holds 4096 key proofs in their 60 s window: a new
+upgrade is refused until some expire`, and the child logs a warning on
+target `plexus::audit` (`child upgrade ledger full`, with the count held
+and refused) at most once per 10 s. So at most 4096 upgrades a minute are
+taken per child (about 68 a second, sustained); a flood can deny upgrades
+for a minute, never replay one. Both are kept in memory: a restarted child
+forgets, so a proof or token captured in the 60 s before a restart can be
+replayed to it once after it (a token only while it lives, at most its
+`exp`).
+
+Key files and the data directory are the user's own, 0600 and 0700, never
+read through a symbolic link.
+
+A child dial's key proof is spec/00's one form, signed as the reserved agent
+`plexus.child-dial` (`CHILD_DIAL_AGENT`; `agent` is in the signed bytes): a
+child takes only that agent, so a sign-in proof replayed to a child at
+the same URL is refused. A server's sign-in (plexus-auth-core's
+`KeyProofAdapter`) takes a dial proof as the dialing key's sign-in, by
+design: a dial proof is addressed to the dialed URL and usable only there,
+and it is how a service mounts another service behind key sign-in
+(`--child far=wss://…`, `dyn.connect`). A context of its own would be a
+plexus-wire spec/00 change, not made.
+
 ## License
 
 AGPL-3.0-only

@@ -397,7 +397,11 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
         Err(e) => return Outcome::Refused(e),
     };
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let proof = key_proof(&key, opts.url.trim_end_matches('/'), &opts.agent, &nonce(), ts);
+    // A dial-out signs in to its relay (a service): the sign-in context.
+    let proof = key_proof(&key, super::ws::LOGIN_CONTEXT, opts.url.trim_end_matches('/'), &opts.agent, &nonce(), ts);
+    // KEEL-19: who this dial-out proves to be — what the relay's `_info`
+    // proof must be made for.
+    let me = principal_of(&key);
     drop(key);
     match HeaderValue::from_str(&format!("Bearer {proof}")) {
         Ok(v) => req.headers_mut().insert(AUTHORIZATION, v),
@@ -552,7 +556,7 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
             return ended(host, format!("the relay did not answer `_info` in {:?}", opts.timeout), false);
         }
     };
-    if let Err(why) = relay_proved(&trusted, &service, &asked, key.as_deref(), key_proof.as_deref()) {
+    if let Err(why) = relay_proved(&trusted, &service, &asked, &me, key.as_deref(), key_proof.as_deref()) {
         reader.abort();
         ended(host, String::new(), false);
         tracing::warn!(target: "plexus::audit", url = %opts.url, "dial-out refused: {why}");
@@ -626,15 +630,16 @@ fn trusted_key(trust: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// KEEL-8: whether the relay's `_info` proved `trusted` over `nonce`.
-fn relay_proved(trusted: &str, backend: &str, nonce: &str, key: Option<&str>, proof: Option<&str>) -> Result<(), String> {
+/// KEEL-8: whether the relay's `_info` proved `trusted` over `nonce` —
+/// KEEL-19: made for `me`, the key this dial-out proved to it.
+fn relay_proved(trusted: &str, backend: &str, nonce: &str, me: &str, key: Option<&str>, proof: Option<&str>) -> Result<(), String> {
     let Some(key) = key else {
         return Err(format!("the relay proved no key at `_info` (trusted: {trusted})"));
     };
     if key != trusted {
         return Err(format!("the relay proved another key ({key}) than the one trusted ({trusted})"));
     }
-    crate::plexus::peer_token::check_key_proof(key, proof.unwrap_or_default(), nonce, backend)
+    crate::plexus::peer_token::check_key_proof_for(key, proof.unwrap_or_default(), nonce, backend, me)
         .map(|_| ())
         .map_err(|e| format!("the relay's `_info` names the key {key} without proving it: {e}"))
 }

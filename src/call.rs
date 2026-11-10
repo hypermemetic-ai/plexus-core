@@ -455,8 +455,11 @@ pub struct Hop {
     /// DYNAUTH-12: the peer token the service minted for this one call
     /// (`plexus::peer_token`): addressed to this child, bound to its key,
     /// naming `call` and the method. A child that verifies
-    /// (`ServeChild::tokens`) believes the hop by it rather than by its
-    /// sender. Never logged.
+    /// (`ServeChild::tokens`) checks the hop by it, and (KEEL-19) believes
+    /// it only from whoever the token's `cnf` names: the service's own
+    /// connection for a token it forwards, or the presenter, with its proof
+    /// (the hop's `proof`, beside the token), for one exchanged
+    /// (`dyn.exchange`). Never logged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }

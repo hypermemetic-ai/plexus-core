@@ -399,30 +399,10 @@ impl RemoteChild {
         let up = &self.inner.shared.upcalls;
         let svc = up.host().and_then(|h| h.upgrade()).ok_or_else(|| format!("`{}`'s service is not known yet", self.name()))?;
         let decided = up.decide(need, Some((&svc, presented))).map_err(|(_, said)| said)?;
-        let Some(upcall::Decided { consented, held: Some(held) }) = decided else {
+        let Some(upcall::Decided { held: Some(held), .. }) = decided else {
             return Err(format!("`{need}` is not among `{}`'s needs", self.name()));
         };
-        let within = |inner: &str, outer: &str| outer == "*" || inner == outer;
-        let mut scope: Vec<String> = Vec::new();
-        for h in &held {
-            for c in &consented {
-                let s = if within(h, c) {
-                    h
-                } else if within(c, h) {
-                    c
-                } else {
-                    continue;
-                };
-                let e = format!("{forwarded}@{s}");
-                if !scope.contains(&e) {
-                    scope.push(e);
-                }
-            }
-        }
-        if scope.is_empty() {
-            return Err(format!("`{need}` is consented on {consented:?}, and the token holds it on {held:?}: nowhere both"));
-        }
-        Ok(scope)
+        Ok(held.iter().map(|s| format!("{forwarded}@{s}")).collect())
     }
 
     /// DYNAUTH-5: the Ed25519 key the child proved at its mount
@@ -699,6 +679,18 @@ impl RemoteChild {
         };
         if let Some(m) = &minted {
             hop["token"] = json!(m.token);
+            // KEEL-19: and the service's proof that it sends it, by the key
+            // that signed it — checked by the child against the JWKS it
+            // trusts, on a pipe and a connection alike.
+            if let Some(issuer) = shared.opts.tokens.as_ref() {
+                match issuer.prove_forward(&m.token, &m.claims) {
+                    Ok(p) => hop["proof"] = json!(p),
+                    Err(why) => {
+                        let e = PlexusError::Unauthenticated(format!("no proof could be signed for `{}`'s token: {why}", self.name()));
+                        return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false));
+                    }
+                }
+            }
         }
         // NEST-11: the child may call back under this call while it is open.
         let under = shared.upcalls.open(&call_id, auth, &reach, minted);

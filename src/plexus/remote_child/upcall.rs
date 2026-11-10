@@ -120,8 +120,10 @@ pub(super) struct Upcalls {
 }
 
 /// KEEL-19: what [`Upcalls::decide`] answers for a need: the scopes it is
-/// consented on (`["*"]` anywhere), and, decided under a token, the scopes
-/// that token holds its grant on.
+/// consented on now (`["*"]` anywhere), and, decided under a token, the
+/// scopes both that token holds its grant on and the consent holds now
+/// (KEEL-20's first row: a consent narrowed while a call is open narrows
+/// the next call back made under it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Decided {
     pub consented: Vec<String>,
@@ -183,7 +185,12 @@ impl Upcalls {
                     let e = parent::not_needed(method);
                     return Err((e, format!("`{method}` is not within the scope of the token minted for this call")));
                 }
-                Some(held)
+                let both = intersect(&held, &consented);
+                if both.is_empty() {
+                    let e = parent::not_needed(method);
+                    return Err((e, format!("`{method}` is consented on {consented:?} now, and the token holds it on {held:?}: nowhere both")));
+                }
+                Some(both)
             }
         };
         Ok(Some(Decided { consented, held }))
@@ -281,6 +288,28 @@ impl Upcalls {
     pub(super) fn open_now(&self) -> usize {
         self.under.lock().unwrap().len()
     }
+}
+
+/// Each scope both `a` and `b` hold, the narrower of each pair (`*` holds
+/// every scope).
+fn intersect(a: &[String], b: &[String]) -> Vec<String> {
+    let within = |inner: &str, outer: &str| outer == "*" || inner == outer;
+    let mut out: Vec<String> = Vec::new();
+    for x in a {
+        for y in b {
+            let s = if within(x, y) {
+                x
+            } else if within(y, x) {
+                y
+            } else {
+                continue;
+            };
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
 }
 
 /// A forwarded call's standing for the child's calls back: dropped, the

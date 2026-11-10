@@ -42,11 +42,45 @@ peer and call that peer directly as the caller.
   exchange is refused at once (`RemoteChild::revoke` keeps the mark with its
   calls back now).
 
-Wire: a hop may carry `proof` beside `token`. A 0.11.0 verifying peer
-ignores it and still believes any verified token (upgrade the peers); a
-0.11.1 peer refuses a token of a 0.11.0 service's `dyn.exchange` sent
-directly by its presenter (bound to the audience's key, which the presenter
-cannot prove), while hops the service forwards are unchanged.
+Second pass (the review re-attacked: a peer that relayed another's `_info`
+key proof was registered under its key, and sent that peer the tokens
+minted for calls into itself):
+
+- **A forwarded hop proves its sender.** The service signs each forwarded
+  hop's proof with the key that signed its token
+  (`TokenIssuer::prove_forward`: over the token, its method and call), sent
+  as `hop.proof`; a verifying child takes a token bound to its own key only
+  with that proof, checked against the JWKS it trusts — on a pipe and a
+  connection alike — and on a connection only from a sender `takes`.
+- **A pipe proves nobody.** `serve_child_with` refuses (`InvalidInput`) a
+  `ChildPeer::Pipe` with a key, or with a verifier addressed to a key: a
+  keyed child is served on `ChildPeer::connection` only.
+- **The `_info` key proof is bound to its asker** (KEEL-21's core, folded
+  in): `plexus-peer-key/v2\n<nonce>\n<backend>\n<asker>`, the asker the
+  principal the prover's connection proved (on a pipe, the one its parent
+  names). A mount checks it was made for its own principal; a dial-out
+  checks its relay's was made for its own key (KEEL-8's `relay_proved`, the
+  relay's `Peers::with_key` answer): one form, `PeerKey::key_proof(nonce,
+  backend, asker)` / `check_key_proof(key, proof, nonce, backend, asker)`.
+  Not bound: the URL dialed, or a TLS exporter on `wss`.
+- **The consent of now** (KEEL-20's first row): `Upcalls::decide` answers
+  the scopes both the token holds and consent allows now; a call back and
+  an exchange both take that.
+- **A replay does not burn a token**: a child spends a token's `jti` only
+  once its sender is proven.
+- `TokenIssuer::exchange` is deprecated and hidden (undecided; a service
+  uses `exchange_decided`).
+
+**Breaking (Rust API):** `PeerKey::key_proof` and `check_key_proof` take an
+`asker`; `serve_child_with` refuses a keyed or key-verifying `Pipe`.
+
+**Required upgrade of both sides (wire):** `KEY_PROOF_CONTEXT` is v2, so a
+0.11.1 service refuses the `_info` key proof of a 0.11.0 peer (it is not
+mounted until upgraded), and a 0.11.1 dial-out refuses a 0.11.0 relay's.
+A 0.11.1 verifying peer refuses a 0.11.0 service's forwarded hops (no
+`hop.proof`) and the token of a 0.11.0 `dyn.exchange` sent by its presenter.
+A 0.11.0 verifying peer ignores `hop.proof` and still believes any verified
+token whoever sends it — upgrade the peers.
 
 ## [Unreleased] — 0.11.0
 

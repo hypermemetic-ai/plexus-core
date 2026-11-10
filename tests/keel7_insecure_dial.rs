@@ -86,11 +86,13 @@ async fn far_anywhere() -> (u16, jsonrpsee::server::ServerHandle) {
 async fn stand_in_relay(ip: std::net::IpAddr) -> (u16, String) {
     let relay = Arc::new(plexus_core::plexus::peer_token::PeerKey::generate());
     let kid = relay.kid().to_string();
+    // KEEL-19: the proof is made for the dialing peer (`key(dir, 3)`).
+    let dialer = plexus_core::plexus::peer_token::PeerKey::from_seed([3u8; 32]).kid().to_string();
     let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
-            let relay = Arc::clone(&relay);
+            let (relay, dialer) = (Arc::clone(&relay), dialer.clone());
             tokio::spawn(async move {
                 let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else { return };
                 while let Some(Ok(m)) = ws.next().await {
@@ -102,7 +104,7 @@ async fn stand_in_relay(ip: std::net::IpAddr) -> (u16, String) {
                         let md = StreamMetadata::new(vec!["relay".into()], "0".into());
                         out.push(json!({ "jsonrpc": "2.0", "id": id, "result": "s1" }));
                         let nonce = v["params"]["nonce"].as_str().unwrap_or_default();
-                        let data = PlexusStreamItem::data(md.clone(), "_info".into(), json!({ "backend": "relay", "key": relay.kid(), "proof": relay.key_proof(nonce, "relay") }));
+                        let data = PlexusStreamItem::data(md.clone(), "_info".into(), json!({ "backend": "relay", "key": relay.kid(), "proof": relay.key_proof(nonce, "relay", &dialer) }));
                         out.push(json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": "s1", "result": data } }));
                         out.push(json!({ "jsonrpc": "2.0", "method": "_info", "params": { "subscription": "s1", "result": PlexusStreamItem::done(md) } }));
                     } else if method == "relay.offer" {

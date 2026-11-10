@@ -32,7 +32,10 @@
 //! token, as DPoP's, RFC 9449 §4.2). The proof's key must be the token's
 //! `cnf.jkt`, its `method` and `call` the ones it is presented for, its
 //! `iat` within ±30 s, its `jti` new. A peer on its issuer's own pipe needs
-//! no proof (D3: the pipe is the issuer's alone).
+//! no proof (D3: the pipe is the issuer's alone). KEEL-19: the other way, a
+//! service sends each forwarded hop with its own proof
+//! ([`TokenIssuer::prove_forward`], by the key that signed the token), and
+//! a verifying child takes the hop only with it.
 //!
 //! **Exchange** ([`TokenIssuer::exchange`], RFC 8693 semantics): a token
 //! presented for an onward call becomes one for the next peer — the same
@@ -76,8 +79,9 @@ pub const EXCHANGE: &str = "exchange";
 /// RFC 8693's identifier of the token type issued.
 pub const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 /// The context a peer's key proof at `_info` is signed over (domain
-/// separation: no other signature can be passed off as one).
-pub const KEY_PROOF_CONTEXT: &str = "plexus-peer-key/v1";
+/// separation: no other signature can be passed off as one). KEEL-19: v2
+/// binds the proof to its asker (a v1 proof is refused).
+pub const KEY_PROOF_CONTEXT: &str = "plexus-peer-key/v2";
 
 fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -247,18 +251,31 @@ impl PeerKey {
     }
 
     /// The `_info` key proof: a signature over
-    /// `plexus-peer-key/v1\n<nonce>\n<backend>`, base64url.
-    pub fn key_proof(&self, nonce: &str, backend: &str) -> String {
-        b64(&self.signing.sign(format!("{KEY_PROOF_CONTEXT}\n{nonce}\n{backend}").as_bytes()).to_bytes())
+    /// `plexus-peer-key/v2\n<nonce>\n<backend>\n<asker>`, base64url —
+    /// KEEL-19: `asker` the principal of whoever asked, **as the prover
+    /// knows it**: the principal its connection proved (a mount's, a dialing
+    /// peer's), or, on its parent's own pipe, the one the parent names. A
+    /// proof made for one asker is refused by any other
+    /// ([`check_key_proof`]), so a peer cannot relay another's proof and be
+    /// registered under its key. The one form for a mount's child and a
+    /// dial-out's relay (KEEL-8).
+    pub fn key_proof(&self, nonce: &str, backend: &str, asker: &str) -> String {
+        b64(&self.signing.sign(key_proof_input(nonce, backend, asker).as_bytes()).to_bytes())
     }
 }
 
-/// Check a peer's `_info` key proof: `key` (`key:<hex>`) signed `nonce` and
-/// `backend` with [`PeerKey::key_proof`].
-pub fn check_key_proof(key: &str, proof: &str, nonce: &str, backend: &str) -> Result<VerifyingKey, TokenError> {
+fn key_proof_input(nonce: &str, backend: &str, asker: &str) -> String {
+    format!("{KEY_PROOF_CONTEXT}\n{nonce}\n{backend}\n{asker}")
+}
+
+/// Check a peer's `_info` key proof: `key` (`key:<hex>`) signed `nonce`,
+/// `backend` and `asker` — the checker's own principal, as the prover was
+/// to know it — with [`PeerKey::key_proof`]. A proof made for another
+/// asker does not verify.
+pub fn check_key_proof(key: &str, proof: &str, nonce: &str, backend: &str, asker: &str) -> Result<VerifyingKey, TokenError> {
     let vk = key_of(key).ok_or_else(|| TokenError::Malformed(format!("`{key}` is not an Ed25519 key")))?;
     let sig = signature_of(proof)?;
-    vk.verify_strict(format!("{KEY_PROOF_CONTEXT}\n{nonce}\n{backend}").as_bytes(), &sig).map_err(|_| TokenError::Signature)?;
+    vk.verify_strict(key_proof_input(nonce, backend, asker).as_bytes(), &sig).map_err(|_| TokenError::Signature)?;
     Ok(vk)
 }
 
@@ -650,6 +667,16 @@ impl Verifier {
 
     /// Verify `token` as of `now` (seconds since the epoch).
     pub fn verify_at(&self, token: &str, expect: &Expect<'_>, now: u64) -> Result<PeerClaims, TokenError> {
+        let claims = self.inspect_at(token, expect, now)?;
+        self.admit(&claims, now)?;
+        Ok(claims)
+    }
+
+    /// KEEL-19: every check of [`Self::verify_at`] but the replay cache —
+    /// nothing is recorded, so a presentation refused afterwards (no proof
+    /// by its sender) does not burn the token for the one who may present
+    /// it. [`Self::admit`] records it once the presentation is taken.
+    pub(crate) fn inspect_at(&self, token: &str, expect: &Expect<'_>, now: u64) -> Result<PeerClaims, TokenError> {
         let parsed = parse(token, TOKEN_TYP)?;
         let kid = parsed.header.get("kid").and_then(Value::as_str).unwrap_or_default().to_string();
         let key = self.issuers.read().unwrap().get(&kid).copied().ok_or(TokenError::UnknownKey(kid.clone()))?;
@@ -668,12 +695,17 @@ impl Verifier {
         if let Some(method) = expect.method.filter(|m| *m != claims.method) {
             return Err(TokenError::Binding(format!("it names {}, presented for {method}", claims.method)));
         }
+        Ok(claims)
+    }
+
+    /// KEEL-19: record `claims`' `jti` as used: refused when it was before.
+    pub(crate) fn admit(&self, claims: &PeerClaims, now: u64) -> Result<(), TokenError> {
         let mut seen = self.seen.lock().unwrap();
         seen.retain(|_, exp| *exp + SKEW.as_secs() >= now);
         if seen.insert(claims.jti.clone(), claims.exp).is_some() {
             return Err(TokenError::Replayed);
         }
-        Ok(claims)
+        Ok(())
     }
 
     /// `jti`s held now (the replay cache's size).
@@ -720,6 +752,12 @@ pub struct ProofCache(Mutex<HashMap<String, u64>>);
 /// names, over this token, method and call, fresh, and not seen before.
 pub fn check_proof(proof: &str, token: &str, claims: &PeerClaims, method: &str, call: &str, now: u64, seen: &ProofCache) -> Result<(), TokenError> {
     let jkt = claims.cnf.as_ref().map(|c| c.jkt.as_str()).ok_or_else(|| TokenError::Proof("the token is bound to no key".into()))?;
+    check_proof_by(proof, token, jkt, method, call, now, seen)
+}
+
+/// KEEL-19: [`check_proof`] by the key whose thumbprint is `jkt` (the
+/// issuer's, for a forwarded hop's proof).
+pub(crate) fn check_proof_by(proof: &str, token: &str, jkt: &str, method: &str, call: &str, now: u64, seen: &ProofCache) -> Result<(), TokenError> {
     let parsed = parse(proof, PROOF_TYP).map_err(|e| TokenError::Proof(e.to_string()))?;
     let jwk: Jwk = parsed.header.get("jwk").cloned().and_then(|j| serde_json::from_value(j).ok()).ok_or_else(|| TokenError::Proof("no `jwk` in its header".into()))?;
     let key = jwk.key().map_err(|e| TokenError::Proof(e.to_string()))?;
@@ -996,6 +1034,25 @@ impl TokenIssuer {
         self.kid()
     }
 
+    /// KEEL-19: the service's proof that it sends this forwarded hop — a
+    /// proof of possession ([`prove`]) by the key that signed `claims`'
+    /// token (its `iss`), over the token, its method and its call. A
+    /// verifying child takes a token bound to its own key only with this
+    /// proof (`hop.proof`), checked against the JWKS it trusts: on a pipe and
+    /// on a connection alike, whoever holds the token's bytes alone cannot
+    /// present it.
+    pub fn prove_forward(&self, token: &str, claims: &PeerClaims) -> Result<String, TokenError> {
+        let key = {
+            let now_key = self.key.read().unwrap();
+            if now_key.kid() == claims.iss {
+                now_key.clone()
+            } else {
+                self.retired.lock().unwrap().iter().find(|(k, _)| k.kid() == claims.iss).map(|(k, _)| k.clone()).ok_or_else(|| TokenError::UnknownKey(claims.iss.clone()))?
+            }
+        };
+        Ok(prove(&key, token, &claims.method, &claims.call))
+    }
+
     /// Mint one forwarded call's token (an exchange when `req.presented`).
     pub fn mint(&self, req: MintRequest) -> Result<(String, PeerClaims), TokenError> {
         self.mint_at(req, now())
@@ -1054,6 +1111,12 @@ impl TokenIssuer {
     /// with [`Self::exchange_decided`] (plexus-dyn's `dyn.exchange` does);
     /// the token is bound to the presenter's key and taken once per
     /// (subject `jti`, audience, method) either way.
+    ///
+    /// KEEL-19: **not for a service's method** — it decides nothing about
+    /// the presenter. Kept public (hidden, deprecated) only because removing
+    /// it would break 0.11's API.
+    #[deprecated(since = "0.11.1", note = "undecided: a service exchanges with `exchange_decided`, which asks whether the presenter may reach the audience")]
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn exchange(&self, subject: &str, proof: Option<&str>, name: &str, peer_key: Option<String>, requested: Option<&[String]>, call: &str, method: &str, seen: &ProofCache) -> Result<(String, PeerClaims), TokenError> {
         let name = name.to_string();
@@ -1135,6 +1198,7 @@ impl TokenIssuer {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // the undecided `exchange` primitive is tested as it is
 mod tests {
     use super::*;
 
@@ -1315,10 +1379,15 @@ mod tests {
     #[test]
     fn a_key_proof_at_info_is_checked() {
         let peer = PeerKey::generate();
-        let p = peer.key_proof("n0nce", "far");
-        assert!(check_key_proof(peer.kid(), &p, "n0nce", "far").is_ok());
-        assert_eq!(check_key_proof(peer.kid(), &p, "other", "far").map(|_| ()), Err(TokenError::Signature));
-        assert_eq!(check_key_proof(PeerKey::generate().kid(), &p, "n0nce", "far").map(|_| ()), Err(TokenError::Signature));
+        let (service, mallory) = ("key:5e5e", "key:ma11");
+        let p = peer.key_proof("n0nce", "far", service);
+        assert!(check_key_proof(peer.kid(), &p, "n0nce", "far", service).is_ok());
+        assert_eq!(check_key_proof(peer.kid(), &p, "other", "far", service).map(|_| ()), Err(TokenError::Signature));
+        assert_eq!(check_key_proof(PeerKey::generate().kid(), &p, "n0nce", "far", service).map(|_| ()), Err(TokenError::Signature));
+        // KEEL-19: made for another asker (a proof Mallory asked for and
+        // relays to the service as its own): refused.
+        let relayed = peer.key_proof("n0nce", "far", mallory);
+        assert_eq!(check_key_proof(peer.kid(), &relayed, "n0nce", "far", service).map(|_| ()), Err(TokenError::Signature));
     }
 
     #[test]

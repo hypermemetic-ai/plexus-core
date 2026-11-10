@@ -15,9 +15,20 @@
 //! (`TokenIssuer::exchange_decided`, plexus-dyn's `dyn.exchange`), tested in
 //! plexus-dyn; here A is given the token by the issuer's primitive, as the
 //! reviewer's program was.
+//!
+//! The second review (`b1`, `b2`): a peer M asks V's `_info` over its own
+//! connection, relays the proof to the service at its mount and is
+//! registered under V's key; every token for calls into M is then bound to
+//! V's own key, and M sends them to V. Now the `_info` proof is made for the
+//! asker the connection proved (M), so the service refuses it; a keyed or
+//! key-verifying child cannot be served on a `Pipe`; and a forwarded token
+//! is taken only with the service's own proof (`prove_forward`), on a pipe
+//! and a connection alike — its `jti` spent only once the sender is proven.
+
+#![allow(deprecated)] // the undecided `exchange` primitive is the attacker's tool here
 
 use futures::Stream;
-use plexus_core::plexus::peer_token::{prove, MintRequest, PeerKey, ProofCache, TokenError, TokenIssuer, Verifier, EXCHANGE};
+use plexus_core::plexus::peer_token::{check_key_proof, prove, random_nonce, MintRequest, PeerKey, ProofCache, TokenError, TokenIssuer, Verifier, EXCHANGE};
 use plexus_core::plexus::remote_child::{serve_child_with, ChildPeer, ServeChild};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -70,8 +81,28 @@ impl World {
 
     /// B, verifying, serving one input whose sender is `peer`.
     fn serve_b(&self, peer: ChildPeer) -> Input {
-        let v = Verifier::new(self.b.kid(), &self.issuer.jwks()).unwrap();
-        let opts = ServeChild { peer, key: Some(self.b.clone()), tokens: Some(Arc::new(v)) };
+        self.serve_b_with(peer, self.verifier())
+    }
+
+    fn verifier(&self) -> Arc<Verifier> {
+        Arc::new(Verifier::new(self.b.kid(), &self.issuer.jwks()).unwrap())
+    }
+
+    /// The service's mint for a call into the peer keyed `aud` (bound to
+    /// that key: a forward), and its proof that it sends it.
+    fn forwarded(&self, aud: &str, call: &str) -> (String, String) {
+        let (t, c) = self
+            .issuer
+            .mint(MintRequest { sub: CALLER.into(), peer_key: Some(aud.into()), name: "b".into(), scope: vec!["weather.forecast@*".into()], call: call.into(), method: "weather.forecast".into(), presented: None })
+            .unwrap();
+        let p = self.issuer.prove_forward(&t, &c).unwrap();
+        (t, p)
+    }
+
+    /// B, serving one input whose sender is `peer`, with the verifier `v`
+    /// (shared between inputs: one replay cache).
+    fn serve_b_with(&self, peer: ChildPeer, v: Arc<Verifier>) -> Input {
+        let opts = ServeChild { peer, key: Some(self.b.clone()), tokens: Some(v) };
         let (to_b, b_in) = tokio::io::duplex(1 << 16);
         let (b_out, from_b) = tokio::io::duplex(1 << 16);
         tokio::spawn(serve_child_with(WeatherActivation, b_in, b_out, opts));
@@ -137,24 +168,118 @@ async fn the_reviewers_attack_is_refused_at_the_audience() {
 }
 
 /// A token the service forwarded to B (bound to B's own key), stolen and
-/// sent by A: taken only from the service's own connection. (KEEL-19 (2).)
+/// sent by A: taken only from the service's own connection, and only with
+/// the service's proof that it sends it. (KEEL-19 (2), second pass (a).)
 #[tokio::test]
-async fn a_forwarded_token_is_taken_only_from_the_service() {
+async fn a_forwarded_token_is_taken_only_from_the_service_with_its_proof() {
     let w = World::new();
-    let forwarded = |call: &str| {
-        w.issuer
-            .mint(MintRequest { sub: CALLER.into(), peer_key: Some(w.b.kid().into()), name: "b".into(), scope: vec!["weather.forecast@*".into()], call: call.into(), method: "weather.forecast".into(), presented: None })
-            .unwrap()
-            .0
-    };
+    let b = w.b.kid().to_string();
     let mut from_a = w.serve_b(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]));
-    refused(&from_a.call(hop(w.a.kid(), "f1", Some(&forwarded("f1")), None)).await, "the service's own connection");
+    let (t, p) = w.forwarded(&b, "f1");
+    refused(&from_a.call(hop(w.a.kid(), "f1", Some(&t), Some(p))).await, "the service's own connection");
     // Even with a proof by A: the token is B's, not A's.
-    let t = forwarded("f2");
+    let (t, _) = w.forwarded(&b, "f2");
     refused(&from_a.call(hop(w.a.kid(), "f2", Some(&t), Some(prove(&w.a, &t, "weather.forecast", "f2")))).await, "the service's own connection");
-    // From the service, on its own connection: taken, as the caller.
+    // On the service's own connection, but with no proof, or another's.
     let mut from_host = w.serve_b(ChildPeer::connection(w.host.kid(), [w.host.kid().to_string()]));
-    let got = from_host.call(hop(w.host.kid(), "f3", Some(&forwarded("f3")), None)).await;
+    let (t, _) = w.forwarded(&b, "f3");
+    refused(&from_host.call(hop(w.host.kid(), "f3", Some(&t), None)).await, "no proof of possession");
+    let (t, _) = w.forwarded(&b, "f4");
+    refused(&from_host.call(hop(w.host.kid(), "f4", Some(&t), Some(prove(&w.a, &t, "weather.forecast", "f4")))).await, "another key");
+    // The service's own proof, on its own connection: taken, as the caller.
+    let (t, p) = w.forwarded(&b, "f5");
+    let got = from_host.call(hop(w.host.kid(), "f5", Some(&t), Some(p))).await;
+    assert_eq!(got["content"]["ran_for"], CALLER, "{got}");
+}
+
+/// The second review's b1: M asks V's `_info` over M's own connection and
+/// relays V's proof to the service as its own. The proof was made for M,
+/// the asker V's connection proved, so the service — checking it was made
+/// for itself — refuses it, and M is never registered under V's key.
+/// (Second pass (b).) Any token M holds bound to V's key (minted as if it
+/// were) and sent to V is refused as well.
+#[tokio::test]
+async fn b1_a_relayed_key_proof_is_refused_and_v_takes_nothing_from_m() {
+    let w = World::new();
+    let m = PeerKey::generate();
+    let mut b = w.serve_b(ChildPeer::connection(m.kid(), [w.host.kid().to_string()]));
+    let nonce = random_nonce();
+    // M relays the service's nonce, naming the service as the asker.
+    let frame = json!({ "jsonrpc": "2.0", "id": 9, "method": "_info", "params": { "nonce": nonce, "asker": w.host.kid() } });
+    b.to_b.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    let info = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), b.lines.next_line()).await.unwrap().unwrap().unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v.pointer("/params/result/type").and_then(Value::as_str) == Some("data") {
+            break v["params"]["result"]["content"].clone();
+        }
+    };
+    let _done = b.lines.next_line().await.unwrap();
+    assert_eq!(info["asker"], m.kid(), "made for the asker the connection proved, not the one named: {info}");
+    let (key, proof, backend) = (info["key"].as_str().unwrap(), info["proof"].as_str().unwrap(), info["backend"].as_str().unwrap());
+    assert!(check_key_proof(key, proof, &nonce, backend, w.host.kid()).is_err(), "the service refuses a proof made for M");
+    assert!(check_key_proof(key, proof, &nonce, backend, m.kid()).is_ok(), "it is V's proof, for M");
+    // Were M registered so: the token for a call into M, sent by M to V.
+    let (t, p) = w.forwarded(w.b.kid(), "m1");
+    refused(&b.call(hop(m.kid(), "m1", Some(&t), Some(p))).await, "the service's own connection");
+}
+
+/// The second review's b2: V served as `ServeChild::default()` (a `Pipe`)
+/// on a network, as dyn's tests served a WebSocket peer. A keyed child, or
+/// one verifying tokens addressed to a key, is refused on a pipe outright;
+/// a pipe child verifying pipe tokens takes a forwarded hop only with the
+/// service's proof. (Second pass (a).)
+#[tokio::test]
+async fn b2_a_pipe_proves_nobody() {
+    let w = World::new();
+    // A keyed child on a pipe: refused before it reads a line.
+    let (_to, b_in) = tokio::io::duplex(1 << 10);
+    let (b_out, _from) = tokio::io::duplex(1 << 10);
+    let at_once = std::time::Duration::from_secs(2);
+    let keyed = tokio::time::timeout(at_once, serve_child_with(WeatherActivation, b_in, b_out, ServeChild { peer: ChildPeer::Pipe, key: Some(w.b.clone()), tokens: Some(w.verifier()) })).await.expect("refused at once, not served");
+    assert_eq!(keyed.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    let (_to, b_in) = tokio::io::duplex(1 << 10);
+    let (b_out, _from) = tokio::io::duplex(1 << 10);
+    let key_verifier = tokio::time::timeout(at_once, serve_child_with(WeatherActivation, b_in, b_out, ServeChild { peer: ChildPeer::Pipe, key: None, tokens: Some(w.verifier()) })).await.expect("refused at once, not served");
+    assert_eq!(key_verifier.unwrap_err().kind(), std::io::ErrorKind::InvalidInput, "a key-addressed verifier on a pipe");
+    // A pipe child verifying its pipe's tokens: the bytes of a forwarded
+    // token alone are refused; with the service's proof, taken.
+    let pipe = Arc::new(Verifier::new("pipe:v", &w.issuer.jwks()).unwrap());
+    let opts = ServeChild { peer: ChildPeer::Pipe, key: None, tokens: Some(pipe) };
+    let (mut to_v, v_in) = tokio::io::duplex(1 << 16);
+    let (v_out, from_v) = tokio::io::duplex(1 << 16);
+    tokio::spawn(serve_child_with(WeatherActivation, v_in, v_out, opts));
+    let mut v = Input { to_b: std::mem::replace(&mut to_v, tokio::io::duplex(1).0), lines: BufReader::new(from_v).lines(), next: 1 };
+    let mint = |call: &str| {
+        let (t, c) = w.issuer.mint(MintRequest { sub: CALLER.into(), peer_key: None, name: "v".into(), scope: vec!["weather.forecast@*".into()], call: call.into(), method: "weather.forecast".into(), presented: None }).unwrap();
+        let p = w.issuer.prove_forward(&t, &c).unwrap();
+        (t, p)
+    };
+    let (t, _) = mint("p1");
+    refused(&v.call(hop(w.host.kid(), "p1", Some(&t), None)).await, "no proof of possession");
+    let (t, p) = mint("p2");
+    let got = v.call(hop(w.host.kid(), "p2", Some(&t), Some(p))).await;
+    assert_eq!(got["content"]["ran_for"], CALLER, "{got}");
+}
+
+/// N3: a replay of a token without its proof, by someone who saw it, does
+/// not spend it: the service's own presentation, with its proof, is taken
+/// after it.
+#[tokio::test]
+async fn a_replay_without_its_proof_does_not_burn_the_token() {
+    let w = World::new();
+    let v = w.verifier();
+    let mut observer = w.serve_b_with(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]), Arc::clone(&v));
+    let mut from_host = w.serve_b_with(ChildPeer::connection(w.host.kid(), [w.host.kid().to_string()]), v);
+    let (t, p) = w.forwarded(w.b.kid(), "r1");
+    refused(&observer.call(hop(w.a.kid(), "r1", Some(&t), None)).await, "the service's own connection");
+    let got = from_host.call(hop(w.host.kid(), "r1", Some(&t), Some(p))).await;
+    assert_eq!(got["content"]["ran_for"], CALLER, "the observer's replay spent the token: {got}");
+    // An exchanged token replayed by an observer without its presenter's proof, too.
+    let mut from_a = w.serve_b_with(ChildPeer::connection(w.a.kid(), [w.host.kid().to_string()]), w.verifier());
+    let (t, c) = w.exchanged_for_b("weather.forecast").unwrap();
+    refused(&from_a.call(hop(w.a.kid(), &c.call, Some(&t), None)).await, "no proof of possession");
+    let got = from_a.call(hop(w.a.kid(), &c.call, Some(&t), Some(prove(&w.a, &t, "weather.forecast", &c.call)))).await;
     assert_eq!(got["content"]["ran_for"], CALLER, "{got}");
 }
 

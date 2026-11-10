@@ -2835,12 +2835,14 @@ impl DynamicHub {
                     // KEEL-32: the own-namespace form is the bare form.
                     let method = self.bare_introspection(method);
                     let grant = plexus_auth_core::grants::Grant::new(method.to_string());
-                    in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
+                    // PERF.115-49: boxed — the introspection path's future is
+                    // the largest, and inline every call's future was its size.
+                    Box::pin(in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
                         match self.introspect_in_view(method, &params, auth, raw_ctx).await {
                             Some(answer) => answer,
                             None => self.route_ungated(method, params, auth, raw_ctx).await,
                         }
-                    })
+                    }))
                     .await
                 }
                 super::grant_gate::Admit::Reach(reach) => {
@@ -2873,7 +2875,9 @@ impl DynamicHub {
                 .scope_registry
                 .as_deref()
                 .unwrap_or_else(|| super::scope_gate::empty_registry());
-            super::scope_gate::enforce(
+            // PERF.115-49: boxed — configured by no tenant; inline, its
+            // future was part of every call's.
+            Box::pin(super::scope_gate::enforce(
                 registry,
                 self.inner.default_deny,
                 &self.inner.audit_sink,
@@ -2881,7 +2885,7 @@ impl DynamicHub {
                 self.gate_index().info(method),
                 auth,
                 raw_ctx.and_then(|ctx| ctx.peer.map(|peer| peer.ip())),
-            )
+            ))
             .await?;
         }
 

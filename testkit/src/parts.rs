@@ -1,7 +1,7 @@
 //! What a [`Host`](crate::Host) is made of, for a test that builds
 //! something the host does not: who holds what ([`Members`]), where every
-//! target lives ([`Everywhere`]), a caller's context ([`who`]) and a call's
-//! answer as values ([`items`]).
+//! target lives ([`Everywhere`], or by its shortcode: [`Shortcodes`]), a
+//! caller's context ([`who`]) and a call's answer as values ([`items`]).
 
 use std::sync::Mutex;
 
@@ -21,8 +21,20 @@ pub struct Members(pub Mutex<Vec<Membership>>);
 impl Members {
     /// `who` holds `role` everywhere.
     pub fn hold(&self, who: &str, role: &str) {
+        self.hold_at(who, role, "*");
+    }
+
+    /// `who` holds `role` on `scope` — `*`, or a scope's name (`MENGER`).
+    pub fn hold_at(&self, who: &str, role: &str, scope: &str) {
         let principal = who.parse().unwrap_or_else(|e| panic!("{who}: not a principal: {e:?}"));
-        self.0.lock().unwrap().push(Membership { principal, role: RoleName::new(role), scope: ScopeRef::Everywhere });
+        self.0.lock().unwrap().push(Membership { principal, role: RoleName::new(role), scope: ScopeRef::parse(scope) });
+    }
+
+    /// `who` holds nothing any more, anywhere. (Say so to the gate if a
+    /// test needs it to notice: `moved`.)
+    pub fn forget(&self, who: &str) {
+        let principal: Principal = who.parse().unwrap_or_else(|e| panic!("{who}: not a principal: {e:?}"));
+        self.0.lock().unwrap().retain(|m| m.principal != principal);
     }
 }
 
@@ -66,9 +78,32 @@ impl Resolve for Everywhere {
     }
 }
 
-/// The context of a call made by the principal `p` (session `s1`).
+/// A ticket lives in its shortcode: `CODE-n` → `[CODE, *]`, a bare `CODE`
+/// → `[CODE, *]`; a target that is no shortcode (empty, or not all
+/// upper-case letters) locates nothing, and the call is refused.
+pub struct Shortcodes;
+
+impl Resolve for Shortcodes {
+    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
+        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
+        if code.is_empty() || !code.chars().all(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
+        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
+    }
+}
+
+/// The context of a call made by the principal `p`, in its own session,
+/// [`session_of`]`(p)`: two callers never share one, so a test can tell a
+/// caller's session from another's (a hop's, a signed-out one's).
 pub fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
+    AuthContext::for_principal(&p.parse().unwrap(), session_of(p), vec![], Value::Null)
+}
+
+/// The session [`who`] gives the principal `p`: `sess-<p>`, the same on
+/// every call.
+pub fn session_of(p: &str) -> String {
+    format!("sess-{p}")
 }
 
 /// A session id planted in [`who_carrying_secrets`]'s context: a test
@@ -81,6 +116,22 @@ pub const KEY_SECRET: &str = "plexus-key.PROOFSECRET0123456789";
 /// ([`SESSION_SECRET`], [`KEY_SECRET`]) — what must never reach a child.
 pub fn who_carrying_secrets(p: &str) -> AuthContext {
     AuthContext::for_principal(&p.parse().unwrap(), SESSION_SECRET, vec![], json!({ "session_key": KEY_SECRET, "token": KEY_SECRET }))
+}
+
+/// [`items`], the closing `done` kept: for a test that reads item 0 of an
+/// answer that may be no more than its `done`, or counts every item a
+/// stream sends.
+pub async fn every_item(routed: Result<PlexusStream, PlexusError>) -> Vec<Value> {
+    match routed {
+        Err(e) => items(Err(e)).await,
+        Ok(stream) => stream
+            .map(|i| match i {
+                PlexusStreamItem::Data { content, .. } => content.into_value(),
+                other => serde_json::to_value(other).unwrap(),
+            })
+            .collect()
+            .await,
+    }
 }
 
 /// A call's answer as values: each data item's content, any other item as

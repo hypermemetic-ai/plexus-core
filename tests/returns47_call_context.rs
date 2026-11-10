@@ -15,15 +15,14 @@
 
 use futures::stream::{Stream, StreamExt};
 use plexus_core::call;
-use plexus_core::plexus::{
-    current_reach, AuthContext, Gate, Membership, Memberships, PlexusError, PlexusStream, PlexusStreamItem, RemoteError,
-    Resolve, RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{current_reach, AuthContext, PlexusError, PlexusStream, PlexusStreamItem, RemoteError};
 use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
+use plexus_testkit::parts::{who, Shortcodes};
+use plexus_testkit::World;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -163,42 +162,22 @@ impl jottings::Jottings for Jot {
 
 // ------------------------------------------------------------ the service
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-/// `CODE-n` → `[CODE, *]`.
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
-
 fn plain() -> DynamicHub {
     DynamicHub::new("menger").register(NotesActivation::default()).register(Jot::default())
 }
 
-/// ADA views MENGER; BOB holds nothing.
-fn gated() -> DynamicHub {
-    let members = Arc::new(Members::default());
-    members.0.lock().unwrap().push(Membership {
-        principal: ADA.parse().unwrap(),
-        role: plexus_auth_core::RoleName::new("viewer"),
-        scope: ScopeRef::parse("MENGER"),
-    });
-    let declared = plain().declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    plain().with_gate(Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Shortcodes))))
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], serde_json::Value::Null)
+/// ADA views MENGER; BOB holds nothing. `CODE-n` → `[CODE, *]`.
+async fn gated() -> Arc<DynamicHub> {
+    let host = World::new()
+        .host()
+        .named("menger")
+        .with(NotesActivation::default())
+        .with(Jot::default())
+        .resolving(Shortcodes)
+        .without_named_callers()
+        .member_at(ADA, "viewer", "MENGER")
+        .await;
+    host.service().clone()
 }
 
 async fn data(stream: PlexusStream) -> Vec<serde_json::Value> {
@@ -236,7 +215,7 @@ fn a_menger_shaped_activation_keeps_its_activation_name() {
 
 #[tokio::test]
 async fn a_trait_method_reading_caller_is_refused_and_answered_as_the_from_auth_one() {
-    let service = gated();
+    let service = gated().await;
     let cases: Vec<(serde_json::Value, Option<&str>)> = vec![
         (serde_json::json!({ "id": "MENGER-1" }), None),
         (serde_json::json!({ "id": "MENGER-1" }), Some(BOB)),
@@ -273,7 +252,7 @@ async fn caller_and_current_reach_outside_a_call_are_errors_not_everything() {
 
 #[tokio::test]
 async fn a_spawned_task_does_not_see_the_caller_unless_handed_it() {
-    let service = gated();
+    let service = gated().await;
     let got = data(service.route("jottings.spawned", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
     // [in the method, spawned bare, spawned with call::scope]
     assert_eq!(got, vec![serde_json::json!([true, false, true])]);
@@ -281,7 +260,7 @@ async fn a_spawned_task_does_not_see_the_caller_unless_handed_it() {
 
 #[tokio::test]
 async fn the_calls_stream_carries_its_context() {
-    let service = gated();
+    let service = gated().await;
     let got = data(service.route("notes.lazy", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(got, vec![serde_json::json!({ "type": "note", "id": "lazy", "by": ADA, "held_on": ["MENGER"] })]);
 }

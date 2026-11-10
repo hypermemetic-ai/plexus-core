@@ -21,19 +21,13 @@ mod echo;
 #[path = "../../plexus-wire/reference/echo-rs/src/service.rs"]
 mod service;
 
-use futures::StreamExt;
-use plexus_core::plexus::{
-    AuthContext, ChildOptions, ChildSpec, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem, RemoteChild,
-    Resolve, RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{AuthContext, ChildOptions, ChildSpec, RemoteChild, RoleTable};
 use plexus_core::plexus::Activation;
 use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
+use plexus_testkit::parts::{every_item, items};
+use plexus_testkit::{Host, World, EDITOR, VIEWER};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
-
-const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const EDITOR: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 #[derive(PlexusRequest)]
 pub struct Req {
@@ -208,48 +202,10 @@ mod variant {
 }
 use variant::Nest2Activation;
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
-async fn items(r: Result<PlexusStream, plexus_core::plexus::PlexusError>) -> Vec<Value> {
-    match r {
-        Err(e) => vec![json!({ "route_error": format!("{e:?}") })],
-        Ok(stream) => stream
-            .map(|i| match i {
-                PlexusStreamItem::Data { content, .. } => content.into_value(),
-                other => serde_json::to_value(other).unwrap(),
-            })
-            .collect()
-            .await,
-    }
-}
-
 /// VIEWER holds viewer, EDITOR editor, both on `*`; the roles the host
 /// declares are the mount's, renamed at every level.
-fn gated(child: &RemoteChild) -> DynamicHub {
-    let plain = DynamicHub::new("host").register(child.clone());
-    let members = Arc::new(Members::default());
-    for (p, r) in [(VIEWER, "viewer"), (EDITOR, "editor")] {
-        members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::parse("*") });
-    }
-    let declared = plain.declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    DynamicHub::new("host").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere))))
+async fn gated(child: &RemoteChild) -> Host {
+    World::new().host().with(child.clone()).await
 }
 
 fn spec(name: &str) -> ChildSpec {
@@ -276,33 +232,31 @@ async fn the_mount_keeps_the_tree_and_the_host_declares_it() {
 
 async fn each_level_schema_is_answered_from_the_kept_tree() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let v = Some(who(VIEWER));
+    let host = gated(&child).await;
     let before = child.stats().calls;
-    let top = items(host.route("mnt.schema", json!({}), v.as_ref()).await).await;
+    let top = host.as_(VIEWER).call("mnt.schema", json!({})).await;
     assert_eq!(top[0]["namespace"], "mnt", "{top:?}");
     let names: Vec<&str> = top[0]["methods"].as_array().unwrap().iter().filter_map(|m| m["name"].as_str()).collect();
     assert!(names.contains(&"a"), "the root lists its child: {names:?}");
-    let a = items(host.route("mnt.a.schema", json!({}), v.as_ref()).await).await;
+    let a = host.as_(VIEWER).call("mnt.a.schema", json!({})).await;
     assert_eq!(a[0]["namespace"], "a", "{a:?}");
-    let b = items(host.route("mnt.a.b.schema", json!({}), v.as_ref()).await).await;
+    let b = host.as_(VIEWER).call("mnt.a.b.schema", json!({})).await;
     assert_eq!(b[0]["namespace"], "b", "{b:?}");
-    let one = items(host.route("mnt.a.b.c.schema", json!({ "method": "m" }), v.as_ref()).await).await;
+    let one = host.as_(VIEWER).call("mnt.a.b.c.schema", json!({ "method": "m" })).await;
     assert_eq!(one[0]["name"], "m", "{one:?}");
     assert_eq!(child.stats().calls, before, "no schema call crossed the hop (spec/12 rule 7)");
 }
 
 async fn every_method_is_gated_by_its_full_path() {
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let (v, e) = (Some(who(VIEWER)), Some(who(EDITOR)));
-    let got = items(host.route("mnt.a.b.c.m", json!({}), v.as_ref()).await).await;
+    let host = gated(&child).await;
+    let got = host.as_(VIEWER).call("mnt.a.b.c.m", json!({})).await;
     assert_eq!(got[0], json!({ "at": "c", "grant": "nest.a.b.c.m", "for": VIEWER }), "routed four levels, the far side's grant the full path, its caller the hop's: {got:?}");
-    let got = items(host.route("mnt.a.m", json!({}), v.as_ref()).await).await;
+    let got = host.as_(VIEWER).call("mnt.a.m", json!({})).await;
     assert_eq!(got[0]["at"], "a", "{got:?}");
-    let refused = items(host.route("mnt.a.b.m", json!({}), v.as_ref()).await).await;
+    let refused = host.as_(VIEWER).call("mnt.a.b.m", json!({})).await;
     assert!(refused[0]["route_error"].as_str().is_some_and(|r| r.contains("mnt.a.b.m") && r.contains("editor")), "a viewer is refused the editor's: {refused:?}");
-    let got = items(host.route("mnt.a.b.m", json!({}), e.as_ref()).await).await;
+    let got = host.as_(EDITOR).call("mnt.a.b.m", json!({})).await;
     assert_eq!(got[0], json!({ "at": "b", "grant": "nest.a.b.m", "for": EDITOR }), "{got:?}");
 }
 
@@ -311,16 +265,16 @@ async fn a_call_into_a_dynamic_slot_is_forwarded_on_the_slot_grant() {
     // a name in a slot on the slot grant (NEST-5), and the mount forwards it
     // with that grant in the child's terms; the far side checks the slot.
     let child = mount("mnt").await;
-    let host = gated(&child);
-    let got = items(host.route("mnt.a.earth.m", json!({}), Some(&who(VIEWER))).await).await;
+    let host = gated(&child).await;
+    let got = host.as_(VIEWER).call("mnt.a.earth.m", json!({})).await;
     assert_eq!(got[0], json!({ "at": "item", "grant": "nest.a.{item}.m", "for": VIEWER }), "{got:?}");
-    let got = items(host.route("mnt.a.b.zz.m", json!({}), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("mnt.a.b.zz.m", json!({})).await;
     assert_eq!(got[0], json!({ "at": "item", "grant": "nest.a.b.{opaque}.m", "for": VIEWER }), "{got:?}");
     // An unknown name: the child's own not-found, relayed.
-    let got = items(host.route("mnt.a.pluto.m", json!({}), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("mnt.a.pluto.m", json!({})).await;
     assert_eq!(got[0]["error"]["kind"], "activation_not_found", "{got:?}");
     // An instance's schema: crosses once.
-    let got = items(host.route("mnt.a.earth.schema", json!({}), Some(&who(VIEWER))).await).await;
+    let got = host.as_(VIEWER).call("mnt.a.earth.schema", json!({})).await;
     assert_eq!(got[0]["namespace"], "item", "{got:?}");
 }
 
@@ -334,13 +288,13 @@ async fn past_the_depth_the_mount_fails_naming_the_path() {
 async fn restart_with_a_changed_grandchild_is_refused() {
     std::env::remove_var("NEST_VARIANT");
     let child = mount("mnt").await;
-    let host = gated(&child);
+    let host = gated(&child).await;
     let pid = child.pid().expect("a stdio child has a pid");
     std::env::set_var("NEST_VARIANT", "2");
     let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let got = loop {
-        let got = items(host.route("mnt.a.m", json!({}), Some(&who(VIEWER))).await).await;
+        let got = every_item(host.as_(VIEWER).route("mnt.a.m", json!({})).await).await;
         if got[0].get("at").is_none() || std::time::Instant::now() > deadline {
             break got;
         }
@@ -351,7 +305,7 @@ async fn restart_with_a_changed_grandchild_is_refused() {
     } else {
         // the first call after the exit may meet the old connection going
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        items(host.route("mnt.a.m", json!({}), Some(&who(VIEWER))).await).await
+        every_item(host.as_(VIEWER).route("mnt.a.m", json!({})).await).await
     };
     std::env::remove_var("NEST_VARIANT");
     assert!(got[0]["message"].as_str().is_some_and(|m| m.contains("schema changed; restart the service")), "{got:?}");

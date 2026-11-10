@@ -7,11 +7,12 @@
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
 use plexus_core::plexus::{
-    error_item, AuthContext, ForbiddenItem, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem,
-    Reach, Resolve, RoleTable, ScopeRef,
+    error_item, AuthContext, ForbiddenItem, PlexusStream, PlexusStreamItem, Reach, Resolve, RoleTable, ScopeRef,
 };
 use plexus_core::{AuthzDenyReason, DynamicHub, PlexusError};
-use std::sync::{Arc, Mutex};
+use plexus_testkit::parts::{who, Shortcodes};
+use plexus_testkit::{HostBuilder, World};
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct TicketsActivation;
@@ -71,48 +72,10 @@ const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ROOT: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Members {
-    fn add(&self, who: &str, role: &str, scope: &str) {
-        self.0.lock().unwrap().push(Membership {
-            principal: who.parse().unwrap(),
-            role: plexus_auth_core::RoleName::new(role),
-            scope: ScopeRef::parse(scope),
-        });
-    }
-    fn clear(&self) {
-        self.0.lock().unwrap().clear();
-    }
-}
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-
-/// `CODE-n` → `[CODE, *]`; a bare shortcode → `[CODE, *]`.
-struct Shortcodes;
-impl Resolve for Shortcodes {
-    fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        let code = target.split_once('-').map(|(c, _)| c).unwrap_or(target);
-        if code.is_empty() || !code.chars().all(|c| c.is_ascii_uppercase()) {
-            return None;
-        }
-        Some(vec![ScopeRef::named(code), ScopeRef::Everywhere])
-    }
-}
-
-fn hub(members: &Arc<Members>) -> DynamicHub {
-    // Roles seeded from the activation's declared defaults.
-    let declared = DynamicHub::new("menger").register(TicketsActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let gate = Gate::new(members.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate))
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], serde_json::Value::Null)
+/// The service `menger`, its roles seeded from the activation's declared
+/// defaults, a ticket living in its shortcode (`CODE-n` → `[CODE, *]`).
+fn menger() -> HostBuilder {
+    World::new().host().named("menger").with(TicketsActivation).resolving(Shortcodes).without_named_callers()
 }
 
 async fn data(stream: PlexusStream) -> Vec<serde_json::Value> {
@@ -135,12 +98,9 @@ fn call(method: &str, params: serde_json::Value) -> jsonrpsee::core::params::Obj
     p
 }
 
-fn members() -> Arc<Members> {
-    let m = Arc::new(Members::default());
-    m.add(ADA, "editor", "MENGER");
-    m.add(BOB, "viewer", "*");
-    m.add(ROOT, "admin", "*");
-    m
+/// ADA edits MENGER, BOB views everywhere, ROOT is admin.
+fn members() -> HostBuilder {
+    menger().member_at(ADA, "editor", "MENGER").member(BOB, "viewer").member(ROOT, "admin")
 }
 
 #[tokio::test]
@@ -155,8 +115,8 @@ async fn a_hub_without_a_gate_dispatches_as_before() {
 
 #[tokio::test]
 async fn held_on_menger_allows_a_menger_target_not_an_identity_one() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     let ok = hub.route("tickets.set_status", serde_json::json!({"id": "MENGER-12", "status": "Ready"}), Some(&who(ADA))).await;
     assert!(ok.is_ok());
     let err = hub
@@ -178,8 +138,8 @@ async fn held_on_menger_allows_a_menger_target_not_an_identity_one() {
 
 #[tokio::test]
 async fn the_refusal_on_the_wire() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     let err = hub
         .route("tickets.set_status", serde_json::json!({"id": "IDENTITY-1", "status": "Ready"}), Some(&who(ADA)))
         .await
@@ -222,8 +182,8 @@ async fn the_refusal_on_the_wire() {
 async fn the_wire_through_the_rpc_module_anonymous() {
     // into_rpc_module dispatches `<ns>.call` without a connection identity:
     // anonymous, so a non-public method is refused as unauthenticated…
-    let m = members();
-    let module = hub(&m).into_rpc_module().unwrap();
+    let host = members().await;
+    let module = host.service().as_ref().clone().into_rpc_module().unwrap();
     let mut sub = module
         .subscribe_unbounded("menger.call", call("tickets.get", serde_json::json!({"id": "MENGER-1"})))
         .await
@@ -245,8 +205,8 @@ async fn the_wire_through_the_rpc_module_anonymous() {
 
 #[tokio::test]
 async fn no_role_lists_it_refused_except_admin() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     // `close` is listed by no role.
     let err = hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1"]}), Some(&who(ADA))).await.err().unwrap();
     assert!(matches!(
@@ -258,19 +218,18 @@ async fn no_role_lists_it_refused_except_admin() {
 
 #[tokio::test]
 async fn a_list_target_needs_every_element() {
-    let m = members();
-    m.add(ADA, "closer", "MENGER");
-    let roles = RoleTable::new().define("closer", ["tickets.close"]).unwrap();
-    let gate = Gate::new(m.clone(), Arc::new(roles), Arc::new(Shortcodes));
-    let hub = DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(gate));
+    // The gate reads one role alone, `closer`: none of the declared ones.
+    let closer = RoleTable::new().define("closer", ["tickets.close"]).unwrap();
+    let host = members().member_at(ADA, "closer", "MENGER").roles_through(move |_declared| Arc::new(closer)).await;
+    let hub = host.service();
     assert!(hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1", "MENGER-2"]}), Some(&who(ADA))).await.is_ok());
     assert!(hub.route("tickets.close", serde_json::json!({"ids": ["MENGER-1", "IDENTITY-2"]}), Some(&who(ADA))).await.is_err());
 }
 
 #[tokio::test]
 async fn anonymous_is_unauthenticated_public_passes() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     let err = hub.route("tickets.get", serde_json::json!({"id": "MENGER-1"}), None).await.err().unwrap();
     assert!(matches!(err, PlexusError::Unauthenticated(_)));
     let out = data(hub.route("tickets.providers", serde_json::json!({}), None).await.unwrap()).await;
@@ -282,8 +241,8 @@ async fn anonymous_is_unauthenticated_public_passes() {
 
 #[tokio::test]
 async fn a_method_receives_its_reach() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     let out = data(hub.route("tickets.list", serde_json::json!({}), Some(&who(ADA))).await.unwrap()).await;
     assert_eq!(out, vec![serde_json::json!("MENGER")]);
     let out = data(hub.route("tickets.list", serde_json::json!({}), Some(&who(BOB))).await.unwrap()).await;
@@ -308,9 +267,8 @@ async fn a_method_receives_its_reach() {
             Some(v)
         }
     }
-    let declared = DynamicHub::new("x").register(TicketsActivation).declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let hub2 = DynamicHub::new("menger").register(TicketsActivation).with_gate(Arc::new(Gate::new(m.clone(), Arc::new(roles), Arc::new(Tickety))));
+    let host2 = members().resolving(Tickety).await;
+    let hub2 = host2.service();
     let out = data(hub2.route("tickets.list", serde_json::json!({}), Some(&narrowed)).await.unwrap()).await;
     assert_eq!(out, vec![serde_json::json!("MENGER-12")]);
     assert!(hub2.route("tickets.set_status", serde_json::json!({"id": "MENGER-12", "status": "x"}), Some(&narrowed)).await.is_ok());
@@ -321,8 +279,8 @@ async fn a_method_receives_its_reach() {
 
 #[tokio::test]
 async fn a_stream_follows_grants_as_they_stand() {
-    let m = members();
-    let hub = hub(&m);
+    let host = members().await;
+    let hub = host.service();
     // `watch` is listed by no role: admin holds it; its membership is then
     // revoked mid-stream.
     let mut stream = hub
@@ -338,7 +296,7 @@ async fn a_stream_follows_grants_as_they_stand() {
     };
     assert_eq!(first, "MENGER-1");
     // …the membership goes, and the next event is dropped.
-    m.clear();
+    host.members().0.lock().unwrap().clear();
     let rest: Vec<_> = data(stream).await;
     assert!(rest.is_empty(), "{rest:?}");
 }

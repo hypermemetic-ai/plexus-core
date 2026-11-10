@@ -14,8 +14,10 @@ use futures::{Stream, StreamExt};
 use plexus_auth_core::adapters::{Carriers, KeyProofAdapter};
 use plexus_auth_core::identity::AuthenticatorChain;
 use plexus_core::plexus::remote_child::{key_principal, DialOut, DialState, Exposed, PeerSocket, Peers};
-use plexus_core::plexus::{AuthContext, Gate, MemoryMemberships, PlexusStreamItem, Resolve, RoleTable, ScopeRef};
+use plexus_core::plexus::{AuthContext, GrantSet, PlexusStreamItem, Roles};
 use plexus_core::DynamicHub;
+use plexus_testkit::parts::who;
+use plexus_testkit::World;
 use plexus_transport::ws::{ConnectionHook, Hooks, Outbound};
 use plexus_transport::TransportServer;
 use schemars::JsonSchema;
@@ -55,10 +57,15 @@ impl GreeterActivation {
     }
 }
 
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
+/// The roles the relay declares, as `Peers::roles` takes them: a `Roles`
+/// of its own (the kit hands them over shared).
+struct Declared(Arc<dyn Roles>);
+impl Roles for Declared {
+    fn grants(&self, role: &plexus_auth_core::RoleName) -> Option<GrantSet> {
+        self.0.grants(role)
+    }
+    fn names(&self) -> Vec<plexus_auth_core::RoleName> {
+        self.0.names()
     }
 }
 
@@ -116,15 +123,21 @@ async fn relay(members: &[&str]) -> Relay {
     let key = plexus_core::plexus::peer_token::PeerKey::generate();
     let principal = key.kid().to_string();
     let peers = Peers::new("peers", "relay", "service:relay").with_timeout(Duration::from_secs(5)).with_key(key);
-    let plain = DynamicHub::new("relay").register(peers.clone());
-    let base = RoleTable::from_lists(plain.declared_roles().iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let mut listed = MemoryMemberships::new();
+    // The gate reads the declared roles through the peers' (each member may
+    // offer and call every peer); only the `member`s hold anything.
+    let for_roles = peers.clone();
+    let mut relay = World::new()
+        .host()
+        .named("relay")
+        .with(peers.clone())
+        .without_named_callers()
+        .roles_through(move |declared| Arc::new(for_roles.roles(Declared(declared), Some("member"))));
     for m in members {
-        listed = listed.with(m, "member", "*");
+        relay = relay.member(m, "member");
     }
-    let gate = Arc::new(Gate::new(Arc::new(listed), Arc::new(peers.roles(base, Some("member"))), Arc::new(Everywhere)));
-    peers.set_gate(Arc::clone(&gate));
-    let service = Arc::new(plain.with_gate(gate));
+    let relay = relay.await;
+    peers.set_gate(Arc::clone(relay.gate()));
+    let service = relay.service().clone();
     let weak = Arc::downgrade(&service);
     peers.on_change(move || {
         if let Some(s) = weak.upgrade() {
@@ -303,7 +316,7 @@ async fn the_relays_gate_decides_who_may_offer_and_who_may_call() {
     assert!(refused.contains("forbidden") || refused.contains("name_taken"), "{refused}");
 
     // A caller the relay's gate does not admit never reaches the peer.
-    let ctx = AuthContext::for_principal(&mallory.parse().unwrap(), "s", vec![], json!({}));
+    let ctx = who(&mallory);
     let routed = relay.service.route("peers.alice.hello", json!({ "name": "x" }), Some(&ctx)).await;
     let refused = match routed {
         Err(e) => format!("{e:?}"),
@@ -311,7 +324,7 @@ async fn the_relays_gate_decides_who_may_offer_and_who_may_call() {
     };
     assert!(refused.contains("Forbidden") || refused.contains("forbidden"), "{refused}");
     // A member does.
-    let ctx = AuthContext::for_principal(&alice.parse().unwrap(), "s", vec![], json!({}));
+    let ctx = who(&alice);
     let items = collect(relay.service.route("peers.alice.hello", json!({ "name": "y" }), Some(&ctx)).await.unwrap()).await;
     assert_eq!(contents(&items)[0]["caller"], alice.as_str());
 }

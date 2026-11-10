@@ -116,8 +116,9 @@ fn key(p: &str, agent: &str) -> AuthContext {
     AuthContext::for_principal(&p.parse().unwrap(), "kp-1", vec![], json!({"agent": agent, "name": agent}))
 }
 
-/// Items of a stream: data contents and error items, as the wire sends them.
-async fn items(stream: PlexusStream) -> Vec<Value> {
+/// An answer's data contents, and each error as its message alone (not
+/// the kit's `items`, which gives an error item whole).
+async fn answered(stream: PlexusStream) -> Vec<Value> {
     stream
         .filter_map(|i| async move {
             match i {
@@ -132,7 +133,7 @@ async fn items(stream: PlexusStream) -> Vec<Value> {
 
 async fn call(w: &World, method: &str, params: Value, who: Option<&AuthContext>) -> Result<Vec<Value>, PlexusError> {
     match w.hub.route(method, params, who).await {
-        Ok(s) => Ok(items(s).await),
+        Ok(s) => Ok(answered(s).await),
         Err(e) => Err(e),
     }
 }

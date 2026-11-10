@@ -155,24 +155,10 @@ async fn kit_green_through_child() {
 #[tokio::test(flavor = "multi_thread")]
 async fn nested_child_through_the_seam() {
     use futures::StreamExt;
-    use plexus_core::plexus::{AuthContext, Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef};
+    use plexus_testkit::parts::who;
+    use plexus_testkit::{World, VIEWER};
     use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
 
-    const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    #[derive(Default)]
-    struct Members(Mutex<Vec<Membership>>);
-    impl Memberships for Members {
-        fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-            self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-        }
-    }
-    struct Everywhere;
-    impl Resolve for Everywhere {
-        fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-            Some(vec![ScopeRef::Everywhere])
-        }
-    }
     async fn first(r: Result<plexus_core::plexus::PlexusStream, plexus_core::plexus::PlexusError>) -> Value {
         match r {
             Err(e) => json!({ "route_error": format!("{e:?}") }),
@@ -195,11 +181,10 @@ async fn nested_child_through_the_seam() {
     let roles = DynamicHub::new("host").register(child.clone()).declared_roles();
     assert_eq!(roles["viewer"], ["deep.ping", "deep.a.m"], "{roles:?}");
     assert_eq!(roles["editor"], ["deep.a.b.m"], "{roles:?}");
-    let members = Arc::new(Members::default());
-    members.0.lock().unwrap().push(Membership { principal: VIEWER.parse().unwrap(), role: plexus_auth_core::RoleName::new("viewer"), scope: ScopeRef::parse("*") });
-    let table = RoleTable::from_lists(roles.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let host = DynamicHub::new("host").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(table), Arc::new(Everywhere))));
-    let viewer = AuthContext::for_principal(&VIEWER.parse().unwrap(), "s1", vec![], Value::Null);
+    // VIEWER holds viewer on `*`; the roles are the ones the host declares.
+    let gated = World::new().host().with(child.clone()).await;
+    let host = gated.service();
+    let viewer = who(VIEWER);
 
     let calls = child.stats().calls;
     let a = first(host.route("deep.a.schema", json!({}), Some(&viewer)).await).await;
@@ -243,41 +228,9 @@ async fn nested_child_through_the_seam() {
 /// drops every name.
 #[tokio::test(flavor = "multi_thread")]
 async fn dynamic_children_through_the_seam() {
-    use futures::StreamExt;
-    use plexus_core::plexus::{AuthContext, Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef};
-    use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
-
-    const VIEWER: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const EDITOR: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    #[derive(Default)]
-    struct Members(Mutex<Vec<Membership>>);
-    impl Memberships for Members {
-        fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-            self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-        }
-    }
-    struct Everywhere;
-    impl Resolve for Everywhere {
-        fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-            Some(vec![ScopeRef::Everywhere])
-        }
-    }
-    async fn all(r: Result<plexus_core::plexus::PlexusStream, plexus_core::plexus::PlexusError>) -> Vec<Value> {
-        match r {
-            Err(e) => vec![json!({ "route_error": format!("{e:?}") })],
-            Ok(s) => s
-                .filter_map(|i| async move {
-                    match i {
-                        plexus_core::plexus::PlexusStreamItem::Data { content, .. } => Some(content.into_value()),
-                        plexus_core::plexus::PlexusStreamItem::Done { .. } => None,
-                        other => Some(serde_json::to_value(other).unwrap()),
-                    }
-                })
-                .collect()
-                .await,
-        }
-    }
+    use plexus_testkit::parts::{items as all, who};
+    use plexus_testkit::{World, EDITOR, VIEWER};
+    use serde_json::json;
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/slot_child.py");
     let spec = ChildSpec::Stdio { name: "sky".into(), argv: vec!["python3".into(), "-I".into(), fixture.to_string_lossy().into_owned()] };
@@ -290,14 +243,11 @@ async fn dynamic_children_through_the_seam() {
         assert!(roles["viewer"].contains(&g.to_string()), "{g}: {roles:?}");
     }
     assert_eq!(roles["editor"], ["sky.{planet}.rename"], "{roles:?}");
-    let members = Arc::new(Members::default());
-    for (p, r) in [(VIEWER, "viewer"), (EDITOR, "editor")] {
-        members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::parse("*") });
-    }
-    let table = RoleTable::from_lists(roles.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let host = DynamicHub::new("host").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(table), Arc::new(Everywhere))));
-    let viewer = AuthContext::for_principal(&VIEWER.parse().unwrap(), "s1", vec![], Value::Null);
-    let editor = AuthContext::for_principal(&EDITOR.parse().unwrap(), "s1", vec![], Value::Null);
+    // VIEWER holds viewer, EDITOR editor, on `*`; the roles are the ones the
+    // host declares.
+    let gated = World::new().host().with(child.clone()).await;
+    let host = gated.service();
+    let (viewer, editor) = (who(VIEWER), who(EDITOR));
     let (v, e) = (Some(&viewer), Some(&editor));
 
     // A typed slot: the slot grant, in the child's terms.

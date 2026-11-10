@@ -41,8 +41,11 @@
 //! ```
 //!
 //! The parts a host is made of — [`parts::Members`], [`parts::Everywhere`],
-//! [`parts::who`], [`parts::items`] — are public for a test that builds
-//! something the host does not (a second gate, a transport as a caller).
+//! [`parts::Shortcodes`], [`parts::who`] (each caller in a session of its
+//! own, [`parts::session_of`]), [`parts::items`] (or
+//! [`parts::every_item`], the closing `done` kept) — are public for
+//! a test that builds something the host does not (a second gate, a
+//! transport as a caller).
 //!
 //! This is the kit's root (KEEL-9); there is no `#[plexus_test]` attribute
 //! yet: a test makes its world with [`World::new`], which works the same in
@@ -53,7 +56,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use plexus_core::plexus::{
-    Activation, AuthSetup, ChildRouter, Gate, MemoryAuthBackend, MemoryRoles, PlexusStream, RoleTable, Roles,
+    Activation, AuthSetup, ChildRouter, Gate, MemoryAuthBackend, MemoryRoles, PlexusStream, Resolve, RoleTable, Roles,
 };
 use plexus_core::{DynamicHub, PlexusError};
 use serde_json::Value;
@@ -97,9 +100,11 @@ impl World {
             name: "host".into(),
             steps: Vec::new(),
             roles: Vec::new(),
-            members: NAMED.iter().map(|(p, r)| (p.to_string(), r.to_string())).collect(),
+            members: Vec::new(),
+            named: true,
             through: None,
             auth: false,
+            resolve: Arc::new(Everywhere),
         }
     }
 }
@@ -115,9 +120,11 @@ pub struct HostBuilder {
     name: String,
     steps: Vec<Step>,
     roles: Vec<(String, Vec<String>)>,
-    members: Vec<(String, String)>,
+    members: Vec<(String, String, String)>,
+    named: bool,
     through: Option<Through>,
     auth: bool,
+    resolve: Arc<dyn Resolve>,
 }
 
 impl HostBuilder {
@@ -164,8 +171,30 @@ impl HostBuilder {
 
     /// `who` holds `role` everywhere — a caller the test names itself, or a
     /// named one given another role besides its own.
-    pub fn member(mut self, who: &str, role: &str) -> Self {
-        self.members.push((who.to_string(), role.to_string()));
+    pub fn member(self, who: &str, role: &str) -> Self {
+        self.member_at(who, role, "*")
+    }
+
+    /// `who` holds `role` on `scope` alone — `*`, or a scope's name
+    /// (`MENGER`), which [`resolving`](Self::resolving) says what lives in.
+    pub fn member_at(mut self, who: &str, role: &str, scope: &str) -> Self {
+        self.members.push((who.to_string(), role.to_string(), scope.to_string()));
+        self
+    }
+
+    /// No caller holds anything unless the test says so: the named callers
+    /// ([`VIEWER`], [`EDITOR`], [`ADMIN`], [`USER`]) are not seated — for a
+    /// test whose own principals share their keys, or that counts who holds
+    /// what.
+    pub fn without_named_callers(mut self) -> Self {
+        self.named = false;
+        self
+    }
+
+    /// Where a target lives, the gate asks `resolve` — [`parts::Shortcodes`],
+    /// or the test's own; [`parts::Everywhere`] unless said.
+    pub fn resolving(mut self, resolve: impl Resolve + 'static) -> Self {
+        self.resolve = Arc::new(resolve);
         self
     }
 
@@ -191,14 +220,19 @@ impl HostBuilder {
             service = step(service);
         }
         let members = Arc::new(Members::default());
-        for (who, role) in &self.members {
-            members.hold(who, role);
+        if self.named {
+            for (who, role) in NAMED {
+                members.hold(who, role);
+            }
+        }
+        for (who, role, scope) in &self.members {
+            members.hold_at(who, role, scope);
         }
         let service = if self.auth {
             assert!(self.through.is_none(), "roles_through is not for a host with_auth: its roles are the auth store's");
             let roles = Arc::new(MemoryRoles::default());
             let backend = Arc::new(MemoryAuthBackend::new("http://x/login"));
-            let service = service.with_auth(AuthSetup::new(backend, roles.clone(), members.clone(), Arc::new(Everywhere)));
+            let service = service.with_auth(AuthSetup::new(backend, roles.clone(), members.clone(), self.resolve));
             roles.seed(&merged(service.declared_roles(), self.roles));
             service
         } else {
@@ -208,7 +242,7 @@ impl HostBuilder {
                 Some(f) => f(table),
                 None => table,
             };
-            service.with_gate(Arc::new(Gate::new(members.clone(), roles, Arc::new(Everywhere))))
+            service.with_gate(Arc::new(Gate::new(members.clone(), roles, self.resolve)))
         };
         Host { _world: self.world, service: Arc::new(service), members }
     }

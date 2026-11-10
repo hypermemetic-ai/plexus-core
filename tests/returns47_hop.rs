@@ -6,18 +6,15 @@
 //! stdio — a Rust child served by `remote_child::serve_child_stdio`, whose
 //! stdout carries the protocol alone.
 
-use futures::StreamExt;
 use plexus_core::call;
-use plexus_core::plexus::{
-    AuthContext, ChildOptions, ChildSpec, Gate, Membership, Memberships, PlexusStream, PlexusStreamItem, RemoteChild,
-    Resolve, RoleTable, ScopeRef,
-};
+use plexus_core::plexus::{AuthContext, ChildOptions, ChildSpec, RemoteChild, ScopeRef};
 use plexus_core::DynamicHub;
 use plexus_macros::PlexusRequest;
+use plexus_testkit::parts::{every_item, who};
+use plexus_testkit::{Host, World};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
 
 const ADA: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -109,34 +106,6 @@ impl forge::Forge for Plugin {
     }
 }
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
-async fn items(stream: PlexusStream) -> Vec<Value> {
-    stream
-        .map(|i| match i {
-            PlexusStreamItem::Data { content, .. } => content.into_value(),
-            other => serde_json::to_value(other).unwrap(),
-        })
-        .collect()
-        .await
-}
-
 async fn mounted() -> RemoteChild {
     let exe = std::env::current_exe().unwrap();
     let spec: ChildSpec = format!("forge=stdio:{}", exe.display()).parse().unwrap();
@@ -144,39 +113,30 @@ async fn mounted() -> RemoteChild {
 }
 
 /// ADA views MENGER; BOB holds nothing.
-fn gated(child: &RemoteChild) -> DynamicHub {
-    let plain = DynamicHub::new("menger").register(child.clone());
-    let members = Arc::new(Members::default());
-    members.0.lock().unwrap().push(Membership {
-        principal: ADA.parse().unwrap(),
-        role: plexus_auth_core::RoleName::new("viewer"),
-        scope: ScopeRef::parse("MENGER"),
-    });
-    let declared = plain.declared_roles();
-    let roles = RoleTable::from_lists(declared.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    DynamicHub::new("menger").register(child.clone()).with_gate(Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere))))
+async fn gated(child: &RemoteChild) -> Host {
+    World::new().host().named("menger").with(child.clone()).without_named_callers().member_at(ADA, "viewer", "MENGER").await
 }
 
 async fn the_plugins_hop_names_the_caller_and_the_ceiling() {
     let child = mounted().await;
-    let service = gated(&child);
-    let got = items(service.route("forge.whoami", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let host = gated(&child).await;
+    let got = host.as_(ADA).call("forge.whoami", json!({})).await;
     assert_eq!(
         got[0],
         json!({ "principal": "service:menger", "caller": ADA, "grant": "forge.whoami", "held_on": ["MENGER"], "caller_principal": ADA, "reach": ["MENGER"] }),
         "the caller is the hop's, its reach the hop's ceiling: {got:?}"
     );
-    let verified = items(service.route("forge.verified", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let verified = host.as_(ADA).call("forge.verified", json!({})).await;
     assert_eq!(verified[0], json!(format!("{ADA}@MENGER")), "the child's own verifier, on the hop's caller: {verified:?}");
 }
 
 async fn the_plugins_reads_are_bounded_by_the_ceiling() {
     let child = mounted().await;
-    let service = gated(&child);
-    let got = items(service.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let host = gated(&child).await;
+    let got = host.as_(ADA).call("forge.repos", json!({})).await;
     assert_eq!(got[0], json!(["menger", "menger-skills"]), "{got:?}");
     // Refused at the gate: the plugin never hears of it.
-    let refused = service.route("forge.repos", json!({}), Some(&who(BOB))).await;
+    let refused = host.as_(BOB).route("forge.repos", json!({})).await;
     assert!(refused.is_err(), "BOB holds nothing");
 }
 
@@ -186,7 +146,7 @@ async fn with_no_gate_deciding_the_plugin_refuses_before_the_method() {
     // schema, asked at the mount with no limit either, was answered.
     let child = mounted().await;
     let service = DynamicHub::new("menger").register(child.clone());
-    let got = items(service.route("forge.repos", json!({}), Some(&who(ADA))).await.unwrap()).await;
+    let got = every_item(service.route("forge.repos", json!({}), Some(&who(ADA))).await).await;
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0]["type"], "error", "{got:?}");
     assert_eq!(got[0]["error_kind"], "forbidden", "{got:?}");

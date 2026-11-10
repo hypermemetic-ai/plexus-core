@@ -8,10 +8,10 @@ use futures::StreamExt;
 use plexus_core::plexus::config::{
     settings, Config, ConfigAction, ConfigAudit, ConfigRecord, Millis, Reload, Sensitivity, Setting, Source,
 };
-use plexus_core::plexus::{
-    AuthContext, AuthSetup, MemoryAuthBackend, MemoryMemberships, MemoryRoles, PlexusStream, PlexusStreamItem, Resolve, ScopeRef,
-};
+use plexus_core::plexus::{PlexusStream, PlexusStreamItem};
 use plexus_core::{setting, DynamicHub, PlexusError};
+use plexus_testkit::parts::who;
+use plexus_testkit::{World, ADMIN, VIEWER};
 use serde_json::{json, Value};
 
 const WORKERS: Setting<u32> = setting!("test.workers", default = 4, reload = Restart, doc = "workers at start");
@@ -180,36 +180,26 @@ fn child_options_follow_the_settings() {
 
 // ------------------------------------------------------------------ the activation
 
-const ADMIN: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const VIEWER: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const KEYHOLDER: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _target: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
+/// ADMIN is admin, VIEWER a viewer, KEYHOLDER holds one key's methods.
+async fn served(c: &Config) -> Arc<DynamicHub> {
+    let c = c.clone();
+    let host = World::new()
+        .host()
+        .named("svc")
+        .configure(move |s| s.with_config(c).with_config_service())
+        // One key's methods, by their literal paths (NEST-5: the slot grant is additive).
+        .role("keyholder", ["config.test.mode.get", "config.test.mode.set", "config.transport.insecure_ws.set"])
+        .member(KEYHOLDER, "keyholder")
+        .with_auth()
+        .await;
+    host.service().clone()
 }
 
-fn hub(c: &Config) -> Arc<DynamicHub> {
-    let roles = Arc::new(MemoryRoles::default());
-    let members = MemoryMemberships::new().with(ADMIN, "admin", "*").with(VIEWER, "viewer", "*").with(KEYHOLDER, "keyholder", "*");
-    let hub = DynamicHub::new("svc")
-        .with_config(c.clone())
-        .with_config_service()
-        .with_auth(AuthSetup::new(Arc::new(MemoryAuthBackend::new("http://x/login")), roles.clone(), Arc::new(members), Arc::new(Everywhere)));
-    let mut declared = hub.declared_roles();
-    // One key's methods, by their literal paths (NEST-5: the slot grant is additive).
-    declared.insert("keyholder".into(), vec!["config.test.mode.get".into(), "config.test.mode.set".into(), "config.transport.insecure_ws.set".into()]);
-    roles.seed(&declared);
-    Arc::new(hub)
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], json!({}))
-}
-
-async fn items(stream: PlexusStream) -> Vec<Value> {
+/// An answer's data, and each error as its message and fields (not the
+/// kit's `items`, which gives an error item whole).
+async fn answered(stream: PlexusStream) -> Vec<Value> {
     stream
         .filter_map(|i| async move {
             match i {
@@ -224,7 +214,7 @@ async fn items(stream: PlexusStream) -> Vec<Value> {
 
 async fn call(hub: &DynamicHub, p: &str, method: &str, params: Value) -> Vec<Value> {
     match hub.route(method, params, Some(&who(p))).await {
-        Ok(s) => items(s).await,
+        Ok(s) => answered(s).await,
         Err(PlexusError::Forbidden { reason: plexus_core::AuthzDenyReason::MissingGrant { grant, .. } }) => vec![json!({ "forbidden": grant.as_str() })],
         Err(e) => vec![json!({ "route_error": e.to_string() })],
     }
@@ -237,7 +227,7 @@ async fn the_config_activation_serves_each_key_on_its_own_grant() {
     c.declare(&MODE);
     c.declare(&TOKEN);
     c.declare(&LOCAL);
-    let h = hub(&c);
+    let h = served(&c).await;
     // The admin: list, get, set.
     let listed = call(&h, ADMIN, "config.list", json!({})).await;
     assert!(listed.iter().any(|k| k["key"] == "transport.insecure_ws" && k["value"] == false && k["critical"] == true), "{listed:?}");
@@ -275,7 +265,7 @@ async fn guards_remote_false_critical_secret_and_confirm() {
     let c = Config::new().with_audit(sink.clone());
     c.declare(&TOKEN);
     c.declare(&LOCAL);
-    let h = hub(&c);
+    let h = served(&c).await;
     // remote = false: readable, never set over the wire.
     for (m, p) in [("config.transport.tls_roots.set", json!({ "value": "/x.pem" })), ("config.test.host_only.set", json!({ "value": true })), ("config.test.host_only.reset", json!({}))] {
         let got = call(&h, ADMIN, m, p).await;

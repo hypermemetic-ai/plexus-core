@@ -1,8 +1,11 @@
 //! KEEL-9: the kit's own rows — a host admits by role, refuses without, and
-//! `roles(..)` adds to the declared ones.
+//! `roles(..)` adds to the declared ones. KEEL-10: a membership on a scope,
+//! targets resolved by shortcode, a host without the named callers, and a
+//! member forgotten; each caller in a session of its own.
 
 use async_stream::stream;
 use futures::stream::Stream;
+use plexus_testkit::parts::{every_item, items, session_of, who, Shortcodes};
 use plexus_testkit::{World, ADMIN, EDITOR, NOBODY, USER, VIEWER};
 use serde_json::{json, Value};
 
@@ -107,4 +110,99 @@ async fn the_service_is_handed_over_and_is_the_one_called() {
     host.gate().moved(plexus_auth_core::grants::GrantsMove::Revoke);
     let got = host.as_(VIEWER).call("shop.items", json!({})).await;
     assert!(refused_naming(&got, "shop.items"), "{got:?}");
+}
+
+#[derive(Clone)]
+struct AislesActivation;
+
+/// A shop's aisles, each a ticket of its department (`BAKERY-3`).
+#[plexus_macros::activation(namespace = "aisles", roles(viewer = ["stock"]))]
+impl AislesActivation {
+    /// What an aisle holds.
+    #[plexus_macros::method(target = "aisle")]
+    async fn stock(&self, aisle: String) -> impl Stream<Item = String> + Send + 'static {
+        stream! { yield aisle; }
+    }
+}
+
+#[tokio::test]
+async fn a_member_on_a_shortcode_reaches_its_targets_alone() {
+    let world = World::new();
+    let host = world.host().with(AislesActivation).resolving(Shortcodes).member_at(CLERK, "viewer", "BAKERY").await;
+    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "BAKERY-3" })).await, [json!("BAKERY-3")]);
+    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "BAKERY" })).await, [json!("BAKERY")]);
+    let got = host.as_(CLERK).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await;
+    assert!(refused_naming(&got, "aisles.stock"), "{got:?}");
+    // No shortcode: it locates nothing, refused even to a viewer everywhere.
+    let got = host.as_(VIEWER).call("aisles.stock", json!({ "aisle": "bakery-3" })).await;
+    assert!(got.len() == 1 && got[0]["route_error"].is_string(), "{got:?}");
+    // The named viewer holds viewer on `*`: every shortcode.
+    assert_eq!(host.as_(VIEWER).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await, [json!("DAIRY-1")]);
+}
+
+#[tokio::test]
+async fn without_the_named_callers_only_the_tests_members_hold_anything() {
+    let world = World::new();
+    let host = world.host().with(AislesActivation).resolving(Shortcodes).without_named_callers().member(CLERK, "viewer").await;
+    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await, [json!("DAIRY-1")]);
+    for named in [VIEWER, EDITOR, ADMIN, USER] {
+        let got = host.as_(named).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await;
+        assert!(refused_naming(&got, "aisles.stock"), "{named}: {got:?}");
+    }
+    assert_eq!(host.members().0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_member_forgotten_holds_nothing() {
+    let world = World::new();
+    let host = world.host().with(AislesActivation).member_at(CLERK, "viewer", "*").member(CLERK, "editor").await;
+    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "x" })).await, [json!("x")]);
+    host.members().forget(CLERK);
+    let got = host.as_(CLERK).call("aisles.stock", json!({ "aisle": "x" })).await;
+    assert!(refused_naming(&got, "aisles.stock"), "{got:?}");
+    // The others keep what they hold.
+    assert_eq!(host.as_(VIEWER).call("aisles.stock", json!({ "aisle": "x" })).await, [json!("x")]);
+}
+
+/// What a method saw of its caller's session.
+#[derive(Clone)]
+struct SessionActivation;
+
+#[plexus_macros::activation(namespace = "session", roles(viewer = ["mine"]))]
+impl SessionActivation {
+    /// The caller's session id.
+    #[plexus_macros::method]
+    async fn mine(&self, auth: &plexus_core::plexus::AuthContext) -> impl Stream<Item = String> + Send + 'static {
+        let id = auth.session_id.clone();
+        stream! { yield id; }
+    }
+}
+
+#[tokio::test]
+async fn each_caller_has_a_session_of_its_own_and_keeps_it() {
+    assert_ne!(who(VIEWER).session_id, who(EDITOR).session_id);
+    assert_eq!(who(VIEWER).session_id, who(VIEWER).session_id);
+    assert_eq!(who(VIEWER).session_id, session_of(VIEWER));
+    let world = World::new();
+    let host = world.host().with(SessionActivation).member(EDITOR, "viewer").await;
+    let viewer = host.as_(VIEWER).call("session.mine", json!({})).await;
+    let editor = host.as_(EDITOR).call("session.mine", json!({})).await;
+    assert_eq!(viewer, [json!(session_of(VIEWER))]);
+    assert_eq!(editor, [json!(session_of(EDITOR))]);
+    assert_ne!(viewer, editor);
+    assert_eq!(host.as_(VIEWER).call("session.mine", json!({})).await, viewer, "the same session on the next call");
+}
+
+#[tokio::test]
+async fn every_item_keeps_the_closing_done_that_items_leaves_out() {
+    let world = World::new();
+    let host = world.host().with(ShopActivation).await;
+    let all = every_item(host.as_(VIEWER).route("shop.items", json!({})).await).await;
+    assert_eq!(all.len(), 3, "{all:?}");
+    assert_eq!(&all[..2], [json!("flour"), json!("salt")]);
+    assert_eq!(all[2]["type"], "done", "{all:?}");
+    assert_eq!(items(host.as_(VIEWER).route("shop.items", json!({})).await).await, all[..2]);
+    // A call not routed: one item, as `items` gives it.
+    let refused = every_item(host.as_(NOBODY).route("shop.items", json!({})).await).await;
+    assert!(refused_naming(&refused, "shop.items"), "{refused:?}");
 }

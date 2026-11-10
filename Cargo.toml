@@ -89,7 +89,7 @@ plexus-client = { path = "../plexus-macros/plexus-client", version = "0.11.0", f
 # Sealed-type auth primitives. plexus-core re-exports AuthContext /
 # VerifiedUser / Principal from here for backward compatibility. New code
 # should import directly from plexus-auth-core. Per AUTHZ-CORE-CRATE-1.
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1" }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.2" }
 
 # KEEL-19 (P5): a key file opened O_NOFOLLOW, its owner the effective user.
 [target.'cfg(unix)'.dependencies]
@@ -238,7 +238,7 @@ plexus-transport = { path = "../plexus-transport", default-features = false }
 # `src/plexus/credential_envelope.rs` can mint real `Credential<T>`
 # values. Added by AUTHZ-CRED-CORE-1B as part of wiring CRED-CORE-2's
 # deferred end-to-end ACs (#1, #2 full, #4 end-to-end, #5 end-to-end).
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1", features = ["test-support", "adapters"] }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.2", features = ["test-support", "adapters"] }
 
 # PLEXUS-45: tests/wasm_dispatch.rs, a DynamicHub dispatched in wasm32 under
 # Node (`scripts/wasm-test.sh`); its timers and clock are the normal

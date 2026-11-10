@@ -371,3 +371,81 @@ async fn a_first_contact_with_no_pairing_code_is_refused_unasked() {
     assert_eq!(b.mounted(Duration::from_secs(10)).await.unwrap(), "peers.bob");
     assert_eq!(b.code(), None);
 }
+
+/// Review R2-4's admission: mounts the first offer; at the second offer's
+/// mount, closes the first offer's socket, then refuses the second.
+#[derive(Default)]
+struct Rollback {
+    first: Mutex<Option<Arc<PeerSocket>>>,
+    mounts: std::sync::atomic::AtomicUsize,
+}
+
+struct RollbackOf(Arc<Rollback>);
+
+impl Admission for RollbackOf {
+    fn decide(&self, _: &Offer) -> Decision {
+        Decision::Admit
+    }
+    fn vet(&self, _: &Offer, _: &RemoteChild) -> Result<(), OfferRefused> {
+        Ok(())
+    }
+    fn mounted(&self, _: &Offer, _: &RemoteChild, socket: &Arc<PeerSocket>) -> Result<(), OfferRefused> {
+        match self.0.mounts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => {
+                *self.0.first.lock().unwrap() = Some(Arc::clone(socket));
+                Ok(())
+            }
+            1 => {
+                // The older socket goes now, while the newer one is in its place.
+                if let Some(old) = self.0.first.lock().unwrap().take() {
+                    old.close("gone mid-mount");
+                }
+                Err(OfferRefused::new("refused", "refused as it was mounted"))
+            }
+            _ => Ok(()),
+        }
+    }
+    fn closed(&self, _: u64, _: Option<&str>, _: &str) {}
+}
+
+/// Review R2-4: a mount refused at its last step puts back the entry it
+/// replaced only while that entry's socket is open — a closed one would hold
+/// the name for its key until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_mount_never_puts_back_a_closed_socket() {
+    let rollback = Arc::new(Rollback::default());
+    let key = plexus_core::plexus::peer_token::PeerKey::from_seed([39; 32]);
+    let peers = Peers::new("peers", "relay", "service:relay").with_key(key).with_admission(Arc::new(RollbackOf(Arc::clone(&rollback))));
+    let alice = |seed: u8| AuthContext::for_principal(&plexus_core::plexus::peer_token::PeerKey::from_seed([seed; 32]).kid().parse().unwrap(), "s", vec![], serde_json::json!({ "auth_method": "key" }));
+    // A node by hand: answers the host's schema request on its socket.
+    async fn offer(peers: &Peers, auth: AuthContext) -> serde_json::Value {
+        let (socket, mut out) = peers.socket(Some(auth));
+        socket.on_frame(br#"{"jsonrpc":"2.0","id":"o","method":"relay.offer","params":{"namespace":"greeter","mount":"alice"}}"#);
+        loop {
+            let frame: serde_json::Value = serde_json::from_slice(&tokio::time::timeout(Duration::from_secs(5), out.recv()).await.unwrap().unwrap()).unwrap();
+            if frame["id"] == "o" && frame.get("method").is_none() {
+                return frame;
+            }
+            if let Some(id) = frame.get("id").filter(|_| frame.get("method").is_some()) {
+                let schema = serde_json::json!({ "namespace": "greeter", "version": "0.1.0", "description": "g", "hash": "g1", "self_hash": "g1", "methods": [] });
+                let meta = serde_json::json!({ "provenance": ["greeter"], "plexus_hash": "g1", "timestamp": 0 });
+                for f in [
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": 7 }),
+                    serde_json::json!({ "jsonrpc": "2.0", "method": "greeter.call", "params": { "subscription": 7, "result": { "type": "data", "metadata": meta, "content_type": "greeter.schema", "content": schema } } }),
+                    serde_json::json!({ "jsonrpc": "2.0", "method": "greeter.call", "params": { "subscription": 7, "result": { "type": "done", "metadata": meta } } }),
+                ] {
+                    socket.on_frame(f.to_string().as_bytes());
+                }
+            }
+        }
+    }
+    let first = offer(&peers, alice(1)).await;
+    assert!(first.get("result").is_some(), "{first}");
+    assert_eq!(peers.names(), ["alice"]);
+    let second = offer(&peers, alice(1)).await;
+    assert!(second.get("error").is_some(), "{second}");
+    assert!(peers.names().is_empty(), "a closed socket's entry was put back: {:?}", peers.names());
+    // So another key may take the name.
+    let third = offer(&peers, alice(2)).await;
+    assert!(third.get("result").is_some(), "the name is still held: {third}");
+}

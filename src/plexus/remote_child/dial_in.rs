@@ -184,6 +184,8 @@ struct Entry {
     namespace: String,
     socket: u64,
     since: Instant,
+    /// NEST-25 (review R2-4): the socket that holds it, to know it is still open.
+    holder: std::sync::Weak<PeerSocket>,
 }
 
 impl Entry {
@@ -835,7 +837,7 @@ impl PeerSocket {
                 self.link.lock().unwrap().take();
                 return refusal(id, -32000, "child_unavailable", "the socket closed while it was mounted");
             }
-            let replaced = peers.inner.table.write().unwrap().insert(name.clone(), Entry { child: child.clone(), principal: principal.clone(), namespace: namespace.clone(), socket: self.id, since: Instant::now() });
+            let replaced = peers.inner.table.write().unwrap().insert(name.clone(), Entry { child: child.clone(), principal: principal.clone(), namespace: namespace.clone(), socket: self.id, since: Instant::now(), holder: Arc::downgrade(self) });
             *m = Some(name.clone());
             replaced
         };
@@ -851,7 +853,9 @@ impl PeerSocket {
                     if t.get(&name).is_some_and(|e| e.socket == self.id) {
                         t.remove(&name);
                     }
-                    if let Some(old) = replaced {
+                    // Put back only while its socket is open (review R2-4): a
+                    // closed one would hold the name for its key until a restart.
+                    if let Some(old) = replaced.filter(|e| e.holder.upgrade().is_some_and(|s| !s.is_closed())) {
                         t.entry(name.clone()).or_insert(old);
                     }
                 }

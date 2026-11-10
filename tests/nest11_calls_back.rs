@@ -204,9 +204,9 @@ async fn host_and_child() -> (Host, RemoteChild) {
 async fn the_child_calls_a_sibling_as_the_original_caller() {
     let (host, child) = host_and_child().await;
     let at_start = child.stats().calls_back;
-    let got = host.as_(VIEWER).call("relay.ask", json!({ "to": "get" })).await;
+    let got = host.as_(VIEWER).call("relay.ask", json!({ "to": "get" })).await.values();
     assert_eq!(got[0], json!({ "sibling": "get", "caller": VIEWER }), "{got:?}");
-    let got = host.as_(EDITOR).call("relay.ask", json!({ "to": "get" })).await;
+    let got = host.as_(EDITOR).call("relay.ask", json!({ "to": "get" })).await.values();
     assert_eq!(got[0]["caller"], EDITOR, "{got:?}");
     assert_eq!(child.stats().calls_back - at_start, 2, "the schema at its start, then one a call");
     assert_eq!(child.calls_open_back(), 0, "each forwarded call ended, and its standing with it");
@@ -216,12 +216,12 @@ async fn the_child_calls_a_sibling_as_the_original_caller() {
 /// grant is refused, though the child is the service's own.
 async fn a_caller_without_the_siblings_grant_is_refused() {
     let (host, _child) = host_and_child().await;
-    let got = host.as_(RELAY_ONLY).call("relay.ask", json!({ "to": "get" })).await;
+    let got = host.as_(RELAY_ONLY).call("relay.ask", json!({ "to": "get" })).await.values();
     assert_eq!(got[0]["refused"]["kind"], "forbidden", "{got:?}");
     assert!(got[0]["message"].as_str().unwrap().contains("sibling.get"), "{got:?}");
-    let got = host.as_(VIEWER).call("relay.ask", json!({ "to": "secret" })).await;
+    let got = host.as_(VIEWER).call("relay.ask", json!({ "to": "secret" })).await.values();
     assert_eq!(got[0]["refused"]["kind"], "forbidden", "a viewer holds no sibling.secret: {got:?}");
-    let got = host.as_(EDITOR).call("relay.ask", json!({ "to": "secret" })).await;
+    let got = host.as_(EDITOR).call("relay.ask", json!({ "to": "secret" })).await.values();
     assert_eq!(got[0], json!({ "sibling": "secret" }), "{got:?}");
 }
 
@@ -229,9 +229,9 @@ async fn a_caller_without_the_siblings_grant_is_refused() {
 /// naming why.
 async fn a_call_back_after_its_call_ended_is_refused() {
     let (host, _child) = host_and_child().await;
-    let kept = host.as_(VIEWER).call("relay.keep", json!({})).await;
+    let kept = host.as_(VIEWER).call("relay.keep", json!({})).await.values();
     assert_eq!(kept[0], "kept");
-    let got = host.as_(VIEWER).call("relay.later", json!({})).await;
+    let got = host.as_(VIEWER).call("relay.later", json!({})).await.values();
     assert_eq!(got[0]["refused"]["kind"], "unauthenticated", "{got:?}");
     assert!(got[0]["message"].as_str().unwrap().contains("no call"), "{got:?}");
 }
@@ -242,7 +242,7 @@ async fn the_forwarded_call_ending_ends_what_was_made_under_it() {
     let (host, child) = host_and_child().await;
     let before = TICKING.load(Ordering::SeqCst);
     {
-        let mut s = host.as_(VIEWER).route("relay.follow", json!({})).await.unwrap();
+        let mut s = host.as_(VIEWER).stream("relay.follow", json!({})).await.unwrap();
         let mut seen = vec![];
         while seen.len() < 3 {
             if let Some(PlexusStreamItem::Data { content, .. }) = s.next().await {
@@ -264,7 +264,7 @@ async fn the_forwarded_call_ending_ends_what_was_made_under_it() {
 /// whole description), anything else refused `unauthenticated`.
 async fn outside_a_call_only_a_schema_is_answered() {
     let (host, _child) = host_and_child().await;
-    let got = host.as_(VIEWER).call("relay.started", json!({})).await;
+    let got = host.as_(VIEWER).call("relay.started", json!({})).await.values();
     assert_eq!(got[0]["schema_namespace"], "sibling", "{got:?}");
     assert_eq!(got[0]["plain"]["code"], -32001, "{got:?}");
     assert!(got[0]["plain"]["message"].as_str().unwrap().contains("only for a schema"), "{got:?}");

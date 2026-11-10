@@ -5,9 +5,10 @@
 
 use async_stream::stream;
 use futures::stream::Stream;
+use plexus_core::plexus::AuthEvent;
 use plexus_testkit::parts::{every_item, items, session_of, who, Shortcodes};
-use plexus_testkit::{World, ADMIN, EDITOR, NOBODY, USER, VIEWER};
-use serde_json::{json, Value};
+use plexus_testkit::{Forbidden, Unauthenticated, World, ADMIN, EDITOR, NOBODY, USER, VIEWER};
+use serde_json::json;
 
 #[derive(Clone)]
 struct ShopActivation;
@@ -34,35 +35,26 @@ impl ShopActivation {
 
 const CLERK: &str = "key:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
 
-fn refused_naming(got: &[Value], grant: &str) -> bool {
-    got.len() == 1 && got[0]["route_error"].as_str().is_some_and(|e| e.contains("Forbidden") && e.contains(grant))
-}
-
 #[tokio::test]
 async fn a_host_admits_by_role() {
     let world = World::new();
     let host = world.host().with(ShopActivation).await;
-    assert_eq!(host.as_(VIEWER).call("shop.items", json!({})).await, [json!("flour"), json!("salt")]);
-    assert_eq!(host.as_(EDITOR).call("shop.restock", json!({ "what": "rye" })).await, [json!("restocked rye")]);
+    assert_eq!(host.as_(VIEWER).call("shop.items", json!({})).await.answers(2), [json!("flour"), json!("salt")]);
+    assert_eq!(host.as_(EDITOR).call("shop.restock", json!({ "what": "rye" })).await.answer::<String>(), "restocked rye");
     // admin holds every grant, listed or not.
-    assert_eq!(host.as_(ADMIN).call("shop.till", json!({})).await, [json!(42)]);
+    assert_eq!(host.as_(ADMIN).call("shop.till", json!({})).await.answer::<u64>(), 42);
 }
 
 #[tokio::test]
 async fn a_host_refuses_without_the_grant() {
     let world = World::new();
     let host = world.host().with(ShopActivation).await;
-    let got = host.as_(VIEWER).call("shop.restock", json!({ "what": "rye" })).await;
-    assert!(refused_naming(&got, "shop.restock"), "{got:?}");
-    // The refusal names the roles that list the grant.
-    assert!(got[0]["route_error"].as_str().unwrap().contains("editor"), "{got:?}");
-    let got = host.as_(NOBODY).call("shop.items", json!({})).await;
-    assert!(refused_naming(&got, "shop.items"), "{got:?}");
+    // The refusal names the grant and the roles that list it.
+    host.as_(VIEWER).call("shop.restock", json!({ "what": "rye" })).await.refused(Forbidden).naming("shop.restock").listed_by(["editor", "admin"]);
+    host.as_(NOBODY).call("shop.items", json!({})).await.refused(Forbidden).naming("shop.items");
     // `user` is held by USER, but no activation declares it.
-    let got = host.as_(USER).call("shop.items", json!({})).await;
-    assert!(refused_naming(&got, "shop.items"), "{got:?}");
-    let got = host.anonymous().call("shop.items", json!({})).await;
-    assert!(got[0]["route_error"].as_str().is_some_and(|e| e.contains("Unauthenticated")), "{got:?}");
+    host.as_(USER).call("shop.items", json!({})).await.refused(Forbidden).naming("shop.items");
+    host.anonymous().call("shop.items", json!({})).await.refused(Unauthenticated);
 }
 
 #[tokio::test]
@@ -70,33 +62,31 @@ async fn roles_add_to_the_declared_ones() {
     let world = World::new();
     let host = world.host().with(ShopActivation).roles([("viewer", ["shop.till"]), ("user", ["shop.items"])]).await;
     // Added: the viewer reaches the till, the user the shelves…
-    assert_eq!(host.as_(VIEWER).call("shop.till", json!({})).await, [json!(42)]);
-    assert_eq!(host.as_(USER).call("shop.items", json!({})).await.len(), 2);
+    assert_eq!(host.as_(VIEWER).call("shop.till", json!({})).await.answer::<u64>(), 42);
+    host.as_(USER).call("shop.items", json!({})).await.answers(2);
     // …and the declared grants stay.
-    assert_eq!(host.as_(VIEWER).call("shop.items", json!({})).await.len(), 2);
-    let got = host.as_(VIEWER).call("shop.restock", json!({ "what": "rye" })).await;
-    assert!(refused_naming(&got, "shop.restock"), "{got:?}");
+    host.as_(VIEWER).call("shop.items", json!({})).await.answers(2);
+    host.as_(VIEWER).call("shop.restock", json!({ "what": "rye" })).await.refused(Forbidden).naming("shop.restock");
 }
 
 #[tokio::test]
 async fn a_caller_the_test_names_holds_the_role_it_is_given() {
     let world = World::new();
     let host = world.host().with(ShopActivation).role("clerk", ["shop.till"]).member(CLERK, "clerk").await;
-    assert_eq!(host.as_(CLERK).call("shop.till", json!({})).await, [json!(42)]);
-    let got = host.as_(CLERK).call("shop.items", json!({})).await;
-    assert!(refused_naming(&got, "shop.items"), "{got:?}");
+    assert_eq!(host.as_(CLERK).call("shop.till", json!({})).await.answer::<u64>(), 42);
+    host.as_(CLERK).call("shop.items", json!({})).await.refused(Forbidden).naming("shop.items");
 }
 
 #[tokio::test]
 async fn with_auth_the_auth_activation_answers_and_decides() {
     let world = World::new();
     let host = world.host().named("store").with(ShopActivation).role("clerk", ["shop.till"]).member(CLERK, "clerk").with_auth().await;
-    let req = host.as_(VIEWER).call("auth.requires", json!({ "method": "shop.items" })).await;
-    assert_eq!(req[0]["grant"], "shop.items", "{req:?}");
-    assert!(req[0]["roles"].as_array().unwrap().iter().any(|r| r == "viewer"), "{req:?}");
-    assert_eq!(host.as_(CLERK).call("shop.till", json!({})).await, [json!(42)]);
-    let got = host.as_(VIEWER).call("shop.till", json!({})).await;
-    assert!(refused_naming(&got, "shop.till"), "{got:?}");
+    let req = host.as_(VIEWER).call("auth.requires", json!({ "method": "shop.items" })).await.answer::<AuthEvent>();
+    let AuthEvent::Requires { grant, roles, .. } = req else { panic!("auth.requires answered {req:?}") };
+    assert_eq!(grant, "shop.items");
+    assert!(roles.iter().any(|r| r == "viewer"), "{roles:?}");
+    assert_eq!(host.as_(CLERK).call("shop.till", json!({})).await.answer::<u64>(), 42);
+    host.as_(VIEWER).call("shop.till", json!({})).await.refused(Forbidden).naming("shop.till");
 }
 
 #[tokio::test]
@@ -108,8 +98,7 @@ async fn the_service_is_handed_over_and_is_the_one_called() {
     // A membership taken away while the host serves, said to the gate.
     host.members().0.lock().unwrap().clear();
     host.gate().moved(plexus_auth_core::grants::GrantsMove::Revoke);
-    let got = host.as_(VIEWER).call("shop.items", json!({})).await;
-    assert!(refused_naming(&got, "shop.items"), "{got:?}");
+    host.as_(VIEWER).call("shop.items", json!({})).await.refused(Forbidden).naming("shop.items");
 }
 
 #[derive(Clone)]
@@ -129,25 +118,23 @@ impl AislesActivation {
 async fn a_member_on_a_shortcode_reaches_its_targets_alone() {
     let world = World::new();
     let host = world.host().with(AislesActivation).resolving(Shortcodes).member_at(CLERK, "viewer", "BAKERY").await;
-    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "BAKERY-3" })).await, [json!("BAKERY-3")]);
-    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "BAKERY" })).await, [json!("BAKERY")]);
-    let got = host.as_(CLERK).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await;
-    assert!(refused_naming(&got, "aisles.stock"), "{got:?}");
+    let stock = |aisle: &str| json!({ "aisle": aisle });
+    assert_eq!(host.as_(CLERK).call("aisles.stock", stock("BAKERY-3")).await.answer::<String>(), "BAKERY-3");
+    assert_eq!(host.as_(CLERK).call("aisles.stock", stock("BAKERY")).await.answer::<String>(), "BAKERY");
+    host.as_(CLERK).call("aisles.stock", stock("DAIRY-1")).await.refused(Forbidden).naming("aisles.stock").at("DAIRY").held_on(["BAKERY"]);
     // No shortcode: it locates nothing, refused even to a viewer everywhere.
-    let got = host.as_(VIEWER).call("aisles.stock", json!({ "aisle": "bakery-3" })).await;
-    assert!(got.len() == 1 && got[0]["route_error"].is_string(), "{got:?}");
+    host.as_(VIEWER).call("aisles.stock", stock("bakery-3")).await.refused(Forbidden).naming("aisles.stock");
     // The named viewer holds viewer on `*`: every shortcode.
-    assert_eq!(host.as_(VIEWER).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await, [json!("DAIRY-1")]);
+    assert_eq!(host.as_(VIEWER).call("aisles.stock", stock("DAIRY-1")).await.answer::<String>(), "DAIRY-1");
 }
 
 #[tokio::test]
 async fn without_the_named_callers_only_the_tests_members_hold_anything() {
     let world = World::new();
     let host = world.host().with(AislesActivation).resolving(Shortcodes).without_named_callers().member(CLERK, "viewer").await;
-    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await, [json!("DAIRY-1")]);
+    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await.answer::<String>(), "DAIRY-1");
     for named in [VIEWER, EDITOR, ADMIN, USER] {
-        let got = host.as_(named).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await;
-        assert!(refused_naming(&got, "aisles.stock"), "{named}: {got:?}");
+        host.as_(named).call("aisles.stock", json!({ "aisle": "DAIRY-1" })).await.refused(Forbidden).naming("aisles.stock");
     }
     assert_eq!(host.members().0.lock().unwrap().len(), 1);
 }
@@ -156,12 +143,11 @@ async fn without_the_named_callers_only_the_tests_members_hold_anything() {
 async fn a_member_forgotten_holds_nothing() {
     let world = World::new();
     let host = world.host().with(AislesActivation).member_at(CLERK, "viewer", "*").member(CLERK, "editor").await;
-    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "x" })).await, [json!("x")]);
+    assert_eq!(host.as_(CLERK).call("aisles.stock", json!({ "aisle": "x" })).await.answer::<String>(), "x");
     host.members().forget(CLERK);
-    let got = host.as_(CLERK).call("aisles.stock", json!({ "aisle": "x" })).await;
-    assert!(refused_naming(&got, "aisles.stock"), "{got:?}");
+    host.as_(CLERK).call("aisles.stock", json!({ "aisle": "x" })).await.refused(Forbidden).naming("aisles.stock");
     // The others keep what they hold.
-    assert_eq!(host.as_(VIEWER).call("aisles.stock", json!({ "aisle": "x" })).await, [json!("x")]);
+    assert_eq!(host.as_(VIEWER).call("aisles.stock", json!({ "aisle": "x" })).await.answer::<String>(), "x");
 }
 
 /// What a method saw of its caller's session.
@@ -185,24 +171,26 @@ async fn each_caller_has_a_session_of_its_own_and_keeps_it() {
     assert_eq!(who(VIEWER).session_id, session_of(VIEWER));
     let world = World::new();
     let host = world.host().with(SessionActivation).member(EDITOR, "viewer").await;
-    let viewer = host.as_(VIEWER).call("session.mine", json!({})).await;
-    let editor = host.as_(EDITOR).call("session.mine", json!({})).await;
-    assert_eq!(viewer, [json!(session_of(VIEWER))]);
-    assert_eq!(editor, [json!(session_of(EDITOR))]);
+    let viewer = host.as_(VIEWER).call("session.mine", json!({})).await.answer::<String>();
+    let editor = host.as_(EDITOR).call("session.mine", json!({})).await.answer::<String>();
+    assert_eq!(viewer, session_of(VIEWER));
+    assert_eq!(editor, session_of(EDITOR));
     assert_ne!(viewer, editor);
-    assert_eq!(host.as_(VIEWER).call("session.mine", json!({})).await, viewer, "the same session on the next call");
+    assert_eq!(host.as_(VIEWER).call("session.mine", json!({})).await.answer::<String>(), viewer, "the same session on the next call");
 }
 
 #[tokio::test]
 async fn every_item_keeps_the_closing_done_that_items_leaves_out() {
     let world = World::new();
     let host = world.host().with(ShopActivation).await;
-    let all = every_item(host.as_(VIEWER).route("shop.items", json!({})).await).await;
+    let all = every_item(host.as_(VIEWER).stream("shop.items", json!({})).await).await;
     assert_eq!(all.len(), 3, "{all:?}");
     assert_eq!(&all[..2], [json!("flour"), json!("salt")]);
     assert_eq!(all[2]["type"], "done", "{all:?}");
-    assert_eq!(items(host.as_(VIEWER).route("shop.items", json!({})).await).await, all[..2]);
+    assert_eq!(items(host.as_(VIEWER).stream("shop.items", json!({})).await).await, all[..2]);
+    // The outcome's raw() is every_item's shape.
+    assert_eq!(host.as_(VIEWER).call("shop.items", json!({})).await.raw(), all);
     // A call not routed: one item, as `items` gives it.
-    let refused = every_item(host.as_(NOBODY).route("shop.items", json!({})).await).await;
-    assert!(refused_naming(&refused, "shop.items"), "{refused:?}");
+    let refused = every_item(host.as_(NOBODY).stream("shop.items", json!({})).await).await;
+    assert!(refused.len() == 1 && refused[0]["route_error"].as_str().is_some_and(|e| e.contains("Forbidden") && e.contains("shop.items")), "{refused:?}");
 }

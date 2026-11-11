@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### ONE-7 — the gate passes the call's address: an activation's door, and one peer's (0.11.4, patch)
+
+Build 2 of ONE-4, on plexus-auth-core 0.3.4 (ONE-6; the requirement is now
+`0.3.4`). Owner, 2026-11-11: "activation and data scopes are separate. we
+can only generally handle activation scopes. data scopes must be handled by
+the application". A role may be held on an **address** — `/dyn` (dyn's own
+methods), `/dyn.*` (dyn and all beneath it), `/dyn.peer.shop.*` (one peer)
+— and it opens a **door**, never data.
+
+- **The door, for two shapes only.** The dispatcher makes one
+  `DispatchedCall` per dispatch (`grant_gate::dispatched`, the one place):
+  the address from the literal routed path (`CallAddress::of_segments`,
+  every dot a segment), the grant from the entry it was routed to. A method
+  marked `everywhere` with **no target**, and a call into an **untyped peer
+  slot** (`dyn.{peer}`), are decided at that door
+  (`Gate::check_everywhere_at`): `*`, or an address scope covering the
+  call. Everything else is decided as before — a declared target on its
+  chain, a targetless read "held anywhere" on data, a literal path through a
+  slot (consent's `callers`) as before. A method marked `everywhere` that
+  also declares a target is held to `*` alone, never the door. A path with
+  no address (a segment `of_segments` refuses, or a name its activation
+  gives a method and a child alike) is decided on `*` alone — never on a
+  shorter address, never "held anywhere".
+- **KEEL-44 closed for the slot grant.** A role listing `dyn.{peer}` (any
+  untyped peer slot's grant) on a data scope no longer reaches every peer:
+  the slot is decided at the peer's door. `operator on /dyn.peer.shop.*`
+  reaches `shop` alone; `operator on /dyn.*` every peer; `*` everything.
+  A session ceiling on a data scope alone (`operator@KILN`) now opens no
+  peer, where it narrowed one. **Not closed:** `admin` lists every grant,
+  a peer method's literal path among them, and a literal path is decided as
+  before — an admin of a data scope still reaches a peer's ordinary methods
+  (not its whole-activation ones); KEEL-31's `keel31_through_slots` rows
+  rely on it.
+- **A refusal at a door says `*`**, as KEEL-31's did (plexus-auth-core names
+  the activation's address; plexus-core keeps the one shape clients read).
+- **Backstops ask the door of their own call.** `call::admits_everywhere`
+  (the macro's check before a whole-activation method) passes on `*` or on
+  a reach that holds the activation at this method's door
+  (`Reach::holds_activation`, the reach's grant naming the method, or an
+  untyped peer slot's whole grant); `auth.role_set` and `auth.waiting` the
+  same for their own grants. Every check that means "every data scope"
+  keeps `is_everywhere()`.
+- **`with_reach` (L1)** refuses a reach that holds the activation where the
+  call's does not, and a door reach of another grant.
+- **Across a hop** (plexus-wire spec/12, rules 8–11): a call admitted at a
+  door carries `limit.door` — `"/" + the method called`, in the child's
+  terms, for `limit.grant` alone — never `held_on: ["*"]`; `held_on` stays
+  the data held (`[]` for an address-only caller). The peer token's scope
+  holds `<grant>@<door>`; the child (`serve_child*`) takes a door only when
+  it names exactly the call served, refuses any other, and gives the method
+  a reach that holds the activation at that door and no data. The call-back
+  ceiling (`_host.call` under a door-admitted call) holds the data of
+  `held_on` and that one door for its own grant — nothing at another
+  address. A hop carries a door only for the call the gate admitted at it,
+  never for a forward made inside another call. An older child ignores the
+  field and fails closed (spec/12).
+- **Writers use `parse_checked`.** `auth.grant` writes its scope through
+  `ScopeRef::parse_checked`: `self` is `*`; a malformed address is refused
+  in band, naming the rule. An address scope (any — served now or not) is
+  granted and revoked by a holder of `auth.grant` on `*` alone. A session
+  ceiling minted through `auth.login {session}` is written the same way.
+- **A method and a child of one name**: refused as an activation's schema
+  is built (`PluginSchema`'s own check, already) and, for a schema read from
+  elsewhere, at `register` (a panic, as Z2H-8's); a call at or under such a
+  name has no address.
+- **What a caller sees knows the door.** A view shows a whole-activation
+  method to one who opens its door; an untyped peer slot to one who opens it
+  for every name (`/dyn.*`); a peer's schema (`dyn.peer.shop.schema`) is
+  answered to one who opens that peer's door, even where the view does not
+  show the activation — and no longer by the slot grant held on data. The
+  view cache keeps its key (the caller's grants' fingerprint and the grants
+  generation): a door is decided from exactly what the fingerprint holds.
+- Additive API: `grant_gate::named_twice`, `Slots::is_untyped_peer_slot`.
+  No signature changes; the wire gains one optional field. Behaviour that
+  narrows: KEEL-44 above; a data-scoped consent of a need into a peer
+  (`dyn.peer.t.claims@MENGER`) now refuses that call back, where it narrowed
+  it. Behaviour that widens: only for a caller holding an address scope,
+  which nobody held before plexus-auth-core 0.3.4.
+- Tests: `one7_door` (the shapes, the doors, the views, the writers),
+  `grant_gate` and `host` units; plexus-dyn's `one7_door` over keyed hops.
+
 KEEL-51 (security, High): **a session's ceiling holds on a peer's call
 back.** A call routed into a child or a peer (`route_to_child`: a peer slot,
 `dyn.peer.<name>`, `Peers`, a static child) runs on the context its forward

@@ -1470,6 +1470,11 @@ impl DynamicHub {
         Self { inner }
     }
 
+    /// KEEL-54: whether `weak` is this service's own handle.
+    pub(crate) fn is_inner(&self, weak: &std::sync::Weak<DynamicHubInner>) -> bool {
+        std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&self.inner))
+    }
+
     /// Create a new DynamicHub with explicit namespace
     ///
     /// Unlike single activations which have fixed namespaces, DynamicHub is a
@@ -2535,6 +2540,15 @@ impl DynamicHub {
     /// this shape and was dead on arrival. A loud, immediate error at
     /// registration time beats silent unreachability at call time.
     fn assert_no_root_shadow(&self, child_namespace: &str) {
+        // KEEL-54 (R5): an entry named as one of the service's own methods
+        // would be routed to the method, and its schema collides with it.
+        if self.is_own_method(child_namespace) {
+            panic!(
+                "DynamicHub: an activation named `{child_namespace}` collides with the service's own method `{root}.{child_namespace}` \
+                 (its own methods: call, hash, hashes, ir, schema) — it would never be reached. Name it otherwise. [KEEL-54]",
+                root = self.inner.namespace,
+            );
+        }
         if child_namespace == self.inner.namespace {
             panic!(
                 "DynamicHub namespace shadow: activation namespace '{child}' collides with the hub root namespace '{root}'. \
@@ -2676,7 +2690,8 @@ impl DynamicHub {
     /// `replace`) a name taken. Answers whether an entry was replaced.
     pub(crate) fn insert_entry(&self, name: String, entry: super::service_root::Entry, replace: bool) -> Result<bool, super::service_root::RootError> {
         super::service_root::check_name(&name)?;
-        if name == self.inner.namespace {
+        // KEEL-54 (R5): nor one of the service's own methods.
+        if name == self.inner.namespace || self.is_own_method(&name) {
             return Err(super::service_root::RootError::Shadows { name });
         }
         // NEST-16: a graft is checked against the service it joins.
@@ -2986,7 +3001,11 @@ impl DynamicHub {
                     // KEEL-31: a slot's method that acts everywhere is
                     // decided on `*` by its literal path too.
                     Some(slot) => {
-                        let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, ..Default::default() };
+                        // KEEL-54 (R1): and on the slot method's target, as
+                        // the slot's own entry would be — a grant held by
+                        // its literal name is still checked where the call
+                        // acts, never "held anywhere".
+                        let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, target: slot.target.clone(), ..Default::default() };
                         // ONE-7 (review M1): through an untyped peer slot,
                         // the literal grant held at the call's address — a
                         // role listing the peer's method (or admin) on
@@ -3033,6 +3052,12 @@ impl DynamicHub {
                     // KEEL-54: the call runs only where it was decided — the
                     // reach is for this path's own grant (its entry's, its
                     // slot's, or its literal path's), or nothing runs.
+                    // A backstop: no input reaches it today — every arm
+                    // above decides `path` itself, for its entry's, its
+                    // slot's or its literal grant. It stands against a
+                    // future arm or a second reading of the path; the unit
+                    // test `keel54_routing::a_reach_for_another_grant_never_runs_the_call`
+                    // is its only cover. Do not remove it as dead code.
                     routes_as_decided(&index, path, &reach)?;
                     let ctx = crate::call::CallContext::admitted_by_gate(auth, reach);
                     // ONE-7: the call a door admitted, kept with the call —
@@ -3980,7 +4005,25 @@ impl DynamicHub {
         use super::context::PlexusContext;
         use super::types::{PlexusStreamItem, StreamMetadata};
 
-        let result = self.route(&method, params.unwrap_or_default(), None).await;
+        // KEEL-54 (R2): a service registered as an entry of another is
+        // reached by its path (`inner.leaf.read`), which the outer gate
+        // decides. Its own `call`, run inside a call the outer gate
+        // admitted on `inner.call` alone, would route as this service —
+        // ungated here, with the outer call's reach — past every check the
+        // path would meet. Refused, decided where it runs: whatever mounted
+        // it, in whatever order its gate was set.
+        let outer = super::service_scope::current().filter(|w| !w.is(self)).and_then(|w| w.upgrade());
+        let result = match outer {
+            Some(outer) if outer.inner.gate.is_some() => Err(PlexusError::Forbidden {
+                reason: AuthzDenyReason::MissingGrant {
+                    grant: plexus_auth_core::grants::Grant::new(format!("{}.call", self.inner.namespace)),
+                    scope: plexus_auth_core::grants::ScopeRef::Everywhere,
+                    roles: Vec::new(),
+                    held_on: Vec::new(),
+                },
+            }),
+            _ => self.route(&method, params.unwrap_or_default(), None).await,
+        };
 
         match result {
             Ok(plexus_stream) => {
@@ -4755,7 +4798,7 @@ mod keel54_routing {
         let reach = |grant: &str| gate.check(Some(&admin), &Grant::new(grant), None).unwrap();
         assert!(routes_as_decided(&index, CallPath("health.check"), &reach("health.check")).is_ok());
         assert!(routes_as_decided(&index, CallPath("svc.hash"), &reach("svc.hash")).is_ok());
-        for (path, decided) in [("health.check", "svc.health.check"), ("svc.hash", "auth.grant"), ("health.check", "health")] {
+        for (path, decided) in [("health.check", "svc.health.check"), ("svc.hash", "health.other"), ("health.check", "health")] {
             assert!(matches!(routes_as_decided(&index, CallPath(path), &reach(decided)), Err(PlexusError::Forbidden { .. })), "{path} on {decided}");
         }
         assert!(routes_as_decided(&index, CallPath("health.check"), &Reach::everywhere()).is_err(), "a reach no gate made");

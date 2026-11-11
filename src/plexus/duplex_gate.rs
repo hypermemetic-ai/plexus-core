@@ -320,6 +320,24 @@ impl DuplexGate {
         self.gate.check(caller, grant, target).map(drop).map_err(|r| DuplexRefusal::Gate(r.into()))
     }
 
+    /// KEEL-54 (R4): `reach` asked again by the rule it was given by — every
+    /// target the dispatch checked, or (none) the reach whole.
+    fn recheck(&self, reach: &plexus_auth_core::grants::Reach, targets: &[String]) -> Result<(), DuplexRefusal> {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        let refused = |r: plexus_auth_core::grants::Refusal| DuplexRefusal::Gate(r.into());
+        if targets.is_empty() {
+            return reach.recheck().map(drop).map_err(refused);
+        }
+        for t in targets {
+            if !reach.allows(t) {
+                // Why, said as the gate says it: the reach's own rule first.
+                let why = reach.recheck().err().or_else(|| self.gate.check(reach.caller(), reach.grant()?, Some(t)).err());
+                return Err(refused(why.unwrap_or(plexus_auth_core::grants::Refusal::Unauthenticated)));
+            }
+        }
+        Ok(())
+    }
+
     /// The refusal, audited: one record, built here and only here.
     fn audited(&self, call: CallRef, who: Option<&AuthContext>, grant: &Grant, why: DuplexRefusal) -> DuplexRefusal {
         if let Some(q) = &self.audit {
@@ -376,7 +394,15 @@ impl DuplexGate {
     ) -> Result<DuplexCall, DuplexRefusal> {
         let mut moves = self.gate.generation().subscribe();
         moves.mark_changed();
-        self.opened(at.into(), calls, caller, Grant::new(grant), targets, seen, moves, recheck, ceiling, answer_by)
+        let grant = Grant::new(grant);
+        // KEEL-54 (R4): the decision the dispatch made, kept — the reach the
+        // call runs under, when it is for this grant — so a move asks the
+        // gate again by the rule it was admitted by (`*` alone, a door, a
+        // target), never "held anywhere" re-derived from the terms.
+        let decided = crate::call::context().ok().and_then(|c| c.reach().cloned()).filter(|r| r.grant() == Some(&grant));
+        let mut call = self.opened(at.into(), calls, caller, grant, targets, seen, moves, recheck, ceiling, answer_by)?;
+        call.decided = decided;
+        Ok(call)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -413,6 +439,7 @@ impl DuplexGate {
             bytes: 0,
             closed: None,
             answer_by,
+            decided: None,
             _place: place,
         })
     }
@@ -435,6 +462,9 @@ pub struct DuplexCall {
     bytes: u64,
     closed: Option<DuplexRefusal>,
     answer_by: Answerer,
+    /// KEEL-54 (R4): the reach the dispatch admitted the call under, asked
+    /// again by its own rule at a move.
+    decided: Option<plexus_auth_core::grants::Reach>,
     _place: CallPlace,
 }
 
@@ -480,6 +510,8 @@ impl DuplexCall {
         let now = self.dg.gate.generation().current();
         let asked = if !self.recheck {
             Ok(())
+        } else if let Some(reach) = &self.decided {
+            self.dg.recheck(reach, &self.targets)
         } else if self.targets.is_empty() {
             self.dg.check(self.caller.as_deref(), &self.grant, None)
         } else {

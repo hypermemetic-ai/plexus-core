@@ -5,9 +5,13 @@
 //! another case, with a stray dot — is the method, or nothing: never a door
 //! around the gate.
 //!
-//! The class closed: a path the gate's index did not know was decided as
-//! "held anywhere" on a grant made from its spelling — which `admin` on any
-//! scope holds — and routed on into the method it named.
+//! The class closed: a call decided on a grant made from its spelling —
+//! which `admin` on any scope holds by name — without the check its method
+//! declares. A path the gate's index did not know; a slot's method held by
+//! its literal name, its target unread; a service inside a service called
+//! through its own `call`. Each is decided now as the method it reaches is:
+//! on its target, on `*` alone, or not at all. A duplex call is asked again
+//! by the rule it was admitted by.
 
 use futures::{Stream, StreamExt};
 use plexus_auth_core::grants::CEILING_KEY;
@@ -40,6 +44,12 @@ impl LeafActivation {
     #[plexus_macros::method]
     async fn ping(&self) -> Value {
         json!("pong")
+    }
+
+    /// Read one ticket: the gate checks `id`, the method does not.
+    #[plexus_macros::method(target = "id")]
+    async fn read(&self, id: String) -> Value {
+        json!(format!("read {id}"))
     }
 }
 
@@ -75,6 +85,12 @@ impl VaultActivation {
         HiddenActivation
     }
 
+    /// The same leaf, as a static child.
+    #[plexus_macros::child]
+    fn fixed(&self) -> LeafActivation {
+        LeafActivation
+    }
+
     /// A slot: one leaf per name.
     #[plexus_macros::child]
     fn item(&self, _name: &str) -> Option<LeafActivation> {
@@ -86,6 +102,8 @@ impl VaultActivation {
 const KILN_ADMIN: &str = "key:4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e";
 /// The principal the probes try to raise; never a caller.
 const TARGET: &str = "key:7474747474747474747474747474747474747474747474747474747474747474";
+/// Holds a role listing a slot method by its literal name, on KILN.
+const LITERAL: &str = "key:4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c";
 
 /// `svc`: login on, the vault, and a whole service registered inside it as
 /// an entry (`inner`, whose own routing no schema of `svc` describes).
@@ -98,7 +116,9 @@ async fn host() -> Host {
         .with(VaultActivation)
         .with(inner)
         .resolving(Shortcodes)
+        .role("literal", ["vault.box1.read", "vault.fixed.read", "inner.call"])
         .member_at(KILN_ADMIN, "admin", "KILN")
+        .member_at(LITERAL, "literal", "KILN")
         .await
 }
 
@@ -256,7 +276,7 @@ async fn a_doubled_name_is_not_found_even_for_the_admin_of_everything() {
 async fn every_spelling_of_every_method_is_that_method_or_nothing() {
     let host = host().await;
     let mut paths: Vec<String> = host.service().list_methods().into_iter().filter(|m| !m.ends_with(".schema") && m != "auth.logout").collect();
-    paths.extend(["vault.hidden.rotate", "vault.box1.ping", "inner.leaf.ping"].map(String::from));
+    paths.extend(["vault.hidden.rotate", "vault.box1.ping", "vault.box1.read", "vault.fixed.read", "inner.leaf.ping", "inner.leaf.read"].map(String::from));
     let callers = [
         ("admin", host.as_(ADMIN)),
         ("kiln admin", host.as_(KILN_ADMIN)),
@@ -271,7 +291,7 @@ async fn every_spelling_of_every_method_is_that_method_or_nothing() {
         "auth.requires" => json!({ "method": "vault.get" }),
         "auth.role_set" => json!({ "role": "reader", "grants": ["vault.get"] }),
         "auth.login" => json!({ "flow": { "session": {} } }),
-        "vault.get" => json!({ "id": "KILN-1" }),
+        "vault.get" | "vault.box1.read" | "vault.fixed.read" | "inner.leaf.read" => json!({ "id": "KILN-1" }),
         "svc.call" => json!({ "method": "vault.tally" }),
         "inner.call" => json!({ "method": "leaf.ping" }),
         _ => json!({}),
@@ -292,4 +312,99 @@ async fn every_spelling_of_every_method_is_that_method_or_nothing() {
         }
     }
     assert!(checked > 1000, "{checked}");
+}
+
+/// R1: a slot's method is decided on the target it declares, as the same
+/// method on a static child is — whoever holds it by name, wherever.
+#[tokio::test]
+async fn a_slot_methods_target_is_checked_as_a_static_childs_is() {
+    let host = host().await;
+    let callers = [("kiln admin", host.as_(KILN_ADMIN)), ("capped admin@KILN", capped(&host, ADMIN, &["admin@KILN"])), ("literal on KILN", host.as_(LITERAL))];
+    for (name, c) in &callers {
+        for path in ["vault.fixed.read", "vault.box1.read", "svc.vault.box1.read"] {
+            assert_eq!(decision(c, path, json!({ "id": "ACME-1" })).await, Decision::Refused, "{name}: {path} ACME-1");
+            assert_eq!(c.call(path, json!({ "id": "KILN-1" })).await.answer::<String>(), "read KILN-1", "{name}: {path} KILN-1");
+        }
+    }
+    host.as_(KILN_ADMIN).call("vault.box1.read", json!({ "id": "ACME-1" })).await.refused(Forbidden).at("ACME");
+    assert_eq!(host.as_(ADMIN).call("vault.box1.read", json!({ "id": "ACME-1" })).await.answer::<String>(), "read ACME-1");
+}
+
+/// R2: a service registered as an entry of a gated service is reached by
+/// its path, which the outer gate decides — never through its own `call`,
+/// which would route as the inner service, ungated, with the outer reach.
+#[tokio::test]
+async fn a_service_inside_a_service_is_reached_by_its_path_never_through_its_call() {
+    let host = host().await;
+    let through_call = json!({ "method": "leaf.read", "params": { "id": "ACME-1" } });
+    for (name, c) in [("kiln admin", host.as_(KILN_ADMIN)), ("capped admin@KILN", capped(&host, ADMIN, &["admin@KILN"])), ("literal inner.call on KILN", host.as_(LITERAL)), ("admin", host.as_(ADMIN))] {
+        for path in ["inner.call", "svc.inner.call"] {
+            assert_eq!(decision(&c, path, through_call.clone()).await, Decision::Refused, "{name}: {path}");
+        }
+    }
+    host.as_(KILN_ADMIN).call("inner.leaf.read", json!({ "id": "ACME-1" })).await.refused(Forbidden).at("*");
+    assert_eq!(host.as_(ADMIN).call("inner.leaf.read", json!({ "id": "ACME-1" })).await.answer::<String>(), "read ACME-1");
+    // The service's own `call`, at the top, is as it was: it routes as no one.
+    assert_eq!(decision(&host.as_(ADMIN), "svc.call", json!({ "method": "vault.get", "params": { "id": "KILN-1" } })).await, Decision::Refused);
+}
+
+/// R5: an entry named as one of the service's own methods is refused when
+/// it is registered, naming why.
+#[tokio::test]
+async fn an_entry_named_as_the_services_own_method_is_refused_when_registered() {
+    #[derive(Clone)]
+    struct CallActivation;
+    #[plexus_macros::activation(namespace = "call", version = "1.0.0")]
+    impl CallActivation {
+        /// Answer.
+        #[plexus_macros::method]
+        async fn ping(&self) -> Value {
+            json!("pong")
+        }
+    }
+    let panicked = std::panic::catch_unwind(|| DynamicHub::new("svc").register(CallActivation)).err().expect("refused at registration");
+    let said = panicked.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(said.contains("`call`") && said.contains("own method"), "{said}");
+    let host = host().await;
+    for name in ["call", "schema", "hash", "hashes", "ir", "svc"] {
+        let refused = host.service().root().insert_peer(name, std::sync::Arc::new(CallActivation), false);
+        assert!(matches!(refused, Err(plexus_core::plexus::RootError::Shadows { .. })), "{name}: {refused:?}");
+    }
+}
+
+/// R4: a duplex call is asked again, at a move, by the rule it was admitted
+/// by — a path admitted on `*` alone stays on `*` alone, never "held
+/// anywhere" re-derived from its terms.
+#[tokio::test]
+async fn a_duplex_call_is_asked_again_as_it_was_admitted() {
+    use plexus_auth_core::duplex::{Answerer, CallCeiling};
+    use plexus_auth_core::grants::{Grant, GrantsMove};
+    use plexus_core::plexus::duplex_gate::{CallCounter, CallPlace, ConnId, DuplexGate, InputFrame};
+
+    struct Unlimited;
+    impl CallCounter for Unlimited {
+        fn take_place(&self) -> Result<CallPlace, usize> {
+            Ok(CallPlace::new(()))
+        }
+    }
+    const CHANGING: &str = "key:6363636363636363636363636363636363636363636363636363636363636363";
+    let host = host().await;
+    host.members().hold_at(CHANGING, "admin", "*");
+    let gate = (**host.gate()).clone();
+    let dg = DuplexGate::new(gate.clone());
+    let who = plexus_testkit::parts::who(CHANGING);
+    // What the dispatch decided: a path no schema describes, on `*` alone.
+    let reach = gate.check_everywhere(Some(&who), &Grant::new("inner.leaf.read")).unwrap();
+    let seen = gate.generation().current();
+    let mut call = plexus_core::call::test::in_call(Some(&who), reach, async {
+        dg.admitted(ConnId(1), &Unlimited, Some(std::sync::Arc::new(who.clone())), "inner.leaf.read", vec![], seen, true, CallCeiling::default(), Answerer::Caller)
+    })
+    .await
+    .unwrap();
+    call.admit(&InputFrame::new(ConnId(1), 0, json!(1))).unwrap();
+    // Demoted mid-call to an admin of KILN: no longer on `*`.
+    host.members().forget(CHANGING);
+    host.members().hold_at(CHANGING, "admin", "KILN");
+    gate.moved(GrantsMove::Revoke);
+    assert_eq!(call.admit(&InputFrame::new(ConnId(1), 1, json!(2))).unwrap_err().kind(), "forbidden");
 }

@@ -1065,7 +1065,7 @@ mod keel54_body_checks {
     async fn an_admin_of_one_scope_granting_everything_is_refused_by_the_method_itself() {
         let (auth, gate, members) = mounted();
         let ctx = who(KILN_ADMIN, None);
-        for decided in ["svc.auth.grant", "auth.grant"] {
+        for decided in ["vault.anything", "auth.grant"] {
             let reach = gate.check(Some(&ctx), &Grant::new(decided), None).unwrap();
             let refused = said(&auth, &ctx, reach, "grant", everything()).await;
             assert_eq!((refused["type"].as_str(), refused["error_kind"].as_str()), (Some("error"), Some("forbidden")), "{decided}: {refused}");

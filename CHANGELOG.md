@@ -7,35 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### KEEL-54 — one path for the gate and the router (security)
+### KEEL-54 — security
 
-The gate and the router could read one call as two paths: a path the
-gate's index did not know was decided as "held anywhere" on a grant made
-from its spelling — which `admin` on any one scope holds, and a session
-ceiling on a scope allows — while the router could reach a method by it.
-Upgrade.
+Security: a path the gate did not know could be decided without its target; upgrade.
 
-- **One path.** `DynamicHub::call_path` reads the caller's spelling once:
-  the service's own-namespace form (`svc.vault.get`, the form a hop
-  forwards) is the bare form (`vault.get`), as KEEL-32 made it for
-  introspection. One prefix, once; a name given twice, another case, an
-  empty or stray segment are not rewritten. The gate decides that path and
-  the router routes it; `input_terms`, `may_take_input` and `grant_at` read
-  it too.
-- **A path no schema describes and no slot holds is never held anywhere.**
-  It is decided as a whole-service call (KEEL-31): its literal grant held on
-  `*`, within a ceiling that allows it on `*`. A role on `*` that lists a
-  literal path (a relay's member, VISION-5) still reaches it; `admin` of a
-  data scope does not. Untyped peer slots are decided at their door, as
-  ONE-7 left them.
-- **Routing never outruns the gate.** The service's own namespace routes to
-  the service's own methods alone (`svc.hash`, `svc.call`,
-  `svc.<method>.schema`), never on into an entry; a call runs only under a
-  reach made for its own path's grant (its entry's, its slot's, or its
-  literal path's).
-- **`auth.grant` and `auth.revoke` check in their bodies**: the reach is for
-  the method itself, and the caller holds it on the scope written (as said
-  and as kept), within the session's ceiling.
+- A role naming a path no schema describes and no slot holds reaches it only
+  when held on `*`.
+- A service registered inside another is reached by its path; its own
+  `call` inside the outer service's call is refused.
+- An entry can no longer be named `call`, `hash`, `hashes`, `ir` or
+  `schema` (refused at registration, `RootError::Shadows`).
 
 ### ONE-7 — the gate passes the call's address: an activation's door, and one peer's (0.11.4, patch)
 

@@ -38,6 +38,11 @@ impl WeakService {
         Self(inner)
     }
 
+    /// KEEL-54: whether this is `hub`'s handle.
+    pub(crate) fn is(&self, hub: &DynamicHub) -> bool {
+        hub.is_inner(&self.0)
+    }
+
     /// The service, while it lives.
     pub fn upgrade(&self) -> Option<DynamicHub> {
         self.0.upgrade().map(DynamicHub::from_inner)

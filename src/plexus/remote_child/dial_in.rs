@@ -431,8 +431,12 @@ impl Peers {
                 _ => None,
             }
         };
-        if removed.is_some() {
+        if let Some(e) = removed {
             tracing::info!(target: "plexus::peers", peer = %name, "peer unmounted: {why}");
+            // KEEL-59: its calls are told why first — the move below would
+            // otherwise end them as callers no longer allowed a name that
+            // is gone.
+            e.child.stop(why);
             self.moved();
             let _ = self.inner.events.send(PeerEvent::Unmounted { name: name.to_string(), why: why.to_string() });
         }

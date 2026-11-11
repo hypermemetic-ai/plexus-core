@@ -143,10 +143,19 @@ impl futures::Stream for Held {
                         None => Some(Refusal::Unauthenticated),
                     };
                     if let Some(why) = refused {
+                        // The method's own end, already there, is the truer
+                        // answer (a peer gone that took the method's name
+                        // with it): it is given instead. Anything else it
+                        // had ready is not.
+                        let own = match crate::call::poll_in(&this.ctx, stream, cx) {
+                            Poll::Ready(Some(item @ (PlexusStreamItem::Error { .. } | PlexusStreamItem::Done { .. }))) => Some(item),
+                            _ => None,
+                        };
                         // The method's stream goes first: its work stops now,
                         // whether or not its caller reads the item.
                         this.inner = None;
-                        return Poll::Ready(Some(end_item(this.service.runtime_namespace(), &PlexusError::from(why))));
+                        let item = own.unwrap_or_else(|| end_item(this.service.runtime_namespace(), &PlexusError::from(why)));
+                        return Poll::Ready(Some(item));
                     }
                 }
                 continue;

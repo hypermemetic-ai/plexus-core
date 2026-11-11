@@ -94,6 +94,28 @@ impl WorkActivation {
         work(tag)
     }
 
+    /// Work done beside the call, not in its stream: a task that runs while
+    /// the call is held (until its stream is dropped). The stream itself is
+    /// never woken by its own work — only a move can end it.
+    #[plexus_macros::method]
+    pub async fn idle(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
+        let (held, mut dropped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                mark(&tag);
+                tokio::select! {
+                    _ = &mut dropped => return,
+                    _ = tokio::time::sleep(Duration::from_millis(2)) => {}
+                }
+            }
+        });
+        async_stream::stream! {
+            let _held = held;
+            yield json!("started");
+            futures::future::pending::<()>().await;
+        }
+    }
+
     /// The same, on a target.
     #[plexus_macros::method(target = "id")]
     pub async fn on(&self, id: String, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -219,7 +241,7 @@ fn exe_spec(name: &str) -> ChildSpec {
     format!("{name}=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap()
 }
 
-const READER: [&str; 6] = ["work.quiet", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
+const READER: [&str; 7] = ["work.quiet", "work.idle", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
 
 async fn host_with(members: &[(&str, &str)], leaves: &[RemoteChild]) -> Host {
     let mut b = World::new().host().without_named_callers().resolving(Shortcodes).with(WorkActivation).role("reader", READER);
@@ -256,6 +278,17 @@ async fn a_viewer_whose_grant_is_revoked_mid_stream_is_told_forbidden_and_the_wo
     let end = call.ends("forbidden").await;
     assert_eq!(end["grant"], json!("work.quiet"), "{end}");
     stopped("revoked", cause).await;
+}
+
+/// A call whose stream says nothing and never wakes on its own (its work
+/// runs beside it) is ended by the move itself, not by its next item.
+async fn a_call_that_waits_in_silence_is_ended_at_the_revoke() {
+    let host = host_with(&[(ALICE, "*")], &[]).await;
+    let mut call = Open::start(&host.as_(ALICE), "work.idle", json!({ "tag": "silent" })).await;
+    let cause = revoke(&host, ALICE, "*");
+    let end = call.ends("forbidden").await;
+    assert_eq!(end["grant"], json!("work.idle"), "{end}");
+    stopped("silent", cause).await;
 }
 
 async fn across_a_hop_the_caller_is_told_and_the_peers_work_stops() {
@@ -374,6 +407,14 @@ fn main() {
         return;
     }
     std::fs::create_dir_all(run_dir()).unwrap();
+    // A row that fails ends the run at once: the runtime's shutdown would
+    // wait on the children's stdio readers.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |p| {
+        report(p);
+        let _ = std::fs::remove_dir_all(run_dir());
+        std::process::exit(101);
+    }));
     let filter: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     macro_rules! rows {
@@ -393,6 +434,7 @@ fn main() {
     }
     rows!(
         a_viewer_whose_grant_is_revoked_mid_stream_is_told_forbidden_and_the_work_stops,
+        a_call_that_waits_in_silence_is_ended_at_the_revoke,
         across_a_hop_the_caller_is_told_and_the_peers_work_stops,
         a_call_back_ends_with_the_call_it_was_made_under,
         a_read_whose_reach_narrowed_ends_and_one_that_follows_its_reach_runs_on,

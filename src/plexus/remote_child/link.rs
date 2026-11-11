@@ -99,6 +99,8 @@ struct Opening {
 struct Sub {
     tx: mpsc::Sender<PlexusStreamItem>,
     method: Arc<str>,
+    /// KEEL-59: the call it was opened in, told when the peer is cut off.
+    call: Option<crate::call::CallContext>,
 }
 
 /// How long after its `true` an unsubscribed call's late item is still the
@@ -254,7 +256,7 @@ impl Conn {
             }
             // a `{ns}.call`'s params name the method called (`echo.count`)
             let called = params.get("method").and_then(Value::as_str).unwrap_or(method);
-            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into() } });
+            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into(), call: crate::call::context().ok() } });
         }
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         match tokio::time::timeout(timeout, answer).await {
@@ -321,7 +323,12 @@ impl Conn {
         for (id, key) in &unsubs {
             self.send_unsub(*id, key);
         }
-        for (_, Sub { tx, .. }) in subs {
+        for (_, Sub { tx, call, .. }) in subs {
+            // Told before the item is sent: a grants move the cut-off makes
+            // leaves the call this end.
+            if let Some(c) = call {
+                c.peer_ended();
+            }
             Self::tell(tx, unavailable(&self.name, why));
         }
         for (_, open) in pending {
@@ -495,7 +502,11 @@ impl Conn {
             r.abandoned.clear();
             (std::mem::take(&mut r.subs), std::mem::take(&mut r.pending))
         };
-        for (_, Sub { tx, .. }) in subs {
+        for (_, Sub { tx, call, .. }) in subs {
+            // KEEL-59: as `stop` — the peer gone, its end is the call's.
+            if let Some(c) = call {
+                c.peer_ended();
+            }
             Self::tell(tx, unavailable(&self.name, why));
         }
         for (_, open) in pending {

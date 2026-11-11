@@ -124,6 +124,9 @@ struct Inner {
 const HOLDS_ITSELF: u8 = 1;
 /// [`Inner::hold`]: the dispatch has the call's stream (the call is routed).
 const ROUTED: u8 = 2;
+/// [`Inner::hold`]: the peer the call was forwarded to was cut off, and its
+/// end (`child_unavailable`, saying why) is the call's next item.
+const PEER_ENDED: u8 = 4;
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
 
@@ -374,6 +377,24 @@ impl CallContext {
     /// KEEL-59: whether the dispatched method answers for its own reach.
     pub(crate) fn holds_itself(&self) -> bool {
         self.0.hold.load(std::sync::atomic::Ordering::Acquire) & HOLDS_ITSELF != 0
+    }
+
+    /// KEEL-59: the peer this call was forwarded to was cut off — its end
+    /// is on its way — said on this context and those it was derived from
+    /// while routed, so a grants move the cut-off made (a peer leaving
+    /// takes its grants with it) leaves the call its own end, not a
+    /// `forbidden` for a name that went.
+    pub(crate) fn peer_ended(&self) {
+        let mut at = Some(self);
+        while let Some(ctx) = at {
+            ctx.0.hold.fetch_or(PEER_ENDED, std::sync::atomic::Ordering::AcqRel);
+            at = ctx.0.up.as_ref();
+        }
+    }
+
+    /// KEEL-59: whether the call's peer was cut off ([`Self::peer_ended`]).
+    pub(crate) fn ended_by_peer(&self) -> bool {
+        self.0.hold.load(std::sync::atomic::Ordering::Acquire) & PEER_ENDED != 0
     }
 
     /// KEEL-59: the dispatch has this call's stream: what is derived from

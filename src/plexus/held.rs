@@ -146,7 +146,10 @@ impl futures::Stream for Held {
             if now != this.seen {
                 this.seen = now;
                 this.wait = None;
-                if !this.ctx.holds_itself() {
+                // A call whose peer was cut off has its own end on its way
+                // (`child_unavailable`, saying why): the move the cut-off
+                // made is not asked about it.
+                if !this.ctx.holds_itself() && !this.ctx.ended_by_peer() {
                     let refused = match this.ctx.reach() {
                         Some(reach) => redecide(gate, reach, &this.targets).err(),
                         None => Some(Refusal::Unauthenticated),

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### KEEL-54 — security
+
+Security: a path the gate did not know could be decided without its target; upgrade.
+
+- A role naming a path no schema describes and no slot holds reaches it only
+  when held on `*`.
+- A service registered inside another is reached by its path; its own
+  `call` inside the outer service's call is refused.
+- An entry can no longer be named `call`, `hash`, `hashes`, `ir` or
+  `schema` (refused at registration, `RootError::Shadows`).
+
 ### ONE-7 — the gate passes the call's address: an activation's door, and one peer's (0.11.4, patch)
 
 Build 2 of ONE-4, on plexus-auth-core 0.3.4 (ONE-6; the requirement is now

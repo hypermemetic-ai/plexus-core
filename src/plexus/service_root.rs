@@ -59,8 +59,9 @@ pub enum RootError {
     #[error("a peer is already served as `{name}` at the top level")]
     Taken { name: String },
     /// `name` is the service's own: its methods would answer, never the entry
-    /// (Z2H-8 / HOSTLESS-3).
-    #[error("`{name}` is the service's own name: an entry under it would be unreachable")]
+    /// (Z2H-8 / HOSTLESS-3) — its name, or (KEEL-54) one of its own methods
+    /// (`call`, `hash`, `hashes`, `ir`, `schema`).
+    #[error("`{name}` is the service's own name or one of its own methods (call, hash, hashes, ir, schema): an entry under it would be unreachable")]
     Shadows { name: String },
     /// Not one segment of `[A-Za-z0-9_-]`.
     #[error("`{name}` is not a top-level name: one segment of letters, digits, `_` and `-`")]

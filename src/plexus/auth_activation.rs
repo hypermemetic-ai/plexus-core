@@ -23,7 +23,7 @@
 //! | `whoami`, `logout`, `requires` | any signed-in caller (whatever its roles or ceiling) | `whoami`, `logged_out`, `requires` |
 //! | `roles` | whoever holds `auth.roles` (admin) | one `role` per role |
 //! | `role_set` | admin on `*` | the role as it now stands |
-//! | `grant`, `revoke` | whoever holds them on the scope (`target = "scope"`) | `granted` / `revoked` |
+//! | `grant`, `revoke` | whoever holds them on the scope (`target = "scope"`; KEEL-54: checked again in the method, on the scope written) | `granted` / `revoked` |
 //! | `waiting` | admin on `*` | one `waiting` per principal asking |
 //!
 //! A refusal the gate makes is AUTH-2's typed error item; one this
@@ -597,6 +597,42 @@ fn needs_everywhere(gate: &Gate, grant: &str, reach: &Reach) -> AuthEvent {
     }
 }
 
+/// KEEL-54: `auth.grant` / `auth.revoke`'s own check, which no route
+/// replaces — the call's reach is for `grant` itself (the gate decided this
+/// method, not another spelling of it), and the caller holds `grant` on
+/// every scope the call writes (`scopes`: as said, and as kept), within its
+/// session's ceiling. Admin of `KILN` grants within `KILN`; on `*` only an
+/// admin on `*` does.
+fn holds_where_written(gate: &Gate, auth: &AuthContext, reach: &Reach, grant: &str, scopes: &[&str]) -> Result<(), Box<AuthEvent>> {
+    let g = Grant::new(grant);
+    if reach.grant() != Some(&g) {
+        return Err(Box::new(needs_on(gate, grant, "*", reach.held_on().iter().map(|s| s.as_str().to_string()).collect())));
+    }
+    for scope in scopes {
+        match gate.check(Some(auth), &g, Some(scope)) {
+            Ok(_) => {}
+            Err(plexus_auth_core::grants::Refusal::MissingGrant { scope, held_on, .. }) => {
+                return Err(Box::new(needs_on(gate, grant, scope.as_str(), held_on.iter().map(|s| s.as_str().to_string()).collect())));
+            }
+            Err(plexus_auth_core::grants::Refusal::Ended { reason }) => return Err(Box::new(AuthEvent::error(reason))),
+            Err(plexus_auth_core::grants::Refusal::Unauthenticated) => return Err(Box::new(AuthEvent::error("sign in first"))),
+        }
+    }
+    Ok(())
+}
+
+/// An in-band refusal: `grant` is needed on `scope`.
+fn needs_on(gate: &Gate, grant: &str, scope: &str, held_on: Vec<String>) -> AuthEvent {
+    AuthEvent::Error {
+        message: format!("needs {grant} on {scope}"),
+        error_kind: Some("forbidden".into()),
+        grant: Some(grant.into()),
+        scope: Some(scope.into()),
+        roles: Some(gate.roles_listing(&Grant::new(grant)).iter().map(|r| r.as_str().to_string()).collect()),
+        held_on: Some(held_on),
+    }
+}
+
 fn role_event(role: &RoleName, grants: Option<GrantSet>) -> AuthEvent {
     match grants {
         Some(GrantSet::All) => AuthEvent::Role { role: role.as_str().into(), grants: Vec::new(), all: true },
@@ -863,9 +899,9 @@ impl AuthActivation {
         example(note = "make a person an editor on MENGER", params = r#"{"principal": "oidc:workos/user_01M4", "role": "editor", "scope": "MENGER"}"#),
         example(note = "make an agent's key an admin everywhere", params = r#"{"principal": "key:ac79e0d1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", "role": "admin", "scope": "*"}"#)
     )]
-    async fn grant(&self, auth: &AuthContext, principal: param::Principal, role: param::RoleName, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
-        let _ = auth;
+    async fn grant(&self, auth: &AuthContext, reach: Reach, principal: param::Principal, role: param::RoleName, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
+        let caller = auth.clone();
         stream! {
             let who: Principal = principal.principal();
             let role_name = role.role();
@@ -884,6 +920,11 @@ impl AuthActivation {
                     return;
                 }
             };
+            // KEEL-54: held where it is written, whatever routed the call.
+            if let Err(refused) = holds_where_written(&inner.gate, &caller, &reach, "auth.grant", &[scope.as_str(), scope_ref.as_str()]) {
+                yield *refused;
+                return;
+            }
             let m = Membership { principal: who.clone(), role: role_name.clone(), scope: scope_ref.clone() };
             match inner.memberships.grant(m).await {
                 Ok(()) => {
@@ -906,14 +947,19 @@ impl AuthActivation {
         description = "Take a principal's role on a scope away",
         params(principal = "key:…, oidc:…/…, idp:…", role = "The role; absent: every role there", scope = "Where: a scope name, or *")
     )]
-    async fn revoke(&self, auth: &AuthContext, principal: param::Principal, role: Option<param::RoleName>, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
-        let _ = auth;
+    async fn revoke(&self, auth: &AuthContext, reach: Reach, principal: param::Principal, role: Option<param::RoleName>, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
+        let caller = auth.clone();
         stream! {
             let who: Principal = principal.principal();
             // ONE-7: as it is granted (`self` is `*`); a malformed scope stored
             // before — which holds nothing — is taken away by its text.
             let scope_ref = ScopeRef::parse_checked(scope.as_str()).unwrap_or_else(|_| scope.scope());
+            // KEEL-54: held where it is taken away, whatever routed the call.
+            if let Err(refused) = holds_where_written(&inner.gate, &caller, &reach, "auth.revoke", &[scope.as_str(), scope_ref.as_str()]) {
+                yield *refused;
+                return;
+            }
             let role_name = role.as_ref().map(param::RoleName::role);
             match inner.memberships.revoke(&who, role_name.as_ref(), &scope_ref).await {
                 Ok(removed) => {
@@ -955,5 +1001,113 @@ impl AuthActivation {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod keel54_body_checks {
+    //! KEEL-54, layer 4: `auth.grant` and `auth.revoke` check in their
+    //! bodies — run here with a reach in hand, as whatever route reaches
+    //! them would hand one, and no gate before them.
+    use super::super::auth_memory::{MemoryAuthBackend, MemoryMemberships, MemoryRoles};
+    use super::*;
+    use crate::plexus::Activation;
+    use futures::StreamExt;
+    use plexus_auth_core::grants::{RoleTable, CEILING_KEY};
+    use serde_json::{json, Value};
+
+    const KILN_ADMIN: &str = "key:4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e4b494c4e";
+    const ADMIN: &str = "key:adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad";
+    const TARGET: &str = "key:7474747474747474747474747474747474747474747474747474747474747474";
+
+    struct Kiln;
+    impl Resolve for Kiln {
+        fn chain(&self, t: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::named(t.split('-').next().unwrap_or(t)), ScopeRef::Everywhere])
+        }
+    }
+
+    fn mounted() -> (AuthActivation, Gate, Arc<MemoryMemberships>) {
+        let members = Arc::new(MemoryMemberships::new().with(KILN_ADMIN, "admin", "KILN").with(ADMIN, "admin", "*"));
+        let roles = Arc::new(MemoryRoles::new(RoleTable::from_lists([("viewer", ["auth.whoami"])])));
+        let setup = AuthSetup::new(Arc::new(MemoryAuthBackend::new("http://x/login")), roles, members.clone(), Arc::new(Kiln));
+        let (auth, gate) = AuthActivation::mount(setup, Catalog::default());
+        (auth, gate, members)
+    }
+
+    fn who(p: &str, ceiling: Option<&[&str]>) -> AuthContext {
+        let meta = ceiling.map_or(Value::Null, |c| json!({ CEILING_KEY: c }));
+        AuthContext::for_principal(&p.parse().unwrap(), "s", vec![], meta)
+    }
+
+    /// Run `method` as `ctx` under `reach`: the first event it says.
+    async fn said(auth: &AuthActivation, ctx: &AuthContext, reach: Reach, method: &str, params: Value) -> Value {
+        let run = async {
+            let mut stream = Activation::call(auth, method, params, Some(ctx), None).await.expect("dispatched");
+            stream.next().await.expect("an item")
+        };
+        let item = crate::call::scope(crate::call::CallContext::admitted(Some(ctx), reach), run).await;
+        serde_json::to_value(item).unwrap()["content"].clone()
+    }
+
+    fn everything() -> Value {
+        json!({ "principal": TARGET, "role": "admin", "scope": "*" })
+    }
+
+    fn raised(members: &MemoryMemberships) -> bool {
+        members.all().iter().any(|m| m.principal.to_string() == TARGET && m.scope.is_everywhere())
+    }
+
+    /// The probe's shape: the gate admitted the call on some grant held
+    /// somewhere — the made-up one, or the method's own held on KILN — and
+    /// the method was reached with that reach.
+    #[tokio::test]
+    async fn an_admin_of_one_scope_granting_everything_is_refused_by_the_method_itself() {
+        let (auth, gate, members) = mounted();
+        let ctx = who(KILN_ADMIN, None);
+        for decided in ["vault.anything", "auth.grant"] {
+            let reach = gate.check(Some(&ctx), &Grant::new(decided), None).unwrap();
+            let refused = said(&auth, &ctx, reach, "grant", everything()).await;
+            assert_eq!((refused["type"].as_str(), refused["error_kind"].as_str()), (Some("error"), Some("forbidden")), "{decided}: {refused}");
+            assert!(!raised(&members), "{decided}");
+        }
+        let reach = gate.check(Some(&ctx), &Grant::new("auth.revoke"), Some("KILN")).unwrap();
+        let refused = said(&auth, &ctx, reach, "revoke", json!({ "principal": ADMIN, "scope": "*" })).await;
+        assert_eq!(refused["error_kind"], "forbidden", "{refused}");
+        assert!(members.all().iter().any(|m| m.principal.to_string() == ADMIN), "nothing was taken");
+        // Within KILN, it grants.
+        let reach = gate.check(Some(&ctx), &Grant::new("auth.grant"), Some("KILN")).unwrap();
+        let granted = said(&auth, &ctx, reach, "grant", json!({ "principal": TARGET, "role": "admin", "scope": "KILN" })).await;
+        assert_eq!(granted["type"], "granted", "{granted}");
+    }
+
+    #[tokio::test]
+    async fn a_capped_session_is_held_to_its_cap_by_the_method_itself() {
+        let (auth, gate, members) = mounted();
+        let ctx = who(ADMIN, Some(&["admin@KILN"]));
+        let reach = gate.check(Some(&ctx), &Grant::new("auth.grant"), Some("KILN")).unwrap();
+        let refused = said(&auth, &ctx, reach.clone(), "grant", everything()).await;
+        assert_eq!(refused["error_kind"], "forbidden", "{refused}");
+        assert!(!raised(&members));
+        let granted = said(&auth, &ctx, reach, "grant", json!({ "principal": TARGET, "role": "viewer", "scope": "KILN-3" })).await;
+        assert_eq!(granted["type"], "granted", "{granted}");
+    }
+
+    /// The admin of everything, with the reach for the method: as before.
+    #[tokio::test]
+    async fn the_admin_of_everything_grants_and_revokes_as_before() {
+        let (auth, gate, members) = mounted();
+        let ctx = who(ADMIN, None);
+        let reach = gate.check(Some(&ctx), &Grant::new("auth.grant"), Some("*")).unwrap();
+        assert_eq!(said(&auth, &ctx, reach, "grant", everything()).await["type"], "granted");
+        assert!(raised(&members));
+        let reach = gate.check(Some(&ctx), &Grant::new("auth.revoke"), Some("self")).unwrap();
+        let revoked = said(&auth, &ctx, reach, "revoke", json!({ "principal": TARGET, "scope": "self" })).await;
+        assert_eq!(revoked["type"], "revoked", "{revoked}");
+        assert!(!raised(&members));
+        // A reach for another grant, even the admin's: not this method's.
+        let reach = gate.check(Some(&ctx), &Grant::new("auth.revoke"), Some("*")).unwrap();
+        assert_eq!(said(&auth, &ctx, reach, "grant", everything()).await["error_kind"], "forbidden");
+        assert!(!raised(&members));
     }
 }

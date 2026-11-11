@@ -1323,6 +1323,39 @@ pub(crate) struct GateIndex {
     ambiguous: std::collections::HashSet<String>,
 }
 
+/// KEEL-54: a call's path as its service decides and routes it — made only
+/// by [`DynamicHub::call_path`], once a call, from what the caller said.
+/// The gate decides it and the router routes it; neither reads the caller's
+/// spelling again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CallPath<'m>(&'m str);
+
+impl<'m> CallPath<'m> {
+    pub(crate) fn as_str(&self) -> &'m str {
+        self.0
+    }
+}
+
+/// KEEL-54 · **routing never outruns the gate**: the call at `path` runs
+/// only under a reach the gate made for `path` itself — for the grant its
+/// index entry names (its own, or the slot's it goes through), or for the
+/// literal path (a grant written as the path, NEST-5). A reach for any other
+/// grant is refused, never run: whatever decided it decided another call.
+fn routes_as_decided(index: &GateIndex, path: CallPath<'_>, reach: &plexus_auth_core::grants::Reach) -> Result<(), PlexusError> {
+    let named = index.info(path.as_str()).and_then(|i| i.grant.as_deref());
+    match reach.grant().map(|g| g.as_str()) {
+        Some(decided) if decided == path.as_str() || Some(decided) == named => Ok(()),
+        decided => Err(PlexusError::Forbidden {
+            reason: AuthzDenyReason::MissingGrant {
+                grant: plexus_auth_core::grants::Grant::new(named.unwrap_or(path.as_str())),
+                scope: plexus_auth_core::grants::ScopeRef::Everywhere,
+                roles: Vec::new(),
+                held_on: if decided.is_some() { reach.held_on().to_vec() } else { Vec::new() },
+            },
+        }),
+    }
+}
+
 impl GateIndex {
     /// NEST-5: the gate's facts for `method` — its own entry, else its
     /// slot's (`solar.earth.info` → `solar.{planet}.info`).
@@ -1435,6 +1468,11 @@ impl DynamicHub {
     /// NEST-11: the service a [`super::service_scope::WeakService`] upgrades to.
     pub(crate) fn from_inner(inner: Arc<DynamicHubInner>) -> Self {
         Self { inner }
+    }
+
+    /// KEEL-54: whether `weak` is this service's own handle.
+    pub(crate) fn is_inner(&self, weak: &std::sync::Weak<DynamicHubInner>) -> bool {
+        std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&self.inner))
     }
 
     /// Create a new DynamicHub with explicit namespace
@@ -1798,11 +1836,12 @@ impl DynamicHub {
     /// visible activation) — route it as before.
     async fn introspect_in_view(
         &self,
-        method: &str,
+        path: CallPath<'_>,
         params: &Value,
         auth: Option<&super::auth::AuthContext>,
         raw_ctx: Option<&crate::request::RawRequestContext>,
     ) -> Option<Result<PlexusStream, PlexusError>> {
+        let method = path.as_str();
         let (ns, rest) = method.split_once('.')?;
         let hub_ns = self.inner.namespace.as_str();
         // PERF-15: the view, and what it was decided over, from the cache.
@@ -1892,7 +1931,7 @@ impl DynamicHub {
         // R-5's scope gate decides introspection on every call, and audits
         // it: routed every time, as before.
         if self.inner.scope_registry.is_some() || self.inner.default_deny {
-            let routed = self.route_ungated(method, params.clone(), auth, raw_ctx).await;
+            let routed = self.route_ungated(path, params.clone(), auth, raw_ctx).await;
             return Some(routed.map(|s| -> PlexusStream { Box::pin(s.map(with(content))) }));
         }
         // PERF-15: that stream's envelope is learned from the first answer
@@ -1902,7 +1941,7 @@ impl DynamicHub {
         if let Some(shell) = base.shell(&key) {
             return Some(Ok(Box::pin(futures::stream::iter(shell.answer(content)))));
         }
-        let items: Vec<super::types::PlexusStreamItem> = match self.route_ungated(method, params.clone(), auth, raw_ctx).await {
+        let items: Vec<super::types::PlexusStreamItem> = match self.route_ungated(path, params.clone(), auth, raw_ctx).await {
             Ok(s) => s.collect().await,
             Err(e) => return Some(Err(e)),
         };
@@ -1912,29 +1951,38 @@ impl DynamicHub {
         Some(Ok(Box::pin(futures::stream::iter(items.into_iter().map(with(content))))))
     }
 
-    /// KEEL-32: an introspection path in the service's own-namespace form
-    /// (`svc.vault.hidden.schema`) as its bare form (`vault.hidden.schema`),
-    /// so the two answer the same for every caller: routing reaches the same
-    /// place by both. A path whose first segment below the service names
-    /// one of the service's own methods (`svc.call.schema`) is the service's
-    /// own, and stays.
-    fn bare_introspection<'m>(&self, method: &'m str) -> &'m str {
+    /// KEEL-54 · **the one path** a call is decided and routed by: what the
+    /// caller said, in the service's own-namespace form (`svc.vault.get`,
+    /// the form a hop forwards — plexus-wire spec/12) as its bare form
+    /// (`vault.get`, spec/02's `method`), so the gate decides exactly the
+    /// path the router routes, and the two forms are one call (KEEL-32 made
+    /// them one for introspection). One prefix is taken, once: a path whose
+    /// first segment below the service is one of the service's own methods
+    /// (`svc.call.schema`) is the service's own and stays, and so does
+    /// anything else — `svc.svc.vault.get` stays, and names nothing. Nothing
+    /// else is rewritten: no case, no dot, no empty segment.
+    pub(crate) fn call_path<'m>(&self, method: &'m str) -> CallPath<'m> {
         let Some(rest) = method.strip_prefix(self.inner.namespace.as_str()).and_then(|r| r.strip_prefix('.')) else {
-            return method;
+            return CallPath(method);
         };
-        let Some((first, _)) = rest.split_once('.') else { return method };
-        let own = self.described().service.methods.iter().any(|m| m.name == first);
-        if own || first.is_empty() {
-            method
-        } else {
-            rest
+        match rest.split_once('.') {
+            // No entry is named as the service (`RootError::Shadows`): a
+            // name given twice is not taken twice.
+            Some((first, _)) if !first.is_empty() && first != self.inner.namespace && !self.is_own_method(first) => CallPath(rest),
+            _ => CallPath(method),
         }
+    }
+
+    /// KEEL-54: whether `name` is one of the service's own methods (`call`,
+    /// `hash`, `hashes`, `ir`, `schema`) — what `<ns>.<name>` routes to.
+    fn is_own_method(&self, name: &str) -> bool {
+        name == "schema" || Activation::methods(self).contains(&name)
     }
 
     /// KEEL-32: a child's schema request, `<path>.schema` in either form, as
     /// its bare path (`svc.vault.hidden.schema` → `vault.hidden`).
     pub(crate) fn bare_schema_path(&self, method: &str) -> String {
-        self.bare_introspection(method).trim_end_matches(".schema").to_string()
+        self.call_path(method).as_str().trim_end_matches(".schema").to_string()
     }
 
     /// KEEL-32: whether reaching `path` looks a name up in a dynamic or peer
@@ -2235,6 +2283,8 @@ impl DynamicHub {
         if self.inner.gate.is_none() {
             return Ok(InputTerms { grant: method.to_string(), targets: Vec::new(), recheck: false });
         }
+        // KEEL-54: held to the grant of the path the call was decided on.
+        let method = self.call_path(method).as_str();
         let index = self.gate_index();
         let info = index.info(method);
         let grant = info.and_then(|i| i.grant.clone()).unwrap_or_else(|| method.to_string());
@@ -2264,6 +2314,7 @@ impl DynamicHub {
     /// none — its own, each activation's, each static child's. A path they do
     /// not show (a dynamic child's) may.
     pub(crate) fn may_take_input(&self, method: &str) -> bool {
+        let method = self.call_path(method).as_str();
         // PERF.115-49: answered under the read guard, no `Arc` taken.
         if let Some(index) = self.inner.input_index.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
             return index.get(method).copied().unwrap_or(true);
@@ -2336,7 +2387,8 @@ impl DynamicHub {
             // (`tickets.commits.link`, see `super::children`). A dynamic
             // child (an open name set) has no MethodSchema at this hub's
             // level; the gate treats its paths as schema-less (grant = the
-            // dotted path; registry overlay / default_deny still apply).
+            // dotted path, held on `*` alone — KEEL-54; registry overlay /
+            // default_deny still apply).
             // NEST-5: and each typed slot's, as `<parent>.{<slot>}.<method>`
             // with its grant qualified by the slot's path; an untyped slot
             // is one entry, `<parent>.{<slot>}`, granted whole.
@@ -2488,6 +2540,15 @@ impl DynamicHub {
     /// this shape and was dead on arrival. A loud, immediate error at
     /// registration time beats silent unreachability at call time.
     fn assert_no_root_shadow(&self, child_namespace: &str) {
+        // KEEL-54 (R5): an entry named as one of the service's own methods
+        // would be routed to the method, and its schema collides with it.
+        if self.is_own_method(child_namespace) {
+            panic!(
+                "DynamicHub: an activation named `{child_namespace}` collides with the service's own method `{root}.{child_namespace}` \
+                 (its own methods: call, hash, hashes, ir, schema) — it would never be reached. Name it otherwise. [KEEL-54]",
+                root = self.inner.namespace,
+            );
+        }
         if child_namespace == self.inner.namespace {
             panic!(
                 "DynamicHub namespace shadow: activation namespace '{child}' collides with the hub root namespace '{root}'. \
@@ -2629,7 +2690,8 @@ impl DynamicHub {
     /// `replace`) a name taken. Answers whether an entry was replaced.
     pub(crate) fn insert_entry(&self, name: String, entry: super::service_root::Entry, replace: bool) -> Result<bool, super::service_root::RootError> {
         super::service_root::check_name(&name)?;
-        if name == self.inner.namespace {
+        // KEEL-54 (R5): nor one of the service's own methods.
+        if name == self.inner.namespace || self.is_own_method(&name) {
             return Err(super::service_root::RootError::Shadows { name });
         }
         // NEST-16: a graft is checked against the service it joins.
@@ -2720,7 +2782,7 @@ impl DynamicHub {
     /// NEST-16: the grant the gate holds a call to `path` to (its index's,
     /// kept until the service changes).
     pub(crate) fn grant_at(&self, path: &str) -> Option<String> {
-        self.gate_index().info(path).and_then(|i| i.grant.clone())
+        self.gate_index().info(self.call_path(path).as_str()).and_then(|i| i.grant.clone())
     }
 
     /// NEST-16: check a graft's `needs` against what this service serves,
@@ -2895,7 +2957,8 @@ impl DynamicHub {
     /// it will call): the service's whole description at `method` (a
     /// `….schema` path), as the service itself sees it — no caller's view.
     pub(crate) async fn schema_for_child(&self, method: &str, params: Value) -> Result<PlexusStream, PlexusError> {
-        let (_, name) = self.parse_method(method)?;
+        let path = self.call_path(method);
+        let (_, name) = self.parse_method(path.as_str())?;
         if !Self::is_schema_query(name) {
             return Err(PlexusError::Unauthenticated(format!(
                 "`{method}` is not a schema: outside a call, a child asks its service only for a schema"
@@ -2904,18 +2967,23 @@ impl DynamicHub {
         // KEEL-32: decided by the mount before it gets here (`may_read_schema`);
         // it runs with no reach, never everywhere.
         let ctx = crate::call::CallContext::admitted(None, plexus_auth_core::grants::Reach::nowhere());
-        let routed = self.route_ungated(method, params, None, None);
+        let routed = self.route_ungated(path, params, None, None);
         super::service_scope::scope(self.downgrade(), in_call(ctx, routed)).await
     }
 
     /// [`DynamicHub::route_with_ctx`], inside its service's scope.
+    ///
+    /// KEEL-54: the caller's spelling is read once, here, into the one
+    /// [`CallPath`] the gate decides and the router routes.
     async fn route_entered(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        let path = self.call_path(method);
         // AUTH-2 grant gate: only when configured — a hub without one pays
         // this one branch and dispatches as before.
         if let Some(gate) = self.inner.gate.as_ref() {
             // AUTH-11: a sign-in that ended proves no one, on every method.
             let (auth, ended) = super::grant_gate::standing(gate, auth);
             let index = self.gate_index();
+            let method = path.as_str();
             // ONE-7 (review M1): the untyped peer slot this path goes
             // through, if it does — a literal door's shape opens the
             // peer's name.
@@ -2933,7 +3001,11 @@ impl DynamicHub {
                     // KEEL-31: a slot's method that acts everywhere is
                     // decided on `*` by its literal path too.
                     Some(slot) => {
-                        let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, ..Default::default() };
+                        // KEEL-54 (R1): and on the slot method's target, as
+                        // the slot's own entry would be — a grant held by
+                        // its literal name is still checked where the call
+                        // acts, never "held anywhere".
+                        let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, target: slot.target.clone(), ..Default::default() };
                         // ONE-7 (review M1): through an untyped peer slot,
                         // the literal grant held at the call's address — a
                         // role listing the peer's method (or admin) on
@@ -2945,7 +3017,16 @@ impl DynamicHub {
                             .or_else(|e| if slot.door { decide(Some(&literal_door)).or(Err(e)) } else { Err(e) })
                             .or_else(|_| decide(Some(slot)))
                     }
-                    None => decide(None),
+                    // KEEL-54: a path no schema of this service describes,
+                    // and no slot holds, names nothing the gate can read a
+                    // target from — so it is never "held anywhere" on a
+                    // grant made up from its spelling, which `admin` on any
+                    // data scope holds. It is decided as a whole-service
+                    // call is (KEEL-31): its literal grant held on `*`, by a
+                    // role on `*` that lists it (or admin on `*`), within a
+                    // ceiling that allows it on `*`. Introspection answers
+                    // from the caller's view, as before.
+                    None => decide(Some(&super::scope_gate::MethodGateInfo { everywhere: true, ..Default::default() })),
                 },
             }
             .map_err(|e| super::grant_gate::say_ended(e, ended.as_deref()))?;
@@ -2953,21 +3034,31 @@ impl DynamicHub {
                 // AUTH-4: introspection answers from the caller's view.
                 // RETURNS-47: in a context too — the caller's reach for the
                 // path, as the gate gives a public method's — never none.
+                // KEEL-32: the own-namespace form is the bare form
+                // (`call_path`).
                 super::grant_gate::Admit::Open => {
-                    // KEEL-32: the own-namespace form is the bare form.
-                    let method = self.bare_introspection(method);
                     let grant = plexus_auth_core::grants::Grant::new(method.to_string());
                     // PERF.115-49: boxed — the introspection path's future is
                     // the largest, and inline every call's future was its size.
                     Box::pin(in_call(crate::call::CallContext::introspection(auth, Arc::clone(gate), grant), async {
-                        match self.introspect_in_view(method, &params, auth, raw_ctx).await {
+                        match self.introspect_in_view(path, &params, auth, raw_ctx).await {
                             Some(answer) => answer,
-                            None => self.route_ungated(method, params, auth, raw_ctx).await,
+                            None => self.route_ungated(path, params, auth, raw_ctx).await,
                         }
                     }))
                     .await
                 }
                 super::grant_gate::Admit::Reach(reach, door) => {
+                    // KEEL-54: the call runs only where it was decided — the
+                    // reach is for this path's own grant (its entry's, its
+                    // slot's, or its literal path's), or nothing runs.
+                    // A backstop: no input reaches it today — every arm
+                    // above decides `path` itself, for its entry's, its
+                    // slot's or its literal grant. It stands against a
+                    // future arm or a second reading of the path; the unit
+                    // test `keel54_routing::a_reach_for_another_grant_never_runs_the_call`
+                    // is its only cover. Do not remove it as dead code.
+                    routes_as_decided(&index, path, &reach)?;
                     let ctx = crate::call::CallContext::admitted_by_gate(auth, reach);
                     // ONE-7: the call a door admitted, kept with the call —
                     // what a hop carries across for exactly that call.
@@ -2975,7 +3066,7 @@ impl DynamicHub {
                         Some(call) => ctx.at_door(call, peer_slot.as_deref()),
                         None => ctx,
                     };
-                    in_call(ctx, self.route_ungated(method, params, auth, raw_ctx)).await
+                    in_call(ctx, self.route_ungated(path, params, auth, raw_ctx)).await
                 }
             };
         }
@@ -2989,11 +3080,34 @@ impl DynamicHub {
             Ok(outer) => outer.with_auth(auth),
             Err(_) => crate::call::CallContext::admitted(auth, plexus_auth_core::grants::Reach::everywhere()),
         };
-        in_call(ctx, self.route_ungated(method, params, auth, raw_ctx)).await
+        in_call(ctx, self.route_ungated(path, params, auth, raw_ctx)).await
+    }
+
+    /// KEEL-54: what routing answers a path it has nowhere to send, said
+    /// without routing it: no dot — not `namespace.method`; a first segment
+    /// no entry is (and not the service's own) — `Activation not found`;
+    /// else `Method not found` there.
+    fn not_found(&self, path: CallPath<'_>) -> PlexusError {
+        let (ns, rest) = match self.parse_method(path.as_str()) {
+            Ok(split) => split,
+            Err(e) => return e,
+        };
+        if ns != self.inner.namespace && !self.table().entries.contains_key(ns) {
+            return PlexusError::ActivationNotFound(ns.to_string());
+        }
+        PlexusError::MethodNotFound { activation: ns.to_string(), method: rest.to_string() }
     }
 
     /// Everything [`DynamicHub::route_with_ctx`] does after the grant gate.
-    async fn route_ungated(&self, method: &str, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+    ///
+    /// KEEL-54: it routes the path the gate decided ([`CallPath`]) as the
+    /// gate's index names it: the service's own namespace to the service's
+    /// own methods alone (`svc.hash`, `svc.call`, `svc.<method>.schema`),
+    /// every other first segment to its entry. It never takes `svc.` off
+    /// again: the macro's fallback below the service's own methods into an
+    /// entry would be a second reading of a path the gate decided as one.
+    async fn route_ungated(&self, path: CallPath<'_>, params: Value, auth: Option<&super::auth::AuthContext>, raw_ctx: Option<&crate::request::RawRequestContext>) -> Result<PlexusStream, PlexusError> {
+        let method = path.as_str();
         // R-5 scope gate (AUTHZ-CORE-1 + CORE-5). Inactive unless a
         // ScopeRegistry is configured or default_deny is set — a hub with
         // neither pays exactly this one branch and dispatches as before
@@ -3030,6 +3144,16 @@ impl DynamicHub {
         // `schema`, `ir`), every other name the root's table; the entry
         // routes the rest of the path below it.
         let stream = if namespace == self.inner.namespace {
+            // KEEL-54: the service's own methods, and their schemas — never
+            // a path below them routed on into an entry.
+            let own = match method_name.split_once('.') {
+                None => self.is_own_method(method_name),
+                Some((first, "schema")) => first != "schema" && self.is_own_method(first),
+                Some(_) => false,
+            };
+            if !own {
+                return Err(self.not_found(path));
+            }
             Activation::call(self, method_name, params, auth, raw_ctx).await?
         } else {
             let entry = self.table().entries.get(namespace).map(|e| e.object.clone())
@@ -3881,7 +4005,25 @@ impl DynamicHub {
         use super::context::PlexusContext;
         use super::types::{PlexusStreamItem, StreamMetadata};
 
-        let result = self.route(&method, params.unwrap_or_default(), None).await;
+        // KEEL-54 (R2): a service registered as an entry of another is
+        // reached by its path (`inner.leaf.read`), which the outer gate
+        // decides. Its own `call`, run inside a call the outer gate
+        // admitted on `inner.call` alone, would route as this service —
+        // ungated here, with the outer call's reach — past every check the
+        // path would meet. Refused, decided where it runs: whatever mounted
+        // it, in whatever order its gate was set.
+        let outer = super::service_scope::current().filter(|w| !w.is(self)).and_then(|w| w.upgrade());
+        let result = match outer {
+            Some(outer) if outer.inner.gate.is_some() => Err(PlexusError::Forbidden {
+                reason: AuthzDenyReason::MissingGrant {
+                    grant: plexus_auth_core::grants::Grant::new(format!("{}.call", self.inner.namespace)),
+                    scope: plexus_auth_core::grants::ScopeRef::Everywhere,
+                    roles: Vec::new(),
+                    held_on: Vec::new(),
+                },
+            }),
+            _ => self.route(&method, params.unwrap_or_default(), None).await,
+        };
 
         match result {
             Ok(plexus_stream) => {
@@ -4597,4 +4739,90 @@ mod tests {
     // asserts the live behavior. Splitting it that way avoids forcing the
     // unit test to construct a working RpcSubscriptionSink, which is not
     // straightforward in the bare jsonrpsee API.
+}
+
+#[cfg(test)]
+mod keel54_routing {
+    //! KEEL-54, layer 3: routing never outruns the gate — each piece alone,
+    //! with nothing before it to normalize or refuse the path.
+    use super::*;
+    use crate::activations::health::Health;
+    use plexus_auth_core::grants::{Gate, Grant, Membership, Memberships, Reach, Resolve, RoleTable, ScopeRef};
+    use serde_json::json;
+
+    const ADMIN: &str = "key:adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad";
+
+    struct AdminEverywhere;
+    impl Memberships for AdminEverywhere {
+        fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
+            vec![Membership { principal: who.clone(), role: plexus_auth_core::RoleName::new("admin"), scope: ScopeRef::Everywhere }]
+        }
+    }
+    struct Anywhere;
+    impl Resolve for Anywhere {
+        fn chain(&self, _: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::Everywhere])
+        }
+    }
+
+    fn service() -> DynamicHub {
+        DynamicHub::new("svc").register(Health::new())
+    }
+
+    async fn routed(svc: &DynamicHub, path: &'static str) -> Result<PlexusStream, PlexusError> {
+        let ctx = crate::call::CallContext::admitted(None, Reach::everywhere());
+        crate::call::scope(ctx, svc.route_ungated(CallPath(path), json!({}), None, None)).await
+    }
+
+    /// The service's own name routes to the service's own methods alone:
+    /// the macro's fallback below them (`svc.health.check` into `health`)
+    /// is never reached, whatever the gate before it decided.
+    #[tokio::test]
+    async fn the_router_sends_the_services_own_name_to_its_own_methods_alone() {
+        let svc = service();
+        for path in ["svc.health.check", "svc.svc.health.check", "svc.hash.check", "svc.call.check", "svc.schema.schema"] {
+            assert!(matches!(routed(&svc, path).await, Err(PlexusError::MethodNotFound { .. })), "{path}");
+        }
+        for path in ["svc.hash", "svc.schema", "svc.call.schema", "health.check"] {
+            assert!(routed(&svc, path).await.is_ok(), "{path}");
+        }
+    }
+
+    /// The call runs only under a reach made for its own path's grant.
+    #[test]
+    fn a_reach_for_another_grant_never_runs_the_call() {
+        let svc = service();
+        let index = svc.gate_index();
+        let gate = Gate::new(Arc::new(AdminEverywhere), Arc::new(RoleTable::from_lists([("viewer", ["health.check"])])), Arc::new(Anywhere));
+        let admin = crate::plexus::AuthContext::for_principal(&ADMIN.parse().unwrap(), "s", vec![], Value::Null);
+        let reach = |grant: &str| gate.check(Some(&admin), &Grant::new(grant), None).unwrap();
+        assert!(routes_as_decided(&index, CallPath("health.check"), &reach("health.check")).is_ok());
+        assert!(routes_as_decided(&index, CallPath("svc.hash"), &reach("svc.hash")).is_ok());
+        for (path, decided) in [("health.check", "svc.health.check"), ("svc.hash", "health.other"), ("health.check", "health")] {
+            assert!(matches!(routes_as_decided(&index, CallPath(path), &reach(decided)), Err(PlexusError::Forbidden { .. })), "{path} on {decided}");
+        }
+        assert!(routes_as_decided(&index, CallPath("health.check"), &Reach::everywhere()).is_err(), "a reach no gate made");
+    }
+
+    /// Layer 1 alone: the one prefix taken, once, and nothing else rewritten.
+    #[test]
+    fn the_caller_s_spelling_is_read_once() {
+        let svc = service();
+        let cases = [
+            ("svc.health.check", "health.check"),
+            ("health.check", "health.check"),
+            ("svc.hash", "svc.hash"),
+            ("svc.call.schema", "svc.call.schema"),
+            ("svc.svc.health.check", "svc.svc.health.check"),
+            ("svc..health.check", "svc..health.check"),
+            ("SVC.health.check", "SVC.health.check"),
+            ("svc.Health.check", "Health.check"),
+            ("svc.health", "svc.health"),
+            ("svcx.health.check", "svcx.health.check"),
+            (".svc.health.check", ".svc.health.check"),
+        ];
+        for (said, path) in cases {
+            assert_eq!(svc.call_path(said).as_str(), path, "{said}");
+        }
+    }
 }

@@ -17,11 +17,16 @@
 //! | method with a `target`, value present | `Unauthenticated` | allowed iff a role held on a scope in the value's chain lists the grant, and every ceiling layer allows it there |
 //! | method that acts `everywhere` (KEEL-31) | `Unauthenticated` | allowed iff a role held on `*` lists the grant, and every ceiling layer allows it on `*` — held on a scope is refused, naming `*` |
 //! | method without a target (or the target param absent / null) | `Unauthenticated` | allowed iff the grant is held anywhere (within the ceiling) |
-//! | method no schema describes (a nested child path) | `Unauthenticated` | as "without a target", grant = the dotted path |
+//! | method no schema describes and no slot holds (KEEL-54) | `Unauthenticated` | grant = the dotted path, held on `*` alone (as `everywhere`) — never "held anywhere" |
 //! | a signed-in grant (AUTH-5: `auth.whoami`, `auth.logout`, `auth.requires`) | `Unauthenticated` | runs (its reach), whatever the roles or ceiling |
 //!
 //! A target whose value is a list is checked element by element; every
 //! element must be allowed.
+//!
+//! KEEL-54: every row is decided on the path the service routes —
+//! [`DynamicHub::call_path`](super::DynamicHub), the caller's spelling read
+//! once (`svc.vault.get` is `vault.get`) — and the router runs the call only
+//! under a reach made for that path's own grant.
 //!
 //! # The door (ONE-7)
 //!

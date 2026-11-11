@@ -3072,13 +3072,15 @@ impl DynamicHub {
                     // KEEL-59: a signed-in caller's call, on a grant not
                     // everyone holds, is held to this decision while it runs
                     // (`held`); any other runs as before.
-                    match held.filter(|_| auth.is_some()) {
-                        Some(targets) => {
-                            let stream = crate::call::scope(ctx.clone(), self.route_ungated(path, params, auth, raw_ctx)).await?;
-                            Ok(super::held::held(ctx, self.clone(), seen, targets, stream))
-                        }
-                        None => in_call(ctx, self.route_ungated(path, params, auth, raw_ctx)).await,
-                    }
+                    // One await for both: the future's state stays the size
+                    // it was (two awaits of the routed call made it ~400
+                    // bytes larger, PERF's `call.one_item`).
+                    let held = held.filter(|_| auth.is_some());
+                    let stream = crate::call::scope(ctx.clone(), self.route_ungated(path, params, auth, raw_ctx)).await?;
+                    Ok(match held {
+                        Some(targets) => super::held::held(ctx, self.clone(), seen, targets, stream),
+                        None => Box::pin(crate::call::InCall::new(ctx, stream)),
+                    })
                 }
             };
         }

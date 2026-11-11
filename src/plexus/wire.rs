@@ -819,13 +819,10 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
                 biased;
                 _ = sink.closed() => {
                     // KEEL-59: closing because its sign-in ended: the call
-                    // says so, once, before the close.
-                    if let (Some(to), false) = (&frames, said_end) {
-                        if let Some(why) = to.ending() {
-                            let item = ending_item(sink.method_name(), why);
-                            let bytes = WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item));
-                            let _ = to.tx.send(WireFrame { bytes, fence: first }).await;
-                        }
+                    // says so, once, before the close. Made apart and boxed:
+                    // this rare await keeps out of every call's state.
+                    if let Some(say) = frames.as_ref().filter(|_| !said_end).and_then(|to| saying_end(to, &mut notification, sink.method_name(), first)) {
+                        say.await;
                     }
                     return Ok(());
                 }
@@ -891,6 +888,17 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         }
     }
     out
+}
+
+/// KEEL-59: the frame a call writes as its connection closes because its
+/// sign-in ended, sent — or nothing, when the connection is not ending so.
+fn saying_end(to: &FrameSink, notification: &mut Frames, method: &str, first: bool) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+    let why = to.ending()?;
+    let bytes = WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &ending_item(method, why)));
+    let tx = to.tx.clone();
+    Some(Box::pin(async move {
+        let _ = tx.send(WireFrame { bytes, fence: first }).await;
+    }))
 }
 
 /// KEEL-59: the item a call ends with when its connection closes because

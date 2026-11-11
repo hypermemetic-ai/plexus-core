@@ -12,10 +12,13 @@
 //! drop (spec/12 rule 6), and the calls that peer was making back under it
 //! end with it.
 //!
-//! A sign-in's own end (`expires_at`, AUTH-11) is not a move: a call open
-//! in process runs on past it, and what it asks after is refused (KEEL-51).
-//! On a socket the transport closes the connection when the sign-in ends,
-//! and tells each open call first (`wire::FrameSink::end_saying`).
+//! A sign-in's own end (`expires_at`, AUTH-11, a capped session's the same)
+//! ends a held call at that moment, on every path — in process, through a
+//! bridge, across a hop — with one `unauthenticated` item (M2): a call that
+//! waits is woken by a timer made with its wait; one that never waits looks
+//! at the clock every 64 items. On a socket the transport also closes the
+//! connection then, and tells each open call first
+//! (`wire::FrameSink::end_saying`).
 //!
 //! **What "no longer holds" means** ([`redecide`]):
 //!
@@ -104,7 +107,31 @@ fn end_item(ns: &str, e: &PlexusError) -> PlexusStreamItem {
 
 /// The wait for the generation's next move: its own receiver inside, so it
 /// lives across polls (made only once the method has nothing ready).
-type Wait = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+type Wait = std::pin::Pin<Box<dyn Future<Output = Woke> + Send>>;
+
+/// What ended a held call's wait.
+enum Woke {
+    Moved,
+    /// The sign-in's `expires_at` came.
+    Expired,
+}
+
+/// When the call's sign-in ends (M2): read once, when first needed.
+#[derive(Clone, Copy)]
+enum Ends {
+    Unread,
+    Never,
+    At(std::time::SystemTime),
+}
+
+/// How many items a busy call yields between looks at the clock (one that
+/// never waits never arms the timer).
+const CLOCK_EVERY: u8 = 64;
+
+/// What a held call ends with when its sign-in ends.
+fn expired() -> PlexusError {
+    PlexusError::Unauthenticated("your sign-in has expired: sign in again".into())
+}
 
 /// `inner`, each poll of it inside `ctx` (as [`crate::call::InCall`]), held
 /// to `ctx`'s admission: decided again by [`redecide`] when `service`'s
@@ -114,7 +141,7 @@ pub(crate) fn held(ctx: CallContext, service: super::plexus::DynamicHub, seen: u
     if service.gate().is_none() {
         return Box::pin(crate::call::InCall::new(ctx, inner));
     }
-    Box::pin(Held { ctx, service, seen, targets, inner: Some(inner), wait: None })
+    Box::pin(Held { ctx, service, seen, targets, inner: Some(inner), wait: None, ends: Ends::Unread, items: 0 })
 }
 
 /// A held call's stream ([`held`]). A poll is one atomic load and the
@@ -129,6 +156,38 @@ struct Held {
     /// `None` once over: ended by the method, or by the hold.
     inner: Option<PlexusStream>,
     wait: Option<Wait>,
+    ends: Ends,
+    /// Items since the clock was last read.
+    items: u8,
+}
+
+impl Ends {
+    /// When the sign-in ends, read from the call's identity once.
+    fn at(&mut self, ctx: &CallContext) -> Option<std::time::SystemTime> {
+        if let Ends::Unread = self {
+            let at = ctx.auth().and_then(|a| a.metadata.get(plexus_auth_core::auth::EXPIRES_AT_KEY)).and_then(serde_json::Value::as_i64);
+            *self = match at {
+                Some(at) => Ends::At(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at.max(0) as u64)),
+                None => Ends::Never,
+            };
+        }
+        match self {
+            Ends::At(t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// The sign-in has ended.
+    fn over(&mut self, ctx: &CallContext) -> bool {
+        self.at(ctx).is_some_and(|t| std::time::SystemTime::now() >= t)
+    }
+}
+
+/// The call's end: its stream dropped first, never polled again.
+fn end(inner: &mut Option<PlexusStream>, wait: &mut Option<Wait>, ns: &str, e: PlexusError) -> Poll<Option<PlexusStreamItem>> {
+    *inner = None;
+    *wait = None;
+    Poll::Ready(Some(end_item(ns, &e)))
 }
 
 impl futures::Stream for Held {
@@ -158,8 +217,7 @@ impl futures::Stream for Held {
                         // The method's stream goes first, never polled again
                         // (L3): its work stops now, whether or not its caller
                         // reads the item.
-                        this.inner = None;
-                        return Poll::Ready(Some(end_item(this.service.runtime_namespace(), &PlexusError::from(why))));
+                        return end(&mut this.inner, &mut this.wait, this.service.runtime_namespace(), PlexusError::from(why));
                     }
                 }
                 continue;
@@ -167,25 +225,50 @@ impl futures::Stream for Held {
             if let Poll::Ready(item) = crate::call::poll_in(&this.ctx, stream, cx) {
                 if item.is_none() {
                     this.inner = None;
+                    return Poll::Ready(None);
+                }
+                // M2: a call that never waits looks at the clock now and
+                // then; one that waits is woken by its timer.
+                this.items = this.items.wrapping_add(1);
+                if this.items % CLOCK_EVERY == 0 && this.ends.over(&this.ctx) {
+                    return end(&mut this.inner, &mut this.wait, this.service.runtime_namespace(), expired());
                 }
                 return Poll::Ready(item);
             }
-            // Nothing ready: wake at the next move too.
-            let wait = this.wait.get_or_insert_with(|| {
+            // Nothing ready: wake at the next move, or at the sign-in's end.
+            if this.wait.is_none() {
+                if this.ends.over(&this.ctx) {
+                    return end(&mut this.inner, &mut this.wait, this.service.runtime_namespace(), expired());
+                }
+                let ends = this.ends.at(&this.ctx);
                 let mut moves = generation.subscribe();
-                Box::pin(async move {
-                    // A closed channel (the gate gone) never wakes again.
-                    if moves.changed().await.is_err() {
-                        std::future::pending::<()>().await;
+                this.wait = Some(Box::pin(async move {
+                    let expiry = async move {
+                        match ends.map(|t| t.duration_since(std::time::SystemTime::now()).unwrap_or_default()) {
+                            Some(left) => crate::rt::sleep(left).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
+                    let moved = async move {
+                        // A closed channel (the gate gone) never wakes again.
+                        if moves.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        () = moved => Woke::Moved,
+                        () = expiry => Woke::Expired,
                     }
-                })
-            });
+                }));
+            }
             // A move between the read above and the subscription is read now.
             if generation.current() != this.seen {
                 continue;
             }
-            match wait.as_mut().poll(cx) {
-                Poll::Ready(()) => this.wait = None,
+            match this.wait.as_mut().expect("made above").as_mut().poll(cx) {
+                Poll::Ready(Woke::Moved) => this.wait = None,
+                Poll::Ready(Woke::Expired) => return end(&mut this.inner, &mut this.wait, this.service.runtime_namespace(), expired()),
                 Poll::Pending => return Poll::Pending,
             }
         }

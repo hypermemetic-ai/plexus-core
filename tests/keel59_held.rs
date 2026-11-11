@@ -133,6 +133,19 @@ impl WorkActivation {
         }
     }
 
+    /// Works and says so each time: always has an item ready.
+    #[plexus_macros::method]
+    pub async fn chatty(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
+        async_stream::stream! {
+            yield json!("started");
+            loop {
+                // Never waits: always an item ready.
+                mark(&tag);
+                yield json!("tick");
+            }
+        }
+    }
+
     /// The same, on a target.
     #[plexus_macros::method(target = "id")]
     pub async fn on(&self, id: String, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -257,6 +270,22 @@ impl Open {
         item
     }
 
+    /// Its data items skipped, its last item an error of `kind`, then it ends.
+    async fn ends_after_data(&mut self, kind: &str) -> Value {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < until, "no end within 5 s: it ran on");
+            let item = self.next().await.expect("an end, not silence");
+            if item["type"] == json!("data") {
+                continue;
+            }
+            assert_eq!(item["type"], json!("error"), "{item}");
+            assert_eq!(item["error_kind"], json!(kind), "{item}");
+            assert_eq!(self.next().await, None, "one item, then the end");
+            return item;
+        }
+    }
+
     /// Nothing has ended it.
     fn runs(&mut self) {
         match self.items.try_recv() {
@@ -272,7 +301,7 @@ fn exe_spec(name: &str) -> ChildSpec {
     format!("{name}=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap()
 }
 
-const READER: [&str; 8] = ["work.quiet", "work.idle", "work.leans", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
+const READER: [&str; 9] = ["work.quiet", "work.idle", "work.leans", "work.chatty", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
 
 async fn host_with(members: &[(&str, &str)], leaves: &[RemoteChild]) -> Host {
     let mut b = World::new().host().without_named_callers().resolving(Shortcodes).with(WorkActivation).role("reader", READER);
@@ -331,6 +360,25 @@ async fn a_callees_word_does_not_exempt_the_call() {
     let end = call.ends("forbidden").await;
     assert_eq!(end["grant"], json!("work.leans"), "{end}");
     stopped("leans", cause).await;
+}
+
+/// M2: a sign-in that ends ends the call at that moment, in process — a
+/// call that waits (its timer) and one that never does (the clock, read
+/// every 64 items) — with one `unauthenticated` item, its work stopped.
+async fn a_sign_in_that_ends_ends_the_call_in_process() {
+    let host = host_with(&[(ALICE, "*")], &[]).await;
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 2;
+    let ending = plexus_core::plexus::AuthContext::for_principal(&ALICE.parse().unwrap(), "ending", vec![], json!({ plexus_auth_core::auth::EXPIRES_AT_KEY: secs }));
+    let caller = Caller::new(host.service().clone(), Some(ending));
+    let mut quiet = Open::start(&caller, "work.idle", json!({ "tag": "expiry-quiet" })).await;
+    let mut busy = Open::start(&caller, "work.chatty", json!({ "tag": "expiry-busy" })).await;
+    let at = (secs as u128) * 1_000_000_000;
+    let end = quiet.ends("unauthenticated").await;
+    assert!(end["message"].as_str().unwrap().contains("expired"), "{end}");
+    stopped("expiry-quiet", at).await;
+    let end = busy.ends_after_data("unauthenticated").await;
+    assert!(end["message"].as_str().unwrap().contains("expired"), "{end}");
+    stopped("expiry-busy", at).await;
 }
 
 async fn across_a_hop_the_caller_is_told_and_the_peers_work_stops() {
@@ -478,6 +526,7 @@ fn main() {
         a_viewer_whose_grant_is_revoked_mid_stream_is_told_forbidden_and_the_work_stops,
         a_call_that_waits_in_silence_is_ended_at_the_revoke,
         a_callees_word_does_not_exempt_the_call,
+        a_sign_in_that_ends_ends_the_call_in_process,
         across_a_hop_the_caller_is_told_and_the_peers_work_stops,
         a_call_back_ends_with_the_call_it_was_made_under,
         a_read_whose_reach_narrowed_ends_and_one_that_follows_its_reach_runs_on,

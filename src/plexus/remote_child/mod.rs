@@ -509,7 +509,19 @@ impl RemoteChild {
     /// The hop (spec/12) for a call by `auth`, decided as `reach`: the
     /// service acts, the caller is named `for`, the verdict is the limit.
     /// Nothing of the caller's credential.
-    fn hop(&self, conn: &Conn, auth: Option<&AuthContext>, reach: &Reach, method: &str) -> (Value, String) {
+    ///
+    /// ONE-7: a call the service's gate admitted at a door — an address
+    /// scope, not `*` ([`super::grant_gate::is_door`]) — carries it as
+    /// `limit.door`: the address scope of exactly the call the child serves,
+    /// in its terms (`/{ns}.{method}`), for `limit.grant` alone. Never as
+    /// `held_on: ["*"]`: `held_on` stays the data scopes the caller holds the
+    /// grant on (`[]` for one holding only addresses).
+    ///
+    /// Review M1: `limit.door_own: true` beside it when the door was the
+    /// method's own grant at its address ([`crate::call::CallContext`]'s
+    /// recorded door) — what lets the far side run a whole-activation method
+    /// on it; absent when a slot's whole grant (`dyn.{peer}`) opened it.
+    fn hop(&self, conn: &Conn, auth: Option<&AuthContext>, reach: &Reach, method: &str, door: Option<bool>) -> (Value, String) {
         let for_: Vec<String> = auth.and_then(|a| a.principal()).map(|p| p.to_string()).into_iter().collect();
         let limit = reach.grant().map(|g| {
             let grant = match g.as_str().strip_prefix(&format!("{}.", self.name())) {
@@ -521,10 +533,32 @@ impl RemoteChild {
                 None => format!("{}.{method}", conn.ns()),
             };
             let held_on: Vec<String> = reach.held_on().iter().map(|s| s.to_string()).collect();
-            json!({ "grant": grant, "held_on": held_on })
+            match door {
+                Some(true) => json!({ "grant": grant, "held_on": held_on, "door": format!("/{}.{method}", conn.ns()), "door_own": true }),
+                Some(false) => json!({ "grant": grant, "held_on": held_on, "door": format!("/{}.{method}", conn.ns()) }),
+                None => json!({ "grant": grant, "held_on": held_on }),
+            }
         });
         let call = uuid::Uuid::new_v4().to_string();
         (json!({ "principal": self.inner.shared.principal, "for": for_, "limit": limit, "call": call }), call)
+    }
+
+    /// ONE-7: the call the service's gate admitted this forward at a door
+    /// — the activation held at an address, not on `*`
+    /// ([`super::grant_gate::is_door`]) — when that call is this one: its
+    /// grant the reach's, its path this mount's `method` (`{name}.{method}`,
+    /// or, through a slot, ending `.{name}.{method}`). A door is one call's:
+    /// a forward made inside another call (a method's body reaching a child
+    /// itself) carries none, and is decided across by its data alone.
+    fn door_of(&self, reach: &Reach, method: &str) -> Option<plexus_auth_core::grants::DispatchedCall> {
+        if !super::grant_gate::is_door(reach) {
+            return None;
+        }
+        let call = crate::call::context().ok()?.door()?.clone();
+        let own = format!("{}.{method}", self.name());
+        let path = call.at().path();
+        let this = path == own || path.ends_with(&format!(".{own}"));
+        (this && Some(call.grant()) == reach.grant()).then_some(call)
     }
 
     /// DYNAUTH-12: mint the token for one forwarded call — for a signed-in
@@ -557,10 +591,21 @@ impl RemoteChild {
         let forwarded = hop.get("limit").and_then(|l| l.get("grant")).and_then(Value::as_str);
         let presented = upcall::presented();
         // DYNAUTH-6: onward from a call back, never wider than its token.
-        let scope = match &presented {
+        let mut scope = match &presented {
             Some(p) => onward_scope(p, reach.grant().map(|g| g.as_str()), forwarded, &held, &needs),
             None => mint_scope(forwarded, &held, &needs),
         };
+        // ONE-7: the door the hop carries, for the forwarded grant at this
+        // call alone (`grant@/{ns}.{method}`) — onward from a call back only
+        // where the token presented holds the grant admitted on `*`.
+        let door = hop.get("limit").and_then(|l| l.get("door")).and_then(Value::as_str);
+        if let (Some(g), Some(at)) = (forwarded, door) {
+            let admitted = reach.grant().map(|g| g.as_str());
+            let onward_held = presented.as_ref().is_none_or(|p| admitted.is_some_and(|a| p.scopes_for(a).iter().any(|s| s == "*")));
+            if onward_held {
+                scope.push(format!("{g}@{at}"));
+            }
+        }
         let req = MintRequest { sub, peer_key, name: self.name().to_string(), scope, call: call.to_string(), method: path.to_string(), presented };
         let (token, claims) = issuer.mint(req).map_err(|e| e.to_string())?;
         Ok(Some(upcall::Minted { token, claims }))
@@ -684,7 +729,10 @@ impl RemoteChild {
             Err(item) => return one(item),
         };
         shared.counters.calls.fetch_add(1, Ordering::Relaxed);
-        let (mut hop, call_id) = self.hop(&conn, auth, &reach, method);
+        // ONE-7: the door this call was admitted at, if it is this call's.
+        let door = self.door_of(&reach, method);
+        let own = door.is_some() && crate::call::context().is_ok_and(|c| c.door_own());
+        let (mut hop, call_id) = self.hop(&conn, auth, &reach, method, door.as_ref().map(|_| own));
         let path = format!("{}.{method}", conn.ns());
         // DYNAUTH-12: the token for this one call, when the service issues.
         let minted = match self.mint(auth, &reach, &hop, &path, &call_id) {
@@ -710,7 +758,8 @@ impl RemoteChild {
             }
         }
         // NEST-11: the child may call back under this call while it is open.
-        let under = shared.upcalls.open(&call_id, auth, &reach, minted);
+        // ONE-7: a call a door admitted is called back under that door only.
+        let under = shared.upcalls.open(&call_id, auth, &reach, minted, door);
         // KEEL-19: a revoke since the top of `forward` (the dial awaited)
         // opens nothing.
         if let Some(why) = shared.upcalls.revoked() {

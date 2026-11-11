@@ -71,6 +71,11 @@ pub(super) struct Under {
     ended: watch::Sender<Option<String>>,
     /// DYNAUTH-12: the token minted for the forwarded call, if one was.
     minted: Option<Minted>,
+    /// ONE-7: the door the forwarded call was admitted at, as a ceiling
+    /// entry for exactly it (`dyn.{peer}@/dyn.peer.shop.items.list`): what a
+    /// call back made under it holds beyond the call's data — that one
+    /// door, never `*`.
+    door: Option<String>,
 }
 
 tokio::task_local! {
@@ -295,13 +300,14 @@ impl Upcalls {
 
     /// A forwarded call opens: the child may call back under `id` until the
     /// guard is dropped (or [`UnderGuard::end`]ed).
-    pub(super) fn open(self: &Arc<Self>, id: &str, auth: Option<&AuthContext>, reach: &Reach, minted: Option<Minted>) -> Option<UnderGuard> {
+    pub(super) fn open(self: &Arc<Self>, id: &str, auth: Option<&AuthContext>, reach: &Reach, minted: Option<Minted>, door: Option<plexus_auth_core::grants::DispatchedCall>) -> Option<UnderGuard> {
         // The service is learned here, with the first call forwarded (a
         // schema the child asks outside any call is answered by it).
         let known = self.host();
         let service = service_scope::current().or(known)?;
         let (ended, _) = watch::channel(None);
-        let under = Arc::new(Under { auth: auth.cloned(), reach: reach.clone(), service, ended, minted });
+        let door = door.map(|d| format!("{}@/{}", d.grant(), d.at().path()));
+        let under = Arc::new(Under { auth: auth.cloned(), reach: reach.clone(), service, ended, minted, door });
         {
             // KEEL-19: a revoked child is opened nothing to call back under —
             // asked under the lock `revoke`'s `end_all` drains, after the
@@ -415,7 +421,14 @@ impl Drop for UnderGuard {
 /// scope. NEST-16 (TM-1): for a need, the layer is its own grant on
 /// each of those scopes (`shop.items@*` when everywhere), so the call back
 /// reaches that method and nothing else, whatever the caller holds.
-fn narrowed(auth: &AuthContext, reach: &Reach, grant: Option<&str>) -> AuthContext {
+///
+/// ONE-7: a forwarded call admitted at a door (`door`: its grant at its
+/// address, `dyn.{peer}@/dyn.peer.shop.items.list`) adds that entry to the
+/// layer — the door of that one call, for its own grant, never `*` — so a
+/// call back under it reaches the data the caller holds the grant on, and
+/// that door, and nothing else: `operator on /dyn.*` calling into a peer
+/// does not hand the peer `dyn.connect`.
+fn narrowed(auth: &AuthContext, reach: &Reach, grant: Option<&str>, door: Option<&str>) -> AuthContext {
     if reach.is_everywhere() && grant.is_none() {
         return auth.clone();
     }
@@ -428,7 +441,9 @@ fn narrowed(auth: &AuthContext, reach: &Reach, grant: Option<&str>) -> AuthConte
     };
     let what = grant.unwrap_or(plexus_auth_core::grants::ADMIN);
     let scopes: Vec<String> = if reach.is_everywhere() { vec!["*".into()] } else { reach.held_on().iter().map(|s| s.to_string()).collect() };
-    layers.push(Value::Array(scopes.iter().map(|s| json!(format!("{what}@{s}"))).collect()));
+    let mut layer: Vec<Value> = scopes.iter().map(|s| json!(format!("{what}@{s}"))).collect();
+    layer.extend(door.filter(|_| !reach.is_everywhere()).map(|d| json!(d)));
+    layers.push(Value::Array(layer));
     if !ctx.metadata.is_object() {
         ctx.metadata = json!({});
     }
@@ -669,7 +684,7 @@ async fn pump(route: Route, out: &mpsc::UnboundedSender<Vec<u8>>, sid: u64, name
             // TM-1: a need is routed under its own grant as one more ceiling;
             // DYNAUTH-5: and only on the scopes it was consented on.
             let grant = need.as_ref().and_then(|_| service.grant_at(target));
-            let auth = u.auth.as_ref().map(|a| narrowed(a, &u.reach, grant.as_deref()));
+            let auth = u.auth.as_ref().map(|a| narrowed(a, &u.reach, grant.as_deref(), u.door.as_deref()));
             let auth = match (auth, &grant, &need) {
                 (Some(a), Some(g), Some(scopes)) if !scopes.iter().any(|s| s == "*") => Some(consented(&a, g, scopes)),
                 (a, _, _) => a,
@@ -755,7 +770,7 @@ mod tests {
         let gate = Gate::new(Arc::new(Held), Arc::new(roles), Arc::new(Chain));
         let who = AuthContext::for_principal(&"key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(), "s", vec![], Value::Null);
         let wide = gate.check(Some(&who), &plexus_auth_core::grants::Grant::new("a.get"), None).unwrap();
-        assert_eq!(narrowed(&who, &wide, None).metadata, who.metadata, "held everywhere: nothing added");
+        assert_eq!(narrowed(&who, &wide, None, None).metadata, who.metadata, "held everywhere: nothing added");
         // A reach held on `X` alone: the call back reaches `b.get` on X, not on Y.
         let mut n = who.clone();
         n.metadata[CEILING_KEY] = json!([["admin@X"]]);
@@ -763,7 +778,7 @@ mod tests {
         let g = plexus_auth_core::grants::Grant::new("b.get");
         assert!(gate.check(Some(&narrow), &g, Some("X")).is_ok());
         assert!(gate.check(Some(&narrow), &g, Some("Y")).is_err());
-        let layered = narrowed(&n, &gate.check(Some(&n), &plexus_auth_core::grants::Grant::new("a.get"), None).unwrap(), None);
+        let layered = narrowed(&n, &gate.check(Some(&n), &plexus_auth_core::grants::Grant::new("a.get"), None).unwrap(), None, None);
         assert_eq!(layered.metadata[CEILING_KEY].as_array().unwrap().len(), 2, "{:?}", layered.metadata);
         assert!(gate.check(Some(&layered), &g, Some("Y")).is_err());
     }
@@ -840,7 +855,7 @@ mod tests {
         let up = Upcalls::new(None, false);
         let svc = crate::plexus::DynamicHub::new("svc");
         let reach = plexus_auth_core::grants::Reach::everywhere();
-        let open = |id: &'static str| crate::plexus::service_scope::scope(svc.downgrade(), { let up = Arc::clone(&up); let reach = reach.clone(); async move { up.open(id, None, &reach, None) } });
+        let open = |id: &'static str| crate::plexus::service_scope::scope(svc.downgrade(), { let up = Arc::clone(&up); let reach = reach.clone(); async move { up.open(id, None, &reach, None, None) } });
         assert!(open("c1").await.is_some());
         up.revoke("compromised");
         assert!(open("c2").await.is_none(), "opened after the revoke");
@@ -853,7 +868,7 @@ mod tests {
         let up = Upcalls::new(None, false);
         let svc = crate::plexus::DynamicHub::new("svc");
         let reach = plexus_auth_core::grants::Reach::everywhere();
-        let guard = crate::plexus::service_scope::scope(svc.downgrade(), async { up.open("c1", None, &reach, None) }).await.expect("opened");
+        let guard = crate::plexus::service_scope::scope(svc.downgrade(), async { up.open("c1", None, &reach, None, None) }).await.expect("opened");
         let mut ended = guard.under.ended.subscribe();
         assert_eq!(up.open_now(), 1);
         up.end_all("revoked: compromised");

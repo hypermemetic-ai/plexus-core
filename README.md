@@ -252,6 +252,37 @@ and it is how a service mounts another service behind key sign-in
 (`--child far=wss://…`, `dyn.connect`). A context of its own would be a
 plexus-wire spec/00 change, not made.
 
+## Doors: a role held on an address (ONE-7)
+
+A role may be held on an **address** — `/dyn` (an activation's own
+methods), `/dyn.*` (it and everything beneath), `/dyn.peer.shop.*` (one
+peer) — as well as on a data scope or `*`. An address opens a **door**,
+never data. The gate decides two shapes at the door of the call: a method
+marked `everywhere` with no target, and a call into an untyped peer slot
+(`dyn.{peer}`). Everything else is decided on its data, as before.
+
+What a role on a **peer's address** opens, and does not:
+
+| held | the peer's ordinary methods | its whole-activation methods |
+| -- | -- | -- |
+| `dyn.{peer}` (the slot's grant) on `/dyn.peer.shop.*`, or `/dyn.*` | yes | **no** |
+| the method's own grant (`dyn.peer.shop.restock`, or `admin`) on `/dyn.peer.shop.*`, or a `.*` above | that method (all, for `admin`) | that method (all, for `admin`) |
+| anything on `*` | as the role lists | as the role lists |
+| `dyn.{peer}` on a data scope (`KILN`) | no | no |
+| a peer's **literal path** on a data scope — `admin` on `KILN`, a role listing `dyn.peer.shop.stock` on `KILN`, a consented caller | **yes** (not closed: a follow-up to KEEL-44) | no |
+
+So a peer's whole-activation methods — an in-process bridge's `add`,
+`replace`, `remove` among them — are its admin's: whoever holds the
+method's own grant at its address, or `*`. Across a hop the near side says
+so with `limit.door_own` (plexus-wire spec/12), and the child runs such a
+method on a door only then.
+
+**`/auth` is admin.** A role listing `auth.role_set` held on
+`/auth.role_set` (or `/auth`, `/auth.*`), plus any membership of the holder
+on `*`, is enough to make the holder `admin@*`: it rewrites that role to
+list `auth.grant`, then grants itself. Grant an address on `auth` as you
+would `admin`.
+
 ## License
 
 AGPL-3.0-only

@@ -1317,6 +1317,10 @@ pub(crate) struct DynamicHubInner {
 pub(crate) struct GateIndex {
     methods: HashMap<String, super::scope_gate::MethodGateInfo>,
     slots: super::slots::Slots,
+    /// ONE-7: the paths whose last name its activation gives a method and a
+    /// child alike (`dyn.connect`, were `connect` both): no call at or under
+    /// one has an address ([`super::grant_gate::dispatched`]).
+    ambiguous: std::collections::HashSet<String>,
 }
 
 impl GateIndex {
@@ -1740,7 +1744,7 @@ impl DynamicHub {
         let (caller, _) = super::grant_gate::standing(gate, caller);
         let who = caller.and_then(|c| gate.fingerprint(c));
         let shape = |base: &super::view::Described| {
-            Arc::new(super::view::shape(gate, &self.inner.signed_in_grants, who.as_ref(), base))
+            Arc::new(super::view::shape(gate, &self.inner.signed_in_grants, who.as_ref(), caller, base))
         };
         match self.inner.describe.view(schema_at, grants_at, &who) {
             Some((base, view)) => {
@@ -1829,10 +1833,19 @@ impl DynamicHub {
             "hash" if ns == hub_ns => serde_json::to_value(HashEvent::Hash { value: view.hash.clone() }).ok()?,
             "hashes" if ns == hub_ns => serde_json::to_value(view.hashes()).ok()?,
             r if r.ends_with(".schema") => {
+                let name = r.trim_end_matches(".schema");
                 if !view.shows(ns) {
+                    // ONE-7: a door below an activation the caller's view
+                    // does not show — one peer's (`/dyn.peer.shop.*` reads
+                    // `dyn.peer.shop.schema`; a view is one per caller, and
+                    // shows a slot only to one who opens it for every name):
+                    // KEEL-32's rule decides it, as below.
+                    let path = format!("{ns}.{name}");
+                    if ns != hub_ns && name.contains('.') && self.crosses_slot(&path) && self.shows_path(&path, auth) {
+                        return None;
+                    }
                     return Some(Err(not_found()));
                 }
-                let name = r.trim_end_matches(".schema");
                 match view.method_of(&base, ns, name) {
                     Some(m) if matches!(m.role, super::MethodRole::Rpc) => {
                         serde_json::to_value(super::SchemaResult::Method(m)).ok()?
@@ -1939,30 +1952,53 @@ impl DynamicHub {
     /// `solar.{planet}`), or the path itself as a grant (an untyped slot
     /// whole, or `admin`, which holds every grant). Asks nothing of an
     /// activation: no child or peer is looked up to decide it.
+    ///
+    /// ONE-7: an entry the door decides (an `everywhere` method with no
+    /// target, an untyped peer slot) is shown where the caller opens its
+    /// door at the literal path asked — the slot's segment as named
+    /// (`solar.earth.rotate`), a peer's schema as `<path>.schema`
+    /// (`dyn.peer.shop.schema`: `/dyn.peer.shop.*` reads it, `admin on KILN`
+    /// does not) — never by its grant held on data.
     fn shows_path(&self, path: &str, auth: Option<&super::auth::AuthContext>) -> bool {
         let Some(gate) = self.inner.gate.as_ref() else { return true };
         let signed_in = auth.and_then(|a| a.principal()).is_some();
-        let holds = |grant: &str, public: bool, everywhere: bool| {
+        let index = self.gate_index();
+        let holds = |grant: &str, public: bool, everywhere: bool, door: Option<&str>| {
             if public || (signed_in && self.inner.signed_in_grants.contains(grant)) {
                 return true;
             }
             let Some(a) = auth else { return false };
-            let held = gate.held_on(a, &plexus_auth_core::grants::Grant::new(grant));
+            let grant = plexus_auth_core::grants::Grant::new(grant);
+            if let Some(at) = door {
+                let (caller, _) = super::grant_gate::standing(gate, Some(a));
+                return match super::grant_gate::dispatched(at, &grant, &index.ambiguous) {
+                    Some(call) => gate.check_everywhere_at(caller, &call).is_ok(),
+                    None => gate.check_everywhere(caller, &grant).is_ok(),
+                };
+            }
+            let held = gate.held_on(a, &grant);
             if everywhere {
                 held.iter().any(plexus_auth_core::grants::ScopeRef::is_everywhere)
             } else {
                 !held.is_empty()
             }
         };
-        if holds(path, false, false) {
+        if holds(path, false, false, None) {
             return true;
         }
-        let index = self.gate_index();
         let key = index.slot_key(path);
         let below = format!("{key}.");
         index.methods.iter().any(|(at, info)| {
-            (*at == key || at.starts_with(&below))
-                && holds(info.grant.as_deref().unwrap_or(at), info.public, info.everywhere)
+            if !(*at == key || at.starts_with(&below)) {
+                return false;
+            }
+            // The literal path of the entry, as the path asked names it.
+            let literal = match at.strip_prefix(key.as_str()) {
+                Some("") if info.door => Some(format!("{path}.schema")),
+                Some(rest) if info.door => Some(format!("{path}{rest}")),
+                _ => None,
+            };
+            holds(info.grant.as_deref().unwrap_or(at), info.public, info.everywhere, literal.as_deref())
         })
     }
 
@@ -2308,21 +2344,28 @@ impl DynamicHub {
             let activations: Vec<PluginSchema> = self.table().entries.values().map(|e| e.object.plugin_schema()).collect();
 
             let statics = self.static_children();
+            let mut ambiguous = std::collections::HashSet::new();
             for schema in activations.iter().chain(statics.iter()).chain(typed.iter()) {
                 for m in &schema.methods {
                     let mut info = super::scope_gate::MethodGateInfo::from_schema(m);
                     info.grant = Some(m.grant_or(&schema.namespace));
                     index.insert(format!("{}.{}", schema.namespace, m.name), info);
                 }
-            }
-            for path in &untyped {
-                index.insert(
-                    path.clone(),
-                    super::scope_gate::MethodGateInfo { grant: Some(path.clone()), ..Default::default() },
-                );
+                // ONE-7: a name both a method and a child has no address.
+                ambiguous.extend(super::grant_gate::named_twice(schema).into_iter().map(|n| format!("{}.{n}", schema.namespace)));
             }
             let slots = super::slots::Slots::of(activations.iter().chain(statics.iter()).chain(typed.iter()), &untyped);
-            GateIndex { methods: index, slots }
+            for path in &untyped {
+                // ONE-7: an untyped peer slot is decided at the door of the
+                // call into it (KEEL-44); an untyped dynamic child's, held
+                // anywhere, as before.
+                let door = super::grant_gate::door_shaped(false, None, slots.is_untyped_peer_slot(path));
+                index.insert(
+                    path.clone(),
+                    super::scope_gate::MethodGateInfo { grant: Some(path.clone()), door, ..Default::default() },
+                );
+            }
+            GateIndex { methods: index, slots, ambiguous }
         }
     }
 
@@ -2459,6 +2502,30 @@ impl DynamicHub {
         }
     }
 
+    /// ONE-7: an activation names each method and child once. A method and a
+    /// child of one name (`#[method(name = "peer")]` beside `#[peer] fn
+    /// peer`) would be one address — `/dyn.peer` would cover the method and
+    /// everything mounted at `dyn.peer` alike — so it is refused here, at
+    /// build, as a root shadow is (Z2H-8). An entry served while the service
+    /// runs is not refused (its error type has no word for it); a call at or
+    /// under such a name has no address and is decided on `*` alone
+    /// ([`super::grant_gate::dispatched`]).
+    fn assert_names_once<A: Activation + ChildRouter>(activation: &A) {
+        let own = activation.plugin_schema();
+        let statics = super::children::qualified(&own.namespace, activation.static_child_schemas());
+        let twice: Vec<String> = std::iter::once(&own)
+            .chain(statics.iter())
+            .flat_map(|s| super::grant_gate::named_twice(s).into_iter().map(move |n| format!("{}.{n}", s.namespace)))
+            .collect();
+        if !twice.is_empty() {
+            panic!(
+                "DynamicHub: {} each name a method and a child alike — one address for both, so a role held on it \
+                 would reach both. Name them apart. [ONE-7]",
+                twice.join(", ")
+            );
+        }
+    }
+
     /// Register an activation
     ///
     /// # Panics
@@ -2497,6 +2564,7 @@ impl DynamicHub {
     fn register_entry<A: Activation + ChildRouter + Clone + 'static>(mut self, activation: A) -> Self {
         let namespace = activation.namespace().to_string();
         self.assert_no_root_shadow(&namespace);
+        Self::assert_names_once(&activation);
         let activation_for_rpc = activation.clone();
         let entry = Self::entry_of(activation);
         let inner = self.inner_mut("Cannot register: DynamicHub has multiple references");
@@ -2847,8 +2915,15 @@ impl DynamicHub {
         if let Some(gate) = self.inner.gate.as_ref() {
             // AUTH-11: a sign-in that ended proves no one, on every method.
             let (auth, ended) = super::grant_gate::standing(gate, auth);
-            let decide = |info| super::grant_gate::decide(gate, &self.inner.namespace, method, info, &params, auth, &self.inner.signed_in_grants);
             let index = self.gate_index();
+            // ONE-7 (review M1): the untyped peer slot this path goes
+            // through, if it does — a literal door's shape opens the
+            // peer's name.
+            let peer_slot = match index.methods.get(method) {
+                Some(_) => None,
+                None => index.info(method).filter(|s| s.door).and_then(|s| s.grant.clone()),
+            };
+            let decide = |info| super::grant_gate::decide(gate, &self.inner.namespace, method, info, &params, auth, &self.inner.signed_in_grants, &index.ambiguous);
             let admit = match index.methods.get(method) {
                 Some(info) => decide(Some(info)),
                 // NEST-5: a path through a slot is decided on the slot's
@@ -2859,7 +2934,16 @@ impl DynamicHub {
                     // decided on `*` by its literal path too.
                     Some(slot) => {
                         let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, ..Default::default() };
-                        decide(Some(&literal)).or_else(|_| decide(Some(slot)))
+                        // ONE-7 (review M1): through an untyped peer slot,
+                        // the literal grant held at the call's address — a
+                        // role listing the peer's method (or admin) on
+                        // `/dyn.peer.vault.*`, `/dyn.*` — is that method's
+                        // own door, before the slot's whole grant, which
+                        // opens the peer's ordinary methods only.
+                        let literal_door = super::scope_gate::MethodGateInfo { door: true, ..Default::default() };
+                        decide(Some(&literal))
+                            .or_else(|e| if slot.door { decide(Some(&literal_door)).or(Err(e)) } else { Err(e) })
+                            .or_else(|_| decide(Some(slot)))
                     }
                     None => decide(None),
                 },
@@ -2883,8 +2967,15 @@ impl DynamicHub {
                     }))
                     .await
                 }
-                super::grant_gate::Admit::Reach(reach) => {
-                    in_call(crate::call::CallContext::admitted_by_gate(auth, reach), self.route_ungated(method, params, auth, raw_ctx)).await
+                super::grant_gate::Admit::Reach(reach, door) => {
+                    let ctx = crate::call::CallContext::admitted_by_gate(auth, reach);
+                    // ONE-7: the call a door admitted, kept with the call —
+                    // what a hop carries across for exactly that call.
+                    let ctx = match door {
+                        Some(call) => ctx.at_door(call, peer_slot.as_deref()),
+                        None => ctx,
+                    };
+                    in_call(ctx, self.route_ungated(method, params, auth, raw_ctx)).await
                 }
             };
         }

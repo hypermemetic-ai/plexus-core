@@ -163,6 +163,16 @@ impl Slots {
         self.known.insert(path.to_string());
     }
 
+    /// ONE-7: whether the slot at `path` (`dyn.{peer}`) is an untyped peer
+    /// slot — a `#[peer]` slot whose names route on into another service, so
+    /// no data of this one is reached through it: the gate decides it at the
+    /// door of the call dispatched. A typed peer slot, and a dynamic child's
+    /// slot of either kind, are not.
+    pub fn is_untyped_peer_slot(&self, path: &str) -> bool {
+        let Some((parent, slot)) = path.strip_suffix('}').and_then(|p| p.rsplit_once(".{")) else { return false };
+        self.peers.get(&(parent.to_string(), slot.to_string())) == Some(&false)
+    }
+
     /// Whether no slot is known.
     pub fn is_empty(&self) -> bool {
         self.by_parent.is_empty() && self.peers.is_empty()

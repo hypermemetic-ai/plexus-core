@@ -524,11 +524,29 @@ struct WithEverywhere(Arc<dyn Resolve>);
 
 impl Resolve for WithEverywhere {
     fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-        if target.trim() == "*" {
+        // ONE-7: `self` is `*`; an address scope (`/dyn`, `/dyn.peer.shop.*`)
+        // is the gate's, not the service's — granting or revoking one is
+        // decided on `*` alone (an address scope holds no data, so no data
+        // scope lies above it).
+        if matches!(target.trim(), "*" | "self") || target.trim().starts_with('/') {
             return Some(vec![ScopeRef::Everywhere]);
         }
         self.0.chain(target)
     }
+}
+
+/// ONE-7: a session's ceiling entries (`role@SCOPE`, `grant@SCOPE`), each
+/// scope written through [`ScopeRef::parse_checked`] — `self` is `*`, a
+/// malformed address refused, naming the rule.
+fn checked_ceiling(entries: &[String]) -> Result<Vec<String>, String> {
+    entries
+        .iter()
+        .map(|e| {
+            let (left, scope) = e.trim().split_once('@').ok_or_else(|| format!("`{e}` is not role@SCOPE or grant@SCOPE"))?;
+            let scope = ScopeRef::parse_checked(scope.trim()).map_err(|e| e.to_string())?;
+            Ok(format!("{}@{scope}", left.trim()))
+        })
+        .collect()
 }
 
 impl AuthActivation {
@@ -623,11 +641,21 @@ impl AuthActivation {
     async fn login(&self, auth: Option<&AuthContext>, flow: LoginFlow) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
         let caller = auth.cloned();
+        let mut flow = flow;
         stream! {
-            if let LoginFlow::Session { ceiling: Some(entries), .. } = &flow {
-                if let Err(e) = Ceiling::parse(entries) {
+            if let LoginFlow::Session { ceiling: Some(entries), .. } = &mut flow {
+                if let Err(e) = Ceiling::parse(entries.iter()) {
                     yield AuthEvent::error(format!("ceiling: {e}"));
                     return;
+                }
+                // ONE-7: a ceiling minted is written through `parse_checked`:
+                // `self` is `*`, a malformed address is refused.
+                match checked_ceiling(entries) {
+                    Ok(checked) => *entries = checked,
+                    Err(e) => {
+                        yield AuthEvent::error(format!("ceiling: {e}"));
+                        return;
+                    }
                 }
             }
             if matches!(flow, LoginFlow::Session { .. }) && caller.as_ref().and_then(principal_of).is_none() {
@@ -778,8 +806,10 @@ impl AuthActivation {
         let inner = self.inner.clone();
         stream! {
             // KEEL-31: the gate decides it on `*` (`everywhere`); kept as a
-            // backstop for a reach handed in by hand.
-            if !reach.is_everywhere() {
+            // backstop for a reach handed in by hand. ONE-7: or at its door
+            // (`admin on /auth`, whose role lists it — the owner's "a role
+            // which gives a grant for /auth is admin").
+            if !reach.holds_activation() || reach.grant().is_some_and(|g| g.as_str() != "auth.role_set") {
                 yield needs_everywhere(&inner.gate, "auth.role_set", &reach);
                 return;
             }
@@ -843,7 +873,17 @@ impl AuthActivation {
                 yield AuthEvent::error(format!("no role {role} here"));
                 return;
             }
-            let scope_ref = scope.scope();
+            // ONE-7: a scope written goes through `parse_checked` — `self` is
+            // `*`; an address must be well formed, and is any activation's or
+            // peer's (`/dyn`, `/dyn.peer.shop.*`), served now or not: it holds
+            // nothing until a call it covers is dispatched.
+            let scope_ref = match ScopeRef::parse_checked(scope.as_str()) {
+                Ok(s) => s,
+                Err(e) => {
+                    yield AuthEvent::error(format!("scope: {e}"));
+                    return;
+                }
+            };
             let m = Membership { principal: who.clone(), role: role_name.clone(), scope: scope_ref.clone() };
             match inner.memberships.grant(m).await {
                 Ok(()) => {
@@ -871,7 +911,9 @@ impl AuthActivation {
         let inner = self.inner.clone();
         stream! {
             let who: Principal = principal.principal();
-            let scope_ref = scope.scope();
+            // ONE-7: as it is granted (`self` is `*`); a malformed scope stored
+            // before — which holds nothing — is taken away by its text.
+            let scope_ref = ScopeRef::parse_checked(scope.as_str()).unwrap_or_else(|_| scope.scope());
             let role_name = role.as_ref().map(param::RoleName::role);
             match inner.memberships.revoke(&who, role_name.as_ref(), &scope_ref).await {
                 Ok(removed) => {
@@ -897,7 +939,8 @@ impl AuthActivation {
         let inner = self.inner.clone();
         stream! {
             // KEEL-31: the gate decides it on `*`; kept as a backstop.
-            if !reach.is_everywhere() {
+            // ONE-7: or at its door.
+            if !reach.holds_activation() || reach.grant().is_some_and(|g| g.as_str() != "auth.waiting") {
                 yield needs_everywhere(&inner.gate, "auth.waiting", &reach);
                 return;
             }

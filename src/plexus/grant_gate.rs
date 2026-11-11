@@ -23,6 +23,36 @@
 //! A target whose value is a list is checked element by element; every
 //! element must be allowed.
 //!
+//! # The door (ONE-7)
+//!
+//! Owner, 2026-11-11: "activation and data scopes are separate. we can only
+//! generally handle activation scopes. data scopes must be handled by the
+//! application". A role may be held on an **address** (`/dyn`, `/dyn.*`,
+//! `/dyn.peer.shop.*`; plexus-auth-core 0.3.4) — never data. The gate passes
+//! the address of the call it dispatches only for the two shapes that touch
+//! no data of this service, and decides them at the **door**
+//! ([`Gate::check_everywhere_at`]):
+//!
+//! | the routed entry | decided by | an address scope covering the call | a data scope | `*` |
+//! |---|---|---|---|---|
+//! | a method marked `everywhere`, no target (`dyn.connect`, `auth.role_set`) | the door | admits | never (KEEL-31) | admits |
+//! | a call into an untyped peer slot (`dyn.peer.shop.items.list`, slot grant `dyn.{peer}`) | the door | admits | **never** (KEEL-44) | admits |
+//! | a method with a declared target | [`Gate::check`] on the target, as before | nothing | its chain | admits |
+//! | a method with no target | [`Gate::check`], "held anywhere", as before | nothing | admits | admits |
+//! | a method marked `everywhere` **and** a target (mis-declared) | `*` alone (KEEL-31), told no address | nothing | never | admits |
+//! | a literal path through a slot (consent's `callers`, KEEL-31's literal grant) | as before: [`Gate::check`] / `*` | nothing | as before | admits |
+//!
+//! The dispatcher makes **one** [`DispatchedCall`] per dispatch, here
+//! ([`dispatched`]): its address from the literal routed path, split at
+//! every dot ([`CallAddress::of_segments`]), its grant the routed entry's.
+//! A path whose address cannot be built — a segment outside `A–Z a–z 0–9 _
+//! -`, an empty one, or one at or under a name that is both a method and a
+//! child ([`named_twice`]) — has no address, and its door is decided on `*`
+//! alone, never on a shorter address and never as "held anywhere".
+//!
+//! A call the door admitted carries the door into a remote child for exactly
+//! that call ([`crate::call::Door`]; plexus-wire spec/12 `limit.door`).
+//!
 //! AUTH-13: before any of this, `params` must be an object (or absent):
 //! the gate reads a target by name, and a bare value (`"MENGER-1"`, `[…]`)
 //! names none — it would be decided as "held anywhere" while the method
@@ -46,7 +76,7 @@
 //! ask the gate again as it stands, which is how a stream checks each event
 //! (IDENTITY-37).
 
-use plexus_auth_core::grants::{Gate, Grant, Reach, Refusal};
+use plexus_auth_core::grants::{CallAddress, DispatchedCall, Gate, Grant, Reach, Refusal};
 use serde_json::Value;
 
 use super::auth::AuthContext;
@@ -76,23 +106,96 @@ pub fn current_reach() -> Result<Reach, PlexusError> {
 /// holds a scope the call's does not (unless the call's is everywhere) —
 /// it used to build an anonymous caller by hand. A test enters a call with
 /// `plexus_core::call::test::in_call` (feature `test-util`).
+///
+/// ONE-7 (ONE-6 review round 2, L1): and on the door — a reach that holds
+/// the activation ([`Reach::holds_activation`]) is taken only where the
+/// call's does too, and a door reach (the activation held at an address, not
+/// on `*`) only for the call's own grant: a door is one call's, never handed
+/// to work inside another.
 pub async fn with_reach<F: std::future::Future>(reach: Reach, fut: F) -> Result<F::Output, PlexusError> {
     let ctx = crate::call::context()?;
     let current = ctx.reach().ok_or(crate::call::CallError::ThroughHop)?;
-    let within = current.is_everywhere() || reach.held_on().iter().all(|s| current.held_on().contains(s));
-    if !within {
-        return Err(PlexusError::Unauthenticated(
-            "with_reach narrows a call's reach; it holds a scope the call does not".into(),
-        ));
+    if let Err(why) = narrows(current, &reach) {
+        return Err(PlexusError::Unauthenticated(why.into()));
     }
     Ok(crate::call::scope(ctx.with_reach(reach), fut).await)
 }
 
+/// [`with_reach`]'s rule: `Ok` when `reach` is within `current`.
+fn narrows(current: &Reach, reach: &Reach) -> Result<(), &'static str> {
+    let within = current.is_everywhere() || reach.held_on().iter().all(|s| current.held_on().contains(s));
+    if !within {
+        return Err("with_reach narrows a call's reach; it holds a scope the call does not");
+    }
+    if reach.holds_activation() && !current.holds_activation() {
+        return Err("with_reach narrows a call's reach; it holds the activation, and the call does not");
+    }
+    if is_door(reach) && reach.grant() != current.grant() {
+        return Err("with_reach narrows a call's reach; it is the door of another grant than the call's");
+    }
+    Ok(())
+}
+
+/// ONE-7: whether `reach` holds its activation at a door — on an address,
+/// not on `*`.
+pub(crate) fn is_door(reach: &Reach) -> bool {
+    reach.holds_activation() && !reach.is_everywhere()
+}
+
 /// What the gate decided for a call that may proceed: run it under this
-/// reach, or (introspection) without one.
+/// reach — with the call the door admitted it at, if a door did (ONE-7) —
+/// or (introspection) without one.
 pub(crate) enum Admit {
-    Reach(Reach),
+    Reach(Reach, Option<DispatchedCall>),
     Open,
+}
+
+/// ONE-7 · **the one place a [`DispatchedCall`] is made**: the call at the
+/// literal routed `path` (`dyn.peer.shop.items.list`), its address split at
+/// every dot ([`CallAddress::of_segments`]: the activation every segment but
+/// the last, the method the last), paired with `grant`, the grant of the
+/// entry the path was routed to. `None` when no address can be built — a
+/// segment `of_segments` refuses (empty, `*`, `@`, `{`, a space, non-ASCII),
+/// a path of one segment, or a path at or under a name its activation uses
+/// for a method and a child alike (`ambiguous`, [`named_twice`]): that call
+/// is decided as told no address — never on a shorter one.
+///
+/// A key cannot hold a dot here: every router of the path (this service's,
+/// a child's, a peer's) splits it at every dot, so a dot in a key is two
+/// segments everywhere, and an address scope deeper than a peer's name
+/// covers what that peer routes beneath it.
+pub(crate) fn dispatched(path: &str, grant: &Grant, ambiguous: &std::collections::HashSet<String>) -> Option<DispatchedCall> {
+    let segments: Vec<&str> = path.split('.').collect();
+    let (method, activation) = segments.split_last()?;
+    let at = CallAddress::of_segments(activation, method).ok()?;
+    let mut prefix = String::with_capacity(path.len());
+    for (i, s) in segments.iter().enumerate() {
+        if i > 0 {
+            prefix.push('.');
+        }
+        prefix.push_str(s);
+        if i > 0 && ambiguous.contains(&prefix) {
+            return None;
+        }
+    }
+    Some(DispatchedCall::new(at, grant.clone()))
+}
+
+/// ONE-7: the names `schema` gives both a method and a child (a static
+/// child, a dynamic child's slot, a peer slot) — `/P` would cover both, so
+/// such a name is refused at registration and has no address at dispatch.
+pub fn named_twice(schema: &super::schema::PluginSchema) -> Vec<String> {
+    use super::schema::MethodRole;
+    let child = |r: &MethodRole| matches!(r, MethodRole::StaticChild | MethodRole::DynamicChild { .. } | MethodRole::Peer { .. });
+    let mut twice: Vec<String> = schema
+        .methods
+        .iter()
+        .filter(|m| matches!(m.role, MethodRole::Rpc) && schema.methods.iter().any(|c| c.name == m.name && child(&c.role)))
+        .map(|m| m.name.clone())
+        .collect();
+    twice.sort();
+    twice.dedup();
+    twice
 }
 
 impl From<Refusal> for PlexusError {
@@ -166,8 +269,36 @@ fn params_shape(params: &Value) -> Result<(), PlexusError> {
     }
 }
 
+/// ONE-7: a door's refusal as KEEL-31's says it — needed at `*` — whatever
+/// address the gate names (plexus-auth-core names the activation's, `/dyn`):
+/// the refusal a client reads for a whole-service method stays one shape,
+/// and `held_on` (the data held) as it was. Only the scope's name changes.
+fn said_at_everywhere(r: Refusal) -> Refusal {
+    match r {
+        Refusal::MissingGrant { grant, roles, held_on, .. } => {
+            Refusal::MissingGrant { grant, scope: plexus_auth_core::grants::ScopeRef::Everywhere, roles, held_on }
+        }
+        other => other,
+    }
+}
+
+/// ONE-7 · **which entries the door decides** — the one rule, applied when
+/// the gate's index is built ([`MethodGateInfo::door`]): a method marked
+/// `everywhere` that declares no target, and an untyped peer slot. A method
+/// that declares a target is never decided at the door, whatever else it
+/// says: its target is checked ([`Gate::check`]), or, marked `everywhere`
+/// as well, it is held to `*` alone (KEEL-31), told no address.
+pub(crate) fn door_shaped(everywhere: bool, target: Option<&str>, untyped_peer_slot: bool) -> bool {
+    match target {
+        Some(_) => false,
+        None => everywhere || untyped_peer_slot,
+    }
+}
+
 /// Decide one call. `full_path` is the dotted method as dispatched;
-/// `service_ns` the service's own namespace.
+/// `service_ns` the service's own namespace; `ambiguous` the paths that name
+/// a method and a child alike ([`dispatched`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decide(
     gate: &Gate,
     service_ns: &str,
@@ -176,6 +307,7 @@ pub(crate) fn decide(
     params: &Value,
     auth: Option<&AuthContext>,
     signed_in_grants: &std::collections::BTreeSet<String>,
+    ambiguous: &std::collections::HashSet<String>,
 ) -> Result<Admit, PlexusError> {
     params_shape(params)?;
     let (ns, method) = full_path.split_once('.').unwrap_or((full_path, ""));
@@ -186,13 +318,23 @@ pub(crate) fn decide(
         return Ok(Admit::Open);
     }
     let grant = Grant::new(info.and_then(|i| i.grant.clone()).unwrap_or_else(|| full_path.to_string()));
+    // ONE-7: a method that acts on the whole activation, or a call into an
+    // untyped peer slot, is decided at the door of the call dispatched —
+    // an address scope covering it, or `*` — and never on a data scope.
+    // No address: `*` alone (KEEL-31's rule), never "held anywhere".
+    if info.is_some_and(|i| i.door) {
+        return Ok(match dispatched(full_path, &grant, ambiguous) {
+            Some(call) => Admit::Reach(gate.check_everywhere_at(auth, &call).map_err(said_at_everywhere)?, Some(call)),
+            None => Admit::Reach(gate.check_everywhere(auth, &grant)?, None),
+        });
+    }
     // KEEL-31: a method that acts on the whole service is decided on `*`,
     // whatever else it says — the rule is the gate's, not the method's.
     if info.is_some_and(|i| i.everywhere) {
-        return Ok(Admit::Reach(gate.check_everywhere(auth, &grant)?));
+        return Ok(Admit::Reach(gate.check_everywhere(auth, &grant)?, None));
     }
     if info.is_some_and(|i| i.public) {
-        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant)));
+        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant), None));
     }
     // AUTH-5: what every signed-in caller reaches (`auth.whoami`,
     // `auth.logout`, `auth.requires`) — whatever its roles or ceiling, but
@@ -201,21 +343,21 @@ pub(crate) fn decide(
         if auth.and_then(|a| a.principal()).is_none() {
             return Err(Refusal::Unauthenticated.into());
         }
-        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant)));
+        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant), None));
     }
     let targets = match info.and_then(|i| i.target.as_deref()) {
         Some(param) => target_values(params, param)?,
         None => None,
     };
     match targets {
-        None => Ok(Admit::Reach(gate.check(auth, &grant, None)?)),
-        Some(values) if values.is_empty() => Ok(Admit::Reach(gate.check(auth, &grant, None)?)),
+        None => Ok(Admit::Reach(gate.check(auth, &grant, None)?, None)),
+        Some(values) if values.is_empty() => Ok(Admit::Reach(gate.check(auth, &grant, None)?, None)),
         Some(values) => {
             let mut reach = None;
             for v in &values {
                 reach = Some(gate.check(auth, &grant, Some(v))?);
             }
-            Ok(Admit::Reach(reach.expect("non-empty")))
+            Ok(Admit::Reach(reach.expect("non-empty"), None))
         }
     }
 }

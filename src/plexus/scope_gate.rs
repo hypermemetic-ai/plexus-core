@@ -141,6 +141,11 @@ pub(crate) struct MethodGateInfo {
     /// KEEL-31: `MethodSchema.everywhere` — the method acts on the whole
     /// service; its grant is needed on `*`.
     pub(crate) everywhere: bool,
+    /// ONE-7: decided at the door of the call dispatched
+    /// ([`super::grant_gate::door_shaped`]): an `everywhere` method with no
+    /// target, or an untyped peer slot. Set only where the gate's index is
+    /// built.
+    pub(crate) door: bool,
 }
 
 impl MethodGateInfo {
@@ -156,6 +161,7 @@ impl MethodGateInfo {
             grant: schema.grant.clone(),
             target: schema.target.clone(),
             everywhere: schema.everywhere,
+            door: super::grant_gate::door_shaped(schema.everywhere, schema.target.as_deref(), false),
         }
     }
 }

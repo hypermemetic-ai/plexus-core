@@ -58,6 +58,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use plexus_auth_core::grants::{Fingerprint, Gate, Grant};
 use serde_json::Value;
 
+use super::auth::AuthContext;
 use super::context::PlexusContext;
 use super::schema::{ChildHashes, ChildSummary, MethodRole, MethodSchema, PluginHashes, PluginSchema, ViewKind};
 use super::types::{PlexusStreamItem, StreamMetadata};
@@ -139,22 +140,54 @@ struct Asker<'a> {
     gate: &'a Gate,
     /// The caller's grants ([`Gate::fingerprint`]); `None` when anonymous.
     who: Option<&'a Fingerprint>,
+    /// ONE-7: the caller the view is first built for — one whose grants are
+    /// `who` — asked at each door the view shows ([`Gate::check_everywhere_at`]
+    /// reads exactly what a fingerprint holds: the memberships and the
+    /// session's ceiling), so every caller sharing `who` shares the answer.
+    caller: Option<&'a AuthContext>,
     /// Grants every signed-in caller reaches (the auth activation's
     /// `whoami`, `logout`, `requires`), whatever its roles or ceiling.
     signed_in_grants: &'a BTreeSet<String>,
 }
 
+/// ONE-7: the name a view asks a slot's door at, for a slot's segment
+/// (`solar.{planet}.rotate` → `solar.__any__.rotate`): a view is one per
+/// caller, not per name, so it shows a door inside a slot only to one whose
+/// scope covers every name there (`/solar.*`, `*`) — one holding a single
+/// name (`/solar.earth.*`) still calls it, and is not shown it. (A real name
+/// `__any__` is no exception: the view only shows, the gate decides.)
+const ANY: &str = "__any__";
+
+/// The literal path a view asks a door at: each slot segment as [`ANY`].
+fn probe(path: &str) -> String {
+    path.split('.').map(|s| if s.starts_with('{') { ANY } else { s }).collect::<Vec<_>>().join(".")
+}
+
 impl Asker<'_> {
+    /// ONE-7: whether the caller opens the door of `grant` at the literal
+    /// path `at` — as the gate would admit the call there.
+    fn opens(&self, grant: &str, at: &str) -> bool {
+        let Some(caller) = self.caller else { return false };
+        let none = std::collections::HashSet::new();
+        match super::grant_gate::dispatched(&probe(at), &Grant::new(grant), &none) {
+            Some(call) => self.gate.check_everywhere_at(Some(caller), &call).is_ok(),
+            None => false,
+        }
+    }
+
     /// Whether the view keeps a method, and its `held_on` there. KEEL-31: a
     /// method that acts `everywhere` is kept only where it is held on `*` —
-    /// where the gate would admit it.
-    fn keep(&self, grant: &str, public: bool, everywhere: bool) -> Option<Option<Vec<String>>> {
+    /// where the gate would admit it. ONE-7: or, decided at a door (`door`:
+    /// its literal path — an `everywhere` method with no target), where the
+    /// caller opens it; `held_on` stays the data it holds the grant on.
+    fn keep(&self, grant: &str, public: bool, everywhere: bool, door: Option<&str>) -> Option<Option<Vec<String>>> {
         let Some(who) = self.who else {
             return public.then_some(None);
         };
         let held: Vec<String> = self.gate.held_on_by(who, &Grant::new(grant)).iter().map(|s| s.as_str().to_string()).collect();
         if everywhere {
-            return held.iter().any(|s| s == "*").then_some(Some(held));
+            let at_door = || door.is_some_and(|at| self.opens(grant, at));
+            return (held.iter().any(|s| s == "*") || at_door()).then_some(Some(held));
         }
         if !held.is_empty() {
             return Some(Some(held));
@@ -185,9 +218,9 @@ pub(crate) struct Described {
 /// on menger is as large as `tickets.schema` itself.
 struct Below {
     namespace: String,
-    /// Each method's grant, whether it is `public`, and whether it acts
-    /// `everywhere` (KEEL-31).
-    grants: Vec<(String, bool, bool)>,
+    /// Each method's grant, whether it is `public`, whether it acts
+    /// `everywhere` (KEEL-31), and (ONE-7) its path when the door decides it.
+    grants: Vec<(String, bool, bool, Option<String>)>,
 }
 
 impl Below {
@@ -196,10 +229,17 @@ impl Below {
             .methods
             .iter()
             .filter(|m| matches!(m.role, MethodRole::Rpc) && !m.is_auto_schema())
-            .map(|m| (m.grant_or(&child.namespace), m.public, m.everywhere))
+            .map(|m| (m.grant_or(&child.namespace), m.public, m.everywhere, door_path(&child.namespace, m)))
             .collect();
         Below { namespace: child.namespace.clone(), grants }
     }
+}
+
+/// ONE-7: the literal path of a method the door decides (an `everywhere`
+/// method with no target, [`super::grant_gate::door_shaped`]); `None` for
+/// every other.
+fn door_path(ns: &str, m: &MethodSchema) -> Option<String> {
+    super::grant_gate::door_shaped(m.everywhere, m.target.as_deref(), false).then(|| format!("{ns}.{}", m.name))
 }
 
 /// At most this many envelopes are kept; past it each new one is routed
@@ -388,9 +428,17 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, base: &Described, at: usiz
         // of the slot, or the untyped slot whole.
         if m.role.is_slot() {
             let slot = super::slots::slot_path(ns, &m.name);
+            // ONE-7: an untyped peer slot is decided at the door of the call
+            // into it (KEEL-44): shown to one who opens it for every name
+            // (`/dyn.*`, `*`), never by its grant held on data.
+            let untyped_peer = matches!(m.role, MethodRole::Peer { .. }) && m.role.slot_schema().is_none();
+            let whole = match untyped_peer {
+                true => asker.opens(&slot, &format!("{ns}.{}.{ANY}.{ANY}", m.name)),
+                false => asker.keep(&slot, false, false, None).is_some(),
+            };
             let reached = reaches_below(asker, &slot, &base.below).unwrap_or(false)
-                || asker.keep(&slot, false, false).is_some()
-                || asker.keep(&m.grant_or(ns), m.public, m.everywhere).is_some();
+                || whole
+                || asker.keep(&m.grant_or(ns), m.public, m.everywhere, door_path(ns, m).as_deref()).is_some();
             if reached {
                 kept.push((i, None));
             }
@@ -405,7 +453,7 @@ fn activation_view(asker: &Asker<'_>, kind: ViewKind, base: &Described, at: usiz
             }
         }
         let grant = m.grant_or(ns);
-        if let Some(held) = asker.keep(&grant, m.public, m.everywhere) {
+        if let Some(held) = asker.keep(&grant, m.public, m.everywhere, door_path(ns, m).as_deref()) {
             kept.push((i, held));
         }
     }
@@ -436,7 +484,7 @@ fn reaches_below(asker: &Asker<'_>, path: &str, children: &[Below]) -> Option<bo
     let below = format!("{path}.");
     let mut known = children.iter().filter(|c| c.namespace == path || c.namespace.starts_with(&below)).peekable();
     known.peek()?;
-    Some(known.flat_map(|c| c.grants.iter()).any(|(grant, public, everywhere)| asker.keep(grant, *public, *everywhere).is_some()))
+    Some(known.flat_map(|c| c.grants.iter()).any(|(grant, public, everywhere, door)| asker.keep(grant, *public, *everywhere, door.as_deref()).is_some()))
 }
 
 /// Recompute `self_hash`, `children_hash` and `hash` over what the schema
@@ -459,9 +507,16 @@ fn rehash(schema: &mut PluginSchema, prefix: Option<&str>) {
 
 /// Decide the view of a gated service for whoever has `who` (`None`:
 /// anonymous) over what the service describes.
-pub(crate) fn shape(gate: &Gate, signed_in_grants: &BTreeSet<String>, who: Option<&Fingerprint>, base: &Described) -> Shaped {
+pub(crate) fn shape(
+    gate: &Gate,
+    signed_in_grants: &BTreeSet<String>,
+    who: Option<&Fingerprint>,
+    caller: Option<&AuthContext>,
+    base: &Described,
+) -> Shaped {
     let kind = if who.is_some() { ViewKind::Caller } else { ViewKind::Anonymous };
-    let asker = Asker { gate, who, signed_in_grants };
+    let caller = caller.filter(|_| who.is_some());
+    let asker = Asker { gate, who, caller, signed_in_grants };
 
     let kept: BTreeMap<String, Kept> = (0..base.activations.len())
         .filter_map(|at| activation_view(&asker, kind, base, at))

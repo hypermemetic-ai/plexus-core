@@ -393,7 +393,7 @@ impl Exposed {
         let Some((conn, service)) = live else {
             return one(unavailable("relay", &format!("not connected to {} ({:?})", self.inner.opts.url, self.state())));
         };
-        match conn.open(&format!("{service}.call"), json!({ "method": method, "params": params }), self.inner.opts.timeout).await {
+        match conn.open(&format!("{service}.call"), json!({ "method": method, "params": params }), self.inner.opts.timeout, None).await {
             Ok((sid, rx)) => Box::pin(Items { rx, sid, conn, over: false }),
             Err(item) => one(item),
         }
@@ -642,7 +642,7 @@ async fn session<A: Activation + Clone>(inner: &Arc<ExposedInner>, activation: A
     // now and revealed in the offer, after the host's is known.
     let node_nonce = crate::plexus::peer_token::random_nonce();
     let info = async {
-        let (_, mut rx) = conn.open("_info", json!({ "nonce": asked, "commit": commitment(&node_nonce) }), opts.timeout).await.map_err(|e| format!("{e:?}"))?;
+        let (_, mut rx) = conn.open("_info", json!({ "nonce": asked, "commit": commitment(&node_nonce) }), opts.timeout, None).await.map_err(|e| format!("{e:?}"))?;
         while let Some(item) = rx.recv().await {
             if let PlexusStreamItem::Data { content, .. } = item {
                 let content = content.into_value();

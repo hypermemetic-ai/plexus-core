@@ -1924,6 +1924,8 @@ impl DynamicHub {
         if self.inner.gate.is_none() {
             return Ok(InputTerms { grant: method.to_string(), targets: Vec::new(), recheck: false });
         }
+        // Held to the grant of the path the call was decided on.
+        let method = self.call_path(method);
         let info = self.gate_index().get(method);
         let grant = info.and_then(|i| i.grant.clone()).unwrap_or_else(|| method.to_string());
         let open = info.is_some_and(|i| i.public) || self.inner.signed_in_grants.contains(grant.as_str());
@@ -2301,6 +2303,8 @@ impl DynamicHub {
         // AUTH-2 grant gate: only when configured — a hub without one pays
         // this one branch and dispatches as before.
         if let Some(gate) = self.inner.gate.as_ref() {
+            // The one path this call is decided and routed by.
+            let method = self.call_path(method);
             // AUTH-11: a sign-in that ended proves no one, on every method.
             let (auth, ended) = super::grant_gate::standing(gate, auth);
             let admit = super::grant_gate::decide(
@@ -2325,6 +2329,23 @@ impl DynamicHub {
             };
         }
         self.route_ungated(method, params, auth, raw_ctx).await
+    }
+
+    /// The path a gated call is decided and routed by: what the caller said,
+    /// read once, so the gate decides exactly what the router routes. An
+    /// activation's path written under the service's own namespace is its
+    /// bare path; one prefix is taken, once, and a path whose first segment
+    /// below the service is one of the service's own methods, or the
+    /// service's own name again, stays as said. Nothing else is rewritten.
+    fn call_path<'m>(&self, method: &'m str) -> &'m str {
+        let ns = self.inner.namespace.as_str();
+        let Some(rest) = method.strip_prefix(ns).and_then(|r| r.strip_prefix('.')) else {
+            return method;
+        };
+        match rest.split_once('.') {
+            Some((first, _)) if !first.is_empty() && first != ns && first != "schema" && !Activation::methods(self).contains(&first) => rest,
+            _ => method,
+        }
     }
 
     /// Everything [`DynamicHub::route_with_ctx`] does after the grant gate.

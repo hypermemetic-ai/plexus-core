@@ -23,7 +23,7 @@
 //! | `whoami`, `logout`, `requires` | any signed-in caller (whatever its roles or ceiling) | `whoami`, `logged_out`, `requires` |
 //! | `roles` | whoever holds `auth.roles` (admin) | one `role` per role |
 //! | `role_set` | admin on `*` | the role as it now stands |
-//! | `grant`, `revoke` | whoever holds them on the scope (`target = "scope"`) | `granted` / `revoked` |
+//! | `grant`, `revoke` | whoever holds them on the scope (`target = "scope"`; checked again in the method, on the scope written) | `granted` / `revoked` |
 //! | `waiting` | admin on `*` | one `waiting` per principal asking |
 //!
 //! A refusal the gate makes is AUTH-2's typed error item; one this
@@ -47,7 +47,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use plexus_auth_core::grants::{
-    Ceiling, Gate, Grant, GrantSet, GrantsGeneration, GrantsMove, Liveness, Membership, Memberships, Reach, Resolve, Roles, ScopeRef, ADMIN,
+    Ceiling, Gate, Grant, GrantSet, GrantsGeneration, GrantsMove, Liveness, Membership, Memberships, Reach, Refusal, Resolve, Roles, ScopeRef, ADMIN,
 };
 use plexus_auth_core::identity::Principal;
 use plexus_auth_core::RoleName;
@@ -557,6 +557,39 @@ fn needs_everywhere(gate: &Gate, grant: &str, reach: &Reach) -> AuthEvent {
     }
 }
 
+/// `auth.grant` / `auth.revoke`'s own check, whatever routed the call: the
+/// call's reach is for `grant` itself, and the caller holds `grant` on every
+/// scope the call writes (as said, and as kept), within its session's
+/// ceiling. An admin of `KILN` grants within `KILN`; on `*` only an admin on
+/// `*` does.
+fn holds_where_written(gate: &Gate, caller: &AuthContext, reach: &Reach, grant: &str, scopes: &[&str]) -> Result<(), Box<AuthEvent>> {
+    let g = Grant::new(grant);
+    if reach.grant() != Some(&g) {
+        return Err(Box::new(needs_on(gate, grant, "*", reach.held_on())));
+    }
+    for scope in scopes {
+        match gate.check(Some(caller), &g, Some(scope)) {
+            Ok(_) => {}
+            Err(Refusal::MissingGrant { scope, held_on, .. }) => return Err(Box::new(needs_on(gate, grant, scope.as_str(), &held_on))),
+            Err(Refusal::Ended { reason }) => return Err(Box::new(AuthEvent::error(reason))),
+            Err(Refusal::Unauthenticated) => return Err(Box::new(AuthEvent::error("sign in first"))),
+        }
+    }
+    Ok(())
+}
+
+/// An in-band refusal: `grant` is needed on `scope`.
+fn needs_on(gate: &Gate, grant: &str, scope: &str, held_on: &[ScopeRef]) -> AuthEvent {
+    AuthEvent::Error {
+        message: format!("needs {grant} on {scope}"),
+        error_kind: Some("forbidden".into()),
+        grant: Some(grant.into()),
+        scope: Some(scope.into()),
+        roles: Some(gate.roles_listing(&Grant::new(grant)).iter().map(|r| r.as_str().to_string()).collect()),
+        held_on: Some(held_on.iter().map(|s| s.as_str().to_string()).collect()),
+    }
+}
+
 fn role_event(role: &RoleName, grants: Option<GrantSet>) -> AuthEvent {
     match grants {
         Some(GrantSet::All) => AuthEvent::Role { role: role.as_str().into(), grants: Vec::new(), all: true },
@@ -754,7 +787,7 @@ impl AuthActivation {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
-            if !reach.is_everywhere() {
+            if !reach.is_everywhere() || reach.grant() != Some(&Grant::new("auth.role_set")) {
                 yield needs_everywhere(&inner.gate, "auth.role_set", &reach);
                 return;
             }
@@ -808,9 +841,9 @@ impl AuthActivation {
         example(note = "make a person an editor on MENGER", params = r#"{"principal": "oidc:workos/user_01M4", "role": "editor", "scope": "MENGER"}"#),
         example(note = "make an agent's key an admin everywhere", params = r#"{"principal": "key:ac79e0d1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", "role": "admin", "scope": "*"}"#)
     )]
-    async fn grant(&self, auth: &AuthContext, principal: param::Principal, role: param::RoleName, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
-        let _ = auth;
+    async fn grant(&self, auth: &AuthContext, reach: Reach, principal: param::Principal, role: param::RoleName, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
+        let caller = auth.clone();
         stream! {
             let who: Principal = principal.principal();
             let role_name = role.role();
@@ -819,6 +852,10 @@ impl AuthActivation {
                 return;
             }
             let scope_ref = scope.scope();
+            if let Err(refused) = holds_where_written(&inner.gate, &caller, &reach, "auth.grant", &[scope.as_str(), scope_ref.as_str()]) {
+                yield *refused;
+                return;
+            }
             let m = Membership { principal: who.clone(), role: role_name.clone(), scope: scope_ref.clone() };
             match inner.memberships.grant(m).await {
                 Ok(()) => {
@@ -841,12 +878,16 @@ impl AuthActivation {
         description = "Take a principal's role on a scope away",
         params(principal = "key:…, oidc:…/…, idp:…", role = "The role; absent: every role there", scope = "Where: a scope name, or *")
     )]
-    async fn revoke(&self, auth: &AuthContext, principal: param::Principal, role: Option<param::RoleName>, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
-        let _ = auth;
+    async fn revoke(&self, auth: &AuthContext, reach: Reach, principal: param::Principal, role: Option<param::RoleName>, scope: param::ScopeName) -> impl Stream<Item = AuthEvent> + Send + 'static {
         let inner = self.inner.clone();
+        let caller = auth.clone();
         stream! {
             let who: Principal = principal.principal();
             let scope_ref = scope.scope();
+            if let Err(refused) = holds_where_written(&inner.gate, &caller, &reach, "auth.revoke", &[scope.as_str(), scope_ref.as_str()]) {
+                yield *refused;
+                return;
+            }
             let role_name = role.as_ref().map(param::RoleName::role);
             match inner.memberships.revoke(&who, role_name.as_ref(), &scope_ref).await {
                 Ok(removed) => {
@@ -871,7 +912,7 @@ impl AuthActivation {
         let _ = auth;
         let inner = self.inner.clone();
         stream! {
-            if !reach.is_everywhere() {
+            if !reach.is_everywhere() || reach.grant() != Some(&Grant::new("auth.waiting")) {
                 yield needs_everywhere(&inner.gate, "auth.waiting", &reach);
                 return;
             }

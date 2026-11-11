@@ -16,8 +16,11 @@
 //! | introspection: `<ns>.schema`, the service's `hash` / `hashes` / `schema` / `ir` | runs | runs |
 //! | method with a `target`, value present | `Unauthenticated` | allowed iff a role held on a scope in the value's chain lists the grant, and every ceiling layer allows it there |
 //! | method without a target (or the target param absent / null) | `Unauthenticated` | allowed iff the grant is held anywhere (within the ceiling) |
-//! | method no schema describes (a nested child path) | `Unauthenticated` | as "without a target", grant = the dotted path |
+//! | method no schema describes (a nested child path) | `Unauthenticated` | grant = the dotted path, held on `*` (within the ceiling) |
 //! | a signed-in grant (AUTH-5: `auth.whoami`, `auth.logout`, `auth.requires`) | `Unauthenticated` | runs (its reach), whatever the roles or ceiling |
+//!
+//! Every row is decided on the path the service routes (one path, read
+//! once from what the caller said).
 //!
 //! A target whose value is a list is checked element by element; every
 //! element must be allowed.
@@ -178,6 +181,17 @@ pub(crate) fn decide(
             return Err(Refusal::Unauthenticated.into());
         }
         return Ok(Admit::Reach(gate.reach_of_public(auth, &grant)));
+    }
+    // A path no schema describes: its grant is the path itself, held on `*`
+    // (within the ceiling).
+    if info.is_none() {
+        let reach = gate.check(auth, &grant, None)?;
+        if !reach.is_everywhere() {
+            let roles = gate.roles_listing(&grant);
+            let held_on = reach.held_on().to_vec();
+            return Err(Refusal::MissingGrant { grant, scope: plexus_auth_core::grants::ScopeRef::Everywhere, roles, held_on }.into());
+        }
+        return Ok(Admit::Reach(reach));
     }
     let targets = match info.and_then(|i| i.target.as_deref()) {
         Some(param) => target_values(params, param)?,

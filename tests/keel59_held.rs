@@ -55,7 +55,13 @@ fn now_ns() -> u128 {
 
 /// One unit of work done, now.
 fn mark(tag: &str) {
-    let _ = std::fs::write(format!("{}/{tag}", run_dir()), now_ns().to_string());
+    let path = format!("{}/{tag}", run_dir());
+    if std::fs::write(&path, now_ns().to_string()).is_err() {
+        // The directory removed under the run (a cleanup that globbed the
+        // system temp dir): made again, the mark kept.
+        let _ = std::fs::create_dir_all(run_dir());
+        let _ = std::fs::write(&path, now_ns().to_string());
+    }
 }
 
 fn last(tag: &str) -> Option<u128> {

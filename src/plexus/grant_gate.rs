@@ -406,3 +406,129 @@ impl ForbiddenItem {
         serde_json::from_value(item.clone()).ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! ONE-7: the routing to the door, shape by shape — an operator held on
+    //! `/ops` alone, and an admin of the data scope `KILN`.
+    use super::*;
+    use plexus_auth_core::grants::{Membership, Memberships, Resolve, RoleTable, ScopeRef};
+    use serde_json::json;
+    use std::collections::{BTreeSet, HashSet};
+    use std::sync::Arc;
+
+    const OPERATOR: &str = "key:0101010101010101010101010101010101010101010101010101010101010101";
+    const KILN_ADMIN: &str = "key:0303030303030303030303030303030303030303030303030303030303030303";
+
+    struct Held;
+    impl Memberships for Held {
+        fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
+            let at = |role: &str, scope: &str| Membership { principal: who.clone(), role: plexus_auth_core::RoleName::new(role), scope: ScopeRef::parse(scope) };
+            match who.to_string().as_str() {
+                OPERATOR => vec![at("operator", "/ops")],
+                KILN_ADMIN => vec![at("admin", "KILN")],
+                _ => vec![],
+            }
+        }
+    }
+    struct Kiln;
+    impl Resolve for Kiln {
+        fn chain(&self, t: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::named(t.split('-').next().unwrap_or(t)), ScopeRef::Everywhere])
+        }
+    }
+
+    fn gate() -> Gate {
+        let roles = RoleTable::from_lists([("operator", ["ops.grow", "ops.get", "ops.misdeclared", "ops.tally", "ops.{peer}", "ops.{box}"])]);
+        Gate::new(Arc::new(Held), Arc::new(roles), Arc::new(Kiln))
+    }
+
+    fn who(p: &str) -> AuthContext {
+        AuthContext::for_principal(&p.parse().unwrap(), "s", vec![], Value::Null)
+    }
+
+    fn info(grant: &str, everywhere: bool, target: Option<&str>, peer_slot: bool) -> MethodGateInfo {
+        MethodGateInfo {
+            grant: Some(grant.into()),
+            everywhere,
+            target: target.map(str::to_string),
+            door: door_shaped(everywhere, target, peer_slot),
+            ..Default::default()
+        }
+    }
+
+    /// Admitted, and whether at a door.
+    fn decided(caller: &str, path: &str, info: &MethodGateInfo, params: Value) -> Result<bool, PlexusError> {
+        match decide(&gate(), "svc", path, Some(info), &params, Some(&who(caller)), &BTreeSet::new(), &HashSet::new())? {
+            Admit::Reach(_, door) => Ok(door.is_some()),
+            Admit::Open => Ok(false),
+        }
+    }
+
+    #[test]
+    fn a_whole_activation_method_is_decided_at_its_door() {
+        let grow = info("ops.grow", true, None, false);
+        assert_eq!(decided(OPERATOR, "ops.grow", &grow, json!({})).unwrap(), true);
+        assert!(matches!(decided(KILN_ADMIN, "ops.grow", &grow, json!({})), Err(PlexusError::Forbidden { .. })), "KEEL-31");
+    }
+
+    #[test]
+    fn an_untyped_peer_slot_is_decided_at_the_peer_s_door() {
+        let peer = info("ops.{peer}", false, None, true);
+        assert_eq!(decided(OPERATOR, "ops.peer.shop.look", &peer, json!({})).ok(), None, "`/ops` is ops' own: no prefix rule");
+        assert!(matches!(decided(KILN_ADMIN, "ops.peer.shop.look", &peer, json!({})), Err(PlexusError::Forbidden { .. })), "KEEL-44");
+    }
+
+    #[test]
+    fn a_data_method_is_decided_on_its_target_never_at_a_door() {
+        let get = info("ops.get", false, Some("id"), false);
+        assert!(decided(OPERATOR, "ops.get", &get, json!({ "id": "KILN-3" })).is_err(), "an address holds no data");
+        assert_eq!(decided(KILN_ADMIN, "ops.get", &get, json!({ "id": "KILN-3" })).unwrap(), false);
+        let tally = info("ops.tally", false, None, false);
+        assert!(decided(OPERATOR, "ops.tally", &tally, json!({})).is_err(), "no target: held anywhere, on data");
+        assert_eq!(decided(KILN_ADMIN, "ops.tally", &tally, json!({})).unwrap(), false);
+    }
+
+    /// A method marked `everywhere` that also declares a target is decided
+    /// on `*` alone (KEEL-31) — the door would never check its target.
+    #[test]
+    fn a_misdeclared_data_method_is_not_reachable_through_the_door() {
+        let bad = info("ops.misdeclared", true, Some("id"), false);
+        assert!(!bad.door);
+        assert!(matches!(decided(OPERATOR, "ops.misdeclared", &bad, json!({ "id": "KILN-3" })), Err(PlexusError::Forbidden { .. })));
+        assert!(matches!(decided(KILN_ADMIN, "ops.misdeclared", &bad, json!({ "id": "KILN-3" })), Err(PlexusError::Forbidden { .. })));
+    }
+
+    /// An opaque dynamic child is this service's own: held anywhere, as before.
+    #[test]
+    fn a_dynamic_child_slot_is_held_anywhere_as_before() {
+        let boxes = info("ops.{box}", false, None, false);
+        assert!(!boxes.door);
+        assert!(decided(OPERATOR, "ops.b1.look", &boxes, json!({})).is_err());
+        assert_eq!(decided(KILN_ADMIN, "ops.b1.look", &boxes, json!({})).unwrap(), false);
+    }
+
+    #[test]
+    fn a_call_is_dispatched_from_its_literal_path() {
+        let none = HashSet::new();
+        let g = Grant::new("ops.{peer}");
+        let call = dispatched("ops.peer.shop.items.list", &g, &none).unwrap();
+        assert_eq!((call.at().activation(), call.at().method(), call.grant()), ("ops.peer.shop.items", "list", &g));
+        for bad in ["ops", "ops..x", "ops.sh*p.x", "ops.sh p.x", "ops.{peer}.x", ""] {
+            assert!(dispatched(bad, &g, &none).is_none(), "{bad}");
+        }
+        let ambiguous: HashSet<String> = ["ops.peer".to_string()].into();
+        assert!(dispatched("ops.peer", &g, &ambiguous).is_none(), "a name both a method and a child");
+        assert!(dispatched("ops.peer.shop.look", &g, &ambiguous).is_none(), "and everything under it");
+        assert!(dispatched("ops.peers", &g, &ambiguous).is_some());
+    }
+
+    #[test]
+    fn a_name_given_twice_is_found() {
+        use crate::plexus::schema::{MethodRole, MethodSchema, PluginSchema};
+        let mut s = PluginSchema::leaf("dyn", "1", "d", vec![MethodSchema::new("peers", "d", "h")]);
+        s.methods.push(MethodSchema::new("peer", "d", "h"));
+        s.methods.push(MethodSchema::new("peer", "d", "h").with_role(MethodRole::Peer { list_method: None, search_method: None, interface: None }));
+        assert_eq!(named_twice(&s), ["peer"]);
+    }
+}

@@ -1833,10 +1833,19 @@ impl DynamicHub {
             "hash" if ns == hub_ns => serde_json::to_value(HashEvent::Hash { value: view.hash.clone() }).ok()?,
             "hashes" if ns == hub_ns => serde_json::to_value(view.hashes()).ok()?,
             r if r.ends_with(".schema") => {
+                let name = r.trim_end_matches(".schema");
                 if !view.shows(ns) {
+                    // ONE-7: a door below an activation the caller's view
+                    // does not show — one peer's (`/dyn.peer.shop.*` reads
+                    // `dyn.peer.shop.schema`; a view is one per caller, and
+                    // shows a slot only to one who opens it for every name):
+                    // KEEL-32's rule decides it, as below.
+                    let path = format!("{ns}.{name}");
+                    if ns != hub_ns && name.contains('.') && self.crosses_slot(&path) && self.shows_path(&path, auth) {
+                        return None;
+                    }
                     return Some(Err(not_found()));
                 }
-                let name = r.trim_end_matches(".schema");
                 match view.method_of(&base, ns, name) {
                     Some(m) if matches!(m.role, super::MethodRole::Rpc) => {
                         serde_json::to_value(super::SchemaResult::Method(m)).ok()?

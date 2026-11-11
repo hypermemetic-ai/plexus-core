@@ -31,10 +31,13 @@
 //! While the call is still routed (its method's body running, before it has
 //! a stream: [`routing`]), the last row is only "the grant is held
 //! somewhere" ([`redecide_body`], N1): a third party's grant-then-revoke on
-//! a scope of its own never cuts a body between its steps. A call whose
+//! a scope of its own never cuts a body between its steps. A move judged by
+//! that rule alone owes the stream's full rule once at the handover (P1):
+//! after the stream's first item if it is ready at its first poll, else at
+//! once. A call whose
 //! own write made a move is not asked about it (N2, `call::own_move`); a
 //! call whose peer was cut off keeps its own end while that end is on its
-//! way (N3).
+//! way (N3) — only a call into the peer the dispatch itself opened (P2).
 //!
 //! The last row is the safe rule: a read with no target answers from the
 //! scopes its reach held, and the method may have read them already, so a
@@ -158,11 +161,11 @@ fn expired() -> PlexusError {
 /// to `ctx`'s admission: decided again by [`redecide`] when `service`'s
 /// gate's generation moves past `seen` (read before the dispatch decided).
 /// A service with no gate holds nothing.
-pub(crate) fn held(ctx: CallContext, service: super::plexus::DynamicHub, seen: u64, targets: Vec<String>, inner: PlexusStream) -> PlexusStream {
+pub(crate) fn held(ctx: CallContext, service: super::plexus::DynamicHub, seen: u64, owed: bool, targets: Vec<String>, inner: PlexusStream) -> PlexusStream {
     if service.gate().is_none() {
         return Box::pin(crate::call::InCall::new(ctx, inner));
     }
-    Box::pin(Held { ctx, service, seen, targets, inner: Some(inner), wait: None, ends: Ends::Unread, items: 0 })
+    Box::pin(Held { ctx, service, seen, targets, inner: Some(inner), wait: None, ends: Ends::Unread, items: 0, owed: if owed { Owed::FirstItem } else { Owed::No } })
 }
 
 /// A held call's stream ([`held`]). A poll is one atomic load and the
@@ -180,6 +183,20 @@ struct Held {
     ends: Ends,
     /// Items since the clock was last read.
     items: u8,
+    /// P1: the stream's full rule, owed from the body's hold.
+    owed: Owed,
+}
+
+/// P1: what a stream owes after a body that was held by the body's rule
+/// alone through a move.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    No,
+    /// The first item, if it is ready at the first poll, goes out (a unary
+    /// write's answer, made in its body); then the full rule.
+    FirstItem,
+    /// The full rule, now.
+    Now,
 }
 
 impl Ends {
@@ -242,7 +259,7 @@ fn wait_for(generation: &plexus_auth_core::grants::GrantsGeneration, ends: Optio
 /// dropped there and answered as a stream of its one end. `targets` none:
 /// not held, `routed` awaited as it is. `seen` is left where it was last
 /// decided, for the stream's hold.
-pub(crate) async fn routing<F>(ctx: &CallContext, service: &super::plexus::DynamicHub, seen: &mut u64, targets: Option<&[String]>, routed: F) -> Result<PlexusStream, PlexusError>
+pub(crate) async fn routing<F>(ctx: &CallContext, service: &super::plexus::DynamicHub, seen: &mut u64, owed: &mut bool, targets: Option<&[String]>, routed: F) -> Result<PlexusStream, PlexusError>
 where
     F: Future<Output = Result<PlexusStream, PlexusError>>,
 {
@@ -268,6 +285,12 @@ where
                 };
                 if let Some(why) = refused {
                     return Poll::Ready(ended(PlexusError::from(why)));
+                }
+                // P1: a call with no target was judged by the body's rule
+                // alone ("held somewhere"): the stream's full rule is owed,
+                // once, at the handover.
+                if targets.is_empty() {
+                    *owed = true;
                 }
             }
             continue;
@@ -302,6 +325,36 @@ impl futures::Stream for Held {
         let generation = gate.generation();
         loop {
             let Some(stream) = this.inner.as_mut() else { return Poll::Ready(None) };
+            // P1: a move the body was held through by the body's rule alone
+            // is asked of the stream by its full rule, once: after the first
+            // item if that is ready at the first poll, else at once.
+            match this.owed {
+                Owed::No => {}
+                Owed::FirstItem => {
+                    this.owed = Owed::Now;
+                    match crate::call::poll_in(&this.ctx, stream, cx) {
+                        Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
+                        Poll::Ready(None) => {
+                            this.inner = None;
+                            return Poll::Ready(None);
+                        }
+                        Poll::Pending => continue,
+                    }
+                }
+                Owed::Now => {
+                    this.owed = Owed::No;
+                    if !this.ctx.holds_itself() && !this.ctx.ended_by_peer() {
+                        let refused = match this.ctx.reach() {
+                            Some(reach) => redecide(gate, reach, &this.targets).err(),
+                            None => Some(Refusal::Unauthenticated),
+                        };
+                        if let Some(why) = refused {
+                            return end(&mut this.inner, &mut this.wait, this.service.runtime_namespace(), PlexusError::from(why));
+                        }
+                    }
+                    continue;
+                }
+            }
             // The generation moved since it was last decided: asked again,
             // once — unless the call answers for its own reach.
             let now = generation.current();

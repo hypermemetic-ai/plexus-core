@@ -221,6 +221,28 @@ impl WorkActivation {
         }
     }
 
+    /// P2: opens `quiet` on the peer `PARKED` from its own stream, reads one
+    /// item, then keeps that stream unread and works on, here.
+    #[plexus_macros::method]
+    pub async fn parks(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
+        async_stream::stream! {
+            yield json!("started");
+            mark(&tag);
+            let mut held = None;
+            if let Some(peer) = PARKED.get() {
+                if let Ok(mut s) = plexus_core::plexus::Activation::call(peer, "quiet", json!({ "tag": format!("{tag}-peer") }), None, None).await {
+                    let _ = s.next().await;
+                    held = Some(s);
+                }
+            }
+            loop {
+                mark(&tag);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let _ = &held;
+            }
+        }
+    }
+
     /// Through the seam: follow `work.quiet` at the service (a call back).
     #[plexus_macros::method]
     pub async fn back(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -256,6 +278,9 @@ impl WorkActivation {
         }
     }
 }
+
+/// P2: the peer `work.parks` holds a call into, unread.
+static PARKED: std::sync::OnceLock<RemoteChild> = std::sync::OnceLock::new();
 
 /// N3: the peer `work.rides` follows.
 static RIDDEN: std::sync::OnceLock<RemoteChild> = std::sync::OnceLock::new();
@@ -365,7 +390,7 @@ fn exe_spec(name: &str) -> ChildSpec {
     format!("{name}=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap()
 }
 
-const READER: [&str; 12] = ["work.leans_early", "work.rides", "work.unary", "work.quiet", "work.idle", "work.leans", "work.chatty", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
+const READER: [&str; 13] = ["work.parks", "work.leans_early", "work.rides", "work.unary", "work.quiet", "work.idle", "work.leans", "work.chatty", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
 
 async fn host_with(members: &[(&str, &str)], leaves: &[RemoteChild]) -> Host {
     let mut b = World::new().host().without_named_callers().resolving(Shortcodes).with(WorkActivation).role("reader", READER);
@@ -495,6 +520,23 @@ async fn a_call_that_outlived_its_peers_end_is_still_revocable() {
     let cause = revoke(&host, ALICE, "*");
     call.ends("forbidden").await;
     stopped("rides", cause).await;
+}
+
+/// P2: a method that keeps a cut-off peer's stream unread is held as usual:
+/// the revoke ends it.
+async fn a_call_holding_a_cut_off_peers_stream_unread_is_still_revocable() {
+    let base = Arc::new(DynamicHub::new("host").register(WorkActivation));
+    let peer = mount("leaf4", &base).await;
+    let _ = PARKED.set(peer.clone());
+    let host = host_with(&[(ALICE, "*")], &[]).await;
+    let mut call = Open::start(&host.as_(ALICE), "work.parks", json!({ "tag": "parks" })).await;
+    going("parks-peer").await;
+    peer.stop("dropped by the test");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    going("parks").await;
+    let cause = revoke(&host, ALICE, "*");
+    call.ends("forbidden").await;
+    stopped("parks", cause).await;
 }
 
 async fn across_a_hop_the_caller_is_told_and_the_peers_work_stops() {
@@ -670,6 +712,7 @@ fn main() {
         a_callees_word_in_the_body_does_not_exempt_the_call,
         a_unary_method_at_work_is_ended_at_the_revoke,
         a_call_that_outlived_its_peers_end_is_still_revocable,
+        a_call_holding_a_cut_off_peers_stream_unread_is_still_revocable,
         a_sign_in_that_ends_ends_the_call_in_process,
         across_a_hop_the_caller_is_told_and_the_peers_work_stops,
         a_call_back_ends_with_the_call_it_was_made_under,

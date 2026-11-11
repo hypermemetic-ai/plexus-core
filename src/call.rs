@@ -459,7 +459,7 @@ impl CallContext {
     /// Whether the call this context is in is still being routed to its
     /// method: none of the contexts it was derived from while routing has
     /// been marked routed.
-    fn routing(&self) -> bool {
+    pub(crate) fn routing(&self) -> bool {
         let mut at = Some(self);
         while let Some(ctx) = at {
             if ctx.0.hold.load(std::sync::atomic::Ordering::Acquire) & ROUTED != 0 {

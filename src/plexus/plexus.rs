@@ -3081,12 +3081,13 @@ impl DynamicHub {
                     // whole work).
                     let mut seen = seen;
                     let routed = crate::call::scope(ctx.clone(), self.route_ungated(path, params, auth, raw_ctx));
-                    let stream = super::held::routing(&ctx, self, &mut seen, held.as_deref(), routed).await?;
+                    let mut owed = false;
+                    let stream = super::held::routing(&ctx, self, &mut seen, &mut owed, held.as_deref(), routed).await?;
                     // I1: routed — a context derived from this call's from
                     // now is a callee's, whose claim is its own.
                     ctx.routed();
                     Ok(match held {
-                        Some(targets) => super::held::held(ctx, self.clone(), seen, targets, stream),
+                        Some(targets) => super::held::held(ctx, self.clone(), seen, owed, targets, stream),
                         None => Box::pin(crate::call::InCall::new(ctx, stream)),
                     })
                 }

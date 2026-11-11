@@ -112,9 +112,14 @@ pub(super) struct PeerMark {
 }
 
 impl PeerMark {
-    /// For the call this runs in.
+    /// For the call this runs in — only while it is routed (P2): a call
+    /// into the peer opened then is the dispatched call's own forward,
+    /// whose end is the call's next item. One a method opens from its
+    /// stream is its own business: its peer's end exempts nothing, read or
+    /// not.
     pub(super) fn here() -> Arc<Self> {
-        Arc::new(Self { call: crate::call::context().ok(), set: std::sync::atomic::AtomicBool::new(false) })
+        let call = crate::call::context().ok().filter(crate::call::CallContext::routing);
+        Arc::new(Self { call, set: std::sync::atomic::AtomicBool::new(false) })
     }
 
     /// The peer was cut off: its end is on its way.

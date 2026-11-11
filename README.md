@@ -309,8 +309,12 @@ unary method's whole work, a long `async fn` — the third row above is only
 "the grant is held somewhere": a reach that lost one scope ends a
 targetless call's *stream*, never its body half-way, so another admin's
 grant-then-revoke on a scope of its own cannot cut a caller's write between
-its steps. A body on targets, or admitted on `*` or at a door, is held as
-its stream is (a third party's unrelated scope cannot touch those). A body
+its steps — but a scope lost while the body ran is asked of the stream
+once, when it is handed over: the stream's first item goes out if it is
+ready at its first poll (a unary write's answer), then the call ends
+`forbidden` if the reach no longer holds; a stream with nothing ready then
+is asked at once. A body on targets, or admitted on `*` or at a door, is
+held as its stream is (a third party's unrelated scope cannot touch those). A body
 whose caller holds the grant nowhere any more, or whose sign-in ended, is
 still dropped at the await it is on. **What a tenant must make safe to
 cut:** every method body with more than one step that writes — a real
@@ -326,7 +330,15 @@ generation tells the call that moved it, in the moving task — plexus-core's
 own `auth` writes and a tenant's store that moves its generation inside its
 write (`AuthSetup::with_generation`) alike. Only the call's own run of
 moves: a move made by anything else, before, between or after, is asked as
-usual, so it is no way to stay alive. A call with an input half is held the same way for its whole life.
+usual, so it is no way to stay alive. The mark is made in the task that bumps the
+generation, inside the call: a store that bumps it from `spawn_blocking`, a
+detached task or a forwarder is not marked, and its caller reads
+`forbidden` for its own revoke (closed, never open). menger (v2, and the
+KEEL-48 line) is such a tenant: its store's count is forwarded to the
+gate's generation by a task of its own (`grants_generation` in
+`src/builder.rs`, a `tokio::spawn` that bumps on each change), so a
+`members.*` or `auth.*` call that takes its caller's own right reads
+`forbidden` there until menger bumps in the writing call's task. A call with an input half is held the same way for its whole life.
 Public calls, calls on a grant every signed-in caller holds, and anonymous
 calls are not held. Nothing is asked per item: one decision per open call
 per move.

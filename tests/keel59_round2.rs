@@ -76,6 +76,19 @@ impl WriteActivation {
         self.two_steps().await
     }
 
+    /// A read with no target: 300 ms of body, then rows for ever.
+    #[plexus_macros::method]
+    pub async fn slow_list(&self) -> impl futures::Stream<Item = Value> + Send + 'static {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        async_stream::stream! {
+            yield json!("first row");
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                yield json!("row");
+            }
+        }
+    }
+
     /// Its caller's own write takes its right — the membership removed and
     /// the tenant's generation moved — then it works on, saying so.
     #[plexus_macros::method]
@@ -144,7 +157,7 @@ fn served(alice_on: &str, slow: bool) -> Served {
     let service = DynamicHub::new("svc").register(activation).with_auth(setup);
     let mut declared = service.declared_roles();
     let reader = declared.entry("reader".to_string()).or_default();
-    for g in ["write.two_step", "write.two_step_on", "write.two_step_everywhere", "write.give_up_then_work"] {
+    for g in ["write.slow_list", "write.two_step", "write.two_step_on", "write.two_step_everywhere", "write.give_up_then_work"] {
         reader.push(g.to_string());
     }
     roles.seed(&declared);
@@ -185,7 +198,11 @@ async fn kicked(s: &Served, method: &str, params: Value) -> Vec<Value> {
 async fn a_third_partys_grant_then_revoke_never_cuts_a_write_between_its_steps() {
     let s = served("KILN", false);
     let got = kicked(&s, "write.two_step", json!({})).await;
-    assert_eq!(kinds(&got), ["data:written whole", "done:"], "{got:?}");
+    // P1: the write answers; its reach lost OTHER (granted before the call,
+    // so admitted with it), which the stream's rule then asks once, after
+    // the answer: the call ends `forbidden` naming OTHER, the write whole.
+    assert_eq!(kinds(&got), ["data:written whole", "error:forbidden"], "{got:?}");
+    assert_eq!(got[1]["scope"], "OTHER", "{got:?}");
     assert_eq!((s.steps.one.load(Ordering::SeqCst), s.steps.two.load(Ordering::SeqCst)), (1, 1));
 }
 
@@ -259,4 +276,51 @@ async fn the_own_move_is_no_way_to_stay_alive() {
     };
     assert_eq!(end["error_kind"], "forbidden", "the next move asked it: {end}");
     assert!(tokio::time::timeout(Duration::from_secs(1), call.next()).await.expect("ended").is_none());
+}
+
+/// Alice also holds `reader` on GLAZE; GLAZE taken from her 80 ms into
+/// `method`'s body, by a move that is not hers.
+async fn narrowed_in_the_body(method: &str) -> (Served, plexus_core::plexus::PlexusStream) {
+    let s = served("KILN", false);
+    s.members.hold_at(ALICE, "reader", "GLAZE");
+    let alice = as_(&s, ALICE);
+    let m = method.to_string();
+    let open = tokio::spawn(async move { alice.stream(&m, json!({})).await.expect("opened") });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    s.members.revoke(&ALICE.parse().unwrap(), None, &ScopeRef::parse("GLAZE")).await.unwrap();
+    s.generation.moved(GrantsMove::Revoke);
+    let stream = open.await.unwrap();
+    (s, stream)
+}
+
+/// The stream's items, until it ends (within 2 s, else a panic).
+async fn until_end(mut call: plexus_core::plexus::PlexusStream) -> Vec<Value> {
+    let mut got = Vec::new();
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while let Some(i) = tokio::time::timeout_at(until.into(), call.next()).await.unwrap_or_else(|_| panic!("it ran on: {got:?}")) {
+        got.push(serde_json::to_value(&i).unwrap());
+    }
+    got
+}
+
+/// P1: a list whose reach narrowed while its body ran ends at the handover
+/// — at most the one item ready then — `forbidden`, naming the scope lost.
+#[tokio::test]
+async fn a_scope_lost_in_the_body_is_asked_of_the_stream() {
+    let (_s, call) = narrowed_in_the_body("write.slow_list").await;
+    let got = until_end(call).await;
+    let data = got.iter().filter(|i| i["type"] == "data").count();
+    assert!(data <= 1, "more than the one item ready at the handover: {got:?}");
+    let last = got.last().unwrap();
+    assert_eq!((last["error_kind"].as_str(), last["scope"].as_str()), (Some("forbidden"), Some("GLAZE")), "{got:?}");
+}
+
+/// P1: a unary write whose reach narrowed in its body still answers — then
+/// the call ends, `forbidden`.
+#[tokio::test]
+async fn a_write_whose_reach_narrowed_in_its_body_answers_then_ends() {
+    let (s, call) = narrowed_in_the_body("write.two_step").await;
+    let got = until_end(call).await;
+    assert_eq!(kinds(&got), ["data:written whole", "error:forbidden"], "{got:?}");
+    assert_eq!((s.steps.one.load(Ordering::SeqCst), s.steps.two.load(Ordering::SeqCst)), (1, 1));
 }

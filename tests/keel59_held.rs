@@ -179,6 +179,18 @@ impl WorkActivation {
         }
     }
 
+    /// One answer, after working in its body for `ms` (a unary method: no
+    /// stream until it is done — its work runs while it is routed).
+    #[plexus_macros::method]
+    pub async fn unary(&self, tag: String, ms: u64) -> Value {
+        let until = std::time::Instant::now() + Duration::from_millis(ms);
+        while std::time::Instant::now() < until {
+            mark(&tag);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        json!("done")
+    }
+
     /// Through the seam: follow `work.quiet` at the service (a call back).
     #[plexus_macros::method]
     pub async fn back(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -191,6 +203,25 @@ impl WorkActivation {
                     Ok(StreamItem::Data { content, .. }) => yield content,
                     other => { yield json!({ "end": format!("{other:?}") }); break; }
                 }
+            }
+        }
+    }
+
+    /// KEEL-51's property where a call still outlives its sign-in: open to
+    /// anyone, so not held — it runs past its caller's `expires_at` — and
+    /// after `ms` calls the service's `work.quiet` back, which must then be
+    /// refused.
+    #[plexus_macros::method(public)]
+    pub async fn later_back(&self, ms: u64) -> impl futures::Stream<Item = Value> + Send + 'static {
+        let t = plexus_core::plexus::remote_child::host();
+        async_stream::stream! {
+            yield json!("waiting");
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            let t = match t { Ok(t) => t, Err(e) => { yield json!({ "no_host": e.to_string() }); return; } };
+            let mut s = t.call(MethodRef::new("work", "quiet"), json!({ "tag": "late-back" }));
+            match s.next().await {
+                Some(Ok(StreamItem::Data { content, .. })) => yield json!({ "reached": content }),
+                other => yield json!({ "refused": format!("{other:?}") }),
             }
         }
     }
@@ -301,7 +332,7 @@ fn exe_spec(name: &str) -> ChildSpec {
     format!("{name}=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap()
 }
 
-const READER: [&str; 9] = ["work.quiet", "work.idle", "work.leans", "work.chatty", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
+const READER: [&str; 10] = ["work.unary", "work.quiet", "work.idle", "work.leans", "work.chatty", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
 
 async fn host_with(members: &[(&str, &str)], leaves: &[RemoteChild]) -> Host {
     let mut b = World::new().host().without_named_callers().resolving(Shortcodes).with(WorkActivation).role("reader", READER);
@@ -381,6 +412,30 @@ async fn a_sign_in_that_ends_ends_the_call_in_process() {
     stopped("expiry-busy", at).await;
 }
 
+/// A unary method's body runs while the call is routed, before there is a
+/// stream: a revoke then ends it too, its work stopped.
+async fn a_unary_method_at_work_is_ended_at_the_revoke() {
+    let host = host_with(&[(ALICE, "*")], &[]).await;
+    let _ = std::fs::remove_file(format!("{}/unary", run_dir()));
+    let svc = host.service().clone();
+    let open = tokio::spawn(async move {
+        let caller = Caller::new(svc, Some(plexus_testkit::parts::who(ALICE)));
+        let s = caller.stream("work.unary", json!({ "tag": "unary", "ms": 5000 })).await.expect("opened");
+        s.map(|i| serde_json::to_value(&i).unwrap()).collect::<Vec<_>>().await
+    });
+    for _ in 0..500 {
+        if last("unary").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let cause = revoke(&host, ALICE, "*");
+    let items = tokio::time::timeout(Duration::from_secs(2), open).await.expect("ended within 2 s").unwrap();
+    assert_eq!(items.len(), 1, "one item: {items:?}");
+    assert_eq!(items[0]["error_kind"], json!("forbidden"), "{items:?}");
+    stopped("unary", cause).await;
+}
+
 async fn across_a_hop_the_caller_is_told_and_the_peers_work_stops() {
     let base = Arc::new(DynamicHub::new("host"));
     let leaf = mount("leaf", &base).await;
@@ -411,6 +466,31 @@ async fn a_call_back_ends_with_the_call_it_was_made_under() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("a call back still open: {}", leaf.calls_open_back());
+}
+
+/// KEEL-51's property kept where it still applies: an outer call that is
+/// not held (a `public` method) outlives its caller's sign-in, and its
+/// peer's call back after that end is refused `unauthenticated` — it
+/// reaches nothing. (Every held call ends at the sign-in's end itself, so
+/// no peer can call back under one past it.)
+async fn a_call_back_after_the_sign_in_ended_is_refused_though_the_call_runs_on() {
+    let base = Arc::new(DynamicHub::new("host").register(WorkActivation));
+    let leaf = mount("leaf", &base).await;
+    let host = host_with(&[(ALICE, "*")], &[leaf.clone()]).await;
+    let _ = std::fs::remove_file(format!("{}/late-back", run_dir()));
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 1;
+    let ending = plexus_core::plexus::AuthContext::for_principal(&ALICE.parse().unwrap(), "ending", vec![], json!({ plexus_auth_core::auth::EXPIRES_AT_KEY: secs }));
+    let caller = Caller::new(host.service().clone(), Some(ending));
+    let items: Vec<Value> = caller.stream("leaf.later_back", json!({ "ms": 2500 })).await.expect("opened").map(|i| serde_json::to_value(&i).unwrap()).collect().await;
+    let contents: Vec<&Value> = items.iter().filter(|i| i["type"] == "data").map(|i| &i["content"]).collect();
+    assert_eq!(contents.first().copied(), Some(&json!("waiting")), "{items:?}");
+    // The outer call ran on past the end (it is not held): it said more.
+    let said = contents.get(1).unwrap_or_else(|| panic!("the outer call was ended: {items:?}"));
+    assert!(said.get("reached").is_none(), "the call back ran after the sign-in ended: {said}");
+    let refused = said["refused"].as_str().unwrap_or_default();
+    assert!(refused.contains("nauthenticated") || refused.contains("expired") || refused.contains("sign"), "refused as signed out: {said}");
+    assert!(last("late-back").is_none(), "work.quiet did work for a call back past the sign-in's end");
+    println!("    late call back: {said}");
 }
 
 async fn a_read_whose_reach_narrowed_ends_and_one_that_follows_its_reach_runs_on() {
@@ -526,9 +606,11 @@ fn main() {
         a_viewer_whose_grant_is_revoked_mid_stream_is_told_forbidden_and_the_work_stops,
         a_call_that_waits_in_silence_is_ended_at_the_revoke,
         a_callees_word_does_not_exempt_the_call,
+        a_unary_method_at_work_is_ended_at_the_revoke,
         a_sign_in_that_ends_ends_the_call_in_process,
         across_a_hop_the_caller_is_told_and_the_peers_work_stops,
         a_call_back_ends_with_the_call_it_was_made_under,
+        a_call_back_after_the_sign_in_ended_is_refused_though_the_call_runs_on,
         a_read_whose_reach_narrowed_ends_and_one_that_follows_its_reach_runs_on,
         a_revoke_ends_only_the_calls_that_stood_on_it,
         a_peer_cut_off_ends_the_calls_into_it,

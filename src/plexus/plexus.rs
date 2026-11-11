@@ -3076,7 +3076,12 @@ impl DynamicHub {
                     // it was (two awaits of the routed call made it ~400
                     // bytes larger, PERF's `call.one_item`).
                     let held = held.filter(|_| auth.is_some());
-                    let stream = crate::call::scope(ctx.clone(), self.route_ungated(path, params, auth, raw_ctx)).await?;
+                    // KEEL-59: held while it is routed too — a method's body
+                    // runs here before it has a stream (a unary method's
+                    // whole work).
+                    let mut seen = seen;
+                    let routed = crate::call::scope(ctx.clone(), self.route_ungated(path, params, auth, raw_ctx));
+                    let stream = super::held::routing(&ctx, self, &mut seen, held.as_deref(), routed).await?;
                     // I1: routed — a context derived from this call's from
                     // now is a callee's, whose claim is its own.
                     ctx.routed();

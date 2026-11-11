@@ -190,6 +190,87 @@ fn end(inner: &mut Option<PlexusStream>, wait: &mut Option<Wait>, ns: &str, e: P
     Poll::Ready(Some(end_item(ns, &e)))
 }
 
+/// The wait for the generation's next move, or the sign-in's end.
+fn wait_for(generation: &plexus_auth_core::grants::GrantsGeneration, ends: Option<std::time::SystemTime>) -> Wait {
+    let mut moves = generation.subscribe();
+    Box::pin(async move {
+        let expiry = async move {
+            match ends.map(|t| t.duration_since(std::time::SystemTime::now()).unwrap_or_default()) {
+                Some(left) => crate::rt::sleep(left).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let moved = async move {
+            // A closed channel (the gate gone) never wakes again.
+            if moves.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            () = moved => Woke::Moved,
+            () = expiry => Woke::Expired,
+        }
+    })
+}
+
+/// The call being routed — its method's body running before it has a
+/// stream (a unary method's whole work, a long `async fn`) — held as its
+/// stream will be ([`held`]): decided again when the generation moves past
+/// `seen`, ended at the sign-in's end. A call that no longer holds is
+/// dropped there and answered as a stream of its one end. `targets` none:
+/// not held, `routed` awaited as it is. `seen` is left where it was last
+/// decided, for the stream's hold.
+pub(crate) async fn routing<F>(ctx: &CallContext, service: &super::plexus::DynamicHub, seen: &mut u64, targets: Option<&[String]>, routed: F) -> Result<PlexusStream, PlexusError>
+where
+    F: Future<Output = Result<PlexusStream, PlexusError>>,
+{
+    let (Some(targets), Some(gate)) = (targets, service.gate()) else { return routed.await };
+    let generation = gate.generation();
+    let mut routed = std::pin::pin!(routed);
+    let mut wait: Option<Wait> = None;
+    let mut ends = Ends::Unread;
+    let ended = |e: PlexusError| -> Result<PlexusStream, PlexusError> {
+        let item = end_item(service.runtime_namespace(), &e);
+        Ok(Box::pin(futures::stream::iter([item])))
+    };
+    std::future::poll_fn(|cx| loop {
+        let now = generation.current();
+        if now != *seen {
+            *seen = now;
+            wait = None;
+            if !ctx.holds_itself() && !ctx.ended_by_peer() {
+                let refused = match ctx.reach() {
+                    Some(reach) => redecide(gate, reach, targets).err(),
+                    None => Some(Refusal::Unauthenticated),
+                };
+                if let Some(why) = refused {
+                    return Poll::Ready(ended(PlexusError::from(why)));
+                }
+            }
+            continue;
+        }
+        if let Poll::Ready(r) = routed.as_mut().poll(cx) {
+            return Poll::Ready(r);
+        }
+        if wait.is_none() {
+            if ends.over(ctx) {
+                return Poll::Ready(ended(expired()));
+            }
+            wait = Some(wait_for(generation, ends.at(ctx)));
+        }
+        if generation.current() != *seen {
+            continue;
+        }
+        match wait.as_mut().expect("made above").as_mut().poll(cx) {
+            Poll::Ready(Woke::Moved) => wait = None,
+            Poll::Ready(Woke::Expired) => return Poll::Ready(ended(expired())),
+            Poll::Pending => return Poll::Pending,
+        }
+    })
+    .await
+}
+
 impl futures::Stream for Held {
     type Item = PlexusStreamItem;
 
@@ -240,27 +321,7 @@ impl futures::Stream for Held {
                 if this.ends.over(&this.ctx) {
                     return end(&mut this.inner, &mut this.wait, this.service.runtime_namespace(), expired());
                 }
-                let ends = this.ends.at(&this.ctx);
-                let mut moves = generation.subscribe();
-                this.wait = Some(Box::pin(async move {
-                    let expiry = async move {
-                        match ends.map(|t| t.duration_since(std::time::SystemTime::now()).unwrap_or_default()) {
-                            Some(left) => crate::rt::sleep(left).await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    };
-                    let moved = async move {
-                        // A closed channel (the gate gone) never wakes again.
-                        if moves.changed().await.is_err() {
-                            std::future::pending::<()>().await;
-                        }
-                    };
-                    tokio::select! {
-                        biased;
-                        () = moved => Woke::Moved,
-                        () = expiry => Woke::Expired,
-                    }
-                }));
+                this.wait = Some(wait_for(generation, this.ends.at(&this.ctx)));
             }
             // A move between the read above and the subscription is read now.
             if generation.current() != this.seen {

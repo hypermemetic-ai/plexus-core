@@ -2916,6 +2916,13 @@ impl DynamicHub {
             // AUTH-11: a sign-in that ended proves no one, on every method.
             let (auth, ended) = super::grant_gate::standing(gate, auth);
             let index = self.gate_index();
+            // ONE-7 (review M1): the untyped peer slot this path goes
+            // through, if it does — a literal door's shape opens the
+            // peer's name.
+            let peer_slot = match index.methods.get(method) {
+                Some(_) => None,
+                None => index.info(method).filter(|s| s.door).and_then(|s| s.grant.clone()),
+            };
             let decide = |info| super::grant_gate::decide(gate, &self.inner.namespace, method, info, &params, auth, &self.inner.signed_in_grants, &index.ambiguous);
             let admit = match index.methods.get(method) {
                 Some(info) => decide(Some(info)),
@@ -2927,7 +2934,16 @@ impl DynamicHub {
                     // decided on `*` by its literal path too.
                     Some(slot) => {
                         let literal = super::scope_gate::MethodGateInfo { everywhere: slot.everywhere, ..Default::default() };
-                        decide(Some(&literal)).or_else(|_| decide(Some(slot)))
+                        // ONE-7 (review M1): through an untyped peer slot,
+                        // the literal grant held at the call's address — a
+                        // role listing the peer's method (or admin) on
+                        // `/dyn.peer.vault.*`, `/dyn.*` — is that method's
+                        // own door, before the slot's whole grant, which
+                        // opens the peer's ordinary methods only.
+                        let literal_door = super::scope_gate::MethodGateInfo { door: true, ..Default::default() };
+                        decide(Some(&literal))
+                            .or_else(|e| if slot.door { decide(Some(&literal_door)).or(Err(e)) } else { Err(e) })
+                            .or_else(|_| decide(Some(slot)))
                     }
                     None => decide(None),
                 },
@@ -2956,7 +2972,7 @@ impl DynamicHub {
                     // ONE-7: the call a door admitted, kept with the call —
                     // what a hop carries across for exactly that call.
                     let ctx = match door {
-                        Some(call) => ctx.at_door(call),
+                        Some(call) => ctx.at_door(call, peer_slot.as_deref()),
                         None => ctx,
                     };
                     in_call(ctx, self.route_ungated(method, params, auth, raw_ctx)).await

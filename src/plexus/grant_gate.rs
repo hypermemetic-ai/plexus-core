@@ -142,6 +142,41 @@ pub(crate) fn is_door(reach: &Reach) -> bool {
     reach.holds_activation() && !reach.is_everywhere()
 }
 
+/// ONE-7 (review M1): whether the door `call` was admitted at is the
+/// method's own — its grant names the call's own path, segment for segment
+/// (a `{slot}` segment standing for the one name in its place: a typed
+/// slot's `solar.{planet}.wipe` at `solar.mars.wipe`) — and not a slot's
+/// whole grant above it (`dyn.{peer}` at `dyn.peer.vault.wipe`). Only an
+/// own door runs a whole-activation method ([`crate::call::admits_everywhere`]);
+/// a slot's opens the peer's ordinary methods and nothing more.
+pub(crate) fn door_is_own(call: &DispatchedCall) -> bool {
+    let path = call.at().path();
+    let grant = call.grant().as_str();
+    path.split('.').count() == grant.split('.').count()
+        && path.split('.').zip(grant.split('.')).all(|(p, g)| p == g || is_slot_segment(g))
+}
+
+/// The shape of an own door's grant (`call`'s, [`door_is_own`]): the grant,
+/// and — through an untyped peer slot (`peer_slot`, `dyn.{peer}`) — the
+/// peer's name's segment open: `dyn.peer.{peer}.wipe` for the literal
+/// `dyn.peer.vault.wipe`.
+pub(crate) fn door_shape(call: &DispatchedCall, peer_slot: Option<&str>) -> String {
+    let grant = call.grant().as_str();
+    let Some(slot) = peer_slot else { return grant.to_string() };
+    let at = slot.split('.').count();
+    grant
+        .split('.')
+        .enumerate()
+        .map(|(i, s)| if i == at { "{peer}" } else { s })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// A grant's segment that stands for any one name (`{planet}`).
+pub(crate) fn is_slot_segment(segment: &str) -> bool {
+    segment.len() > 2 && segment.starts_with('{') && segment.ends_with('}')
+}
+
 /// What the gate decided for a call that may proceed: run it under this
 /// reach — with the call the door admitted it at, if a door did (ONE-7) —
 /// or (introspection) without one.
@@ -419,6 +454,7 @@ mod tests {
 
     const OPERATOR: &str = "key:0101010101010101010101010101010101010101010101010101010101010101";
     const KILN_ADMIN: &str = "key:0303030303030303030303030303030303030303030303030303030303030303";
+    const GARDENER: &str = "key:0202020202020202020202020202020202020202020202020202020202020202";
 
     struct Held;
     impl Memberships for Held {
@@ -427,6 +463,7 @@ mod tests {
             match who.to_string().as_str() {
                 OPERATOR => vec![at("operator", "/ops")],
                 KILN_ADMIN => vec![at("admin", "KILN")],
+                GARDENER => vec![at("operator", "/ops.*")],
                 _ => vec![],
             }
         }
@@ -439,7 +476,7 @@ mod tests {
     }
 
     fn gate() -> Gate {
-        let roles = RoleTable::from_lists([("operator", ["ops.grow", "ops.get", "ops.misdeclared", "ops.tally", "ops.{peer}", "ops.{box}"])]);
+        let roles = RoleTable::from_lists([("operator", ["ops.grow", "ops.get", "ops.misdeclared", "ops.tally", "ops.{peer}", "ops.{box}", "ops.{planet}.wipe", "ops.peer.shop.wipe"])]);
         Gate::new(Arc::new(Held), Arc::new(roles), Arc::new(Kiln))
     }
 
@@ -530,5 +567,42 @@ mod tests {
         s.methods.push(MethodSchema::new("peer", "d", "h"));
         s.methods.push(MethodSchema::new("peer", "d", "h").with_role(MethodRole::Peer { list_method: None, search_method: None, interface: None }));
         assert_eq!(named_twice(&s), ["peer"]);
+    }
+
+    /// Review M1: the backstop decides from the door the dispatch recorded.
+    /// Run inside a call admitted at it, `grant` (as the macro names it)
+    /// passes only for the door's own method: not another method's of the
+    /// same name run in-process (`x.grow` on `ops.grow`'s door), not one
+    /// on a slot's whole grant (`ops.{peer}` at a peer's address).
+    #[test]
+    fn the_backstop_takes_only_the_methods_own_door() {
+        let ran = |caller: &str, path: &str, info: &MethodGateInfo, peer_slot: Option<&str>, grant: &str| -> bool {
+            let auth = who(caller);
+            let Ok(Admit::Reach(reach, Some(call))) = decide(&gate(), "svc", path, Some(info), &json!({}), Some(&auth), &BTreeSet::new(), &HashSet::new()) else {
+                panic!("{path}: not admitted at a door");
+            };
+            let ctx = crate::call::CallContext::admitted_by_gate(Some(&auth), reach).at_door(call, peer_slot);
+            futures::executor::block_on(crate::call::scope(ctx, async { crate::call::admits_everywhere(grant) })).is_ok()
+        };
+        let grow = info("ops.grow", true, None, false);
+        assert!(ran(OPERATOR, "ops.grow", &grow, None, "ops.grow"));
+        assert!(!ran(OPERATOR, "ops.grow", &grow, None, "x.grow"), "another activation's `grow`, in process");
+        assert!(!ran(OPERATOR, "ops.grow", &grow, None, "ops.tally"));
+        // A typed slot's own grant: its `{planet}` stands for the namespace there.
+        let wipe = info("ops.{planet}.wipe", true, None, false);
+        assert!(ran(GARDENER, "ops.mars.wipe", &wipe, None, "planet.wipe"));
+        assert!(!ran(GARDENER, "ops.mars.wipe", &wipe, None, "planet.look"));
+        // The slot's whole grant at a peer's address: ordinary methods only.
+        let slot = info("ops.{peer}", false, None, true);
+        assert!(!ran(GARDENER, "ops.peer.shop.wipe", &slot, Some("ops.{peer}"), "shop.wipe"));
+        assert!(!ran(GARDENER, "ops.peer.shop.wipe", &slot, Some("ops.{peer}"), "leaf.wipe"));
+        // The peer's literal grant there: its own door — the peer's name open
+        // (an in-process peer's namespace is not its name).
+        let literal = MethodGateInfo { door: true, ..Default::default() };
+        assert!(ran(GARDENER, "ops.peer.shop.wipe", &literal, Some("ops.{peer}"), "shop.wipe"));
+        assert!(ran(GARDENER, "ops.peer.shop.wipe", &literal, Some("ops.{peer}"), "leaf.wipe"));
+        assert!(!ran(GARDENER, "ops.peer.shop.wipe", &literal, Some("ops.{peer}"), "leaf.look"));
+        // Without the slot said, the literal door's namespace is the peer's name.
+        assert!(!ran(GARDENER, "ops.peer.shop.wipe", &literal, None, "leaf.wipe"));
     }
 }

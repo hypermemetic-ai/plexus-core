@@ -516,7 +516,12 @@ impl RemoteChild {
     /// in its terms (`/{ns}.{method}`), for `limit.grant` alone. Never as
     /// `held_on: ["*"]`: `held_on` stays the data scopes the caller holds the
     /// grant on (`[]` for one holding only addresses).
-    fn hop(&self, conn: &Conn, auth: Option<&AuthContext>, reach: &Reach, method: &str, door: bool) -> (Value, String) {
+    ///
+    /// Review M1: `limit.door_own: true` beside it when the door was the
+    /// method's own grant at its address ([`crate::call::CallContext`]'s
+    /// recorded door) — what lets the far side run a whole-activation method
+    /// on it; absent when a slot's whole grant (`dyn.{peer}`) opened it.
+    fn hop(&self, conn: &Conn, auth: Option<&AuthContext>, reach: &Reach, method: &str, door: Option<bool>) -> (Value, String) {
         let for_: Vec<String> = auth.and_then(|a| a.principal()).map(|p| p.to_string()).into_iter().collect();
         let limit = reach.grant().map(|g| {
             let grant = match g.as_str().strip_prefix(&format!("{}.", self.name())) {
@@ -529,8 +534,9 @@ impl RemoteChild {
             };
             let held_on: Vec<String> = reach.held_on().iter().map(|s| s.to_string()).collect();
             match door {
-                true => json!({ "grant": grant, "held_on": held_on, "door": format!("/{}.{method}", conn.ns()) }),
-                false => json!({ "grant": grant, "held_on": held_on }),
+                Some(true) => json!({ "grant": grant, "held_on": held_on, "door": format!("/{}.{method}", conn.ns()), "door_own": true }),
+                Some(false) => json!({ "grant": grant, "held_on": held_on, "door": format!("/{}.{method}", conn.ns()) }),
+                None => json!({ "grant": grant, "held_on": held_on }),
             }
         });
         let call = uuid::Uuid::new_v4().to_string();
@@ -725,7 +731,8 @@ impl RemoteChild {
         shared.counters.calls.fetch_add(1, Ordering::Relaxed);
         // ONE-7: the door this call was admitted at, if it is this call's.
         let door = self.door_of(&reach, method);
-        let (mut hop, call_id) = self.hop(&conn, auth, &reach, method, door.is_some());
+        let own = door.is_some() && crate::call::context().is_ok_and(|c| c.door_own());
+        let (mut hop, call_id) = self.hop(&conn, auth, &reach, method, door.as_ref().map(|_| own));
         let path = format!("{}.{method}", conn.ns());
         // DYNAUTH-12: the token for this one call, when the service issues.
         let minted = match self.mint(auth, &reach, &hop, &path, &call_id) {

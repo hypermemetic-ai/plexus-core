@@ -14,7 +14,10 @@
 //! - the **corner admin** holds `admin` on the data scope `KILN`;
 //! - the **kiln operator** holds `operator` on `KILN`, a role listing the
 //!   peer slot's grant;
-//! - the **shopkeeper** holds `operator` on `/vault.far.shop.*` — one peer.
+//! - the **shopkeeper** holds `operator` on `/vault.far.shop.*` — one peer;
+//! - the **shop admin** holds `admin` on `/vault.far.shop.*`;
+//! - the **wiper** holds `wiper`, a role listing the peer's own
+//!   `vault.far.shop.wipe`, on `/vault.far.shop.*`.
 
 use futures::stream::Stream;
 use plexus_auth_core::grants::{Grant, CEILING_KEY};
@@ -108,6 +111,8 @@ const GARDENER: &str = "key:0202020202020202020202020202020202020202020202020202
 const CORNER_ADMIN: &str = "key:0303030303030303030303030303030303030303030303030303030303030303";
 const KILN_OPERATOR: &str = "key:0404040404040404040404040404040404040404040404040404040404040404";
 const SHOPKEEPER: &str = "key:0505050505050505050505050505050505050505050505050505050505050505";
+const SHOP_ADMIN: &str = "key:0606060606060606060606060606060606060606060606060606060606060606";
+const WIPER: &str = "key:0707070707070707070707070707070707070707070707070707070707070707";
 
 /// The operator's role: ops' machinery and the vault's peers and boxes.
 const OPERATOR_GRANTS: [&str; 5] = ["ops.grow", "ops.get", "ops.tally", "vault.{far}", "vault.{bin}"];
@@ -126,6 +131,9 @@ async fn service() -> Host {
         .member_at(CORNER_ADMIN, "admin", "KILN")
         .member_at(KILN_OPERATOR, "operator", "KILN")
         .member_at(SHOPKEEPER, "operator", "/vault.far.shop.*")
+        .role("wiper", ["vault.far.shop.wipe"])
+        .member_at(SHOP_ADMIN, "admin", "/vault.far.shop.*")
+        .member_at(WIPER, "wiper", "/vault.far.shop.*")
         .await
 }
 
@@ -189,10 +197,53 @@ async fn an_operator_of_one_peer_calls_into_that_peer_alone() {
     let host = service().await;
     let shopkeeper = host.as_(SHOPKEEPER);
     assert_eq!(shopkeeper.call("vault.far.shop.look", json!({})).await.answer::<String>(), "looked shop");
-    // The peer's whole-activation method too: the door covers the call.
-    assert_eq!(shopkeeper.call("vault.far.shop.wipe", json!({})).await.answer::<String>(), "wiped shop");
+    // Review M1 (flipped): not the peer's whole-activation method — the
+    // slot's grant at the peer's address opens its ordinary methods only.
+    shopkeeper.call("vault.far.shop.wipe", json!({})).await.refused(Forbidden).naming("leaf.wipe").at("*");
     shopkeeper.call("vault.far.till.look", json!({})).await.refused(Forbidden).naming("vault.{far}").at("*");
     shopkeeper.call("ops.grow", json!({})).await.refused(Forbidden);
+}
+
+/// Review M1, the reviewer's three probes in this domain — the peer `shop`
+/// in process, as the bridge is: whoever holds only the peer slot's grant
+/// (`vault.{far}`) at a peer's address — on the peer, on everything above
+/// it, or a session capped to the peer or to the very method — runs its
+/// ordinary methods and never its whole-activation one.
+#[tokio::test]
+async fn the_slot_grant_at_a_peers_address_runs_no_whole_activation_method() {
+    let host = service().await;
+    let probes = [
+        ("operator on the peer's address", host.as_(SHOPKEEPER)),
+        ("operator on everything of the vault", host.as_(GARDENER)),
+        ("a session capped to the peer", capped(&host, ADMIN, &["operator@/vault.far.shop.*"])),
+        ("a session capped to the method", capped(&host, ADMIN, &["operator@/vault.far.shop.wipe"])),
+    ];
+    for (who, caller) in probes {
+        eprintln!("probe: {who}");
+        caller.call("vault.far.shop.wipe", json!({})).await.refused(Forbidden).naming("leaf.wipe").at("*");
+    }
+    // The ordinary method beside it, still theirs (the capped-to-the-method one opens only `wipe`).
+    for caller in [host.as_(SHOPKEEPER), host.as_(GARDENER), capped(&host, ADMIN, &["operator@/vault.far.shop.*"])] {
+        assert_eq!(caller.call("vault.far.shop.look", json!({})).await.answer::<String>(), "looked shop");
+    }
+}
+
+/// Review M1: the peer's whole-activation method runs for one holding the
+/// method's own grant at the peer's address — a role listing it, or admin —
+/// there or on a `.*` above it, and for a session capped there; never
+/// beyond that peer.
+#[tokio::test]
+async fn the_methods_own_grant_at_the_peers_address_runs_it() {
+    let host = service().await;
+    for caller in [host.as_(SHOP_ADMIN), host.as_(WIPER), capped(&host, ADMIN, &["admin@/vault.far.shop.*"]), capped(&host, ADMIN, &["admin@/vault.*"])] {
+        assert_eq!(caller.call("vault.far.shop.wipe", json!({})).await.answer::<String>(), "wiped shop");
+    }
+    host.as_(SHOP_ADMIN).call("vault.far.till.wipe", json!({})).await.refused(Forbidden);
+    host.as_(WIPER).call("vault.far.till.wipe", json!({})).await.refused(Forbidden);
+    // The wiper's role lists `wipe` alone: the peer's other methods are not its.
+    host.as_(WIPER).call("vault.far.shop.look", json!({})).await.refused(Forbidden);
+    // An admin of a data scope: the literal path admits it on data, which opens no door.
+    host.as_(CORNER_ADMIN).call("vault.far.shop.wipe", json!({})).await.refused(Forbidden).at("*");
 }
 
 #[tokio::test]

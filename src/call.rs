@@ -96,6 +96,15 @@ struct Inner {
     /// a hop carries across for exactly this call (`limit.door`) and the
     /// call-back ceiling names.
     door: Option<DispatchedCall>,
+    /// ONE-7 (review M1): when the door is the method's own — its grant the
+    /// call's own path ([`crate::plexus::grant_gate::door_is_own`]), or, in a
+    /// child, a hop that said so (`limit.door_own`) — and not a slot's whole
+    /// grant above it, the grant's shape: the door's grant, a `{…}` segment
+    /// where any one name stands (a typed slot's `solar.{planet}.wipe`; a
+    /// peer's literal grant with its name's segment open,
+    /// `dyn.peer.{peer}.wipe`). Only an own door runs a whole-activation
+    /// method.
+    door_shape: Option<String>,
 }
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
@@ -111,7 +120,7 @@ enum ReachCell {
 
 impl Inner {
     fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Box<Hop>>) -> Self {
-        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None }
+        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None, door_shape: None }
     }
 
     /// The call's verified slot, made when first set or shared (PERF.115-49:
@@ -157,9 +166,16 @@ impl CallContext {
 
     /// ONE-7: this context, admitted at the door of `call` — made by the
     /// dispatch alone, right after the gate answered, for the call it decided.
-    pub(crate) fn at_door(mut self, call: DispatchedCall) -> Self {
+    ///
+    /// `peer_slot`: the untyped peer slot's grant (`dyn.{peer}`) the path
+    /// went through, when it did — the peer's name's segment is then open in
+    /// the door's shape (an in-process peer's namespace is not its name).
+    pub(crate) fn at_door(mut self, call: DispatchedCall, peer_slot: Option<&str>) -> Self {
         match Arc::get_mut(&mut self.0) {
-            Some(inner) => inner.door = Some(call),
+            Some(inner) => {
+                inner.door_shape = crate::plexus::grant_gate::door_is_own(&call).then(|| crate::plexus::grant_gate::door_shape(&call, peer_slot));
+                inner.door = Some(call);
+            }
             None => debug_assert!(false, "a context is given its door as it is made"),
         }
         self
@@ -168,6 +184,17 @@ impl CallContext {
     /// ONE-7: the call whose door admitted this one, if a door did.
     pub(crate) fn door(&self) -> Option<&DispatchedCall> {
         self.0.door.as_ref()
+    }
+
+    /// ONE-7 (review M1): whether the door that admitted this call is the
+    /// method's own, not a slot's whole grant above it.
+    pub(crate) fn door_own(&self) -> bool {
+        self.0.door.is_some() && self.0.door_shape.is_some()
+    }
+
+    /// The shape of an own door's grant ([`CallContext::door_own`]).
+    fn door_shape(&self) -> Option<&str> {
+        self.0.door.as_ref().and(self.0.door_shape.as_deref())
     }
 
     /// An introspection call a gated service let through (AUTH-4): its
@@ -194,7 +221,11 @@ impl CallContext {
     /// at this call's address alone (and `limit.held_on`'s data, as
     /// before), so [`Reach::holds_activation`] is true and no data is held
     /// by it. Never `*`.
-    pub(crate) fn through_hop(hop: Hop, door: Option<&DispatchedCall>) -> Self {
+    ///
+    /// `own` — the hop's `limit.door_own` — says the near side admitted it
+    /// at the method's own grant there, not a slot's whole grant: only then
+    /// does the door run a whole-activation method here (review M1).
+    pub(crate) fn through_hop(hop: Hop, door: Option<&DispatchedCall>, own: bool) -> Self {
         // `for` names someone this cannot read: anonymous, and no ceiling —
         // the verdict was for a caller this child cannot name.
         let unreadable = hop.caller().is_some_and(|p| p.parse::<plexus_auth_core::identity::Principal>().is_err());
@@ -208,6 +239,7 @@ impl CallContext {
         };
         let admitted_at = door.filter(|_| crate::plexus::grant_gate::is_door(&reach)).cloned();
         let mut inner = Inner::with(auth, ReachCell::Known(reach), Some(Box::new(hop)));
+        inner.door_shape = admitted_at.as_ref().filter(|_| own).map(|d| d.grant().to_string());
         inner.door = admitted_at;
         Self(Arc::new(inner))
     }
@@ -215,8 +247,8 @@ impl CallContext {
     /// NEST-11: [`CallContext::through_hop`], with the link back to the
     /// service that forwarded the call.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub(crate) fn through_hop_with(hop: Hop, door: Option<&DispatchedCall>, host: Arc<dyn Any + Send + Sync>) -> Self {
-        let mut ctx = Self::through_hop(hop, door);
+    pub(crate) fn through_hop_with(hop: Hop, door: Option<&DispatchedCall>, own: bool, host: Arc<dyn Any + Send + Sync>) -> Self {
+        let mut ctx = Self::through_hop(hop, door, own);
         if let Some(inner) = Arc::get_mut(&mut ctx.0) {
             inner.host = Some(host);
         }
@@ -250,6 +282,7 @@ impl CallContext {
         inner.host = self.0.host.clone().filter(|_| keeps_identity);
         // ONE-7: the same call, so the same door — with the reach it is kept with.
         inner.door = self.0.door.clone().filter(|_| keeps_identity);
+        inner.door_shape = self.0.door_shape.clone();
         Self(Arc::new(inner))
     }
 
@@ -264,6 +297,7 @@ impl CallContext {
         let mut inner = Inner::with(auth.cloned(), reach, self.0.hop.clone());
         inner.host = self.0.host.clone();
         inner.door = self.0.door.clone();
+        inner.door_shape = self.0.door_shape.clone();
         Self(Arc::new(inner))
     }
 
@@ -277,6 +311,7 @@ impl CallContext {
         inner.verified = OnceLock::from(Arc::clone(self.0.verified()));
         inner.host = self.0.host.clone();
         inner.door = door;
+        inner.door_shape = self.0.door_shape.clone();
         Self(Arc::new(inner))
     }
 
@@ -421,19 +456,25 @@ pub fn context() -> Result<CallContext, CallError> {
 /// directly, with no dispatch and no hop — it allows, as before: no gate
 /// decided anything to consult.
 ///
-/// ONE-7: or when the reach holds the activation at the door of this very
-/// call ([`Reach::holds_activation`]: an address scope covering it — `/dyn`
-/// for `dyn.connect`, `/dyn.peer.shop.*` for a call into the peer `shop` —
-/// or a hop's `limit.door`), never because of a data scope. A door is one
-/// call's: it counts only for a reach whose grant is `grant`'s method
-/// (`dyn.connect` for `dyn.connect`, a typed slot's `solar.{planet}.wipe`
-/// for `planet.wipe`) or an untyped peer slot's whole grant (`dyn.{peer}`,
-/// whose call this is) — not for another method run inside the call.
+/// ONE-7: or when the call was admitted at its own door — decided from
+/// the door the dispatch recorded ([`CallContext::door`]: the address and
+/// the grant it was admitted at), never from grant names (review M1). The
+/// door must be the method's own: its grant the call's own path, segment
+/// for segment (`dyn.connect` at `dyn.connect`, a typed slot's
+/// `solar.{planet}.wipe` at `solar.mars.wipe`, a peer's literal
+/// `dyn.peer.vault.wipe` held at `/dyn.peer.vault.*` or `/dyn.*`), or in a
+/// child a hop that said so (`limit.door_own`); and its address must end in
+/// `grant` itself (`….vault.wipe` for `vault.wipe`; a `{slot}` segment
+/// stands for the namespace there), so a method one call's body runs
+/// in-process is not run on that call's door. An untyped peer slot's whole
+/// grant (`dyn.{peer}`) held at a peer's address opens the peer's ordinary
+/// methods and no whole-activation one: those need the method's own grant
+/// at its address (a role listing it, or admin), or `*`.
 pub fn admits_everywhere(grant: &str) -> Result<(), PlexusError> {
     let Ok(ctx) = context() else { return Ok(()) };
     let held_on = match ctx.reach() {
         Some(r) if r.is_everywhere() => return Ok(()),
-        Some(r) if r.holds_activation() && door_is_for(r, grant) => return Ok(()),
+        Some(r) if r.holds_activation() && own_door_of(&ctx, r, grant) => return Ok(()),
         Some(r) => r.held_on().to_vec(),
         None => Vec::new(),
     };
@@ -447,14 +488,29 @@ pub fn admits_everywhere(grant: &str) -> Result<(), PlexusError> {
     })
 }
 
-/// ONE-7: whether a door reach is the door of the method `grant` names
-/// (`<namespace>.<method>`, as the macro says it): its own grant's last name
-/// is the method's, or it is an untyped slot's whole grant (`dyn.{peer}`).
-fn door_is_for(reach: &Reach, grant: &str) -> bool {
-    let Some(held) = reach.grant() else { return false };
-    let last = |g: &str| g.rsplit('.').next().map(str::to_string);
-    let whole_slot = held.as_str().ends_with('}');
-    whole_slot || (last(held.as_str()).is_some() && last(held.as_str()) == last(grant))
+/// ONE-7 (review M1): whether the call's recorded door is `grant`'s own
+/// (`<namespace>.<method>`, as the macro says it): the method's own grant
+/// ([`CallContext::door_own`]), the reach's, at an address ending in the
+/// namespace and the method — a `{slot}` segment of the door's grant
+/// standing for the namespace in its place.
+fn own_door_of(ctx: &CallContext, reach: &Reach, grant: &str) -> bool {
+    let Some(call) = ctx.door() else { return false };
+    if reach.grant() != Some(call.grant()) {
+        return false;
+    }
+    let Some(shape) = ctx.door_shape() else { return false };
+    let path: Vec<&str> = call.at().path().split('.').collect();
+    let held: Vec<&str> = shape.split('.').collect();
+    let named: Vec<&str> = grant.split('.').collect();
+    let Some((method, ns)) = named.split_last() else { return false };
+    if ns.is_empty() || path.len() < named.len() || path.last() != Some(method) {
+        return false;
+    }
+    let from = path.len() - named.len();
+    ns.iter().enumerate().all(|(i, n)| {
+        let at = from + i;
+        path[at] == *n || held.get(at).is_some_and(|g| crate::plexus::grant_gate::is_slot_segment(g))
+    })
 }
 
 /// What the method's verifier answered for this call: on `impl Trait for

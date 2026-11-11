@@ -401,8 +401,11 @@ async fn run<A: Activation>(
         // ONE-7: the door the near side admitted the call at (`limit.door`),
         // as it was sent: it names exactly this call or nothing.
         let door_said = hop.as_ref().and_then(|h| h.get("limit")).and_then(|l| l.get("door")).cloned();
+        // Review M1: and whether it was the method's own grant there
+        // (`limit.door_own`), not a slot's whole grant above the mount.
+        let own_said = hop.as_ref().and_then(|h| h.get("limit")).and_then(|l| l.get("door_own")).cloned();
         let hop: Option<Hop> = hop.and_then(|h| serde_json::from_value(h).ok());
-        let door = match door_of(door_said.as_ref(), hop.as_ref(), &target, &slots) {
+        let door = match door_own(own_said.as_ref(), door_said.as_ref()).and_then(|own| door_of(door_said.as_ref(), hop.as_ref(), &target, &slots).map(|d| d.map(|d| (d, own)))) {
             Ok(d) => d,
             Err(why) => {
                 let mut e = PlexusStreamItem::error(meta(&ns), RemoteError::Forbidden {
@@ -422,7 +425,7 @@ async fn run<A: Activation>(
         // N3: the `jti` is recorded only once the sender is proven, so a
         // replay without its proof cannot burn it for the one who may.
         let verdict = match (&tokens, &hop) {
-            (Some(v), Some(h)) if !introspection => Some(hop_token_claims(v, h, &target, door.as_ref()).and_then(|claims| {
+            (Some(v), Some(h)) if !introspection => Some(hop_token_claims(v, h, &target, door.as_ref().map(|(d, _)| d)).and_then(|claims| {
                 presented_by(v, &peer, h, &claims, &target, proof.as_deref(), &proofs)?;
                 v.admit(&claims, crate::plexus::peer_token::now()).map_err(|e| e.to_string())
             })),
@@ -473,7 +476,7 @@ async fn run<A: Activation>(
                     Some(hop) => {
                         // The hop's caller is the call's: `caller()` and a
                         // `#[from_auth]` parameter both name it.
-                        let ctx = CallContext::through_hop_with(hop, door.as_ref(), link);
+                        let ctx = CallContext::through_hop_with(hop, door.as_ref().map(|(d, _)| d), door.as_ref().is_some_and(|(_, own)| *own), link);
                         let auth = ctx.auth().cloned();
                         crate::call::scope(ctx.clone(), async { activation.call(method, params, auth.as_ref(), None).await })
                             .await
@@ -520,6 +523,20 @@ fn door_of(said: Option<&Value>, hop: Option<&Hop>, target: &str, slots: &Slots)
     crate::plexus::grant_gate::dispatched(target, &plexus_auth_core::grants::Grant::new(grant), &ambiguous)
         .map(Some)
         .ok_or_else(|| format!("`{target}` has no address"))
+}
+
+/// ONE-7 (review M1): what a hop's `limit.door_own` says — `true`: the near
+/// side admitted the call at the method's own grant at its address, so the
+/// door runs a whole-activation method here; absent or `false`: a slot's
+/// whole grant opened it (the method's ordinary run only). Anything else,
+/// or `true` with no door beside it, refuses the hop.
+fn door_own(said: Option<&Value>, door: Option<&Value>) -> Result<bool, String> {
+    match said.filter(|v| !v.is_null()) {
+        None | Some(Value::Bool(false)) => Ok(false),
+        Some(Value::Bool(true)) if door.is_some_and(|d| !d.is_null()) => Ok(true),
+        Some(Value::Bool(true)) => Err("it says `door_own` and names no door".into()),
+        Some(other) => Err(format!("`door_own` is `{other}`, not a boolean")),
+    }
 }
 
 /// DYNAUTH-12: whether `hop`'s token is the one for this call of `target`:
@@ -894,11 +911,45 @@ mod token_tests {
         assert!(door_of(Some(&json!("/shop.stock")), Some(&other), "shop.stock", &slots).is_err());
         // The door rides beside the data held, never as `*`: the reach holds the activation and no data.
         let h = hop("key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "shop.stock", &[], "c", None);
-        let ctx = CallContext::through_hop(h.clone(), Some(&call));
+        let ctx = CallContext::through_hop(h.clone(), Some(&call), false);
         let reach = ctx.reach().unwrap();
         assert!(reach.holds_activation() && !reach.is_everywhere() && reach.held_on().is_empty());
         assert!(!reach.allows("KILN-3"), "a door holds no data");
-        let none = CallContext::through_hop(h, None);
+        let none = CallContext::through_hop(h, None, false);
         assert!(!none.reach().unwrap().holds_activation(), "no door: what an older near side sent, as before");
+    }
+
+    /// ONE-7 (review M1): `limit.door_own` is a boolean beside a door, or
+    /// the hop is refused; absent, the door is a slot's (ordinary methods
+    /// only) — what a near side sends when the slot's whole grant opened it.
+    #[test]
+    fn a_door_is_the_methods_own_only_when_the_hop_says_so() {
+        let door = json!("/shop.restock");
+        assert_eq!(door_own(None, Some(&door)), Ok(false));
+        assert_eq!(door_own(Some(&Value::Null), Some(&door)), Ok(false));
+        assert_eq!(door_own(Some(&json!(false)), Some(&door)), Ok(false));
+        assert_eq!(door_own(Some(&json!(true)), Some(&door)), Ok(true));
+        assert!(door_own(Some(&json!(true)), None).is_err(), "own, and no door");
+        assert!(door_own(Some(&json!(true)), Some(&Value::Null)).is_err());
+        for odd in [json!("true"), json!(1), json!([true])] {
+            assert!(door_own(Some(&odd), Some(&door)).is_err(), "{odd}");
+        }
+    }
+
+    /// ONE-7 (review M1), the far side: the peer's own backstop runs its
+    /// whole-activation method on a door only when the hop said the door is
+    /// the method's own; a door a slot's whole grant opened (no
+    /// `door_own`) runs its ordinary methods and refuses that one.
+    #[tokio::test]
+    async fn a_slot_door_runs_no_whole_activation_method_at_the_far_side() {
+        let slots = Slots::default();
+        let h = hop("key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "shop.restock", &[], "c", None);
+        let call = door_of(Some(&json!("/shop.restock")), Some(&h), "shop.restock", &slots).unwrap().unwrap();
+        let ask = |own: bool| crate::call::scope(CallContext::through_hop(h.clone(), Some(&call), own), async { crate::call::admits_everywhere("shop.restock") });
+        assert!(ask(false).await.is_err(), "a slot's door: refused");
+        assert!(ask(true).await.is_ok(), "the method's own door: run");
+        // Own, but for this call only: another method run inside it is refused.
+        let other = crate::call::scope(CallContext::through_hop(h.clone(), Some(&call), true), async { crate::call::admits_everywhere("till.restock") });
+        assert!(other.await.is_err());
     }
 }

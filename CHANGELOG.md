@@ -35,20 +35,39 @@ methods), `/dyn.*` (dyn and all beneath it), `/dyn.peer.shop.*` (one peer)
   the slot is decided at the peer's door. `operator on /dyn.peer.shop.*`
   reaches `shop` alone; `operator on /dyn.*` every peer; `*` everything.
   A session ceiling on a data scope alone (`operator@KILN`) now opens no
-  peer, where it narrowed one. **Not closed:** `admin` lists every grant,
-  a peer method's literal path among them, and a literal path is decided as
-  before — an admin of a data scope still reaches a peer's ordinary methods
-  (not its whole-activation ones); KEEL-31's `keel31_through_slots` rows
-  rely on it.
+  peer, where it narrowed one. **Not closed (review M2, a follow-up
+  ticket):** a peer's literal path held on a *data* scope still reaches
+  that peer's ordinary methods (not its whole-activation ones), as before —
+  an admin of `KILN` (`admin` lists every grant, literal paths among them),
+  a role listing `dyn.peer.shop.stock` held on `KILN`, a consented caller
+  (`dyn.consent … callers`) wherever its role is held. KEEL-31's
+  `keel31_through_slots` rows rely on it.
+- **What a role on a peer's address opens (review M1).** The slot's whole
+  grant (`dyn.{peer}`) held on a peer's address — `/dyn.peer.shop.*`,
+  or `/dyn.*` above every peer, or a session capped there — opens **the
+  peer's ordinary methods, and none of its whole-activation
+  (`everywhere`) ones**, in process (the bridge's `add`, `replace`,
+  `remove`) or across a hop. Those need **the method's own grant at its
+  address**: a role listing the peer's literal method
+  (`dyn.peer.shop.restock`), or `admin`, held on `/dyn.peer.shop.*` or a
+  `.*` above it — or anything on `*`. Through an untyped peer slot the
+  gate tries, in order, the literal path on data (as before), the literal
+  path at the call's address (the method's own door), then the slot's
+  grant at that address (the slot's door). A holder of `dyn.{peer}` on `*`
+  keeps what it had.
 - **A refusal at a door says `*`**, as KEEL-31's did (plexus-auth-core names
   the activation's address; plexus-core keeps the one shape clients read).
 - **Backstops ask the door of their own call.** `call::admits_everywhere`
-  (the macro's check before a whole-activation method) passes on `*` or on
-  a reach that holds the activation at this method's door
-  (`Reach::holds_activation`, the reach's grant naming the method, or an
-  untyped peer slot's whole grant); `auth.role_set` and `auth.waiting` the
-  same for their own grants. Every check that means "every data scope"
-  keeps `is_everywhere()`.
+  (the macro's check before a whole-activation method, and the host's
+  before it forwards a child's) passes on `*`, or on the door the dispatch
+  recorded for the call when that door is **the method's own**: its grant
+  the call's own path segment for segment (a typed slot's `{planet}`
+  standing for one name), and its address ending in the method's
+  namespace and name — decided from the recorded `DispatchedCall`, never
+  from grant names (review M1: no slot-grant pass, no last-name match, so
+  a method one call's body runs in process is not run on that call's
+  door). `auth.role_set` and `auth.waiting` pass on a door of their own
+  grant. Every check that means "every data scope" keeps `is_everywhere()`.
 - **`with_reach` (L1)** refuses a reach that holds the activation where the
   call's does not, and a door reach of another grant.
 - **Across a hop** (plexus-wire spec/12, rules 8–11): a call admitted at a
@@ -61,13 +80,25 @@ methods), `/dyn.*` (dyn and all beneath it), `/dyn.peer.shop.*` (one peer)
   ceiling (`_host.call` under a door-admitted call) holds the data of
   `held_on` and that one door for its own grant — nothing at another
   address. A hop carries a door only for the call the gate admitted at it,
-  never for a forward made inside another call. An older child ignores the
-  field and fails closed (spec/12).
+  never for a forward made inside another call. **`limit.door_own: true`**
+  rides beside the door when it is the method's own grant; a child runs its
+  whole-activation method on a door only then (review M1). An older child
+  ignores both fields: one that verifies tokens refuses an address-only
+  caller; one that does not, and the TypeScript dendrite, run its methods
+  that ignore their reach for that caller — data-aware ones fail closed
+  (spec/12, "An older child").
 - **Writers use `parse_checked`.** `auth.grant` writes its scope through
   `ScopeRef::parse_checked`: `self` is `*`; a malformed address is refused
   in band, naming the rule. An address scope (any — served now or not) is
   granted and revoked by a holder of `auth.grant` on `*` alone. A session
   ceiling minted through `auth.login {session}` is written the same way.
+- **An address on `auth` is admin, given any `*` membership.** The
+  smallest grant that escalates: a role listing `auth.role_set`, held on
+  `/auth.role_set` (or `/auth`, `/auth.*`), **plus** any membership of the
+  holder on `*` — `role_set` rewrites that `*` role to list `auth.grant`,
+  then `auth.grant` makes them `admin@*`. With only data-scope memberships
+  it rewrites roles for everyone holding them on those scopes (widening
+  the literal-path reach above too). Grant `/auth…` as you would `admin`.
 - **A method and a child of one name**: refused as an activation's schema
   is built (`PluginSchema`'s own check, already) and, for a schema read from
   elsewhere, at `register` (a panic, as Z2H-8's); a call at or under such a
@@ -80,11 +111,13 @@ methods), `/dyn.*` (dyn and all beneath it), `/dyn.peer.shop.*` (one peer)
   view cache keeps its key (the caller's grants' fingerprint and the grants
   generation): a door is decided from exactly what the fingerprint holds.
 - Additive API: `grant_gate::named_twice`, `Slots::is_untyped_peer_slot`.
-  No signature changes; the wire gains one optional field. Behaviour that
+  No signature changes; the wire gains two optional fields. Behaviour that
   narrows: KEEL-44 above; a data-scoped consent of a need into a peer
   (`dyn.peer.t.claims@MENGER`) now refuses that call back, where it narrowed
-  it. Behaviour that widens: only for a caller holding an address scope,
-  which nobody held before plexus-auth-core 0.3.4.
+  it (plexus-dyn refuses such a consent). Behaviour that widens: only for a
+  caller holding an address scope, which nobody held before
+  plexus-auth-core 0.3.4 — a tenant of 0.3.3 that stored a `/`-prefixed
+  *data* scope name would find it read as an address now.
 - Tests: `one7_door` (the shapes, the doors, the views, the writers),
   `grant_gate` and `host` units; plexus-dyn's `one7_door` over keyed hops.
 

@@ -157,6 +157,9 @@ pub(super) struct Conn {
     /// DYNAUTH-5: the Ed25519 key the far side proved at `_info`
     /// (`key:<hex>`), if it proved one.
     pub peer_key: OnceLock<String>,
+    /// KEEL-59: why the service cut this connection's calls off (a revoke,
+    /// a disconnect), once it has: nothing more is opened on it.
+    stopped: OnceLock<String>,
 }
 
 /// One message, read in one pass: a notification's item stays raw until
@@ -216,6 +219,7 @@ impl Conn {
             served: Arc::default(),
             tls_key: OnceLock::new(),
             peer_key: OnceLock::new(),
+            stopped: OnceLock::new(),
         })
     }
 
@@ -242,6 +246,11 @@ impl Conn {
             let mut r = self.routes.lock().unwrap();
             if !self.alive() {
                 return Err(unavailable(&self.name, "the connection has closed"));
+            }
+            // KEEL-59: checked under the lock `stop` takes, so a call is
+            // either cut off with the rest or never opened.
+            if let Some(why) = self.stopped.get() {
+                return Err(unavailable(&self.name, why));
             }
             // a `{ns}.call`'s params name the method called (`echo.count`)
             let called = params.get("method").and_then(Value::as_str).unwrap_or(method);
@@ -271,14 +280,68 @@ impl Conn {
             if r.subs.remove(key).is_none() || !self.alive() {
                 return;
             }
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            r.closing.insert(id, key.to_string());
-            r.closing_subs.insert(key.to_string());
-            id
+            self.closing(&mut r, key)
         };
+        self.send_unsub(id, key);
+    }
+
+    /// `key` is being unsubscribed: its late items are the cancel's tail.
+    fn closing(&self, r: &mut Routes, key: &str) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        r.closing.insert(id, key.to_string());
+        r.closing_subs.insert(key.to_string());
+        id
+    }
+
+    /// `{ns}.call_unsub [key]` to the child, as request `id`.
+    fn send_unsub(&self, id: u64, key: &str) {
         let method = serde_json::to_string(&format!("{}.call_unsub", self.ns())).unwrap_or_default();
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":{method},"params":[{key}]}}"#);
         let _ = self.out.send(frame.into_bytes());
+    }
+
+    /// KEEL-59: the service cuts this connection's calls off (`dyn.revoke`,
+    /// `dyn.disconnect`): every call open into the child ends with one
+    /// `child_unavailable` item saying `why`, the child is told to stop each
+    /// (`call_unsub`, its late items the cancel's tail), a call still opening
+    /// is answered the same, and nothing more is opened on it. The socket
+    /// stays up: a reconnect is the service's to decide. The first `why`
+    /// stands.
+    pub(super) fn stop(&self, why: &str) {
+        let (subs, pending, unsubs) = {
+            let mut r = self.routes.lock().unwrap();
+            if self.stopped.set(why.to_string()).is_err() {
+                return;
+            }
+            let subs = std::mem::take(&mut r.subs);
+            let alive = self.alive();
+            let unsubs: Vec<(u64, SubKey)> = if alive { subs.keys().map(|k| (self.closing(&mut r, k), k.clone())).collect() } else { Vec::new() };
+            (subs, std::mem::take(&mut r.pending), unsubs)
+        };
+        for (id, key) in &unsubs {
+            self.send_unsub(*id, key);
+        }
+        for (_, Sub { tx, .. }) in subs {
+            Self::tell(tx, unavailable(&self.name, why));
+        }
+        for (_, open) in pending {
+            let _ = open.reply.send(Err(OpenFail::Gone(why.to_string())));
+        }
+    }
+
+    /// KEEL-59: why this connection's calls were cut off, if they were.
+    pub(super) fn stopped(&self) -> Option<&str> {
+        self.stopped.get().map(String::as_str)
+    }
+
+    /// A call's last item, without waiting on a caller that is not reading
+    /// (its buffer full: the item follows what it holds).
+    fn tell(tx: mpsc::Sender<PlexusStreamItem>, item: PlexusStreamItem) {
+        if let Err(mpsc::error::TrySendError::Full(item)) = tx.try_send(item) {
+            tokio::spawn(async move {
+                let _ = tx.send(item).await;
+            });
+        }
     }
 
     /// How many subscriptions are routed now.
@@ -433,14 +496,7 @@ impl Conn {
             (std::mem::take(&mut r.subs), std::mem::take(&mut r.pending))
         };
         for (_, Sub { tx, .. }) in subs {
-            match tx.try_send(unavailable(&self.name, why)) {
-                Err(mpsc::error::TrySendError::Full(item)) => {
-                    tokio::spawn(async move {
-                        let _ = tx.send(item).await;
-                    });
-                }
-                _ => {}
-            }
+            Self::tell(tx, unavailable(&self.name, why));
         }
         for (_, open) in pending {
             let _ = open.reply.send(Err(OpenFail::Gone(why.to_string())));
@@ -538,6 +594,9 @@ pub(super) struct Shared {
     /// a restart that proves another is refused, as one that publishes
     /// another schema is.
     pub identity: OnceLock<super::PeerIdentity>,
+    /// KEEL-59: why the service cut the child off (a revoke, a disconnect),
+    /// once it has: every call into it ended, and nothing more forwarded.
+    stopped: OnceLock<String>,
 }
 
 impl Drop for Shared {
@@ -623,6 +682,7 @@ impl Shared {
             dial: tokio::sync::Mutex::new(()),
             mounted_hash: OnceLock::new(),
             identity: OnceLock::new(),
+            stopped: OnceLock::new(),
         })
     }
 
@@ -850,6 +910,22 @@ impl Shared {
                 Err(unavailable(&self.name, &why))
             }
         }
+    }
+
+    /// KEEL-59: cut the child off — every call open into it ends with one
+    /// item saying `why`, the child is told to stop each, and nothing more is
+    /// forwarded ([`Conn::stop`]). The first `why` stands.
+    pub(super) fn stop(&self, why: &str) {
+        let _ = self.stopped.set(why.to_string());
+        let conn = self.state.lock().unwrap().conn.clone();
+        if let Some(c) = conn {
+            c.stop(why);
+        }
+    }
+
+    /// KEEL-59: why the child was cut off, if it was.
+    pub(super) fn stopped(&self) -> Option<&str> {
+        self.stopped.get().map(String::as_str)
     }
 
     /// Why the child will never be mounted again, if it will not (a restart

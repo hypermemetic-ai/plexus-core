@@ -105,6 +105,16 @@ struct Inner {
     /// `dyn.peer.{peer}.wipe`). Only an own door runs a whole-activation
     /// method.
     door_shape: Option<String>,
+    /// KEEL-59: the call answers for its own reach when the grants move —
+    /// a duplex call's input half ([`crate::plexus::duplex_gate`]), or a
+    /// method that said so ([`follows_its_reach`]) — so the dispatch's hold
+    /// ([`crate::plexus::held`]) does not end it.
+    holds_itself: std::sync::atomic::AtomicBool,
+    /// KEEL-59: the context this one was derived from inside the same call
+    /// (`for_child`, `with_auth`, `with_reach`), so a method run in a child,
+    /// a nested service or a narrowed reach that says it follows its reach
+    /// says so for the call the dispatch holds.
+    up: Option<CallContext>,
 }
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
@@ -120,7 +130,7 @@ enum ReachCell {
 
 impl Inner {
     fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Box<Hop>>) -> Self {
-        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None, door_shape: None }
+        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None, door_shape: None, holds_itself: std::sync::atomic::AtomicBool::new(false), up: None }
     }
 
     /// The call's verified slot, made when first set or shared (PERF.115-49:
@@ -283,6 +293,7 @@ impl CallContext {
         // ONE-7: the same call, so the same door — with the reach it is kept with.
         inner.door = self.0.door.clone().filter(|_| keeps_identity);
         inner.door_shape = self.0.door_shape.clone();
+        inner.up = Some(self.clone());
         Self(Arc::new(inner))
     }
 
@@ -298,6 +309,7 @@ impl CallContext {
         inner.host = self.0.host.clone();
         inner.door = self.0.door.clone();
         inner.door_shape = self.0.door_shape.clone();
+        inner.up = Some(self.clone());
         Self(Arc::new(inner))
     }
 
@@ -312,6 +324,7 @@ impl CallContext {
         inner.host = self.0.host.clone();
         inner.door = door;
         inner.door_shape = self.0.door_shape.clone();
+        inner.up = Some(self.clone());
         Self(Arc::new(inner))
     }
 
@@ -336,6 +349,21 @@ impl CallContext {
     /// The hop the call came through, in a child.
     pub fn hop(&self) -> Option<&Hop> {
         self.0.hop.as_deref()
+    }
+
+    /// KEEL-59: this call answers for its own reach from now
+    /// ([`follows_its_reach`]).
+    pub(crate) fn hold_itself(&self) {
+        let mut at = Some(self);
+        while let Some(ctx) = at {
+            ctx.0.holds_itself.store(true, std::sync::atomic::Ordering::Release);
+            at = ctx.0.up.as_ref();
+        }
+    }
+
+    /// KEEL-59: whether this call answers for its own reach.
+    pub(crate) fn holds_itself(&self) -> bool {
+        self.0.holds_itself.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The caller this context names: an error for a call that came
@@ -435,6 +463,28 @@ pub fn caller() -> Result<Caller, CallError> {
 /// come through a hop.
 pub fn hop() -> Result<Hop, CallError> {
     CALL.try_with(|c| c.hop().cloned().ok_or(CallError::NoHop)).unwrap_or(Err(CallError::OutsideCall))
+}
+
+/// KEEL-59: the call this runs in answers for its own reach when the
+/// grants move, so the dispatch does not end it.
+///
+/// A call a gated service admitted is held to that admission while it runs
+/// ([`crate::plexus::held`]): when the grants generation moves (a grant or
+/// a revoke, a role edited, a team changed, a sign-out), it is decided again
+/// by the rule it was admitted by, and one that no longer holds — or whose
+/// reach lost a scope it had — ends with one `forbidden` (or
+/// `unauthenticated`) item. A method that already follows its reach as it
+/// moves — a `watch` that asks [`plexus_auth_core::grants::Reach::recheck`]
+/// at each move and re-scopes in place, saying what entered and what left,
+/// and ends itself when the grant is held nowhere — calls this once, and
+/// the dispatch leaves the call to it. It is the method's word that it ends
+/// itself when nothing is held: a method that calls this and goes on
+/// answering from a reach it no longer has leaks it, as one that ignores
+/// its reach always could.
+///
+/// An error outside a call.
+pub fn follows_its_reach() -> Result<(), CallError> {
+    CALL.try_with(CallContext::hold_itself).map_err(|_| CallError::OutsideCall)
 }
 
 /// The whole context of the call this runs in — to hand to a task it
@@ -601,6 +651,11 @@ impl<S> InCall<S> {
     pub fn new(ctx: CallContext, inner: S) -> Self {
         Self { ctx, inner }
     }
+}
+
+/// KEEL-59: poll `stream` once inside `ctx`, as [`InCall`] does.
+pub(crate) fn poll_in<S: Stream + Unpin + ?Sized>(ctx: &CallContext, stream: &mut S, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+    CALL.sync_scope(ctx.clone(), || Pin::new(stream).poll_next(cx))
 }
 
 impl<S: Stream> Stream for InCall<S> {

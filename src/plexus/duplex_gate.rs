@@ -321,21 +321,12 @@ impl DuplexGate {
     }
 
     /// KEEL-54 (R4): `reach` asked again by the rule it was given by — every
-    /// target the dispatch checked, or (none) the reach whole.
+    /// target the dispatch checked, or (none) the reach whole. KEEL-59: the
+    /// one rule a plain call is held to as well ([`super::held::redecide`]),
+    /// so a reach that lost a scope ends a duplex call as it ends any other.
     fn recheck(&self, reach: &plexus_auth_core::grants::Reach, targets: &[String]) -> Result<(), DuplexRefusal> {
         self.checks.fetch_add(1, Ordering::Relaxed);
-        let refused = |r: plexus_auth_core::grants::Refusal| DuplexRefusal::Gate(r.into());
-        if targets.is_empty() {
-            return reach.recheck().map(drop).map_err(refused);
-        }
-        for t in targets {
-            if !reach.allows(t) {
-                // Why, said as the gate says it: the reach's own rule first.
-                let why = reach.recheck().err().or_else(|| self.gate.check(reach.caller(), reach.grant()?, Some(t)).err());
-                return Err(refused(why.unwrap_or(plexus_auth_core::grants::Refusal::Unauthenticated)));
-            }
-        }
-        Ok(())
+        super::held::redecide(&self.gate, reach, targets).map_err(|r| DuplexRefusal::Gate(r.into()))
     }
 
     /// The refusal, audited: one record, built here and only here.
@@ -399,7 +390,14 @@ impl DuplexGate {
         // call runs under, when it is for this grant — so a move asks the
         // gate again by the rule it was admitted by (`*` alone, a door, a
         // target), never "held anywhere" re-derived from the terms.
-        let decided = crate::call::context().ok().and_then(|c| c.reach().cloned()).filter(|r| r.grant() == Some(&grant));
+        let ctx = crate::call::context().ok();
+        let decided = ctx.as_ref().and_then(|c| c.reach().cloned()).filter(|r| r.grant() == Some(&grant));
+        // KEEL-59: the input half answers for the call's reach from here
+        // (`input` selects on the generation), so the dispatch's hold over
+        // the output half leaves it to it — one end, said once.
+        if let Some(c) = &ctx {
+            c.hold_itself();
+        }
         let mut call = self.opened(at.into(), calls, caller, grant, targets, seen, moves, recheck, ceiling, answer_by)?;
         call.decided = decided;
         Ok(call)

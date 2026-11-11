@@ -272,15 +272,25 @@ impl WireFrame {
 pub struct FrameSink {
     tx: tokio::sync::mpsc::Sender<WireFrame>,
     encoding: WireEncoding,
-    /// The connection's pool: one spare block a call starts in, so a short
-    /// call allocates none.
-    spare: Arc<Mutex<Option<BytesMut>>>,
+    /// The connection's pool — one spare block a call starts in, so a short
+    /// call allocates none — and (KEEL-59) why it is ending, once it is.
+    /// One `Arc` for both: every call clones the sink.
+    shared: Arc<SinkShared>,
     /// The most items one notification carries (PERF-8): 0 or 1, one an item.
     batch: usize,
     /// BIDIR-6: the connection's input halves. Carried here, not as an entry
     /// of its own in the extensions, which every call clones: an entry is an
     /// allocation a call (call.one_item's +2 allocations, +192 bytes).
     inputs: Option<Arc<super::input::InputTable>>,
+}
+
+/// What every call's [`FrameSink`] on one connection shares.
+#[derive(Default)]
+struct SinkShared {
+    spare: Mutex<Option<BytesMut>>,
+    /// KEEL-59: set by the transport before it closes the connection for a
+    /// reason its calls are told ([`FrameSink::end_saying`]).
+    ending: std::sync::OnceLock<String>,
 }
 
 /// The most items one notification carries when the client offered `batch`
@@ -305,7 +315,7 @@ impl FrameSink {
     /// A connection's frame queue, bounded at `capacity` frames.
     pub fn channel(capacity: usize, encoding: WireEncoding) -> (FrameSink, FrameReceiver) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
-        (FrameSink { tx, encoding, spare: Arc::new(Mutex::new(None)), batch: 0, inputs: None }, rx)
+        (FrameSink { tx, encoding, shared: Arc::new(SinkShared::default()), batch: 0, inputs: None }, rx)
     }
 
     /// The same sink for a client that takes batches (it offered `batch` at
@@ -344,13 +354,28 @@ impl FrameSink {
         self.tx.is_closed()
     }
 
+    /// KEEL-59: the connection is about to close because its sign-in ended
+    /// (`why`, for the caller): from now each call on it, as it learns the
+    /// connection is closing, writes one `unauthenticated` item saying `why`
+    /// before it ends — the transport closes the method table first and the
+    /// frames after, so those items go out ahead of the close. The first
+    /// `why` stands.
+    pub fn end_saying(&self, why: &str) {
+        let _ = self.shared.ending.set(why.to_string());
+    }
+
+    /// KEEL-59: why the connection is ending, when the transport said.
+    pub fn ending(&self) -> Option<&str> {
+        self.shared.ending.get().map(String::as_str)
+    }
+
     fn take_block(&self) -> Option<BytesMut> {
-        self.spare.lock().ok().and_then(|mut s| s.take())
+        self.shared.spare.lock().ok().and_then(|mut s| s.take())
     }
 
     fn give_block(&self, block: BytesMut) {
         if block.capacity() <= Buffer::POOLED {
-            if let Ok(mut s) = self.spare.lock() {
+            if let Ok(mut s) = self.shared.spare.lock() {
                 if s.is_none() {
                     *s = Some(block);
                 }
@@ -783,16 +808,31 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         None => Frames::default(),
     };
     let mut first = true;
+    // KEEL-59: whether the call already said its end (a `done` or an
+    // `error` went out): a connection ending then adds nothing.
+    let mut said_end = false;
     // A batch's items, kept for the call: no allocation until two are ready together.
     let mut ready: Vec<PlexusStreamItem> = Vec::new();
     let out: jsonrpsee::core::SubscriptionResult = async {
         loop {
             let item = tokio::select! {
                 biased;
-                _ = sink.closed() => return Ok(()),
+                _ = sink.closed() => {
+                    // KEEL-59: closing because its sign-in ended: the call
+                    // says so, once, before the close.
+                    if let (Some(to), false) = (&frames, said_end) {
+                        if let Some(why) = to.ending() {
+                            let item = ending_item(sink.method_name(), why);
+                            let bytes = WIRE.with(|e| notification.frame(&mut e.buffer.borrow_mut(), &item));
+                            let _ = to.tx.send(WireFrame { bytes, fence: first }).await;
+                        }
+                    }
+                    return Ok(());
+                }
                 item = stream.next() => item,
             };
             let Some(item) = item else { return Ok(()) };
+            said_end = matches!(item, PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. });
             match &frames {
                 Some(to) => {
                     // PERF-8: what else the stream has ready now goes with it,
@@ -851,6 +891,18 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
         }
     }
     out
+}
+
+/// KEEL-59: the item a call ends with when its connection closes because
+/// its sign-in ended: `unauthenticated`, saying `why`. Its source is the
+/// service the subscription is in (`menger.call` → `menger`).
+fn ending_item(method: &str, why: &str) -> PlexusStreamItem {
+    let ns = method.split('.').next().unwrap_or(method);
+    PlexusStreamItem::from_plexus_error(
+        super::types::StreamMetadata::new(vec![ns.into()], super::context::PlexusContext::hash()),
+        &super::plexus::PlexusError::Unauthenticated(why.to_string()),
+        false,
+    )
 }
 
 /// About what an item writes into a batch: its encoded content, or a guess.
@@ -952,6 +1004,8 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
     let mut slot = Some(slot);
     let mut notification = Frames::new(sink.method_name(), &sink.subscription_id());
     let mut acked = 0u64;
+    // KEEL-59: whether the call already said its end.
+    let mut said_end = false;
     let out: Result<(), ()> = async {
         // Fenced behind the subscription's answer (the client holds nothing
         // yet: it may read this before it has the id).
@@ -959,7 +1013,18 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
         loop {
             let turn = tokio::select! {
                 biased;
-                _ = sink.closed() => return Ok(()),
+                _ = sink.closed() => {
+                    // KEEL-59: closing because its sign-in ended: both
+                    // halves end, said once, before the close.
+                    if let (Some(why), false) = (to.ending(), said_end) {
+                        if slot.take().is_some() && !ledger.client_ended() {
+                            control(&to, &mut notification, &input_closed("unauthenticated", ledger.last_done()), false).await?;
+                        }
+                        let item = serde_json::to_string(&ending_item(sink.method_name(), why)).unwrap_or_default();
+                        return control(&to, &mut notification, &item, false).await;
+                    }
+                    return Ok(());
+                }
                 frame = gate.next(), if inbox.is_some() => match frame {
                     Some(Ok(batch)) => {
                         // The handler let go of its input: the next turn says so.
@@ -1016,6 +1081,7 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
             match &item {
                 // After `done` there is no channel to tell anything on.
                 PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. } => {
+                    said_end = true;
                     inbox = None;
                     if slot.take().is_some() && !ledger.client_ended() {
                         control(&to, &mut notification, &input_closed("method_ended", ledger.last_done()), false).await?;

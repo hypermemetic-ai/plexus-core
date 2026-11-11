@@ -3077,6 +3077,9 @@ impl DynamicHub {
                     // bytes larger, PERF's `call.one_item`).
                     let held = held.filter(|_| auth.is_some());
                     let stream = crate::call::scope(ctx.clone(), self.route_ungated(path, params, auth, raw_ctx)).await?;
+                    // I1: routed — a context derived from this call's from
+                    // now is a callee's, whose claim is its own.
+                    ctx.routed();
                     Ok(match held {
                         Some(targets) => super::held::held(ctx, self.clone(), seen, targets, stream),
                         None => Box::pin(crate::call::InCall::new(ctx, stream)),

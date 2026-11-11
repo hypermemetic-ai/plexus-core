@@ -31,8 +31,17 @@
 //! one. A method that follows its reach itself — menger's `watch`, which
 //! asks again at every move, says `entered` / `left` and re-scopes in place,
 //! and ends itself (`watch_closed`) when nothing is held — says so with
-//! [`crate::call::follows_its_reach`], and is left to it. A duplex call is
-//! left to its input half, which asks the same rule.
+//! [`crate::call::follows_its_reach`], and is left to it — the dispatched
+//! method's word only, never a callee's (I1: a context derived once the
+//! call is routed carries its claim no further). A duplex call is held like
+//! any other for its whole life (H1): its input half asks the same rule
+//! while it is open and says it sooner; once the client ended its input or
+//! the handler let it go, this hold is what ends it. Either way one end.
+//!
+//! A call refused here is never polled again (L3): its stream is dropped
+//! and the refusal is its last item. An end by the server says nothing of
+//! a write the method was making (L2): one that landed before the drop
+//! stays, and its caller reads the refusal, not the write's answer.
 //!
 //! **Not held**: a call admitted on a `public` grant or on a grant every
 //! signed-in caller holds (`auth.whoami`), an anonymous caller's, an
@@ -143,19 +152,11 @@ impl futures::Stream for Held {
                         None => Some(Refusal::Unauthenticated),
                     };
                     if let Some(why) = refused {
-                        // The method's own end, already there, is the truer
-                        // answer (a peer gone that took the method's name
-                        // with it): it is given instead. Anything else it
-                        // had ready is not.
-                        let own = match crate::call::poll_in(&this.ctx, stream, cx) {
-                            Poll::Ready(Some(item @ (PlexusStreamItem::Error { .. } | PlexusStreamItem::Done { .. }))) => Some(item),
-                            _ => None,
-                        };
-                        // The method's stream goes first: its work stops now,
-                        // whether or not its caller reads the item.
+                        // The method's stream goes first, never polled again
+                        // (L3): its work stops now, whether or not its caller
+                        // reads the item.
                         this.inner = None;
-                        let item = own.unwrap_or_else(|| end_item(this.service.runtime_namespace(), &PlexusError::from(why)));
-                        return Poll::Ready(Some(item));
+                        return Poll::Ready(Some(end_item(this.service.runtime_namespace(), &PlexusError::from(why))));
                     }
                 }
                 continue;

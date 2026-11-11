@@ -105,17 +105,25 @@ struct Inner {
     /// `dyn.peer.{peer}.wipe`). Only an own door runs a whole-activation
     /// method.
     door_shape: Option<String>,
-    /// KEEL-59: the call answers for its own reach when the grants move —
-    /// a duplex call's input half ([`crate::plexus::duplex_gate`]), or a
-    /// method that said so ([`follows_its_reach`]) — so the dispatch's hold
-    /// ([`crate::plexus::held`]) does not end it.
-    holds_itself: std::sync::atomic::AtomicBool,
-    /// KEEL-59: the context this one was derived from inside the same call
-    /// (`for_child`, `with_auth`, `with_reach`), so a method run in a child,
-    /// a nested service or a narrowed reach that says it follows its reach
-    /// says so for the call the dispatch holds.
+    /// KEEL-59: [`HOLDS_ITSELF`] — the method the dispatch held this call
+    /// for said it follows its own reach ([`follows_its_reach`]), so the
+    /// dispatch's hold ([`crate::plexus::held`]) does not end it; and
+    /// [`ROUTED`] — the dispatch has its stream, so a context derived from
+    /// this one from now is a callee's, not the dispatched method's.
+    hold: std::sync::atomic::AtomicU8,
+    /// KEEL-59 (I1): the context this one was derived from while the call
+    /// was still being routed to its method (`for_child` — a path into an
+    /// in-process child — `with_auth`, `with_reach`), so the dispatched
+    /// method's claim reaches the context the dispatch holds. A context
+    /// derived once the call is routed — a callee the method calls, an
+    /// ungated service it reaches — has none: its claim is its own.
     up: Option<CallContext>,
 }
+
+/// [`Inner::hold`]: the dispatched method follows its own reach.
+const HOLDS_ITSELF: u8 = 1;
+/// [`Inner::hold`]: the dispatch has the call's stream (the call is routed).
+const ROUTED: u8 = 2;
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
 
@@ -130,7 +138,7 @@ enum ReachCell {
 
 impl Inner {
     fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Box<Hop>>) -> Self {
-        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None, door_shape: None, holds_itself: std::sync::atomic::AtomicBool::new(false), up: None }
+        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None, door_shape: None, hold: std::sync::atomic::AtomicU8::new(0), up: None }
     }
 
     /// The call's verified slot, made when first set or shared (PERF.115-49:
@@ -293,7 +301,7 @@ impl CallContext {
         // ONE-7: the same call, so the same door — with the reach it is kept with.
         inner.door = self.0.door.clone().filter(|_| keeps_identity);
         inner.door_shape = self.0.door_shape.clone();
-        inner.up = Some(self.clone());
+        inner.up = self.routing().then(|| self.clone());
         Self(Arc::new(inner))
     }
 
@@ -309,7 +317,7 @@ impl CallContext {
         inner.host = self.0.host.clone();
         inner.door = self.0.door.clone();
         inner.door_shape = self.0.door_shape.clone();
-        inner.up = Some(self.clone());
+        inner.up = self.routing().then(|| self.clone());
         Self(Arc::new(inner))
     }
 
@@ -324,7 +332,7 @@ impl CallContext {
         inner.host = self.0.host.clone();
         inner.door = door;
         inner.door_shape = self.0.door_shape.clone();
-        inner.up = Some(self.clone());
+        inner.up = self.routing().then(|| self.clone());
         Self(Arc::new(inner))
     }
 
@@ -351,19 +359,41 @@ impl CallContext {
         self.0.hop.as_deref()
     }
 
-    /// KEEL-59: this call answers for its own reach from now
-    /// ([`follows_its_reach`]).
+    /// KEEL-59: the dispatched method answers for its own reach from now
+    /// ([`follows_its_reach`]): said on this context and every one it was
+    /// derived from while the call was routed — the dispatched method's own
+    /// chain, never a callee's (I1).
     pub(crate) fn hold_itself(&self) {
         let mut at = Some(self);
         while let Some(ctx) = at {
-            ctx.0.holds_itself.store(true, std::sync::atomic::Ordering::Release);
+            ctx.0.hold.fetch_or(HOLDS_ITSELF, std::sync::atomic::Ordering::AcqRel);
             at = ctx.0.up.as_ref();
         }
     }
 
-    /// KEEL-59: whether this call answers for its own reach.
+    /// KEEL-59: whether the dispatched method answers for its own reach.
     pub(crate) fn holds_itself(&self) -> bool {
-        self.0.holds_itself.load(std::sync::atomic::Ordering::Acquire)
+        self.0.hold.load(std::sync::atomic::Ordering::Acquire) & HOLDS_ITSELF != 0
+    }
+
+    /// KEEL-59: the dispatch has this call's stream: what is derived from
+    /// it from now is a callee's context.
+    pub(crate) fn routed(&self) {
+        self.0.hold.fetch_or(ROUTED, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Whether the call this context is in is still being routed to its
+    /// method: none of the contexts it was derived from while routing has
+    /// been marked routed.
+    fn routing(&self) -> bool {
+        let mut at = Some(self);
+        while let Some(ctx) = at {
+            if ctx.0.hold.load(std::sync::atomic::Ordering::Acquire) & ROUTED != 0 {
+                return false;
+            }
+            at = ctx.0.up.as_ref();
+        }
+        true
     }
 
     /// The caller this context names: an error for a call that came

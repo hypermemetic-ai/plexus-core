@@ -392,12 +392,11 @@ impl DuplexGate {
         // target), never "held anywhere" re-derived from the terms.
         let ctx = crate::call::context().ok();
         let decided = ctx.as_ref().and_then(|c| c.reach().cloned()).filter(|r| r.grant() == Some(&grant));
-        // KEEL-59: the input half answers for the call's reach from here
-        // (`input` selects on the generation), so the dispatch's hold over
-        // the output half leaves it to it — one end, said once.
-        if let Some(c) = &ctx {
-            c.hold_itself();
-        }
+        // KEEL-59 (H1): the dispatch's hold keeps the call for its whole
+        // life — after the client ended its input, and after the handler let
+        // it go, when nothing polls this half any more; this half's own
+        // check, asked by the same rule (`held::redecide`), only says it
+        // sooner while it is open. Whichever ends first, the call ends once.
         let mut call = self.opened(at.into(), calls, caller, grant, targets, seen, moves, recheck, ceiling, answer_by)?;
         call.decided = decided;
         Ok(call)

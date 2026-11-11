@@ -890,6 +890,20 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
     out
 }
 
+/// KEEL-59: why the input half closed with the call's last item: the
+/// refusal's own kind for a call ended `forbidden` or `unauthenticated`,
+/// else the method's end.
+fn closed_by(item: &PlexusStreamItem) -> &'static str {
+    match item {
+        PlexusStreamItem::Error { fields, .. } => match fields.get("error_kind").and_then(serde_json::Value::as_str) {
+            Some("forbidden") => "forbidden",
+            Some("unauthenticated") => "unauthenticated",
+            _ => "method_ended",
+        },
+        _ => "method_ended",
+    }
+}
+
 /// KEEL-59: the frame a call writes as its connection closes because its
 /// sign-in ended, sent — or nothing, when the connection is not ending so.
 fn saying_end(to: &FrameSink, notification: &mut Frames, method: &str, first: bool) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
@@ -1092,7 +1106,9 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
                     said_end = true;
                     inbox = None;
                     if slot.take().is_some() && !ledger.client_ended() {
-                        control(&to, &mut notification, &input_closed("method_ended", ledger.last_done()), false).await?;
+                        // KEEL-59: a call the dispatch's hold ended says so on
+                        // its input half as the input half's own refusal does.
+                        control(&to, &mut notification, &input_closed(closed_by(&item), ledger.last_done()), false).await?;
                     }
                 }
                 _ => {}

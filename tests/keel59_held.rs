@@ -116,6 +116,23 @@ impl WorkActivation {
         }
     }
 
+    /// Works, after calling — once routed, from its stream — a method of an
+    /// ungated service in process that says it follows its own reach: that
+    /// callee's word is its own, never this call's (I1).
+    #[plexus_macros::method]
+    pub async fn leans(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
+        async_stream::stream! {
+            yield json!("started");
+            let inner = DynamicHub::new("inner").register(ClaimerActivation);
+            let claimed: Vec<_> = inner.route("claimer.claim", json!({}), None).await.expect("the callee answers").collect().await;
+            assert!(!claimed.is_empty());
+            loop {
+                mark(&tag);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+
     /// The same, on a target.
     #[plexus_macros::method(target = "id")]
     pub async fn on(&self, id: String, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -174,6 +191,20 @@ fn work(tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
             mark(&tag);
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+    }
+}
+
+/// A callee that says it follows its own reach (I1).
+#[derive(Clone)]
+pub struct ClaimerActivation;
+
+#[plexus_macros::activation(namespace = "claimer", crate_path = "plexus_core")]
+impl ClaimerActivation {
+    /// Says it follows its reach, answers once.
+    #[plexus_macros::method]
+    pub async fn claim(&self) -> impl futures::Stream<Item = Value> + Send + 'static {
+        let _ = plexus_core::call::follows_its_reach();
+        futures::stream::iter([json!("claimed")])
     }
 }
 
@@ -241,7 +272,7 @@ fn exe_spec(name: &str) -> ChildSpec {
     format!("{name}=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap()
 }
 
-const READER: [&str; 7] = ["work.quiet", "work.idle", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
+const READER: [&str; 8] = ["work.quiet", "work.idle", "work.leans", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
 
 async fn host_with(members: &[(&str, &str)], leaves: &[RemoteChild]) -> Host {
     let mut b = World::new().host().without_named_callers().resolving(Shortcodes).with(WorkActivation).role("reader", READER);
@@ -289,6 +320,17 @@ async fn a_call_that_waits_in_silence_is_ended_at_the_revoke() {
     let end = call.ends("forbidden").await;
     assert_eq!(end["grant"], json!("work.idle"), "{end}");
     stopped("silent", cause).await;
+}
+
+/// I1: a method's callee that says it follows its own reach does not take
+/// the call it was called from out of the hold.
+async fn a_callees_word_does_not_exempt_the_call() {
+    let host = host_with(&[(ALICE, "*")], &[]).await;
+    let mut call = Open::start(&host.as_(ALICE), "work.leans", json!({ "tag": "leans" })).await;
+    let cause = revoke(&host, ALICE, "*");
+    let end = call.ends("forbidden").await;
+    assert_eq!(end["grant"], json!("work.leans"), "{end}");
+    stopped("leans", cause).await;
 }
 
 async fn across_a_hop_the_caller_is_told_and_the_peers_work_stops() {
@@ -435,6 +477,7 @@ fn main() {
     rows!(
         a_viewer_whose_grant_is_revoked_mid_stream_is_told_forbidden_and_the_work_stops,
         a_call_that_waits_in_silence_is_ended_at_the_revoke,
+        a_callees_word_does_not_exempt_the_call,
         across_a_hop_the_caller_is_told_and_the_peers_work_stops,
         a_call_back_ends_with_the_call_it_was_made_under,
         a_read_whose_reach_narrowed_ends_and_one_that_follows_its_reach_runs_on,

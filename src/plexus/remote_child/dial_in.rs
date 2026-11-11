@@ -886,7 +886,7 @@ impl PeerSocket {
 
 /// One unary call into the peer: the first `data`'s content.
 async fn ask(conn: &Conn, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-    let (_, mut rx) = conn.open(method, params, timeout).await.map_err(|e| match e {
+    let (_, mut rx) = conn.open(method, params, timeout, None).await.map_err(|e| match e {
         PlexusStreamItem::Error { message, .. } => message,
         other => format!("{other:?}"),
     })?;

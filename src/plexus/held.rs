@@ -28,6 +28,14 @@
 //! | on `*` or at a door (a whole-service method, KEEL-31, ONE-7) | [`Reach::recheck`] | the grant is no longer held there |
 //! | with no target (a `list`, a `watch`) | [`Reach::recheck`] | the grant is held nowhere, **or the reach lost a scope it had** |
 //!
+//! While the call is still routed (its method's body running, before it has
+//! a stream: [`routing`]), the last row is only "the grant is held
+//! somewhere" ([`redecide_body`], N1): a third party's grant-then-revoke on
+//! a scope of its own never cuts a body between its steps. A call whose
+//! own write made a move is not asked about it (N2, `call::own_move`); a
+//! call whose peer was cut off keeps its own end while that end is on its
+//! way (N3).
+//!
 //! The last row is the safe rule: a read with no target answers from the
 //! scopes its reach held, and the method may have read them already, so a
 //! reach that narrowed ends the call and the client asks again under the new
@@ -98,6 +106,19 @@ pub(crate) fn redecide(gate: &Gate, reach: &Reach, targets: &[String]) -> Result
             Err(Refusal::MissingGrant { grant, scope: lost.clone(), roles, held_on: now.held_on().to_vec() })
         }
     }
+}
+
+/// KEEL-59 (N1): decide a call whose method's body is still running (it is
+/// being routed) again. On targets, or at `*` / a door, as [`redecide`];
+/// with no target, only that the grant is still held somewhere — a reach
+/// that lost one scope ends the call's stream, never its body half-way, so
+/// a third party's grant-then-revoke on a scope of its own cannot cut
+/// another caller's write between its steps.
+pub(crate) fn redecide_body(gate: &Gate, reach: &Reach, targets: &[String]) -> Result<(), Refusal> {
+    if !targets.is_empty() {
+        return redecide(gate, reach, targets);
+    }
+    reach.recheck().map(|_| ())
 }
 
 /// The call's end, as its one error item.
@@ -225,6 +246,7 @@ pub(crate) async fn routing<F>(ctx: &CallContext, service: &super::plexus::Dynam
 where
     F: Future<Output = Result<PlexusStream, PlexusError>>,
 {
+    crate::call::hook_moves();
     let (Some(targets), Some(gate)) = (targets, service.gate()) else { return routed.await };
     let generation = gate.generation();
     let mut routed = std::pin::pin!(routed);
@@ -237,11 +259,11 @@ where
     std::future::poll_fn(|cx| loop {
         let now = generation.current();
         if now != *seen {
-            *seen = now;
+            let before = std::mem::replace(seen, now);
             wait = None;
-            if !ctx.holds_itself() && !ctx.ended_by_peer() {
+            if !ctx.holds_itself() && !ctx.ended_by_peer() && !ctx.own_move(before, now) {
                 let refused = match ctx.reach() {
-                    Some(reach) => redecide(gate, reach, targets).err(),
+                    Some(reach) => redecide_body(gate, reach, targets).err(),
                     None => Some(Refusal::Unauthenticated),
                 };
                 if let Some(why) = refused {
@@ -284,12 +306,12 @@ impl futures::Stream for Held {
             // once — unless the call answers for its own reach.
             let now = generation.current();
             if now != this.seen {
-                this.seen = now;
+                let before = std::mem::replace(&mut this.seen, now);
                 this.wait = None;
                 // A call whose peer was cut off has its own end on its way
                 // (`child_unavailable`, saying why): the move the cut-off
                 // made is not asked about it.
-                if !this.ctx.holds_itself() && !this.ctx.ended_by_peer() {
+                if !this.ctx.holds_itself() && !this.ctx.ended_by_peer() && !this.ctx.own_move(before, now) {
                     let refused = match this.ctx.reach() {
                         Some(reach) => redecide(gate, reach, &this.targets).err(),
                         None => Some(Refusal::Unauthenticated),

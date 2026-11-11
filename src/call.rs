@@ -118,15 +118,26 @@ struct Inner {
     /// derived once the call is routed — a callee the method calls, an
     /// ungated service it reaches — has none: its claim is its own.
     up: Option<CallContext>,
+    /// KEEL-59 (N4): whether a [`follows_its_reach`] claim made here reaches
+    /// `up`: not across a call routed through a service with no gate of its
+    /// own (`with_auth`) — a callee the method's body calls — only along the
+    /// dispatched call's own path (`for_child`, `with_reach`).
+    claim_up: bool,
+    /// KEEL-59 (N3): calls into a peer opened in this call whose peer was cut
+    /// off and whose end (`child_unavailable`) is not yet taken: while any
+    /// is, a grants move the cut-off made is not asked about this call.
+    peer_ends: std::sync::atomic::AtomicU32,
+    /// KEEL-59 (N2): the grants generations this call's own writes made, the
+    /// last run of them with nothing between (`own_from..=own_to`; 0: none)
+    /// — those moves are not asked about it.
+    own_from: std::sync::atomic::AtomicU64,
+    own_to: std::sync::atomic::AtomicU64,
 }
 
 /// [`Inner::hold`]: the dispatched method follows its own reach.
 const HOLDS_ITSELF: u8 = 1;
 /// [`Inner::hold`]: the dispatch has the call's stream (the call is routed).
 const ROUTED: u8 = 2;
-/// [`Inner::hold`]: the peer the call was forwarded to was cut off, and its
-/// end (`child_unavailable`, saying why) is the call's next item.
-const PEER_ENDED: u8 = 4;
 
 type Verified = Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>;
 
@@ -141,7 +152,7 @@ enum ReachCell {
 
 impl Inner {
     fn with(auth: Option<AuthContext>, reach: ReachCell, hop: Option<Box<Hop>>) -> Self {
-        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None, door_shape: None, hold: std::sync::atomic::AtomicU8::new(0), up: None }
+        Inner { auth, auth_in_reach: false, reach, hop, verified: OnceLock::new(), host: None, door: None, door_shape: None, hold: std::sync::atomic::AtomicU8::new(0), up: None, claim_up: true, peer_ends: std::sync::atomic::AtomicU32::new(0), own_from: std::sync::atomic::AtomicU64::new(0), own_to: std::sync::atomic::AtomicU64::new(0) }
     }
 
     /// The call's verified slot, made when first set or shared (PERF.115-49:
@@ -321,6 +332,9 @@ impl CallContext {
         inner.door = self.0.door.clone();
         inner.door_shape = self.0.door_shape.clone();
         inner.up = self.routing().then(|| self.clone());
+        // N4: a service with no gate reached from inside a call is the
+        // body's callee: its claim to follow its reach is its own.
+        inner.claim_up = false;
         Self(Arc::new(inner))
     }
 
@@ -370,7 +384,7 @@ impl CallContext {
         let mut at = Some(self);
         while let Some(ctx) = at {
             ctx.0.hold.fetch_or(HOLDS_ITSELF, std::sync::atomic::Ordering::AcqRel);
-            at = ctx.0.up.as_ref();
+            at = ctx.0.up.as_ref().filter(|_| ctx.0.claim_up);
         }
     }
 
@@ -379,22 +393,61 @@ impl CallContext {
         self.0.hold.load(std::sync::atomic::Ordering::Acquire) & HOLDS_ITSELF != 0
     }
 
-    /// KEEL-59: the peer this call was forwarded to was cut off — its end
-    /// is on its way — said on this context and those it was derived from
-    /// while routed, so a grants move the cut-off made (a peer leaving
-    /// takes its grants with it) leaves the call its own end, not a
-    /// `forbidden` for a name that went.
+    /// KEEL-59 (N3): a call into a peer opened in this call had its peer
+    /// cut off — its end is on its way — said on this context and those it
+    /// was derived from while routed, so a grants move the cut-off made (a
+    /// peer leaving takes its grants with it) leaves the call its own end,
+    /// not a `forbidden` for a name that went. Undone by
+    /// [`Self::peer_end_taken`] once that call is let go.
     pub(crate) fn peer_ended(&self) {
         let mut at = Some(self);
         while let Some(ctx) = at {
-            ctx.0.hold.fetch_or(PEER_ENDED, std::sync::atomic::Ordering::AcqRel);
+            ctx.0.peer_ends.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             at = ctx.0.up.as_ref();
         }
     }
 
-    /// KEEL-59: whether the call's peer was cut off ([`Self::peer_ended`]).
+    /// KEEL-59 (N3): the call into the cut-off peer is let go (its end taken,
+    /// or dropped): this call is asked again at the next move as usual.
+    pub(crate) fn peer_end_taken(&self) {
+        let mut at = Some(self);
+        while let Some(ctx) = at {
+            let _ = ctx.0.peer_ends.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1));
+            at = ctx.0.up.as_ref();
+        }
+    }
+
+    /// KEEL-59: whether a call into a cut-off peer has its end on its way.
     pub(crate) fn ended_by_peer(&self) -> bool {
-        self.0.hold.load(std::sync::atomic::Ordering::Acquire) & PEER_ENDED != 0
+        self.0.peer_ends.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// KEEL-59 (N2): this call's own write moved the grants to `generation`
+    /// (said by plexus-auth-core in the moving task): said on this context
+    /// and those it was derived from while routed.
+    fn moved_by_itself(&self, generation: u64) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let mut at = Some(self);
+        while let Some(ctx) = at {
+            // A move right after its own last one extends the run; any other
+            // starts a new one (a move made between is not its own). The
+            // run's start is written before its end is, so a reader never
+            // pairs a new end with an old start.
+            if ctx.0.own_to.load(Acquire) != generation.wrapping_sub(1) {
+                ctx.0.own_from.store(generation, Release);
+            }
+            ctx.0.own_to.store(generation, Release);
+            at = ctx.0.up.as_ref();
+        }
+    }
+
+    /// KEEL-59 (N2): whether every move from `seen` to `now` was this call's
+    /// own write: then it is not asked about them. A later move, or one
+    /// made between by anything else, is asked as usual — it is never a way
+    /// to stay alive past someone else's revoke.
+    pub(crate) fn own_move(&self, seen: u64, now: u64) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        self.0.own_to.load(Acquire) == now && self.0.own_from.load(Acquire) <= seen.wrapping_add(1) && now > seen
     }
 
     /// KEEL-59: the dispatch has this call's stream: what is derived from
@@ -536,6 +589,17 @@ pub fn hop() -> Result<Hop, CallError> {
 /// An error outside a call.
 pub fn follows_its_reach() -> Result<(), CallError> {
     CALL.try_with(CallContext::hold_itself).map_err(|_| CallError::OutsideCall)
+}
+
+/// KEEL-59 (N2): plexus-auth-core tells, in the moving task, every grants
+/// generation a bump makes; the call that made it marks it its own. Set once.
+pub(crate) fn hook_moves() {
+    static HOOKED: std::sync::Once = std::sync::Once::new();
+    HOOKED.call_once(|| {
+        plexus_auth_core::grants::GrantsGeneration::on_move(|generation| {
+            let _ = CALL.try_with(|c| c.moved_by_itself(generation));
+        });
+    });
 }
 
 /// The whole context of the call this runs in — to hand to a task it

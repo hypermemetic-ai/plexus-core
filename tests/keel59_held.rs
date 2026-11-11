@@ -146,6 +146,16 @@ impl WorkActivation {
         }
     }
 
+    /// N4: the same callee, called in the method's body — while the call is
+    /// still routed — before it returns its stream.
+    #[plexus_macros::method]
+    pub async fn leans_early(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
+        let inner = DynamicHub::new("inner").register(ClaimerActivation);
+        let claimed: Vec<_> = inner.route("claimer.claim", json!({}), None).await.expect("the callee answers").collect().await;
+        assert!(!claimed.is_empty());
+        work(tag)
+    }
+
     /// The same, on a target.
     #[plexus_macros::method(target = "id")]
     pub async fn on(&self, id: String, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -191,6 +201,26 @@ impl WorkActivation {
         json!("done")
     }
 
+    /// N3: from its own stream, follows `quiet` on the peer `RIDDEN` (held
+    /// as a `RemoteChild`, not through the service's router); when the peer
+    /// is cut off it takes the end and works on, here.
+    #[plexus_macros::method]
+    pub async fn rides(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
+        async_stream::stream! {
+            yield json!("started");
+            mark(&tag);
+            if let Some(peer) = RIDDEN.get() {
+                if let Ok(mut s) = plexus_core::plexus::Activation::call(peer, "quiet", json!({ "tag": format!("{tag}-peer") }), None, None).await {
+                    while s.next().await.is_some() {}
+                }
+            }
+            loop {
+                mark(&tag);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+
     /// Through the seam: follow `work.quiet` at the service (a call back).
     #[plexus_macros::method]
     pub async fn back(&self, tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -226,6 +256,9 @@ impl WorkActivation {
         }
     }
 }
+
+/// N3: the peer `work.rides` follows.
+static RIDDEN: std::sync::OnceLock<RemoteChild> = std::sync::OnceLock::new();
 
 /// Says it started, then a unit of work every 2 ms, saying nothing more.
 fn work(tag: String) -> impl futures::Stream<Item = Value> + Send + 'static {
@@ -332,7 +365,7 @@ fn exe_spec(name: &str) -> ChildSpec {
     format!("{name}=stdio:{}", std::env::current_exe().unwrap().display()).parse().unwrap()
 }
 
-const READER: [&str; 10] = ["work.unary", "work.quiet", "work.idle", "work.leans", "work.chatty", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
+const READER: [&str; 12] = ["work.leans_early", "work.rides", "work.unary", "work.quiet", "work.idle", "work.leans", "work.chatty", "work.on", "work.follow", "leaf.quiet", "leaf.back", "leaf2.quiet"];
 
 async fn host_with(members: &[(&str, &str)], leaves: &[RemoteChild]) -> Host {
     let mut b = World::new().host().without_named_callers().resolving(Shortcodes).with(WorkActivation).role("reader", READER);
@@ -384,6 +417,16 @@ async fn a_call_that_waits_in_silence_is_ended_at_the_revoke() {
 
 /// I1: a method's callee that says it follows its own reach does not take
 /// the call it was called from out of the hold.
+/// N4: nor does a callee's word given in the method's body, while the call
+/// is still routed.
+async fn a_callees_word_in_the_body_does_not_exempt_the_call() {
+    let host = host_with(&[(ALICE, "*")], &[]).await;
+    let mut call = Open::start(&host.as_(ALICE), "work.leans_early", json!({ "tag": "leans-early" })).await;
+    let cause = revoke(&host, ALICE, "*");
+    call.ends("forbidden").await;
+    stopped("leans-early", cause).await;
+}
+
 async fn a_callees_word_does_not_exempt_the_call() {
     let host = host_with(&[(ALICE, "*")], &[]).await;
     let mut call = Open::start(&host.as_(ALICE), "work.leans", json!({ "tag": "leans" })).await;
@@ -434,6 +477,24 @@ async fn a_unary_method_at_work_is_ended_at_the_revoke() {
     assert_eq!(items.len(), 1, "one item: {items:?}");
     assert_eq!(items[0]["error_kind"], json!("forbidden"), "{items:?}");
     stopped("unary", cause).await;
+}
+
+/// N3: a call whose method opened a call into a peer and went on after the
+/// peer was cut off is held as usual: the next revoke ends it.
+async fn a_call_that_outlived_its_peers_end_is_still_revocable() {
+    let base = Arc::new(DynamicHub::new("host").register(WorkActivation));
+    let peer = mount("leaf3", &base).await;
+    let _ = RIDDEN.set(peer.clone());
+    let host = host_with(&[(ALICE, "*")], &[]).await;
+    let mut call = Open::start(&host.as_(ALICE), "work.rides", json!({ "tag": "rides" })).await;
+    going("rides-peer").await;
+    peer.stop("dropped by the test");
+    // The method took the peer's end and works on.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    going("rides").await;
+    let cause = revoke(&host, ALICE, "*");
+    call.ends("forbidden").await;
+    stopped("rides", cause).await;
 }
 
 async fn across_a_hop_the_caller_is_told_and_the_peers_work_stops() {
@@ -606,7 +667,9 @@ fn main() {
         a_viewer_whose_grant_is_revoked_mid_stream_is_told_forbidden_and_the_work_stops,
         a_call_that_waits_in_silence_is_ended_at_the_revoke,
         a_callees_word_does_not_exempt_the_call,
+        a_callees_word_in_the_body_does_not_exempt_the_call,
         a_unary_method_at_work_is_ended_at_the_revoke,
+        a_call_that_outlived_its_peers_end_is_still_revocable,
         a_sign_in_that_ends_ends_the_call_in_process,
         across_a_hop_the_caller_is_told_and_the_peers_work_stops,
         a_call_back_ends_with_the_call_it_was_made_under,

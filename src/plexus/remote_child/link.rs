@@ -99,8 +99,41 @@ struct Opening {
 struct Sub {
     tx: mpsc::Sender<PlexusStreamItem>,
     method: Arc<str>,
-    /// KEEL-59: the call it was opened in, told when the peer is cut off.
+    /// KEEL-59 (N3): the call it was opened in, told when the peer is cut
+    /// off — until this call into the peer is let go.
+    mark: Option<Arc<PeerMark>>,
+}
+
+/// KEEL-59 (N3): one call into a peer, and the call it was opened in: set
+/// when the peer is cut off, taken when the call into it is let go.
+pub(super) struct PeerMark {
     call: Option<crate::call::CallContext>,
+    set: std::sync::atomic::AtomicBool,
+}
+
+impl PeerMark {
+    /// For the call this runs in.
+    pub(super) fn here() -> Arc<Self> {
+        Arc::new(Self { call: crate::call::context().ok(), set: std::sync::atomic::AtomicBool::new(false) })
+    }
+
+    /// The peer was cut off: its end is on its way.
+    fn set(&self) {
+        if !self.set.swap(true, Ordering::AcqRel) {
+            if let Some(c) = &self.call {
+                c.peer_ended();
+            }
+        }
+    }
+
+    /// The call into the peer is let go.
+    pub(super) fn taken(&self) {
+        if self.set.swap(false, Ordering::AcqRel) {
+            if let Some(c) = &self.call {
+                c.peer_end_taken();
+            }
+        }
+    }
 }
 
 /// How long after its `true` an unsubscribed call's late item is still the
@@ -240,7 +273,7 @@ impl Conn {
     /// Open a call: `method` with `params` (a `{ns}.call`'s params, or
     /// `_info`'s null); the subscription id back within `timeout`, its items
     /// already routed to the receiver.
-    pub(super) async fn open(&self, method: &str, params: Value, timeout: Duration) -> Result<(SubKey, mpsc::Receiver<PlexusStreamItem>), PlexusStreamItem> {
+    pub(super) async fn open(&self, method: &str, params: Value, timeout: Duration, mark: Option<Arc<PeerMark>>) -> Result<(SubKey, mpsc::Receiver<PlexusStreamItem>), PlexusStreamItem> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(self.buffer);
         let (reply, answer) = oneshot::channel();
@@ -256,7 +289,7 @@ impl Conn {
             }
             // a `{ns}.call`'s params name the method called (`echo.count`)
             let called = params.get("method").and_then(Value::as_str).unwrap_or(method);
-            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into(), call: crate::call::context().ok() } });
+            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into(), mark } });
         }
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         match tokio::time::timeout(timeout, answer).await {
@@ -323,11 +356,11 @@ impl Conn {
         for (id, key) in &unsubs {
             self.send_unsub(*id, key);
         }
-        for (_, Sub { tx, call, .. }) in subs {
+        for (_, Sub { tx, mark, .. }) in subs {
             // Told before the item is sent: a grants move the cut-off makes
             // leaves the call this end.
-            if let Some(c) = call {
-                c.peer_ended();
+            if let Some(m) = mark {
+                m.set();
             }
             Self::tell(tx, unavailable(&self.name, why));
         }
@@ -502,10 +535,10 @@ impl Conn {
             r.abandoned.clear();
             (std::mem::take(&mut r.subs), std::mem::take(&mut r.pending))
         };
-        for (_, Sub { tx, call, .. }) in subs {
+        for (_, Sub { tx, mark, .. }) in subs {
             // KEEL-59: as `stop` — the peer gone, its end is the call's.
-            if let Some(c) = call {
-                c.peer_ended();
+            if let Some(m) = mark {
+                m.set();
             }
             Self::tell(tx, unavailable(&self.name, why));
         }
@@ -983,7 +1016,7 @@ pub(super) fn gone(shared: &Weak<Shared>, conn: &Arc<Conn>, why: &str) {
 
 /// One unary call: the first `data`'s content (the rest read to the end).
 async fn ask(conn: &Conn, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-    let (_, mut rx) = conn.open(method, params, timeout).await.map_err(|e| match e {
+    let (_, mut rx) = conn.open(method, params, timeout, None).await.map_err(|e| match e {
         PlexusStreamItem::Error { message, .. } => message,
         other => format!("{other:?}"),
     })?;

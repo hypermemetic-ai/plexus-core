@@ -799,12 +799,13 @@ impl RemoteChild {
             return one(unavailable(self.name(), why));
         }
         let call = json!({ "method": path, "params": params, "hop": hop });
-        match conn.open(&format!("{}.call", conn.ns()), call, shared.opts.timeout).await {
+        let mark = link::PeerMark::here();
+        match conn.open(&format!("{}.call", conn.ns()), call, shared.opts.timeout, Some(mark.clone())).await {
             Ok((sid, rx)) => {
                 let generation = reach.generation().cloned();
                 let seen = generation.as_ref().map_or(0, GrantsGeneration::current);
                 let instance = instance.map(|path| (Arc::clone(&self.inner), path));
-                Box::pin(CallStream { rx, sid, conn, over: false, _guard: guard, reach, generation, seen, name: self.name().to_string(), instance, under })
+                Box::pin(CallStream { rx, sid, conn, over: false, _guard: guard, reach, generation, seen, name: self.name().to_string(), instance, under, mark })
             }
             Err(item) => one(item),
         }
@@ -840,6 +841,8 @@ struct CallStream {
     /// NEST-11: the child's standing to call back under this call; ended
     /// with it.
     under: Option<upcall::UnderGuard>,
+    /// KEEL-59 (N3): taken when this call into the peer is let go.
+    mark: Arc<link::PeerMark>,
 }
 
 impl CallStream {
@@ -918,6 +921,7 @@ impl Stream for CallStream {
 
 impl Drop for CallStream {
     fn drop(&mut self) {
+        self.mark.taken();
         if !self.over {
             self.conn.unsubscribe(&self.sid);
         }

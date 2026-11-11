@@ -300,7 +300,33 @@ by the rule it was admitted by (`src/plexus/held.rs`, `redecide`):
 One that no longer holds ends with one `forbidden` item (`unauthenticated`
 for a sign-in that ended), and the method's stream is dropped at once: its
 work stops, a call it forwarded is unsubscribed, the calls made back under
-it end. A call with an input half is held the same way for its whole life.
+it end. A call is also ended when its sign-in ends (`expires_at`, a capped
+session's the same), on every path.
+
+**A method's body is held more loosely than its stream.** While a call is
+still routed — its method's body running before it returns a stream: a
+unary method's whole work, a long `async fn` — the third row above is only
+"the grant is held somewhere": a reach that lost one scope ends a
+targetless call's *stream*, never its body half-way, so another admin's
+grant-then-revoke on a scope of its own cannot cut a caller's write between
+its steps. A body on targets, or admitted on `*` or at a door, is held as
+its stream is (a third party's unrelated scope cannot touch those). A body
+whose caller holds the grant nowhere any more, or whose sign-in ended, is
+still dropped at the await it is on. **What a tenant must make safe to
+cut:** every method body with more than one step that writes — a real
+revoke of its caller, or its sign-in's end, stops it between steps.
+Reserve-then-commit with a release on drop, one transaction, or an
+idempotent retry; never two writes the reader assumes go together.
+
+**A caller's own write is not held against it.** A call whose write moves
+the grants generation (a revoke of its caller's own grant, a role edit that
+drops the grant it was called under, `auth.logout`) is not asked about
+those moves: it finishes and its caller reads the write's answer. The
+generation tells the call that moved it, in the moving task — plexus-core's
+own `auth` writes and a tenant's store that moves its generation inside its
+write (`AuthSetup::with_generation`) alike. Only the call's own run of
+moves: a move made by anything else, before, between or after, is asked as
+usual, so it is no way to stay alive. A call with an input half is held the same way for its whole life.
 Public calls, calls on a grant every signed-in caller holds, and anonymous
 calls are not held. Nothing is asked per item: one decision per open call
 per move.
@@ -317,7 +343,10 @@ should follow its own reach: ask `Reach::recheck` at each move, re-scope in
 place and end itself when nothing is held, and say so once with
 `plexus_core::call::follows_its_reach()`. The hold then leaves it to the
 method; only the method the gate dispatched for this call can say it, not a
-method it calls.
+method it calls through the router or a service with no gate (whether from
+its body or its stream). A method's own code calling another activation's
+Rust function directly runs in the same call, and its word is the
+method's. A call that follows its reach still ends at its sign-in's end.
 
 **An end by the server says nothing about a write.** A call ended mid-write
 (its caller's grant revoked while it runs) drops the method at its next

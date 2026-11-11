@@ -38,12 +38,15 @@
 //! signed-in caller holds (`auth.whoami`), an anonymous caller's, an
 //! introspection call, and every call of a service with no gate.
 //!
-//! **Cost.** Nothing a item: the generation is one atomic load a poll, and
-//! the gate is asked only when it moved — once a move for each call held,
-//! O(open calls) a move. A call's stream is the box the dispatch already
-//! made (the context's, `InCall`); it holds the gate, the targets the
-//! dispatch read anyway, and a subscription to the generation, woken only
-//! while the method has nothing ready.
+//! **Cost.** Nothing an item: a poll is one atomic load beside the method's
+//! own poll, and the gate is asked only when the generation moved — once a
+//! move for each call held, O(open calls) a move (10,000 open calls: every
+//! one decided again in about 4.5 ms, every one ended by a revoke in about
+//! 21 ms; `tests/keel59_cost.rs`). A call's stream is still the one box the
+//! dispatch made, larger (the service, the targets the dispatch read
+//! anyway); a call that waits subscribes to the generation once, one
+//! allocation kept until a move wakes it. A gated one-item call in process:
+//! about +70–80 ns and no allocation more (1.10 → 1.18 µs, 30 allocations).
 
 use std::future::Future;
 use std::task::Poll;
@@ -90,11 +93,9 @@ fn end_item(ns: &str, e: &PlexusError) -> PlexusStreamItem {
     PlexusStreamItem::from_plexus_error(StreamMetadata::new(vec![ns.into()], PlexusContext::hash()), e, false)
 }
 
-/// What woke the held call.
-enum Woke {
-    Item(Option<PlexusStreamItem>),
-    Moved,
-}
+/// The wait for the generation's next move: its own receiver inside, so it
+/// lives across polls (made only once the method has nothing ready).
+type Wait = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// `inner`, each poll of it inside `ctx` (as [`crate::call::InCall`]), held
 /// to `ctx`'s admission: decided again by [`redecide`] when `service`'s
@@ -104,59 +105,76 @@ pub(crate) fn held(ctx: CallContext, service: super::plexus::DynamicHub, seen: u
     if service.gate().is_none() {
         return Box::pin(crate::call::InCall::new(ctx, inner));
     }
-    Box::pin(async_stream::stream! {
-        let Some(gate) = service.gate() else { return };
-        let ns = service.runtime_namespace();
-        let mut inner = Some(inner);
-        let mut seen = seen;
+    Box::pin(Held { ctx, service, seen, targets, inner: Some(inner), wait: None })
+}
+
+/// A held call's stream ([`held`]). A poll is one atomic load and the
+/// method's own poll; the gate is asked only when the generation moved; the
+/// wait for a move is made (one allocation) only when the method has
+/// nothing ready, and kept until a move wakes it.
+struct Held {
+    ctx: CallContext,
+    service: super::plexus::DynamicHub,
+    seen: u64,
+    targets: Vec<String>,
+    /// `None` once over: ended by the method, or by the hold.
+    inner: Option<PlexusStream>,
+    wait: Option<Wait>,
+}
+
+impl futures::Stream for Held {
+    type Item = PlexusStreamItem;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<PlexusStreamItem>> {
+        let this = self.get_mut();
+        let Some(gate) = this.service.gate() else { return Poll::Ready(None) };
         let generation = gate.generation();
-        let mut moves = generation.subscribe();
-        'held: loop {
+        loop {
+            let Some(stream) = this.inner.as_mut() else { return Poll::Ready(None) };
             // The generation moved since it was last decided: asked again,
             // once — unless the call answers for its own reach.
             let now = generation.current();
-            if now != seen {
-                seen = now;
-                if !ctx.holds_itself() {
-                    let refused = match ctx.reach() {
-                        Some(reach) => redecide(gate, reach, &targets).err(),
+            if now != this.seen {
+                this.seen = now;
+                this.wait = None;
+                if !this.ctx.holds_itself() {
+                    let refused = match this.ctx.reach() {
+                        Some(reach) => redecide(gate, reach, &this.targets).err(),
                         None => Some(Refusal::Unauthenticated),
                     };
                     if let Some(why) = refused {
                         // The method's stream goes first: its work stops now,
                         // whether or not its caller reads the item.
-                        drop(inner.take());
-                        yield end_item(ns, &PlexusError::from(why));
-                        return;
+                        this.inner = None;
+                        return Poll::Ready(Some(end_item(this.service.runtime_namespace(), &PlexusError::from(why))));
                     }
                 }
+                continue;
             }
-            let mut changed = std::pin::pin!(moves.changed());
-            loop {
-                let woke = std::future::poll_fn(|cx| {
-                    let Some(stream) = inner.as_mut() else { return Poll::Ready(Woke::Item(None)) };
-                    if let Poll::Ready(item) = crate::call::poll_in(&ctx, stream, cx) {
-                        return Poll::Ready(Woke::Item(item));
-                    }
-                    if changed.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(Woke::Moved);
-                    }
-                    Poll::Pending
-                })
-                .await;
-                match woke {
-                    Woke::Item(Some(item)) => {
-                        yield item;
-                        if generation.current() != seen {
-                            continue 'held;
-                        }
-                    }
-                    Woke::Item(None) => return,
-                    // A closed channel (the gate gone) wakes once; the
-                    // atomic is read again either way.
-                    Woke::Moved => continue 'held,
+            if let Poll::Ready(item) = crate::call::poll_in(&this.ctx, stream, cx) {
+                if item.is_none() {
+                    this.inner = None;
                 }
+                return Poll::Ready(item);
+            }
+            // Nothing ready: wake at the next move too.
+            let wait = this.wait.get_or_insert_with(|| {
+                let mut moves = generation.subscribe();
+                Box::pin(async move {
+                    // A closed channel (the gate gone) never wakes again.
+                    if moves.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                })
+            });
+            // A move between the read above and the subscription is read now.
+            if generation.current() != this.seen {
+                continue;
+            }
+            match wait.as_mut().poll(cx) {
+                Poll::Ready(()) => this.wait = None,
+                Poll::Pending => return Poll::Pending,
             }
         }
-    })
+    }
 }

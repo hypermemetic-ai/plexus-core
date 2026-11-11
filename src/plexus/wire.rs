@@ -815,20 +815,27 @@ async fn run(sink: jsonrpsee::SubscriptionSink, mut stream: super::streaming::Pl
     let mut ready: Vec<PlexusStreamItem> = Vec::new();
     let out: jsonrpsee::core::SubscriptionResult = async {
         loop {
+            let mut closing = false;
             let item = tokio::select! {
                 biased;
                 _ = sink.closed() => {
-                    // KEEL-59: closing because its sign-in ended: the call
-                    // says so, once, before the close. Made apart and boxed:
-                    // this rare await keeps out of every call's state.
-                    if let Some(say) = frames.as_ref().filter(|_| !said_end).and_then(|to| saying_end(to, &mut notification, sink.method_name(), first)) {
-                        say.await;
-                    }
-                    return Ok(());
+                    closing = true;
+                    None
                 }
                 item = stream.next() => item,
             };
-            let Some(item) = item else { return Ok(()) };
+            let Some(item) = item else {
+                // KEEL-59: closing because its sign-in ended: the call says
+                // so, once, before the close. Made apart and boxed, awaited
+                // with no item alive: this rare await stays out of every
+                // call's state.
+                if closing {
+                    if let Some(say) = frames.as_ref().filter(|_| !said_end).and_then(|to| saying_end(to, &mut notification, sink.method_name(), first)) {
+                        say.await;
+                    }
+                }
+                return Ok(());
+            };
             said_end = matches!(item, PlexusStreamItem::Done { .. } | PlexusStreamItem::Error { .. });
             match &frames {
                 Some(to) => {
@@ -1033,19 +1040,12 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
         // yet: it may read this before it has the id).
         control(&to, &mut notification, &format!(r#"{{"type":"credit","n":{}}}"#, ledger.window()), true).await?;
         loop {
+            let mut closing = false;
             let turn = tokio::select! {
                 biased;
                 _ = sink.closed() => {
-                    // KEEL-59: closing because its sign-in ended: both
-                    // halves end, said once, before the close.
-                    if let (Some(why), false) = (to.ending(), said_end) {
-                        if slot.take().is_some() && !ledger.client_ended() {
-                            control(&to, &mut notification, &input_closed("unauthenticated", ledger.last_done()), false).await?;
-                        }
-                        let item = serde_json::to_string(&ending_item(sink.method_name(), why)).unwrap_or_default();
-                        return control(&to, &mut notification, &item, false).await;
-                    }
-                    return Ok(());
+                    closing = true;
+                    Turn::Moved
                 }
                 frame = gate.next(), if inbox.is_some() => match frame {
                     Some(Ok(batch)) => {
@@ -1062,6 +1062,20 @@ async fn run_duplex(sink: jsonrpsee::SubscriptionSink, mut output: Output<'_>, d
                 _ = ledger.woken() => Turn::Moved,
                 turn = output.next() => turn,
             };
+            if closing {
+                // KEEL-59: closing because its sign-in ended: both halves
+                // end, said once, before the close — awaited outside the
+                // select, with no item alive.
+                drop(turn);
+                if let (Some(why), false) = (to.ending(), said_end) {
+                    if slot.take().is_some() && !ledger.client_ended() {
+                        control(&to, &mut notification, &input_closed("unauthenticated", ledger.last_done()), false).await?;
+                    }
+                    let item = serde_json::to_string(&ending_item(sink.method_name(), why)).unwrap_or_default();
+                    return control(&to, &mut notification, &item, false).await;
+                }
+                return Ok(());
+            }
             if let Turn::Failed(item) = turn {
                 if slot.take().is_some() && !ledger.client_ended() {
                     control(&to, &mut notification, &input_closed("method_ended", ledger.last_done()), false).await?;

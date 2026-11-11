@@ -873,4 +873,32 @@ mod token_tests {
         let wide = hop(caller, "weather.forecast", &["*"], "c7", Some(mint(&me, &["weather.forecast@MENGER"], "c7")));
         assert!(check_hop_token(&v, &wide, "weather.forecast").unwrap_err().contains("does not hold"));
     }
+
+    /// ONE-7: a hop's door names exactly the call served, for the hop's own
+    /// grant (the method's, or the slot's it goes through) — or it is
+    /// refused; a hop that says none has none.
+    #[test]
+    fn a_door_names_this_call_or_nothing() {
+        let slots = Slots::default();
+        let h = hop("key:aa", "shop.stock", &[], "c", None);
+        let door = |d: Value| door_of(Some(&d), Some(&h), "shop.stock", &slots);
+        let call = door(json!("/shop.stock")).unwrap().expect("a door");
+        assert_eq!((call.at().path(), call.grant().as_str()), ("shop.stock", "shop.stock"));
+        assert_eq!(door_of(None, Some(&h), "shop.stock", &slots), Ok(None));
+        assert_eq!(door_of(Some(&Value::Null), Some(&h), "shop.stock", &slots), Ok(None));
+        for forged in [json!("/shop.*"), json!("/shop"), json!("*"), json!("/shop.restock"), json!(["/shop.stock"])] {
+            assert!(door(forged.clone()).is_err(), "{forged}");
+        }
+        // The hop's grant must be this call's.
+        let other = hop("key:aa", "shop.restock", &[], "c", None);
+        assert!(door_of(Some(&json!("/shop.stock")), Some(&other), "shop.stock", &slots).is_err());
+        // The door rides beside the data held, never as `*`: the reach holds the activation and no data.
+        let h = hop("key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "shop.stock", &[], "c", None);
+        let ctx = CallContext::through_hop(h.clone(), Some(&call));
+        let reach = ctx.reach().unwrap();
+        assert!(reach.holds_activation() && !reach.is_everywhere() && reach.held_on().is_empty());
+        assert!(!reach.allows("KILN-3"), "a door holds no data");
+        let none = CallContext::through_hop(h, None);
+        assert!(!none.reach().unwrap().holds_activation(), "no door: what an older near side sent, as before");
+    }
 }

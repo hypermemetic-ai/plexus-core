@@ -377,6 +377,7 @@ async fn with_login() -> Host {
         .named("svc")
         .with(OpsActivation)
         .with_auth()
+        .resolving(Shortcodes)
         .role("operator", ["ops.grow", "ops.get", "ops.tally"])
         .member_at(CORNER_ADMIN, "admin", "KILN")
         .member_at(AUTH_ADMIN, "admin", "/auth")

@@ -215,6 +215,12 @@ harness = false
 name = "keel51_ceiling"
 harness = false
 
+# KEEL-59: a call held to its admission; the host and, run again by the
+# seam, the child on stdio.
+[[test]]
+name = "keel59_held"
+harness = false
+
 [dev-dependencies]
 # RETURNS-47: this crate's own tests use `call::test::in_call`.
 plexus-core = { path = ".", features = ["test-util"] }

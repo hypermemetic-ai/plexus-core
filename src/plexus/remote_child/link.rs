@@ -99,6 +99,46 @@ struct Opening {
 struct Sub {
     tx: mpsc::Sender<PlexusStreamItem>,
     method: Arc<str>,
+    /// KEEL-59 (N3): the call it was opened in, told when the peer is cut
+    /// off — until this call into the peer is let go.
+    mark: Option<Arc<PeerMark>>,
+}
+
+/// KEEL-59 (N3): one call into a peer, and the call it was opened in: set
+/// when the peer is cut off, taken when the call into it is let go.
+pub(super) struct PeerMark {
+    call: Option<crate::call::CallContext>,
+    set: std::sync::atomic::AtomicBool,
+}
+
+impl PeerMark {
+    /// For the call this runs in — only while it is routed (P2): a call
+    /// into the peer opened then is the dispatched call's own forward,
+    /// whose end is the call's next item. One a method opens from its
+    /// stream is its own business: its peer's end exempts nothing, read or
+    /// not.
+    pub(super) fn here() -> Arc<Self> {
+        let call = crate::call::context().ok().filter(crate::call::CallContext::routing);
+        Arc::new(Self { call, set: std::sync::atomic::AtomicBool::new(false) })
+    }
+
+    /// The peer was cut off: its end is on its way.
+    fn set(&self) {
+        if !self.set.swap(true, Ordering::AcqRel) {
+            if let Some(c) = &self.call {
+                c.peer_ended();
+            }
+        }
+    }
+
+    /// The call into the peer is let go.
+    pub(super) fn taken(&self) {
+        if self.set.swap(false, Ordering::AcqRel) {
+            if let Some(c) = &self.call {
+                c.peer_end_taken();
+            }
+        }
+    }
 }
 
 /// How long after its `true` an unsubscribed call's late item is still the
@@ -157,6 +197,9 @@ pub(super) struct Conn {
     /// DYNAUTH-5: the Ed25519 key the far side proved at `_info`
     /// (`key:<hex>`), if it proved one.
     pub peer_key: OnceLock<String>,
+    /// KEEL-59: why the service cut this connection's calls off (a revoke,
+    /// a disconnect), once it has: nothing more is opened on it.
+    stopped: OnceLock<String>,
 }
 
 /// One message, read in one pass: a notification's item stays raw until
@@ -216,6 +259,7 @@ impl Conn {
             served: Arc::default(),
             tls_key: OnceLock::new(),
             peer_key: OnceLock::new(),
+            stopped: OnceLock::new(),
         })
     }
 
@@ -234,7 +278,7 @@ impl Conn {
     /// Open a call: `method` with `params` (a `{ns}.call`'s params, or
     /// `_info`'s null); the subscription id back within `timeout`, its items
     /// already routed to the receiver.
-    pub(super) async fn open(&self, method: &str, params: Value, timeout: Duration) -> Result<(SubKey, mpsc::Receiver<PlexusStreamItem>), PlexusStreamItem> {
+    pub(super) async fn open(&self, method: &str, params: Value, timeout: Duration, mark: Option<Arc<PeerMark>>) -> Result<(SubKey, mpsc::Receiver<PlexusStreamItem>), PlexusStreamItem> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(self.buffer);
         let (reply, answer) = oneshot::channel();
@@ -243,9 +287,14 @@ impl Conn {
             if !self.alive() {
                 return Err(unavailable(&self.name, "the connection has closed"));
             }
+            // KEEL-59: checked under the lock `stop` takes, so a call is
+            // either cut off with the rest or never opened.
+            if let Some(why) = self.stopped.get() {
+                return Err(unavailable(&self.name, why));
+            }
             // a `{ns}.call`'s params name the method called (`echo.count`)
             let called = params.get("method").and_then(Value::as_str).unwrap_or(method);
-            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into() } });
+            r.pending.insert(id, Opening { reply, items: Sub { tx, method: called.into(), mark } });
         }
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
         match tokio::time::timeout(timeout, answer).await {
@@ -271,14 +320,73 @@ impl Conn {
             if r.subs.remove(key).is_none() || !self.alive() {
                 return;
             }
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            r.closing.insert(id, key.to_string());
-            r.closing_subs.insert(key.to_string());
-            id
+            self.closing(&mut r, key)
         };
+        self.send_unsub(id, key);
+    }
+
+    /// `key` is being unsubscribed: its late items are the cancel's tail.
+    fn closing(&self, r: &mut Routes, key: &str) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        r.closing.insert(id, key.to_string());
+        r.closing_subs.insert(key.to_string());
+        id
+    }
+
+    /// `{ns}.call_unsub [key]` to the child, as request `id`.
+    fn send_unsub(&self, id: u64, key: &str) {
         let method = serde_json::to_string(&format!("{}.call_unsub", self.ns())).unwrap_or_default();
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":{method},"params":[{key}]}}"#);
         let _ = self.out.send(frame.into_bytes());
+    }
+
+    /// KEEL-59: the service cuts this connection's calls off (`dyn.revoke`,
+    /// `dyn.disconnect`): every call open into the child ends with one
+    /// `child_unavailable` item saying `why`, the child is told to stop each
+    /// (`call_unsub`, its late items the cancel's tail), a call still opening
+    /// is answered the same, and nothing more is opened on it. The socket
+    /// stays up: a reconnect is the service's to decide. The first `why`
+    /// stands.
+    pub(super) fn stop(&self, why: &str) {
+        let (subs, pending, unsubs) = {
+            let mut r = self.routes.lock().unwrap();
+            if self.stopped.set(why.to_string()).is_err() {
+                return;
+            }
+            let subs = std::mem::take(&mut r.subs);
+            let alive = self.alive();
+            let unsubs: Vec<(u64, SubKey)> = if alive { subs.keys().map(|k| (self.closing(&mut r, k), k.clone())).collect() } else { Vec::new() };
+            (subs, std::mem::take(&mut r.pending), unsubs)
+        };
+        for (id, key) in &unsubs {
+            self.send_unsub(*id, key);
+        }
+        for (_, Sub { tx, mark, .. }) in subs {
+            // Told before the item is sent: a grants move the cut-off makes
+            // leaves the call this end.
+            if let Some(m) = mark {
+                m.set();
+            }
+            Self::tell(tx, unavailable(&self.name, why));
+        }
+        for (_, open) in pending {
+            let _ = open.reply.send(Err(OpenFail::Gone(why.to_string())));
+        }
+    }
+
+    /// KEEL-59: why this connection's calls were cut off, if they were.
+    pub(super) fn stopped(&self) -> Option<&str> {
+        self.stopped.get().map(String::as_str)
+    }
+
+    /// A call's last item, without waiting on a caller that is not reading
+    /// (its buffer full: the item follows what it holds).
+    fn tell(tx: mpsc::Sender<PlexusStreamItem>, item: PlexusStreamItem) {
+        if let Err(mpsc::error::TrySendError::Full(item)) = tx.try_send(item) {
+            tokio::spawn(async move {
+                let _ = tx.send(item).await;
+            });
+        }
     }
 
     /// How many subscriptions are routed now.
@@ -432,15 +540,12 @@ impl Conn {
             r.abandoned.clear();
             (std::mem::take(&mut r.subs), std::mem::take(&mut r.pending))
         };
-        for (_, Sub { tx, .. }) in subs {
-            match tx.try_send(unavailable(&self.name, why)) {
-                Err(mpsc::error::TrySendError::Full(item)) => {
-                    tokio::spawn(async move {
-                        let _ = tx.send(item).await;
-                    });
-                }
-                _ => {}
+        for (_, Sub { tx, mark, .. }) in subs {
+            // KEEL-59: as `stop` — the peer gone, its end is the call's.
+            if let Some(m) = mark {
+                m.set();
             }
+            Self::tell(tx, unavailable(&self.name, why));
         }
         for (_, open) in pending {
             let _ = open.reply.send(Err(OpenFail::Gone(why.to_string())));
@@ -538,6 +643,9 @@ pub(super) struct Shared {
     /// a restart that proves another is refused, as one that publishes
     /// another schema is.
     pub identity: OnceLock<super::PeerIdentity>,
+    /// KEEL-59: why the service cut the child off (a revoke, a disconnect),
+    /// once it has: every call into it ended, and nothing more forwarded.
+    stopped: OnceLock<String>,
 }
 
 impl Drop for Shared {
@@ -623,6 +731,7 @@ impl Shared {
             dial: tokio::sync::Mutex::new(()),
             mounted_hash: OnceLock::new(),
             identity: OnceLock::new(),
+            stopped: OnceLock::new(),
         })
     }
 
@@ -852,6 +961,22 @@ impl Shared {
         }
     }
 
+    /// KEEL-59: cut the child off — every call open into it ends with one
+    /// item saying `why`, the child is told to stop each, and nothing more is
+    /// forwarded ([`Conn::stop`]). The first `why` stands.
+    pub(super) fn stop(&self, why: &str) {
+        let _ = self.stopped.set(why.to_string());
+        let conn = self.state.lock().unwrap().conn.clone();
+        if let Some(c) = conn {
+            c.stop(why);
+        }
+    }
+
+    /// KEEL-59: why the child was cut off, if it was.
+    pub(super) fn stopped(&self) -> Option<&str> {
+        self.stopped.get().map(String::as_str)
+    }
+
     /// Why the child will never be mounted again, if it will not (a restart
     /// published another schema).
     pub(super) fn dead(&self) -> Option<String> {
@@ -896,7 +1021,7 @@ pub(super) fn gone(shared: &Weak<Shared>, conn: &Arc<Conn>, why: &str) {
 
 /// One unary call: the first `data`'s content (the rest read to the end).
 async fn ask(conn: &Conn, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-    let (_, mut rx) = conn.open(method, params, timeout).await.map_err(|e| match e {
+    let (_, mut rx) = conn.open(method, params, timeout, None).await.map_err(|e| match e {
         PlexusStreamItem::Error { message, .. } => message,
         other => format!("{other:?}"),
     })?;

@@ -2980,6 +2980,9 @@ impl DynamicHub {
         // AUTH-2 grant gate: only when configured — a hub without one pays
         // this one branch and dispatches as before.
         if let Some(gate) = self.inner.gate.as_ref() {
+            // KEEL-59: the generation the call is decided at, read before it
+            // is: a move from here on is a call held asked again.
+            let seen = gate.generation().current();
             // AUTH-11: a sign-in that ended proves no one, on every method.
             let (auth, ended) = super::grant_gate::standing(gate, auth);
             let index = self.gate_index();
@@ -3048,7 +3051,7 @@ impl DynamicHub {
                     }))
                     .await
                 }
-                super::grant_gate::Admit::Reach(reach, door) => {
+                super::grant_gate::Admit::Reach(reach, door, held) => {
                     // KEEL-54: the call runs only where it was decided — the
                     // reach is for this path's own grant (its entry's, its
                     // slot's, or its literal path's), or nothing runs.
@@ -3066,7 +3069,27 @@ impl DynamicHub {
                         Some(call) => ctx.at_door(call, peer_slot.as_deref()),
                         None => ctx,
                     };
-                    in_call(ctx, self.route_ungated(path, params, auth, raw_ctx)).await
+                    // KEEL-59: a signed-in caller's call, on a grant not
+                    // everyone holds, is held to this decision while it runs
+                    // (`held`); any other runs as before.
+                    // One await for both: the future's state stays the size
+                    // it was (two awaits of the routed call made it ~400
+                    // bytes larger, PERF's `call.one_item`).
+                    let held = held.filter(|_| auth.is_some());
+                    // KEEL-59: held while it is routed too — a method's body
+                    // runs here before it has a stream (a unary method's
+                    // whole work).
+                    let mut seen = seen;
+                    let routed = crate::call::scope(ctx.clone(), self.route_ungated(path, params, auth, raw_ctx));
+                    let mut owed = false;
+                    let stream = super::held::routing(&ctx, self, &mut seen, &mut owed, held.as_deref(), routed).await?;
+                    // I1: routed — a context derived from this call's from
+                    // now is a callee's, whose claim is its own.
+                    ctx.routed();
+                    Ok(match held {
+                        Some(targets) => super::held::held(ctx, self.clone(), seen, owed, targets, stream),
+                        None => Box::pin(crate::call::InCall::new(ctx, stream)),
+                    })
                 }
             };
         }

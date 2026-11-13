@@ -185,8 +185,14 @@ pub(crate) fn is_slot_segment(segment: &str) -> bool {
 /// What the gate decided for a call that may proceed: run it under this
 /// reach — with the call the door admitted it at, if a door did (ONE-7) —
 /// or (introspection) without one.
+///
+/// KEEL-59: and what the call is held to while it runs
+/// ([`super::held`]): `Some(targets)` — every target the decision checked,
+/// none for a call without one — is asked again when the grants generation
+/// moves; `None` (a `public` method, a grant every signed-in caller holds)
+/// is never asked again.
 pub(crate) enum Admit {
-    Reach(Reach, Option<DispatchedCall>),
+    Reach(Reach, Option<DispatchedCall>, Option<Vec<String>>),
     Open,
 }
 
@@ -364,17 +370,17 @@ pub(crate) fn decide(
     // No address: `*` alone (KEEL-31's rule), never "held anywhere".
     if info.is_some_and(|i| i.door) {
         return Ok(match dispatched(full_path, &grant, ambiguous) {
-            Some(call) => Admit::Reach(gate.check_everywhere_at(auth, &call).map_err(said_at_everywhere)?, Some(call)),
-            None => Admit::Reach(gate.check_everywhere(auth, &grant)?, None),
+            Some(call) => Admit::Reach(gate.check_everywhere_at(auth, &call).map_err(said_at_everywhere)?, Some(call), Some(Vec::new())),
+            None => Admit::Reach(gate.check_everywhere(auth, &grant)?, None, Some(Vec::new())),
         });
     }
     // KEEL-31: a method that acts on the whole service is decided on `*`,
     // whatever else it says — the rule is the gate's, not the method's.
     if info.is_some_and(|i| i.everywhere) {
-        return Ok(Admit::Reach(gate.check_everywhere(auth, &grant)?, None));
+        return Ok(Admit::Reach(gate.check_everywhere(auth, &grant)?, None, Some(Vec::new())));
     }
     if info.is_some_and(|i| i.public) {
-        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant), None));
+        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant), None, None));
     }
     // AUTH-5: what every signed-in caller reaches (`auth.whoami`,
     // `auth.logout`, `auth.requires`) — whatever its roles or ceiling, but
@@ -383,21 +389,23 @@ pub(crate) fn decide(
         if auth.and_then(|a| a.principal()).is_none() {
             return Err(Refusal::Unauthenticated.into());
         }
-        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant), None));
+        return Ok(Admit::Reach(gate.reach_of_public(auth, &grant), None, None));
     }
     let targets = match info.and_then(|i| i.target.as_deref()) {
         Some(param) => target_values(params, param)?,
         None => None,
     };
     match targets {
-        None => Ok(Admit::Reach(gate.check(auth, &grant, None)?, None)),
-        Some(values) if values.is_empty() => Ok(Admit::Reach(gate.check(auth, &grant, None)?, None)),
+        None => Ok(Admit::Reach(gate.check(auth, &grant, None)?, None, Some(Vec::new()))),
+        Some(values) if values.is_empty() => Ok(Admit::Reach(gate.check(auth, &grant, None)?, None, Some(values))),
         Some(values) => {
             let mut reach = None;
             for v in &values {
                 reach = Some(gate.check(auth, &grant, Some(v))?);
             }
-            Ok(Admit::Reach(reach.expect("non-empty"), None))
+            // KEEL-59: the targets it was decided on, kept with the call
+            // (moved, not copied) to be asked again on a move.
+            Ok(Admit::Reach(reach.expect("non-empty"), None, Some(values)))
         }
     }
 }
@@ -502,7 +510,7 @@ mod tests {
     /// Admitted, and whether at a door.
     fn decided(caller: &str, path: &str, info: &MethodGateInfo, params: Value) -> Result<bool, PlexusError> {
         match decide(&gate(), "svc", path, Some(info), &params, Some(&who(caller)), &BTreeSet::new(), &HashSet::new())? {
-            Admit::Reach(_, door) => Ok(door.is_some()),
+            Admit::Reach(_, door, _) => Ok(door.is_some()),
             Admit::Open => Ok(false),
         }
     }
@@ -583,7 +591,7 @@ mod tests {
     fn the_backstop_takes_only_the_methods_own_door() {
         let ran = |caller: &str, path: &str, info: &MethodGateInfo, peer_slot: Option<&str>, grant: &str| -> bool {
             let auth = who(caller);
-            let Ok(Admit::Reach(reach, Some(call))) = decide(&gate(), "svc", path, Some(info), &json!({}), Some(&auth), &BTreeSet::new(), &HashSet::new()) else {
+            let Ok(Admit::Reach(reach, Some(call), _)) = decide(&gate(), "svc", path, Some(info), &json!({}), Some(&auth), &BTreeSet::new(), &HashSet::new()) else {
                 panic!("{path}: not admitted at a door");
             };
             let ctx = crate::call::CallContext::admitted_by_gate(Some(&auth), reach).at_door(call, peer_slot);

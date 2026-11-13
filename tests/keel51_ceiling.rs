@@ -178,15 +178,28 @@ async fn keel51_a_ceiling_that_allows_it_still_does() {
 
 /// AUTH-11: a sign-in that ends while the call is open ends the peer's
 /// call back on it — admitted at the call, refused after its `expires_at`.
+/// KEEL-59 (M2): the call itself ends at the sign-in's end, with one
+/// `unauthenticated` item, so the peer's call back never runs — the
+/// stronger form of the same property. (Where a call still outlives its
+/// sign-in — a `public` method, not held — the call back is refused:
+/// plexus-core tests/keel59_held.rs
+/// `a_call_back_after_the_sign_in_ended_is_refused_though_the_call_runs_on`.)
 async fn keel51_a_sign_in_that_ended_ends_the_call_back() {
+    use futures::StreamExt;
     let host = shop_host().await;
     for peer in ["restock", "local"] {
         let ending = AuthContext::for_principal(&ADMIN.parse().unwrap(), "ending", vec![], json!({ EXPIRES_AT_KEY: now() + 2 }));
-        let got = Caller::new(host.service().clone(), Some(ending)).call(&format!("garden.dendrite.{peer}.later"), json!({ "ms": 3100 })).await.answers(1);
-        assert!(got[0].get("low").is_none(), "{peer}: the call back ran on a sign-in that had ended: {got:?}");
-        // Refused as a sign-in that no longer stands (the typed client's
-        // error names the kind, `unauthenticated`).
-        assert!(got[0]["error"].as_str().is_some_and(|e| e.contains("unauthenticated")), "{peer}: refused as signed out: {got:?}");
+        let items: Vec<Value> = Caller::new(host.service().clone(), Some(ending))
+            .stream(&format!("garden.dendrite.{peer}.later"), json!({ "ms": 3100 }))
+            .await
+            .expect("opened")
+            .map(|i| serde_json::to_value(&i).unwrap())
+            .collect()
+            .await;
+        let last = items.last().unwrap_or_else(|| panic!("{peer}: no item"));
+        assert_eq!((last["type"].as_str(), last["error_kind"].as_str()), (Some("error"), Some("unauthenticated")), "{peer}: ended as signed out: {items:?}");
+        assert!(last["message"].as_str().is_some_and(|m| m.contains("expired")), "{peer}: says the sign-in expired: {items:?}");
+        assert!(items.iter().all(|i| i["content"].get("low").is_none()), "{peer}: the call back ran on a sign-in that had ended: {items:?}");
     }
     // Before it ends, the same call back goes through.
     for peer in ["restock", "local"] {

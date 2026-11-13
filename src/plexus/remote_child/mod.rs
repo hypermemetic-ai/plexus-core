@@ -381,9 +381,32 @@ impl RemoteChild {
     /// no token is minted for it), and every call it is making back ends
     /// with one error item saying `why`. A token already in its hand lives
     /// out its `exp` (≤ 60 s) at a peer that verifies without asking.
+    ///
+    /// KEEL-59: and every call open into it ends with one `child_unavailable`
+    /// item, `revoked: <why>`, the child told to stop each (`call_unsub`), as
+    /// a dialed-in node's and an in-process peer's do.
     pub fn revoke(&self, why: &str) {
         self.inner.shared.upcalls.revoke(why);
+        self.inner.shared.stop(&format!("revoked: {why}"));
         tracing::warn!(target: "plexus::audit", child = %self.name(), %why, "child revoked");
+    }
+
+    /// KEEL-59: cut the child off (`dyn.disconnect`): every call open into
+    /// it ends with one `child_unavailable` item saying `why`, the child is
+    /// told to stop each (`call_unsub`), every call it is making back under
+    /// them ends, and nothing more is forwarded to it. The first `why`
+    /// stands; a revoke after it is still recorded.
+    pub fn stop(&self, why: &str) {
+        let shared = &self.inner.shared;
+        shared.stop(why);
+        shared.upcalls.end_all(why);
+        tracing::info!(target: "plexus::child", child = %self.name(), %why, "child cut off: its calls ended");
+    }
+
+    /// KEEL-59: why the child was cut off ([`RemoteChild::stop`],
+    /// [`RemoteChild::revoke`]), if it was.
+    pub fn stopped(&self) -> Option<String> {
+        self.inner.shared.stopped().map(str::to_string)
     }
 
     /// DYNAUTH-7: why the child is revoked, if it is.
@@ -712,6 +735,10 @@ impl RemoteChild {
             let e = PlexusError::Unauthenticated(format!("`{}` is revoked ({why}): no call is forwarded to it", self.name()));
             return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false));
         }
+        // KEEL-59: nor one cut off.
+        if let Some(why) = shared.stopped() {
+            return one(unavailable(self.name(), why));
+        }
         // RETURNS-47: the verdict is the call's; outside one (a forward no
         // dispatch admitted) nothing crosses — fail closed, never everywhere.
         let reach = match super::grant_gate::current_reach() {
@@ -767,13 +794,18 @@ impl RemoteChild {
             let e = PlexusError::Unauthenticated(format!("`{}` is revoked ({why}): no call is forwarded to it", self.name()));
             return one(PlexusStreamItem::from_plexus_error(meta(self.name()), &e, false));
         }
+        if let Some(why) = shared.stopped() {
+            drop(under);
+            return one(unavailable(self.name(), why));
+        }
         let call = json!({ "method": path, "params": params, "hop": hop });
-        match conn.open(&format!("{}.call", conn.ns()), call, shared.opts.timeout).await {
+        let mark = link::PeerMark::here();
+        match conn.open(&format!("{}.call", conn.ns()), call, shared.opts.timeout, Some(mark.clone())).await {
             Ok((sid, rx)) => {
                 let generation = reach.generation().cloned();
                 let seen = generation.as_ref().map_or(0, GrantsGeneration::current);
                 let instance = instance.map(|path| (Arc::clone(&self.inner), path));
-                Box::pin(CallStream { rx, sid, conn, over: false, _guard: guard, reach, generation, seen, name: self.name().to_string(), instance, under })
+                Box::pin(CallStream { rx, sid, conn, over: false, _guard: guard, reach, generation, seen, name: self.name().to_string(), instance, under, mark })
             }
             Err(item) => one(item),
         }
@@ -809,6 +841,8 @@ struct CallStream {
     /// NEST-11: the child's standing to call back under this call; ended
     /// with it.
     under: Option<upcall::UnderGuard>,
+    /// KEEL-59 (N3): taken when this call into the peer is let go.
+    mark: Arc<link::PeerMark>,
 }
 
 impl CallStream {
@@ -846,6 +880,14 @@ impl Stream for CallStream {
         if self.over {
             return Poll::Ready(None);
         }
+        // KEEL-59: cut off (a revoke, a disconnect): ends now, ahead of
+        // anything the child sent before (the child was told to stop).
+        if let Some(why) = self.conn.stopped() {
+            let item = unavailable(&self.name, why);
+            let why = why.to_string();
+            self.finish(&why);
+            return Poll::Ready(Some(item));
+        }
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(item)) => {
                 if let (Some((inner, path)), Some(m)) = (&self.instance, item.metadata()) {
@@ -879,6 +921,7 @@ impl Stream for CallStream {
 
 impl Drop for CallStream {
     fn drop(&mut self) {
+        self.mark.taken();
         if !self.over {
             self.conn.unsubscribe(&self.sid);
         }

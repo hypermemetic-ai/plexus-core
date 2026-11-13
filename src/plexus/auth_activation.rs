@@ -774,10 +774,12 @@ impl AuthActivation {
         let ctx = auth.clone();
         stream! {
             let principal = principal_of(&ctx).map(|p| p.to_string()).unwrap_or_default();
-            match inner.backend.logout(&ctx).await {
+            // BIDIR-8: a sign-in ended; whatever holds it verifies again.
+            let moving = MovesOnDrop::armed(&inner.gate, GrantsMove::SignOut);
+            let out = inner.backend.logout(&ctx).await;
+            moving.done(out.is_ok());
+            match out {
                 Ok(()) => {
-                    // BIDIR-8: a sign-in ended; whatever holds it verifies again.
-                    inner.gate.moved(GrantsMove::SignOut);
                     yield AuthEvent::LoggedOut { principal }
                 }
                 Err(e) => yield AuthEvent::error(e.0),
@@ -879,11 +881,13 @@ impl AuthActivation {
                 }
             }
             let name = role.role();
-            if let Err(e) = inner.roles.set(&name, GrantSet::Listed(set)).await {
+            let moving = MovesOnDrop::armed(&inner.gate, GrantsMove::RoleEdit);
+            let set = inner.roles.set(&name, GrantSet::Listed(set)).await;
+            moving.done(set.is_ok());
+            if let Err(e) = set {
                 yield AuthEvent::error(e.0);
                 return;
             }
-            inner.gate.moved(GrantsMove::RoleEdit);
             let now = inner.roles.grants(&name);
             yield role_event(&name, now);
         }
@@ -961,11 +965,11 @@ impl AuthActivation {
                 return;
             }
             let role_name = role.as_ref().map(param::RoleName::role);
-            match inner.memberships.revoke(&who, role_name.as_ref(), &scope_ref).await {
+            let moving = MovesOnDrop::armed(&inner.gate, GrantsMove::Revoke);
+            let revoked = inner.memberships.revoke(&who, role_name.as_ref(), &scope_ref).await;
+            moving.done(revoked.as_ref().is_ok_and(|r| !r.is_empty()));
+            match revoked {
                 Ok(removed) => {
-                    if !removed.is_empty() {
-                        inner.gate.moved(GrantsMove::Revoke);
-                    }
                     yield AuthEvent::Revoked {
                         principal: who.to_string(),
                         scope: scope_ref.as_str().into(),
@@ -1109,5 +1113,37 @@ mod keel54_body_checks {
         let reach = gate.check(Some(&ctx), &Grant::new("auth.revoke"), Some("*")).unwrap();
         assert_eq!(said(&auth, &ctx, reach, "grant", everything()).await["error_kind"], "forbidden");
         assert!(!raised(&members));
+    }
+}
+
+/// KEEL-59: a write that narrows what the gate answers (a revoke, a role
+/// edited, a sign-out) moves the grants generation even when its call is
+/// ended mid-write — a call is now ended by the server too (its caller's own
+/// grant revoked) — so a write that landed is never left without the move
+/// that holds every open call to it. Disarmed when the write said it moved
+/// nothing.
+struct MovesOnDrop<'a> {
+    gate: &'a plexus_auth_core::grants::Gate,
+    why: Option<GrantsMove>,
+}
+
+impl<'a> MovesOnDrop<'a> {
+    fn armed(gate: &'a plexus_auth_core::grants::Gate, why: GrantsMove) -> Self {
+        Self { gate, why: Some(why) }
+    }
+
+    /// The write is over: move now if it changed something, never again.
+    fn done(mut self, changed: bool) {
+        if let Some(why) = self.why.take().filter(|_| changed) {
+            self.gate.moved(why);
+        }
+    }
+}
+
+impl Drop for MovesOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(why) = self.why.take() {
+            self.gate.moved(why);
+        }
     }
 }

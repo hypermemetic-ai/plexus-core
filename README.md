@@ -84,6 +84,7 @@ gate (`DynamicHub::with_gate`) decides each call by its caller's roles.
 - [Activations](docs/activations.md): hosting one, nesting, the two this crate ships.
 - [The service root](docs/service-root.md): a top level that changes while the service serves.
 - [The gate](docs/gate.md): how each call is decided, and a role held on an address.
+- [Held calls](docs/held-calls.md): a call is decided again when the grants move, and ended when it does not hold.
 - [Keyed peers](docs/keyed-peers.md): the rules a child with a key and its service apply.
 
 AGPL-3.0-only.

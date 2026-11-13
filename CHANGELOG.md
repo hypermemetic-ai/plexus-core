@@ -5,7 +5,7 @@ All notable changes to plexus-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.11.3] — 2026-11-13
 
 ### KEEL-54 — security
 
@@ -18,7 +18,7 @@ Security: a path the gate did not know could be decided without its target; upgr
 - An entry can no longer be named `call`, `hash`, `hashes`, `ir` or
   `schema` (refused at registration, `RootError::Shadows`).
 
-### ONE-7 — the gate passes the call's address: an activation's door, and one peer's (0.11.4, patch)
+### ONE-7 — the gate passes the call's address: an activation's door, and one peer's (patch)
 
 Build 2 of ONE-4, on plexus-auth-core 0.3.4 (ONE-6; the requirement is now
 `0.3.4`). Owner, 2026-11-11: "activation and data scopes are separate. we
@@ -159,7 +159,7 @@ a call back made after the session ended still ran.
   ceiling admitted, a call back after the sign-in ended refused);
   `forward_policy_dispatch` checks every policy keeps the bounds.
 
-## [0.11.3] — unreleased
+### Earlier work in 0.11.3
 
 NEST-25 — additive: **dial-in seams for an embedder's table, and first
 contact the way ssh does it.**
